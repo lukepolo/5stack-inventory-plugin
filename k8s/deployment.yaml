@@ -1,0 +1,209 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: inventory-frontend
+  name: inventory-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-frontend
+  # Same as api/web: never drop below one ready pod. The surge pod has to pass
+  # its readiness probe before the old one is torn down.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: inventory-frontend
+    spec:
+      # The hostPath below only exists on the node custom.sh labeled for this
+      # custom dir. Without this the surge pod can schedule elsewhere and come
+      # up with an empty models mount.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: 5stack-5stack-inventory
+                    operator: In
+                    values:
+                      - "true"
+      # Extracted CS2 weapon models (see the plugin's scripts/extract-models.sh).
+      # Mounted from the node; when absent/empty the UI's HEAD checks 404 and
+      # the 3D toggles simply don't appear.
+      volumes:
+        - name: cs2-models
+          hostPath:
+            path: /opt/5stack/models/cs2-model-extract
+            type: DirectoryOrCreate
+      containers:
+        - name: inventory-frontend
+          image: ghcr.io/lukepolo/5stack-inventory-plugin-frontend:latest
+          # :latest defaults to Always anyway (same as the api image); spelled
+          # out so a tagged build can't silently start serving a cached layer.
+          imagePullPolicy: Always
+          volumeMounts:
+            - name: cs2-models
+              mountPath: /cs2-models
+              readOnly: true
+          # Requests only, no limits: `codepier up` swaps this container for
+          # node:22 and runs `vite build` in the same cgroup, and a limit sized
+          # for nginx OOM-kills that build with no error message.
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "10m"
+          ports:
+            - containerPort: 80
+              name: http
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: inventory-backend
+  name: inventory-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-backend
+  # Rolling, not Recreate: the frontend proxies /paints|/renders misses here,
+  # so a gap in the backend shows up as broken item art. maxUnavailable 0 means
+  # the old pod keeps serving until the new one is ready.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: inventory-backend
+    spec:
+      # Both hostPaths (models mount, CS2 install) are node-local — pin to the
+      # node custom.sh labeled for this custom dir.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: 5stack-5stack-inventory
+                    operator: In
+                    values:
+                      - "true"
+      volumes:
+        # Same hostPath as the frontend, but WRITABLE: the backend lazily
+        # mirrors paint files here on first request (see /paints/* route),
+        # and the admin "extract models" action writes the extracted GLBs
+        # plus its extract-state.json here.
+        - name: cs2-models
+          hostPath:
+            path: /opt/5stack/models/cs2-model-extract
+            type: DirectoryOrCreate
+        # The node's CS2 install (game-streamer's steam library), read-only.
+        #
+        # Mount game-streamer's ROOT, not the CS2 dir four levels down, and
+        # reach the game via CS2_DIR. The deep path mounted empty even with the
+        # install plainly present on the node: that subtree is assembled by the
+        # game-streamer container (it holds SteamLinuxRuntime files and a
+        # Steam.dll symlink into /mnt/game-streamer, which only resolves inside
+        # that container) and Steam replaces directories under it on update, so
+        # a bind mount of the leaf goes stale. This is the exact path
+        # game-streamer itself hostPaths, so it is known to resolve.
+        #
+        # type: Directory on purpose — a missing path must fail the pod loudly
+        # rather than be conjured as an empty dir, which is how this last broke
+        # silently and cost hours.
+        - name: cs2-game
+          hostPath:
+            path: /opt/5stack/game-streamer
+            type: Directory
+      containers:
+        - name: inventory-backend
+          image: ghcr.io/lukepolo/5stack-inventory-plugin-backend:latest
+          volumeMounts:
+            - name: cs2-models
+              mountPath: /cs2-models
+            - name: cs2-game
+              mountPath: /cs2-game
+              readOnly: true
+          # :latest defaults to Always anyway (same as the api image); spelled
+          # out so a tagged build can't silently start serving a cached layer.
+          imagePullPolicy: Always
+          env:
+            # Reuse the panel's existing Postgres password — it's already in the
+            # cluster, so a basic install configures nothing here. The plugin
+            # owns an `inventory` SCHEMA (not its own database) and
+            # schema-qualifies every query, so this one connection string is all
+            # it needs.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: timescaledb-secrets
+                  key: POSTGRES_CONNECTION_STRING
+            - name: CS2_DIR
+              value: /cs2-game/steamapps/common/Counter-Strike Global Offensive
+            # Scratch (CLI download + raw decompile) goes on the models mount
+            # we already have — real node disk with room, no extra volume.
+            - name: EXTRACT_WORK_DIR
+              value: /cs2-models/.work
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+          ports:
+            - containerPort: 3000
+              name: http
+          # /healthz is a static handler in main.ts — it answers only after
+          # applySchema() and app.listen(), so "ready" really means serving.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 2
+          # Slacker than the api's: model extraction is a long, disk-heavy
+          # admin job in this same pod, and restarting mid-extract would leave
+          # a half-written mount. 90s of misses before a kill, not 45s.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 6

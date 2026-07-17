@@ -1,0 +1,48 @@
+# Two ingresses on the same host, split by path:
+#   /api  -> backend, which validates the 5stack session cookie itself
+#   /*    -> frontend static assets (remoteEntry.js)
+# No forward-auth annotations: the backend exchanges the inbound cookie for an
+# identity at /plugins/authorize, which fails closed even if this ingress is
+# bypassed. The host must stay a subdomain of the panel or the browser never
+# sends the cookie (SameSite=Lax). Forward-auth here also breaks the game-server
+# API (/api/equipped/v5/*), which authenticates by invsim_apikey and has no
+# cookie to present.
+# CORS is handled by the apps themselves (backend: @fastify/cors; frontend:
+# nginx add_header) — not here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inventory-api
+  namespace: 5stack
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${INVENTORY_DOMAIN}
+      http:
+        paths:
+          - backend:
+              service:
+                name: inventory-backend
+                port:
+                  number: 3000
+            path: /api
+            pathType: Prefix
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inventory-frontend
+  namespace: 5stack
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ${INVENTORY_DOMAIN}
+      http:
+        paths:
+          - backend:
+              service:
+                name: inventory-frontend
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix

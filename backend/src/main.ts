@@ -1,0 +1,1753 @@
+import { readFileSync, createWriteStream } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import Fastify, { LogController } from "fastify";
+import { pool } from "./db.ts";
+import { getIdentity } from "./identity.ts";
+import { buildInspectLink, type InspectSticker } from "./inspect.ts";
+import { getStickerMarkup } from "./stickerMarkup.ts";
+import {
+  getWeapons,
+  getDefaults,
+  getWeaponSkins,
+  getAgents,
+  getKnives,
+  getGloves,
+  getMusicKits,
+  getStickers,
+  getCharms,
+  getPatches,
+  getGraffiti,
+  getItemsByIds,
+  getItem,
+  getItemIdByName,
+  getItemIdBySteamName,
+  slotForItem,
+  isBaseWeapon,
+  getStickerBounds,
+} from "./catalog.ts";
+
+// Per-request in/out logging drowns out everything the app actually says
+// (two lines per request, and the SPA polls). Errors and explicit app.log.*
+// calls still come through; set LOG_REQUESTS=1 to get the firehose back.
+const app = Fastify({
+  logger: true,
+  // logController replaces the top-level disableRequestLogging, which is
+  // deprecated in fastify 5 and removed in 6. It must be a LogController
+  // instance, not a plain options object.
+  logController: new LogController({
+    disableRequestLogging: !process.env.LOG_REQUESTS,
+  }),
+});
+
+// Self-provision the inventory schema on boot (idempotent) so a fresh deploy
+// needs no manual migrate step.
+async function applySchema() {
+  const sql = readFileSync(
+    fileURLToPath(new URL("./schema.sql", import.meta.url)),
+    "utf8",
+  );
+  await pool.query(sql);
+}
+
+const TEAMS = new Set(["CT", "T"]);
+
+// ---- Catalog (CS2 item data; no auth needed, it's public reference data) ----
+
+app.get("/api/catalog", async () => {
+  return { weapons: getWeapons(), agents: getAgents(), defaults: getDefaults() };
+});
+
+// Lazy self-populating paint cache: first request for a paint-chain file
+// fetches it from the public CDN, writes it to the shared hostPath mount
+// (the filesystem IS the "already mirrored" state — no extra bookkeeping),
+// and serves it. Every later request is a plain file read, and nginx serves
+// the file directly once present (try_files falls back here only on miss).
+// scripts/mirror-paints.mjs remains as an optional bulk pre-warm.
+// Rendered item cards (client snapshots of the painted 3D model) live on the
+// same mount; nginx serves /renders/* statically. Upload is 5stack-session
+// authed — no extra keys.
+const RENDERS_DIR = process.env.RENDERS_DIR ?? "/cs2-models/renders";
+app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_req, body, done) => done(null, body));
+// Key is derived SERVER-SIDE from the caller's own instance row — a client
+// can never write another user's render slot (or an arbitrary path).
+export function renderKeyForRow(row: { id: number | string; wear: number | string | null; seed: number | string | null }) {
+  // Version suffix = render pipeline version: bumping it makes every older
+  // bake miss so cards re-render instead of serving stale art. Must match
+  // renderKeyFor in src/api.ts. (v2 compositor/legacy-body, v3 content-crop,
+  // v4 paint+lighting: durability inversion, cavity from ao4.b, the disabled
+  // g_bUseOverlay/g_bUseRoughness gates, and the IBL/key/rim scale-down that
+  // stopped a white specular term swamping every skin's chroma.)
+  //
+  // The key covers id+wear+seed only — NOT the shader — so a compositor fix
+  // changes the pixels while the filename stays put, and every card keeps
+  // serving the pre-fix bake. Bumping this is the ONLY thing that invalidates
+  // them; "clear cache" cannot, because the URL is unchanged.
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}-v4.png`;
+}
+app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "not signed in" });
+  }
+  const body = request.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > 3_000_000 || !/^\x89PNG/.test(body.subarray(0, 4).toString("latin1"))) {
+    return reply.status(400).send({ error: "bad render" });
+  }
+  const { rows } = await pool.query(
+    `SELECT id, wear, seed FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    [Number(request.params.id), identity.steamId],
+  );
+  if (!rows[0]) {
+    return reply.status(403).send({ error: "not your item" });
+  }
+  try {
+    await fs.mkdir(RENDERS_DIR, { recursive: true });
+    await fs.writeFile(path.join(RENDERS_DIR, renderKeyForRow(rows[0])), body);
+    return { ok: true };
+  } catch {
+    return reply.status(500).send({ error: "render store unavailable" });
+  }
+});
+
+const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
+const PAINT_CDN = "https://cdn.cstrike.app";
+const PAINT_TYPES: Record<string, string> = {
+  ".json": "application/json",
+  ".webp": "image/webp",
+  ".png": "image/png",
+};
+app.get<{ Params: { "*": string } }>("/paints/*", async (request, reply) => {
+  const rel = request.params["*"] ?? "";
+  const ext = path.extname(rel).toLowerCase();
+  const type = PAINT_TYPES[ext];
+  if (!type || rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+$/.test(rel)) {
+    return reply.status(404).send({ error: "not found" });
+  }
+  reply.header("Access-Control-Allow-Origin", "*");
+  const dest = path.join(PAINTS_DIR, rel);
+  try {
+    const cached = await fs.readFile(dest);
+    reply.header("Cache-Control", "public, max-age=86400");
+    return reply.type(type).send(cached);
+  } catch {
+    /* not mirrored yet */
+  }
+  try {
+    const res = await fetch(`${PAINT_CDN}/${rel}`, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) {
+      return reply.status(404).send({ error: "not found" });
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    // Best-effort persist — if the mount is absent (dev), we still proxy through.
+    try {
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.writeFile(dest, buf);
+    } catch {
+      /* read-only or missing mount */
+    }
+    reply.header("Cache-Control", "public, max-age=86400");
+    return reply.type(type).send(buf);
+  } catch {
+    return reply.status(502).send({ error: "paint fetch failed" });
+  }
+});
+
+// Serve renders directly too — nginx falls back here when its mount copy
+// misses (e.g. frontend/backend pods on different nodes).
+// Registered under BOTH paths: /api/renders/* is the canonical client path
+// (the /api ingress provably reaches this pod — uploads use it); bare
+// /renders/* backs nginx's static-miss fallback.
+for (const route of ["/api/renders/:key", "/renders/:key"]) {
+  app.get<{ Params: { key: string } }>(route, async (request, reply) => {
+  const key = request.params.key;
+  if (!/^[\w.-]+\.png$/.test(key)) {
+    return reply.status(404).send({ error: "not found" });
+  }
+  try {
+    const buf = await fs.readFile(path.join(RENDERS_DIR, key));
+    // CORS comes from @fastify/cors (echoed origin + allow-credentials). A
+    // manual `*` here overrides that echo, and browsers reject `*` on
+    // credentialed fetches — the client's "already baked?" HEAD check then
+    // fails every load and cards re-bake despite the render being served.
+    reply.header("Cache-Control", "public, max-age=3600");
+    return reply.type("image/png").send(buf);
+  } catch {
+    return reply.status(404).send({ error: "not found" });
+  }
+  });
+}
+
+// Sticker placement envelope for a weapon model (drives the 3D drag editor).
+// Bounds AND the real per-slot UV anchors. Bounds alone can only rule a
+// placement out; the anchors are what let the viewer put a sticker where the
+// game will actually draw it. Markup is fetched from cs2-lib's CDN and cached,
+// so a miss degrades to the old bounds-only behaviour rather than failing.
+app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", async (request) => {
+  const model = request.params.model;
+  const [bounds, slots] = await Promise.all([
+    Promise.resolve(getStickerBounds(model)),
+    getStickerMarkup(model),
+  ]);
+  return { bounds, slots };
+});
+
+app.get<{ Querystring: { slot?: string } }>(
+  "/api/catalog/skins",
+  async (request, reply) => {
+    const slot = request.query.slot;
+    if (!slot) {
+      return reply.status(400).send({ error: "slot required" });
+    }
+    if (slot === "knife") {
+      return { base: null, skins: getKnives() };
+    }
+    if (slot === "gloves") {
+      return { base: null, skins: getGloves() };
+    }
+    if (slot === "agent") {
+      return { base: null, skins: getAgents() };
+    }
+    if (slot === "musickit") {
+      return { base: null, skins: getMusicKits() };
+    }
+    if (slot === "graffiti") {
+      return { base: null, skins: getGraffiti("") };
+    }
+    if (slot === "zeus") {
+      return getWeaponSkins("taser");
+    }
+    if (slot === "c4") {
+      return getWeaponSkins("c4");
+    }
+    return getWeaponSkins(slot);
+  },
+);
+
+app.get<{ Querystring: { q?: string } }>("/api/catalog/stickers", async (request) => {
+  return getStickers(request.query.q ?? "");
+});
+app.get<{ Querystring: { q?: string } }>("/api/catalog/charms", async (request) => {
+  return getCharms(request.query.q ?? "");
+});
+app.get<{ Querystring: { q?: string } }>("/api/catalog/patches", async (request) => {
+  return getPatches(request.query.q ?? "");
+});
+
+// Bulk id → item lookup, for rehydrating a shared craft link. Capped so a
+// hand-written ?ids= can't turn into a catalog dump.
+app.get<{ Querystring: { ids?: string } }>("/api/catalog/items", async (request) => {
+  const ids = (request.query.ids ?? "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0)
+    .slice(0, 24);
+  return ids.length ? getItemsByIds(ids) : [];
+});
+
+// ---- Inventory (per-user owned item instances; the loadout is craft-gated) ----
+
+// Sticker/patch slot entries: legacy rows stored plain item ids; newer rows
+// store {id, x, y, r, w} placement specs. Normalize on read. `w` is the
+// sticker's own scratch wear (0 pristine .. 1 scratched off) — distinct from
+// the weapon's float wear. Rows written before it existed normalize to null,
+// which reads as pristine everywhere downstream.
+type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null } | null;
+// Clamp on READ as well as on write: the game applies this straight to the
+// "sticker slot N wear" econ attribute, so a bad float already sitting in the
+// JSONB column must never reach a server.
+function normWear(w: unknown): number | null {
+  if (typeof w !== "number" || !Number.isFinite(w)) return null;
+  return Math.min(1, Math.max(0, w));
+}
+function normSpecs(arr: unknown): AttachSpec[] {
+  if (!Array.isArray(arr)) return [];
+  return arr.map((entry) => {
+    if (entry == null) return null;
+    if (typeof entry === "number") return { id: entry };
+    if (typeof entry === "object" && typeof (entry as { id?: unknown }).id === "number") {
+      const e = entry as { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null };
+      return { id: e.id, x: e.x ?? null, y: e.y ?? null, r: e.r ?? null, w: normWear(e.w) };
+    }
+    return null;
+  });
+}
+
+interface ItemRow {
+  id: number;
+  item_id: number;
+  wear: number | null;
+  seed: number | null;
+  stattrak: boolean;
+  nametag: string | null;
+  stickers?: unknown[] | null;
+  charm_id?: number | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+  patches?: unknown[] | null;
+}
+
+// Reject bad wear on the RAW array — normSpecs() clamps, so it has to be
+// checked before normalization or an out-of-range value is silently accepted.
+function checkWear(arr: unknown[]): string | null {
+  for (const entry of arr) {
+    if (entry == null || typeof entry !== "object") continue;
+    const w = (entry as { w?: unknown }).w;
+    if (w == null) continue;
+    if (typeof w !== "number" || !Number.isFinite(w) || w < 0 || w > 1) {
+      return "Sticker wear must be between 0 and 1.";
+    }
+  }
+  return null;
+}
+
+// Validate sticker/charm attachments; returns an error string or null.
+function checkAttachments(
+  stickers?: unknown[] | null,
+  charm_id?: number | null,
+  patches?: unknown[] | null,
+): string | null {
+  if (stickers != null) {
+    if (!Array.isArray(stickers) || stickers.length > 5) {
+      return "Up to 5 stickers can be applied.";
+    }
+    for (const spec of normSpecs(stickers)) {
+      if (spec != null && getItem(spec.id)?.type !== "sticker") return "That isn't a sticker.";
+    }
+    const badWear = checkWear(stickers);
+    if (badWear) return badWear;
+  }
+  if (patches != null) {
+    if (!Array.isArray(patches) || patches.length > 5) {
+      return "Up to 5 patches can be applied.";
+    }
+    for (const spec of normSpecs(patches)) {
+      if (spec != null && getItem(spec.id)?.type !== "patch") return "That isn't a patch.";
+    }
+    const badWear = checkWear(patches);
+    if (badWear) return badWear;
+  }
+  if (charm_id != null && getItem(charm_id)?.type !== "keychain") {
+    return "That isn't a charm.";
+  }
+  return null;
+}
+function enrichAttachments<T extends { stickers?: unknown[] | null; charm_id?: number | null; charm_offset?: ItemRow["charm_offset"]; patches?: unknown[] | null }>(row: T) {
+  const enrich = (spec: AttachSpec) =>
+    spec ? { ...getItem(spec.id), x: spec.x ?? null, y: spec.y ?? null, r: spec.r ?? null, w: spec.w ?? null } : null;
+  return {
+    ...row,
+    // Sparse arrays: index = the sticker/patch POSITION on the item.
+    stickers: normSpecs(row.stickers).map(enrich),
+    patches: normSpecs(row.patches).map(enrich),
+    charm: row.charm_id != null ? { ...getItem(row.charm_id), ...(row.charm_offset ?? {}) } : null,
+  };
+}
+
+// Enrich an owned instance with catalog data + its loadout slot + where it's
+// equipped, so the UI can render and validate without a second catalog lookup.
+function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }[]) {
+  const item = getItem(row.item_id);
+  return {
+    id: row.id,
+    item_id: row.item_id,
+    wear: row.wear,
+    seed: row.seed,
+    stattrak: row.stattrak,
+    nametag: row.nametag,
+    slot: slotForItem(row.item_id),
+    item,
+    equipped: equippedOn.filter((e) => e.slot === slotForItem(row.item_id)),
+  };
+}
+
+app.get("/api/inventory", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const [{ rows: items }, { rows: equips }] = await Promise.all([
+    pool.query<ItemRow>(
+      `SELECT id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, origin
+       FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
+      [identity.steamId],
+    ),
+    pool.query<{ team: string; slot: string; item_instance_id: number }>(
+      `SELECT team, slot, item_instance_id FROM inventory.loadout
+       WHERE steam_id = $1 AND item_instance_id IS NOT NULL`,
+      [identity.steamId],
+    ),
+  ]);
+  const byInstance = new Map<number, { team: string; slot: string }[]>();
+  for (const e of equips) {
+    const list = byInstance.get(e.item_instance_id) ?? [];
+    list.push({ team: e.team, slot: e.slot });
+    byInstance.set(e.item_instance_id, list);
+  }
+  return items.map((row) => ({
+    ...enrichAttachments(row),
+    slot: slotForItem(row.item_id),
+    item: getItem(row.item_id),
+    equipped: byInstance.get(row.id) ?? [],
+  }));
+});
+
+app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches } = request.body;
+  if (typeof item_id !== "number" || !getItem(item_id)) {
+    return reply.status(400).send({ error: "That item doesn't exist." });
+  }
+  if (!slotForItem(item_id)) {
+    return reply.status(400).send({ error: "That item can't be equipped." });
+  }
+  const attachErr = checkAttachments(stickers, charm_id, patches);
+  if (attachErr) {
+    return reply.status(400).send({ error: attachErr });
+  }
+  const { rows } = await pool.query<ItemRow>(
+    `INSERT INTO inventory.owned_items (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)
+     RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
+    [
+      identity.steamId, item_id, wear ?? null, seed ?? null, stattrak ?? false, nametag ?? null,
+      normSpecs(stickers).some(Boolean) ? JSON.stringify(normSpecs(stickers)) : null, charm_id ?? null,
+      charm_offset ? JSON.stringify(charm_offset) : null,
+      normSpecs(patches).some(Boolean) ? JSON.stringify(normSpecs(patches)) : null,
+    ],
+  );
+  return { ...enrichInstance(rows[0], []), ...enrichAttachments(rows[0]) };
+});
+
+// Update a crafted instance (StatTrak / wear / pattern / nametag). Reflects
+// everywhere the instance is equipped.
+app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
+  "/api/inventory/:id",
+  async (request, reply) => {
+    {
+      // Imported items mirror a real Steam inventory — read-only by design.
+      const identity0 = await getIdentity(request);
+      if (identity0) {
+        const chk = await pool.query(
+          `SELECT origin FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+          [Number(request.params.id), identity0.steamId],
+        );
+        if (chk.rows[0]?.origin === "steam") {
+          return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
+        }
+      }
+    }
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const id = Number(request.params.id);
+    const { wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches } = request.body;
+    const attachErr = checkAttachments(stickers, charm_id, patches);
+    if (attachErr) {
+      return reply.status(400).send({ error: attachErr });
+    }
+    const hasStickers = stickers !== undefined;
+    const hasCharm = charm_id !== undefined;
+    const hasPatches = patches !== undefined;
+    const { rows } = await pool.query<ItemRow>(
+      `UPDATE inventory.owned_items SET
+         wear = COALESCE($3, wear), seed = COALESCE($4, seed),
+         stattrak = COALESCE($5, stattrak), nametag = $6,
+         stickers = CASE WHEN $7 THEN $8::jsonb ELSE stickers END,
+         charm_id = CASE WHEN $9 THEN $10 ELSE charm_id END,
+         charm_offset = CASE WHEN $9 THEN $11::jsonb ELSE charm_offset END,
+         patches = CASE WHEN $12 THEN $13::jsonb ELSE patches END
+       WHERE id = $1 AND steam_id = $2
+       RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
+      [
+        id, identity.steamId, wear ?? null, seed ?? null, stattrak ?? null, nametag ?? null,
+        hasStickers, hasStickers && normSpecs(stickers).some(Boolean) ? JSON.stringify(normSpecs(stickers)) : null,
+        hasCharm, hasCharm ? charm_id ?? null : null,
+        hasCharm && charm_offset ? JSON.stringify(charm_offset) : null,
+        hasPatches, hasPatches && normSpecs(patches).some(Boolean) ? JSON.stringify(normSpecs(patches)) : null,
+      ],
+    );
+    if (!rows.length) {
+      return reply.status(404).send({ error: "That item isn't in your inventory." });
+    }
+    return { ...enrichInstance(rows[0], []), ...enrichAttachments(rows[0]) };
+  },
+);
+
+// One place that turns an item + its attachments into an inspect link, shared
+// by the saved-instance route and the live draft route below. They MUST agree:
+// the whole point of previewing a draft is that what you inspect is what you
+// will get, so a second copy of this that drifts is worse than useless.
+function inspectLinkFor(
+  itemId: number,
+  row: {
+    wear?: number | null;
+    seed?: number | null;
+    stattrak?: boolean;
+    stattrak_count?: number | null;
+    nametag?: string | null;
+    stickers?: unknown[] | null;
+    patches?: unknown[] | null;
+    charm_id?: number | null;
+    charm_offset?: { x?: number | null; y?: number | null; z?: number | null } | null;
+  },
+): string | null {
+  const item = getItem(itemId);
+  if (!item || item.def == null) return null;
+
+  // Agents carry patches through the sticker slots, same as the equipped feed.
+  const attachments = normSpecs(item.type === "agent" ? row.patches : row.stickers);
+  const stickers: InspectSticker[] = [];
+  attachments.forEach((spec, slot) => {
+    if (!spec) return;
+    const kit = getItem(spec.id)?.index;
+    if (kit == null) return;
+    stickers.push({
+      slot,
+      id: kit as number,
+      wear: spec.w ?? null,
+      offsetX: spec.x ?? null,
+      offsetY: spec.y ?? null,
+      rotation: spec.r ?? null,
+    });
+  });
+
+  const keychains: InspectSticker[] = [];
+  const charmKit = row.charm_id != null ? getItem(row.charm_id)?.index : null;
+  if (charmKit != null) {
+    keychains.push({
+      slot: 0,
+      id: charmKit as number,
+      offsetX: row.charm_offset?.x ?? null,
+      offsetY: row.charm_offset?.y ?? null,
+      offsetZ: row.charm_offset?.z ?? null,
+      pattern: 0,
+    });
+  }
+
+  return buildInspectLink({
+    defindex: item.def as number,
+    paintindex: (item.index as number | undefined) ?? 0,
+    paintseed: row.seed ?? 0,
+    paintwear: row.wear ?? 0,
+    stattrak: row.stattrak ?? false,
+    killeatervalue: row.stattrak ? row.stattrak_count ?? 0 : null,
+    nametag: row.nametag ?? null,
+    stickers,
+    keychains,
+  });
+}
+
+// Inspect link for an UNSAVED craft — the state sitting in the editor right
+// now. Without this, "Inspect in game" could only ever show the last saved
+// version, so moving a sticker or charm and inspecting showed the old
+// placement until you saved and reopened.
+app.post<{ Body: Partial<ItemRow> }>("/api/inspect/preview", async (request, reply) => {
+  if (!(await getIdentity(request))) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const b = request.body ?? ({} as Partial<ItemRow>);
+  if (typeof b.item_id !== "number") {
+    return reply.status(400).send({ error: "Nothing to inspect yet." });
+  }
+  const attachErr = checkAttachments(b.stickers, b.charm_id, b.patches);
+  if (attachErr) {
+    return reply.status(400).send({ error: attachErr });
+  }
+  const link = inspectLinkFor(b.item_id, {
+    wear: b.wear,
+    seed: b.seed,
+    stattrak: b.stattrak,
+    nametag: b.nametag,
+    stickers: b.stickers,
+    patches: b.patches,
+    charm_id: b.charm_id,
+    charm_offset: b.charm_offset,
+  });
+  if (!link) {
+    return reply.status(400).send({ error: "That item can't be expressed as an inspect link." });
+  }
+  return { inspect: link };
+});
+
+// steam:// inspect link for a crafted item — opens the craft, stickers and all,
+// in CS2's inspect view without the item existing on Steam's backend.
+app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<ItemRow & { stattrak_count: number | null }>(
+    `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers,
+            charm_id, charm_offset, patches
+     FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    [Number(request.params.id), identity.steamId],
+  );
+  if (!rows.length) {
+    return reply.status(404).send({ error: "That item isn't in your inventory." });
+  }
+  const row = rows[0];
+  const link = inspectLinkFor(row.item_id, row);
+  if (!link) {
+    return reply.status(400).send({ error: "That item can't be expressed as an inspect link." });
+  }
+  return { inspect: link, stattrak: row.stattrak };
+});
+
+app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  await pool.query(`DELETE FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`, [
+    Number(request.params.id),
+    identity.steamId,
+  ]);
+  return { ok: true };
+});
+
+// ---- Loadout (per-user; slots reference owned instances) ----
+
+app.get("/api/loadout", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{
+    team: string;
+    slot: string;
+    item_instance_id: number | null;
+    item_id: number | null;
+    wear: number | null;
+    seed: number | null;
+    stattrak: boolean;
+    nametag: string | null;
+  }>(
+    `SELECT l.team, l.slot, l.item_instance_id,
+       COALESCE(i.item_id, l.item_id)   AS item_id,
+       COALESCE(i.wear, l.wear)         AS wear,
+       COALESCE(i.seed, l.seed)         AS seed,
+       COALESCE(i.stattrak, l.stattrak) AS stattrak,
+       COALESCE(i.nametag, l.nametag)   AS nametag
+     FROM inventory.loadout l
+     LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+     WHERE l.steam_id = $1`,
+    [identity.steamId],
+  );
+  return rows
+    .filter((row) => row.item_id != null)
+    .map((row) => ({ ...row, item: getItem(row.item_id as number) }));
+});
+
+// ---- CS2-style positional slots (v2) ----
+// sp = starting pistol, p1-p4 = other pistols, m1-m5 = mid-tier (SMGs +
+// shotguns + LMGs), r1-r5 = rifles (incl. snipers), plus knife/gloves/agent.
+const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti)$/;
+const START_PISTOLS = new Set(["glock", "usp_silencer", "hkp2000"]);
+function slotCategories(slot: string): string[] | null {
+  if (slot === "sp" || /^p[1-4]$/.test(slot)) {
+    return ["secondary"];
+  }
+  if (/^m[1-5]$/.test(slot)) {
+    return ["smg", "heavy"];
+  }
+  if (/^r[1-5]$/.test(slot)) {
+    return ["rifle"];
+  }
+  return null;
+}
+
+// Equip into a positional slot: either an owned crafted instance
+// (item_instance_id) or a free default weapon (item_id of a vanilla base item).
+// Validates ownership, slot fit, team, and no duplicate weapon in the loadout.
+app.post<{
+  Body: { team?: string; slot?: string; item_instance_id?: number | string; item_id?: number };
+}>("/api/loadout", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { team, slot, item_instance_id, item_id } = request.body;
+  if (!team || !TEAMS.has(team) || !slot || !SLOT_RE.test(slot)) {
+    return reply.status(400).send({ error: "A team and a valid loadout slot are required." });
+  }
+
+  // Resolve the item being equipped. Bigint ids arrive as strings from
+  // Postgres, so item_instance_id may be a numeric string.
+  let resolvedItemId: number;
+  let instanceId: number | string | null = null;
+  if (item_instance_id != null && item_instance_id !== "") {
+    const { rows } = await pool.query<{ item_id: number }>(
+      `SELECT item_id FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+      [item_instance_id, identity.steamId],
+    );
+    if (!rows.length) {
+      return reply.status(400).send({ error: "That item isn't in your inventory — craft it first." });
+    }
+    resolvedItemId = rows[0].item_id;
+    instanceId = item_instance_id;
+  } else if (typeof item_id === "number") {
+    if (!isBaseWeapon(item_id)) {
+      return reply
+        .status(400)
+        .send({ error: "Only default (vanilla) weapons can be equipped without crafting." });
+    }
+    resolvedItemId = item_id;
+  } else {
+    return reply.status(400).send({ error: "Nothing to equip — pick a skin or a default weapon." });
+  }
+
+  const item = getItem(resolvedItemId);
+  if (!item) {
+    return reply.status(400).send({ error: "Unknown item." });
+  }
+
+  // Slot-fit validation.
+  if (slot === "knife") {
+    if (item.type !== "melee") {
+      return reply.status(400).send({ error: `${item.name} isn't a knife.` });
+    }
+  } else if (slot === "gloves") {
+    if (item.type !== "glove") {
+      return reply.status(400).send({ error: `${item.name} aren't gloves.` });
+    }
+  } else if (slot === "zeus") {
+    if (item.type !== "weapon" || item.model !== "taser") {
+      return reply.status(400).send({ error: `${item.name} isn't a Zeus x27.` });
+    }
+  } else if (slot === "c4") {
+    if (item.type !== "weapon" || item.category !== "c4") {
+      return reply.status(400).send({ error: `${item.name} isn't a C4.` });
+    }
+  } else if (slot === "musickit") {
+    if (item.type !== "musickit") {
+      return reply.status(400).send({ error: `${item.name} isn't a music kit.` });
+    }
+  } else if (slot === "graffiti") {
+    if (item.type !== "graffiti") {
+      return reply.status(400).send({ error: `${item.name} isn't graffiti.` });
+    }
+  } else if (slot === "agent") {
+    if (item.type !== "agent") {
+      return reply.status(400).send({ error: `${item.name} isn't an agent.` });
+    }
+    if (item.teams.length && !item.teams.includes(team as "CT" | "T")) {
+      return reply.status(400).send({ error: `${item.name} can't play on the ${team} side.` });
+    }
+  } else {
+    if (item.type !== "weapon" || !item.model) {
+      return reply.status(400).send({ error: `${item.name} isn't a weapon.` });
+    }
+    const cats = slotCategories(slot)!;
+    if (!cats.includes(item.category as string)) {
+      return reply.status(400).send({ error: `${item.name} doesn't fit that slot.` });
+    }
+    if (slot === "sp" && !START_PISTOLS.has(item.model as string)) {
+      return reply
+        .status(400)
+        .send({ error: "Only a starting pistol (Glock-18, USP-S, P2000) fits that slot." });
+    }
+    if (slot !== "sp" && START_PISTOLS.has(item.model as string)) {
+      return reply
+        .status(400)
+        .send({ error: "Starting pistols go in the starting-pistol slot." });
+    }
+    if (item.teams.length && !item.teams.includes(team as "CT" | "T")) {
+      return reply.status(400).send({ error: `${item.name} can't be used by the ${team} side.` });
+    }
+    // No duplicate weapon across the rest of this team's loadout.
+    const { rows: others } = await pool.query<{ slot: string; item_id: number | null }>(
+      `SELECT l.slot, COALESCE(i.item_id, l.item_id) AS item_id
+       FROM inventory.loadout l
+       LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+       WHERE l.steam_id = $1 AND l.team = $2 AND l.slot <> $3`,
+      [identity.steamId, team, slot],
+    );
+    for (const row of others) {
+      const model = row.item_id != null ? getItem(row.item_id)?.model : null;
+      if (model && model === item.model) {
+        return reply
+          .status(400)
+          .send({ error: "That weapon is already in another slot of this loadout." });
+      }
+    }
+  }
+
+  await pool.query(
+    `INSERT INTO inventory.loadout (steam_id, team, slot, item_instance_id, item_id, updated_at)
+     VALUES ($1,$2,$3,$4,$5, now())
+     ON CONFLICT (steam_id, team, slot) DO UPDATE SET
+       item_instance_id = EXCLUDED.item_instance_id, item_id = EXCLUDED.item_id, updated_at = now()`,
+    [identity.steamId, team, slot, instanceId, instanceId != null ? null : resolvedItemId],
+  );
+  return { ok: true };
+});
+
+app.delete<{ Querystring: { team?: string; slot?: string } }>(
+  "/api/loadout",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const { team, slot } = request.query;
+    if (!team || !slot) {
+      return reply.status(400).send({ error: "team, slot required" });
+    }
+    await pool.query(
+      `DELETE FROM inventory.loadout WHERE steam_id = $1 AND team = $2 AND slot = $3`,
+      [identity.steamId, team, slot],
+    );
+    return { ok: true };
+  },
+);
+
+// ---- Public loadout view + copy (player profiles / sharing) -----------------
+
+// Read-only view of any player's loadout (enriched like /api/loadout, but
+// without inventory instance ids). Public: loadouts are cosmetic + shareable.
+app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request, reply) => {
+  const steamId = request.params.steamId;
+  if (!/^\d{17}$/.test(steamId)) {
+    return reply.status(400).send({ error: "invalid steam id" });
+  }
+  const { rows } = await pool.query<{
+    team: string; slot: string; item_id: number | null;
+    wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+  }>(
+    `SELECT l.team, l.slot,
+       COALESCE(i.item_id, l.item_id) AS item_id,
+       COALESCE(i.wear, l.wear) AS wear, COALESCE(i.seed, l.seed) AS seed,
+       COALESCE(i.stattrak, l.stattrak) AS stattrak, COALESCE(i.nametag, l.nametag) AS nametag
+     FROM inventory.loadout l
+     LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+     WHERE l.steam_id = $1`,
+    [steamId],
+  );
+  return rows
+    .filter((row) => row.item_id != null)
+    .map((row) => ({ ...row, item_instance_id: null, item: getItem(row.item_id as number) }));
+});
+
+// Clone another player's loadout: copies each equipped skin into the caller's
+// inventory (origin 'copied') and equips it in the same slot.
+app.post<{ Params: { steamId: string } }>(
+  "/api/loadout/copy-from/:steamId",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const source = request.params.steamId;
+    if (!/^\d{17}$/.test(source)) {
+      return reply.status(400).send({ error: "invalid steam id" });
+    }
+    if (source === identity.steamId) {
+      return reply.status(400).send({ error: "That's already your loadout." });
+    }
+    const { rows } = await pool.query<{
+      team: string; slot: string; base_item_id: number | null; item_id: number | null;
+      wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+      stickers: (number | null)[] | null; patches: (number | null)[] | null; charm_id: number | null;
+    }>(
+      `SELECT l.team, l.slot, l.item_id AS base_item_id, i.item_id, i.wear, i.seed,
+              i.stattrak, i.nametag, i.stickers, i.patches, i.charm_id
+       FROM inventory.loadout l
+       LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+       WHERE l.steam_id = $1`,
+      [source],
+    );
+    let copied = 0;
+    for (const row of rows) {
+      if (row.item_id != null) {
+        const { rows: inserted } = await pool.query<{ id: string }>(
+          `INSERT INTO inventory.owned_items
+             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, origin)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,'copied') RETURNING id`,
+          [
+            identity.steamId, row.item_id, row.wear, row.seed, row.stattrak, row.nametag,
+            row.stickers?.some((x) => x != null) ? JSON.stringify(row.stickers) : null,
+            row.patches?.some((x) => x != null) ? JSON.stringify(row.patches) : null,
+            row.charm_id,
+          ],
+        );
+        await pool.query(
+          `INSERT INTO inventory.loadout (steam_id, team, slot, item_instance_id, item_id, updated_at)
+           VALUES ($1,$2,$3,$4,NULL, now())
+           ON CONFLICT (steam_id, team, slot) DO UPDATE SET
+             item_instance_id = EXCLUDED.item_instance_id, item_id = NULL, updated_at = now()`,
+          [identity.steamId, row.team, row.slot, inserted[0].id],
+        );
+        copied++;
+      } else if (row.base_item_id != null) {
+        await pool.query(
+          `INSERT INTO inventory.loadout (steam_id, team, slot, item_instance_id, item_id, updated_at)
+           VALUES ($1,$2,$3,NULL,$4, now())
+           ON CONFLICT (steam_id, team, slot) DO UPDATE SET
+             item_instance_id = NULL, item_id = EXCLUDED.item_id, updated_at = now()`,
+          [identity.steamId, row.team, row.slot, row.base_item_id],
+        );
+        copied++;
+      }
+    }
+    return { copied };
+  },
+);
+
+// ---- Steam inventory import (read-only, PUBLIC data only) --------------------
+// Deliberately scam-safe: no login, no API key, no trade access — we fetch the
+// caller's own PUBLIC Steam inventory (they control visibility) and mirror the
+// equippable items. Exact floats/seeds aren't public, so wear maps to the tier
+// midpoint and the pattern is derived from the asset id.
+const WEAR_MID: Record<string, number> = {
+  "Factory New": 0.035, "Minimal Wear": 0.11, "Field-Tested": 0.265,
+  "Well-Worn": 0.415, "Battle-Scarred": 0.725,
+};
+
+interface SteamAsset {
+  classid: string;
+  assetid: string;
+}
+interface SteamDescription {
+  classid: string;
+  market_hash_name?: string;
+  descriptions?: { value?: string; name?: string }[];
+  fraudwarnings?: string[];
+}
+interface SteamPage {
+  assets?: SteamAsset[];
+  descriptions?: SteamDescription[];
+  more_items?: number;
+  last_assetid?: string;
+}
+
+// Steam serves the inventory oldest-first in pages, so the newest items are on
+// the LAST page — we have to walk them all or recent acquisitions never sync.
+const STEAM_PAGE = 1000;
+const STEAM_MAX_PAGES = 10;
+
+// NB: plain field assignment, not a constructor parameter property — node's
+// --experimental-strip-types only erases types, so it can't emit the implicit
+// `this.status = status` a parameter property relies on.
+class SteamFetchError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function fetchSteamInventory(steamId: string) {
+  const assets: SteamAsset[] = [];
+  const byClass = new Map<string, SteamDescription>();
+  let start: string | undefined;
+  let complete = false;
+  for (let page = 0; page < STEAM_MAX_PAGES; page++) {
+    const url =
+      `https://steamcommunity.com/inventory/${steamId}/730/2?l=english&count=${STEAM_PAGE}` +
+      (start ? `&start_assetid=${start}` : "");
+    let payload: SteamPage;
+    try {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(15000),
+        headers: { "User-Agent": "5stack-inventory-plugin" },
+      });
+      if (res.status === 403 || res.status === 401) {
+        throw new SteamFetchError(
+          400,
+          "Your Steam inventory is private. Set it to Public in Steam privacy settings and retry — we only ever read public data.",
+        );
+      }
+      if (!res.ok) {
+        throw new SteamFetchError(502, `Steam responded ${res.status} — try again in a minute.`);
+      }
+      payload = (await res.json()) as SteamPage;
+    } catch (error) {
+      if (error instanceof SteamFetchError) throw error;
+      throw new SteamFetchError(502, "Couldn't reach Steam — try again in a minute.");
+    }
+    assets.push(...(payload.assets ?? []));
+    for (const d of payload.descriptions ?? []) byClass.set(d.classid, d);
+    if (!payload.more_items || !payload.last_assetid) {
+      complete = true;
+      break;
+    }
+    start = payload.last_assetid;
+  }
+  // `complete` gates the prune step — a truncated read must never be mistaken
+  // for "the user no longer owns these".
+  return { assets, byClass, complete };
+}
+
+// Applied stickers/charms/patches only exist in the description HTML blob, as
+// market names minus their type prefix ("Sticker: byali | Krakow 2017"). Names
+// containing a comma can't be split apart reliably and just fail to resolve.
+// Steam can name an attachment more specifically than the catalog models it:
+// the Austin 2025 charms arrive as "Austin 2025 Highlight | flameZ Double Dust
+// II Kill" while cs2-lib only carries the generic "Charm | Austin 2025
+// Highlight". Trim trailing " | " segments until something matches, so the
+// charm resolves to its family instead of dropping to null.
+function resolveAttachment(prefix: string, raw: string): number | null {
+  const parts = raw.split(" | ");
+  for (let end = parts.length; end > 0; end--) {
+    const id = getItemIdByName(`${prefix} | ${parts.slice(0, end).join(" | ")}`);
+    if (id != null) return id;
+  }
+  return null;
+}
+
+function attachmentIds(
+  desc: SteamDescription | undefined,
+  label: string,
+  prefix: string,
+  misses?: string[],
+) {
+  for (const d of desc?.descriptions ?? []) {
+    const text = String(d.value ?? "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]*>/g, " ");
+    const line = text.match(new RegExp(`${label}:\\s*([^\\n]+)`))?.[1];
+    if (!line) continue;
+    return line
+      .split(",")
+      .map((n) => {
+        const raw = n.trim();
+        const id = resolveAttachment(prefix, raw);
+        // A name Steam shows but the catalog can't resolve silently becomes an
+        // empty slot — surface it rather than letting it vanish.
+        if (id == null) misses?.push(`${prefix}: ${raw}`);
+        return id;
+      })
+      .slice(0, 5);
+  }
+  return [];
+}
+
+function nametagOf(desc: SteamDescription | undefined): string | null {
+  for (const w of desc?.fraudwarnings ?? []) {
+    const m = String(w).match(/Name Tag:\s*''(.*)''\s*$/);
+    if (m) return m[1] || null;
+  }
+  return null;
+}
+
+app.post("/api/inventory/import-steam", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  let inventory: Awaited<ReturnType<typeof fetchSteamInventory>>;
+  try {
+    inventory = await fetchSteamInventory(identity.steamId);
+  } catch (error) {
+    const e = error as SteamFetchError;
+    // Explicit 4xx/5xx returns aren't errors as far as fastify is concerned, so
+    // with request logging off a failed sync would otherwise produce NO output
+    // at all — the one case where silence is most misleading.
+    app.log.warn(`[steam-sync] ${identity.steamId}: FAILED (${e.status ?? 502}) — ${e.message}`);
+    return reply.status(e.status ?? 502).send({ error: e.message });
+  }
+  const { assets, byClass, complete } = inventory;
+  let imported = 0;
+  let updated = 0;
+  let skipped = 0;
+  let unknown = 0;
+  const seen: string[] = [];
+  const unresolved: string[] = [];
+  const skippedNames: string[] = [];
+  const seedFrom = (assetid: string) => (Number(BigInt(assetid) % 999n) + 1);
+  for (const asset of assets) {
+    const desc = byClass.get(asset.classid);
+    let name = desc?.market_hash_name ?? "";
+    if (!name) continue;
+    const stattrak = name.startsWith("StatTrak™ ") || name.startsWith("★ StatTrak™ ");
+    name = name.replace(/^★ /, "").replace(/^StatTrak™ /, "").replace(/^Souvenir /, "");
+    const wearMatch = name.match(/ \((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/);
+    const wearTier = wearMatch?.[1];
+    if (wearTier) name = name.slice(0, -wearMatch![0].length);
+    const itemId = getItemIdBySteamName(name);
+    if (itemId == null || !slotForItem(itemId)) {
+      skipped++;
+      // Resolved-but-slotless items (cases, keys, medals, coins) are expected
+      // and would drown the log — only unresolved names are anomalies.
+      if (itemId == null) {
+        unknown++;
+        if (skippedNames.length < 20) skippedNames.push(name);
+      }
+      continue;
+    }
+    seen.push(asset.assetid);
+    const stickers = attachmentIds(desc, "Sticker", "Sticker", unresolved);
+    const patches = attachmentIds(desc, "Patch", "Patch", unresolved);
+    const charmId = attachmentIds(desc, "Charm", "Charm", unresolved)[0] ?? null;
+    // Re-sync mutable state (stickers scraped/added, charm swapped, item
+    // renamed) onto the existing row: the id stays put, so anything equipped
+    // in the loadout stays equipped. charm_offset is the user's own placement
+    // and is deliberately left alone.
+    const { rows } = await pool.query<{ inserted: boolean }>(
+      `INSERT INTO inventory.owned_items
+         (steam_id, item_id, wear, seed, stattrak, origin, steam_asset_id,
+          stickers, charm_id, patches, nametag)
+       VALUES ($1,$2,$3,$4,$5,'steam',$6,$7,$8,$9,$10)
+       ON CONFLICT (steam_id, steam_asset_id) WHERE steam_asset_id IS NOT NULL
+       DO UPDATE SET
+         item_id = EXCLUDED.item_id,
+         wear = EXCLUDED.wear,
+         seed = EXCLUDED.seed,
+         stattrak = EXCLUDED.stattrak,
+         stickers = EXCLUDED.stickers,
+         charm_id = EXCLUDED.charm_id,
+         patches = EXCLUDED.patches,
+         nametag = EXCLUDED.nametag
+       WHERE owned_items.item_id IS DISTINCT FROM EXCLUDED.item_id
+          OR owned_items.wear IS DISTINCT FROM EXCLUDED.wear
+          OR owned_items.seed IS DISTINCT FROM EXCLUDED.seed
+          OR owned_items.stattrak IS DISTINCT FROM EXCLUDED.stattrak
+          OR owned_items.stickers IS DISTINCT FROM EXCLUDED.stickers
+          OR owned_items.charm_id IS DISTINCT FROM EXCLUDED.charm_id
+          OR owned_items.patches IS DISTINCT FROM EXCLUDED.patches
+          OR owned_items.nametag IS DISTINCT FROM EXCLUDED.nametag
+       RETURNING (xmax = 0) AS inserted`,
+      [
+        identity.steamId, itemId,
+        wearTier ? WEAR_MID[wearTier] : null,
+        wearTier ? seedFrom(asset.assetid) : null,
+        stattrak, asset.assetid,
+        stickers.some((s) => s != null) ? JSON.stringify(stickers) : null,
+        charmId,
+        patches.some((p) => p != null) ? JSON.stringify(patches) : null,
+        nametagOf(desc),
+      ],
+    );
+    // No row back means the DO UPDATE's WHERE filtered it out — already in sync.
+    if (rows[0]?.inserted) imported++;
+    else if (rows.length) updated++;
+  }
+  // Drop imported items the user no longer owns on Steam (traded/sold). Skipped
+  // on a partial read so a Steam hiccup can't wipe the inventory.
+  // `seen` empty + complete would make the NOT-ANY below match every row and
+  // wipe the whole Steam-origin inventory. An empty result here means the read
+  // or the catalog lookup went wrong, not that the user sold everything.
+  let removed = 0;
+  if (complete && seen.length) {
+    const { rowCount } = await pool.query(
+      `DELETE FROM inventory.owned_items
+       WHERE steam_id = $1 AND origin = 'steam' AND steam_asset_id IS NOT NULL
+         AND NOT (steam_asset_id = ANY($2::text[]))`,
+      [identity.steamId, seen],
+    );
+    removed = rowCount ?? 0;
+  }
+  app.log.info(
+    `[steam-sync] ${identity.steamId}: ${assets.length} assets` +
+      `${complete ? "" : " (PARTIAL read)"} — ${imported} added, ${updated} updated, ` +
+      `${removed} removed, ${skipped} skipped (${unknown} unknown)` +
+      (skippedNames.length ? ` | unknown names: ${[...new Set(skippedNames)].join("; ")}` : "") +
+      (unresolved.length ? ` | UNRESOLVED attachments: ${[...new Set(unresolved)].join("; ")}` : ""),
+  );
+  return { imported, updated, removed, skipped, partial: !complete };
+});
+
+// ---- Server API key (panel-generated; used as invsim_apikey by game servers) --
+
+async function getServerApiKey(): Promise<string | null> {
+  const { rows } = await pool.query<{ value: string }>(
+    `SELECT value FROM inventory.settings WHERE key = 'server_api_key'`,
+  );
+  return rows[0]?.value ?? process.env.INVSIM_API_KEY ?? null;
+}
+
+// ---- Game type config sync -------------------------------------------------
+// Writes the invsim block to the TOP of the panel's match_type_cfgs rows
+// (Lan/Competitive/Wingman/Duel) so game servers pick the key up without any
+// manual config editing. Runs on startup, on admin key fetch, and on key
+// generation. A cfg row REPLACES the default file on the game server, so a
+// missing row is seeded from the stock config (same source the panel's
+// get-default-config endpoint uses) before prepending.
+const CFG_TYPES = ["Lan", "Competitive", "Wingman", "Duel"];
+const CFG_MARKER = "5stack inventory plugin (auto-added)";
+
+function invsimBlock(url: string, key: string): string {
+  return [
+    `// ${CFG_MARKER}`,
+    `invsim_url "${url}"`,
+    `invsim_apikey "${key}"`,
+    "invsim_ws_enabled true",
+    "invsim_ws_immediately true",
+    "",
+  ].join("\n");
+}
+
+async function fetchDefaultCfg(type: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://raw.githubusercontent.com/5stackgg/game-server/refs/heads/main/shared/cfg/5stack.${type.toLowerCase()}.cfg`,
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.text();
+  } catch (error) {
+    app.log.error({ err: error }, `[invsim-cfg] ${type}: default config fetch failed`);
+    return null;
+  }
+}
+
+// The plugin's public URL, for invsim_url: INVSIM_URL env wins; otherwise it's
+// derived from the admin request's Host header and remembered for startup runs.
+async function resolveInvsimUrl(request?: { headers: Record<string, unknown>; protocol?: string }): Promise<string | null> {
+  if (process.env.INVSIM_URL) return process.env.INVSIM_URL;
+  const host = String(request?.headers?.["x-forwarded-host"] ?? request?.headers?.host ?? "").split(",")[0].trim();
+  if (host) {
+    const proto = String(request?.headers?.["x-forwarded-proto"] ?? request?.protocol ?? "https").split(",")[0].trim();
+    const url = `${proto}://${host}`;
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('invsim_url', $1, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [url],
+    );
+    return url;
+  }
+  const { rows } = await pool.query<{ value: string }>(
+    `SELECT value FROM inventory.settings WHERE key = 'invsim_url'`,
+  );
+  return rows[0]?.value ?? null;
+}
+
+async function syncGameConfigs(url: string, key: string): Promise<{ updated: string[]; failed: string[] }> {
+  const updated: string[] = [];
+  const failed: string[] = [];
+  for (const type of CFG_TYPES) {
+    try {
+      const { rows } = await pool.query<{ cfg: string }>(
+        `SELECT cfg FROM public.match_type_cfgs WHERE type = $1`,
+        [type],
+      );
+      let cfg = rows[0]?.cfg;
+      if (cfg == null) {
+        app.log.info(`[invsim-cfg] ${type}: no row — seeding from default config`);
+        const def = await fetchDefaultCfg(type);
+        if (def == null) {
+          failed.push(type);
+          continue;
+        }
+        cfg = def;
+      }
+      // Strip any invsim lines already present (old bottom-placed block, stale
+      // key) so the fresh block always sits at the very top.
+      const cleaned = cfg
+        .split("\n")
+        .filter((line) => !/^\s*invsim_/.test(line) && !line.includes(CFG_MARKER))
+        .join("\n")
+        .replace(/^\s+/, "")
+        .replace(/\s+$/, "");
+      const next = invsimBlock(url, key) + "\n" + cleaned + "\n";
+      if (next === rows[0]?.cfg) {
+        app.log.info(`[invsim-cfg] ${type}: already up to date`);
+        continue;
+      }
+      await pool.query(
+        `INSERT INTO public.match_type_cfgs (type, cfg) VALUES ($1, $2)
+         ON CONFLICT (type) DO UPDATE SET cfg = EXCLUDED.cfg`,
+        [type, next],
+      );
+      app.log.info(`[invsim-cfg] ${type}: invsim block written at top (${next.length} chars)`);
+      updated.push(type);
+    } catch (error) {
+      app.log.error({ err: error }, `[invsim-cfg] ${type}: sync FAILED`);
+      failed.push(type);
+    }
+  }
+  app.log.info(`[invsim-cfg] sync done — updated: [${updated.join(", ")}] failed: [${failed.join(", ")}]`);
+  return { updated, failed };
+}
+
+// ---- Cached-asset admin: sizes + clearing (renders = baked cards, paints =
+// mirrored CDN files). Clearing is safe — both repopulate lazily on demand.
+async function dirStats(dir: string): Promise<{ files: number; bytes: number }> {
+  let files = 0;
+  let bytes = 0;
+  async function walk(d: string) {
+    let entries;
+    try {
+      entries = await fs.readdir(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) await walk(full);
+      else {
+        files++;
+        bytes += (await fs.stat(full).catch(() => ({ size: 0 }))).size;
+      }
+    }
+  }
+  await walk(dir);
+  return { files, bytes };
+}
+async function requireAdmin(request: Parameters<typeof getIdentity>[0]) {
+  const identity = await getIdentity(request);
+  if (!identity) return { code: 401 as const, error: "unauthorized" };
+  if (identity.role !== "administrator") return { code: 403 as const, error: "Only administrators can manage caches." };
+  return null;
+}
+app.get("/api/admin/cache", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  // models = extracted GLBs + composite inputs on the mount (read-only here;
+  // populated by the extraction Job / manual script). Handy truth-check when
+  // the 3D toggle "disappears" — 0 files means the mount is empty, not a bug.
+  const modelsDir = path.join(path.dirname(RENDERS_DIR), "models");
+  return {
+    renders: await dirStats(RENDERS_DIR),
+    paints: await dirStats(PAINTS_DIR),
+    models: await dirStats(modelsDir),
+  };
+});
+app.delete<{ Querystring: { scope?: string } }>("/api/admin/cache", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const scope = request.query.scope === "paints" ? ["paints"] : request.query.scope === "all" ? ["renders", "paints"] : ["renders"];
+  const cleared: Record<string, number> = {};
+  for (const which of scope) {
+    const dir = which === "paints" ? PAINTS_DIR : RENDERS_DIR;
+    const before = await dirStats(dir);
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    await fs.mkdir(dir, { recursive: true }).catch(() => {});
+    cleared[which] = before.files;
+  }
+  return { cleared };
+});
+
+// ---- Model extraction (admins) ----------------------------------------------
+// Runs scripts/extract-models.sh as a child process of THIS backend: it reads
+// the node's CS2 install (mounted read-only) and writes GLBs + composite inputs
+// straight onto the models mount we already serve from. No k8s Job, no RBAC —
+// the only state is a JSON file on that same mount, so a pod restart still
+// remembers the last run without needing redis or a table.
+import { spawn, type ChildProcess } from "node:child_process";
+
+const MODELS_ROOT = path.dirname(RENDERS_DIR); // /cs2-models
+const EXTRACT_STATE_FILE = path.join(MODELS_ROOT, "extract-state.json");
+// Full run log, streamed to disk as it happens. The state file only carries a
+// tail for the panel; this is the whole thing, and it survives the run ending
+// (and the pod restarting) so a failure can actually be handed to someone.
+const EXTRACT_LOG_FILE = path.join(MODELS_ROOT, "extract-last.log");
+// Where the script lives differs by how the backend is running: the image
+// copies it to /usr/local/bin, while dev syncs the whole repo at /app (so it's
+// the repo's own scripts/). Resolve at request time — under dev sync the file
+// can appear after boot.
+const EXTRACT_SCRIPT_CANDIDATES = [
+  "/usr/local/bin/extract-models.sh", // container image
+  "/app/scripts/extract-models.sh", // dev: repo synced at /app
+  path.resolve("scripts/extract-models.sh"), // running from the repo root
+  path.resolve("../scripts/extract-models.sh"), // running from backend/
+];
+async function resolveExtractScript(): Promise<string | null> {
+  if (process.env.EXTRACT_SCRIPT) return process.env.EXTRACT_SCRIPT;
+  for (const candidate of EXTRACT_SCRIPT_CANDIDATES) {
+    if (await fs.access(candidate).then(() => true, () => false)) return candidate;
+  }
+  return null;
+}
+const CS2_DIR = process.env.CS2_DIR ?? "/cs2-game";
+const EXTRACT_LOG_LINES = 200;
+
+type ExtractState = {
+  state: "idle" | "running" | "succeeded" | "failed" | "interrupted";
+  startedAt: string | null;
+  finishedAt: string | null;
+  exitCode: number | null;
+  error: string | null;
+  log: string;
+};
+const IDLE_STATE: ExtractState = {
+  state: "idle",
+  startedAt: null,
+  finishedAt: null,
+  exitCode: null,
+  error: null,
+  log: "",
+};
+
+// Only one run at a time, and only this process can be running it — a child
+// dies with its parent, so "running in the file" + "no child here" means a
+// restart killed it (reported as `interrupted`, not a phantom `running`).
+let extractChild: ChildProcess | null = null;
+let extractLog: string[] = [];
+
+async function readExtractState(): Promise<ExtractState> {
+  try {
+    const raw = await fs.readFile(EXTRACT_STATE_FILE, "utf8");
+    const parsed = { ...IDLE_STATE, ...(JSON.parse(raw) as Partial<ExtractState>) };
+    if (parsed.state === "running" && !extractChild) {
+      return { ...parsed, state: "interrupted", error: "The backend restarted while extraction was running." };
+    }
+    return parsed;
+  } catch {
+    return IDLE_STATE; // never run, or the mount was wiped
+  }
+}
+
+async function writeExtractState(next: ExtractState) {
+  try {
+    await fs.mkdir(MODELS_ROOT, { recursive: true });
+    await fs.writeFile(EXTRACT_STATE_FILE, JSON.stringify(next, null, 2));
+  } catch (e) {
+    app.log.error(`[extract-models] could not persist state: ${(e as Error).message}`);
+  }
+}
+
+app.post("/api/admin/extract-models", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  if (extractChild) return reply.status(409).send({ error: "Extraction is already running." });
+
+  // Fail loudly up front rather than spawning something that can't work: these
+  // two paths are exactly what the deployment has to mount.
+  const vpk = path.join(CS2_DIR, "game", "csgo", "pak01_dir.vpk");
+  if (!(await fs.access(vpk).then(() => true, () => false))) {
+    return reply.status(412).send({
+      error: `CS2 install not readable at ${CS2_DIR} (looked for game/csgo/pak01_dir.vpk). Mount the game dir into the backend and/or set CS2_DIR.`,
+    });
+  }
+  const script = await resolveExtractScript();
+  if (!script) {
+    return reply.status(412).send({
+      error: `Extraction script not found. Looked in: ${EXTRACT_SCRIPT_CANDIDATES.join(", ")} (override with EXTRACT_SCRIPT).`,
+    });
+  }
+
+  const startedAt = new Date().toISOString();
+  extractLog = [];
+  await fs.mkdir(MODELS_ROOT, { recursive: true }).catch(() => {});
+  // Truncates: only the latest run is kept, which is the one anyone asks about.
+  const logStream = createWriteStream(EXTRACT_LOG_FILE, { flags: "w" });
+  logStream.on("error", (e) => app.log.error(`[extract-models] log file: ${e.message}`));
+  logStream.write(`# extract-models started ${startedAt}\n`);
+  // Scratch defaults onto the models mount: it's already there, it's real node
+  // disk with room, and the raw decompile pass is several GB.
+  const workDir = process.env.EXTRACT_WORK_DIR ?? path.join(MODELS_ROOT, ".work");
+  const child = spawn("bash", [script], {
+    env: { ...process.env, CS2_DIR, OUT_DIR: MODELS_ROOT, WORK_DIR: workDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  extractChild = child;
+  app.log.info(`[extract-models] started: script=${script} CS2_DIR=${CS2_DIR} OUT_DIR=${MODELS_ROOT} WORK_DIR=${workDir}`);
+  await writeExtractState({ ...IDLE_STATE, state: "running", startedAt });
+
+  // Everything goes to the file; only the tail is kept in memory, since that's
+  // all the status panel renders.
+  const absorb = (chunk: Buffer) => {
+    logStream.write(chunk);
+    for (const line of chunk.toString("utf8").split("\n")) {
+      if (line.trim()) extractLog.push(line);
+    }
+    if (extractLog.length > EXTRACT_LOG_LINES) extractLog = extractLog.slice(-EXTRACT_LOG_LINES);
+  };
+  child.stdout?.on("data", absorb);
+  child.stderr?.on("data", absorb);
+
+  const settle = async (exitCode: number | null, error: string | null) => {
+    if (extractChild !== child) return; // superseded; ignore late events
+    extractChild = null;
+    const ok = exitCode === 0 && !error;
+    app.log.info(`[extract-models] finished: exit=${exitCode} error=${error ?? "none"}`);
+    logStream.end(`# extract-models finished ${new Date().toISOString()} exit=${exitCode}${error ? ` error=${error}` : ""}\n`);
+    if (ok) {
+      // The raw decompile output is several GB and lives on the same disk that
+      // serves the models — drop it, but keep cli/ so a re-run doesn't
+      // re-download Source2Viewer. Failures keep raw/ around for debugging.
+      const work = path.join(workDir, "cs2-model-extract");
+      for (const dir of ["raw", "raw_ci"]) {
+        await fs.rm(path.join(work, dir), { recursive: true, force: true }).catch(() => {});
+      }
+    }
+    await writeExtractState({
+      state: ok ? "succeeded" : "failed",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      exitCode,
+      error,
+      log: extractLog.join("\n"),
+    });
+  };
+  child.on("error", (e) => void settle(null, e.message));
+  child.on("close", (code) => void settle(code, null));
+
+  return { started: true };
+});
+
+app.get("/api/admin/extract-models", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const stored = await readExtractState();
+  // While a run is live the freshest log lives in memory, not the file.
+  const status = extractChild ? { ...stored, state: "running" as const, log: extractLog.join("\n") } : stored;
+  const logBytes = await fs.stat(EXTRACT_LOG_FILE).then((s) => s.size, () => 0);
+  return { available: true as const, ...status, logBytes };
+});
+
+// Full log as a download — the panel only ever shows the tail, and the
+// interesting failures (shader/texture exceptions) scroll past it.
+app.get("/api/admin/extract-models/log", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  let data: Buffer;
+  try {
+    data = await fs.readFile(EXTRACT_LOG_FILE);
+  } catch {
+    return reply.status(404).send({ error: "No extraction log yet — run an extraction first." });
+  }
+  return reply
+    .header("Content-Type", "text/plain; charset=utf-8")
+    .header("Content-Disposition", `attachment; filename="extract-models.log"`)
+    .send(data);
+});
+
+app.get("/api/admin/server-api-key", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  if (identity.role !== "administrator") {
+    return reply.status(403).send({ error: "Only administrators can manage the server API key." });
+  }
+  const key = await getServerApiKey();
+  let cfg: { updated: string[]; failed: string[] } | null = null;
+  if (key) {
+    const url = await resolveInvsimUrl(request);
+    if (url) cfg = await syncGameConfigs(url, key);
+  }
+  return { key, cfg };
+});
+
+app.post("/api/admin/server-api-key", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  if (identity.role !== "administrator") {
+    return reply.status(403).send({ error: "Only administrators can manage the server API key." });
+  }
+  const key = `inv_${randomBytes(24).toString("hex")}`;
+  await pool.query(
+    `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('server_api_key', $1, now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [key],
+  );
+  let cfg: { updated: string[]; failed: string[] } | null = null;
+  const url = await resolveInvsimUrl(request);
+  if (url) cfg = await syncGameConfigs(url, key);
+  return { key, cfg };
+});
+
+// ---- Game-server API (ianlucas/cs2-css-inventory-simulator compatible) ------
+// The CS2 server plugin polls this for a player's equipped loadout. Public by
+// design (game servers can't do Steam forward-auth), same as upstream.
+
+const TEAM_BYTE: Record<string, string> = { T: "2", CT: "3" };
+
+interface EquippedItem {
+  def?: number;
+  paint?: number;
+  seed?: number | null;
+  wear?: number | null;
+  stattrak?: number;
+  nametag?: string;
+  stickers?: { def: number; slot: number; wear: number; x?: number; y?: number; rotation?: number }[];
+  keychains?: { def: number; seed: number; slot: number }[];
+  musicId?: number;
+  tint?: number;
+  uid?: number;
+  hash?: string;
+}
+
+function equippedStickers(specs?: unknown[] | null) {
+  const out: NonNullable<EquippedItem["stickers"]> = [];
+  normSpecs(specs).forEach((spec, slot) => {
+    if (!spec) return;
+    const kit = getItem(spec.id)?.index;
+    if (kit == null) return;
+    // Always emit `wear`, even at 0 — the plugin skips the "sticker slot N
+    // wear" attribute when it's absent, and an explicit 0 keeps pristine
+    // stickers behaving exactly as they did before wear existed.
+    const entry: (typeof out)[number] = { def: kit as number, slot, wear: spec.w ?? 0 };
+    if (spec.x != null) entry.x = spec.x;
+    if (spec.y != null) entry.y = spec.y;
+    if (spec.r != null) entry.rotation = spec.r;
+    out.push(entry);
+  });
+  return out.length ? out : undefined;
+}
+
+app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (request, reply) => {
+  const steamId = request.params.steamId.replace(/\.json$/, "");
+  if (!/^\d{17}$/.test(steamId)) {
+    return reply.status(400).send({ error: "invalid steam id" });
+  }
+  const { rows } = await pool.query<{
+    team: string;
+    slot: string;
+    uid: string | null;
+    item_id: number | null;
+    wear: number | null;
+    seed: number | null;
+    stattrak: boolean;
+    stattrak_count: number | null;
+    nametag: string | null;
+    stickers: unknown[] | null;
+    patches: unknown[] | null;
+    charm_id: number | null;
+    charm_offset: { x?: number; y?: number; z?: number } | null;
+  }>(
+    `SELECT l.team, l.slot, i.id AS uid, i.item_id, i.wear, i.seed, i.stattrak,
+            i.stattrak_count, i.nametag, i.stickers, i.patches, i.charm_id, i.charm_offset
+     FROM inventory.loadout l
+     JOIN inventory.owned_items i ON i.id = l.item_instance_id
+     WHERE l.steam_id = $1`,
+    [steamId],
+  );
+
+  const out = {
+    agents: {} as Record<string, EquippedItem>,
+    ctWeapons: {} as Record<string, EquippedItem>,
+    tWeapons: {} as Record<string, EquippedItem>,
+    gloves: {} as Record<string, EquippedItem>,
+    knives: {} as Record<string, EquippedItem>,
+    musicKit: undefined as EquippedItem | undefined,
+    graffiti: undefined as EquippedItem | undefined,
+  };
+
+  for (const row of rows) {
+    const item = getItem(row.item_id as number);
+    if (!item) continue;
+    const base: EquippedItem = {
+      uid: Number(row.uid),
+      hash: `${row.uid}:${row.item_id}:${row.seed ?? ""}:${row.wear ?? ""}:${row.stattrak ? row.stattrak_count : -1}`,
+    };
+    if (row.stattrak) base.stattrak = row.stattrak_count ?? 0;
+    if (row.nametag) base.nametag = row.nametag;
+    const teamByte = TEAM_BYTE[row.team];
+
+    if (row.slot === "agent") {
+      out.agents[teamByte] = {
+        ...base,
+        def: item.def as number | undefined,
+        stickers: equippedStickers(row.patches), // patches apply via sticker slots
+      };
+    } else if (row.slot === "knife") {
+      out.knives[teamByte] = {
+        ...base,
+        def: item.def as number | undefined,
+        paint: (item.index as number | undefined) ?? 0,
+        seed: row.seed ?? 1,
+        wear: row.wear ?? 0,
+      };
+    } else if (row.slot === "gloves") {
+      out.gloves[teamByte] = {
+        ...base,
+        def: item.def as number | undefined,
+        paint: (item.index as number | undefined) ?? 0,
+        seed: row.seed ?? 1,
+        wear: row.wear ?? 0,
+      };
+    } else if (row.slot === "musickit") {
+      out.musicKit = { ...base, musicId: item.index as number | undefined };
+    } else if (row.slot === "graffiti") {
+      out.graffiti = { ...base, def: item.index as number | undefined, tint: item.tint as number | undefined };
+    } else {
+      // Weapon positions incl. zeus/c4 — keyed by weapon def index.
+      if (item.def == null) continue;
+      const entry: EquippedItem = {
+        ...base,
+        def: item.def as number,
+        paint: (item.index as number | undefined) ?? 0,
+        seed: row.seed ?? 1,
+        wear: row.wear ?? 0,
+        stickers: equippedStickers(row.stickers),
+      };
+      const charmKit = row.charm_id != null ? getItem(row.charm_id)?.index : null;
+      if (charmKit != null) {
+        const keychain: { def: number; seed: number; slot: number; x?: number; y?: number; z?: number } = {
+          def: charmKit as number, seed: 0, slot: 0,
+        };
+        if (row.charm_offset?.x != null) keychain.x = row.charm_offset.x;
+        if (row.charm_offset?.y != null) keychain.y = row.charm_offset.y;
+        if (row.charm_offset?.z != null) keychain.z = row.charm_offset.z;
+        entry.keychains = [keychain];
+      }
+      const bucket = row.team === "CT" ? out.ctWeapons : out.tWeapons;
+      bucket[String(item.def)] = entry;
+    }
+  }
+  return out;
+});
+
+// StatTrak kill counting from the game server. Guarded by the panel-generated
+// server API key (Settings → generate; set the same value as `invsim_apikey`
+// on the CS2 server plugin). INVSIM_API_KEY env acts as an override for dev.
+app.post<{ Body: { apiKey?: string; targetUid?: number; userId?: string } }>(
+  "/api/increment-item-stattrak",
+  async (request, reply) => {
+    const key = await getServerApiKey();
+    const { apiKey, targetUid, userId } = request.body;
+    if (!key || apiKey !== key) {
+      return reply.status(401).send({ error: "invalid api key" });
+    }
+    if (targetUid == null || !userId || !/^\d{17}$/.test(userId)) {
+      return reply.status(400).send({ error: "targetUid and userId required" });
+    }
+    await pool.query(
+      `UPDATE inventory.owned_items
+       SET stattrak_count = stattrak_count + 1
+       WHERE id = $1 AND steam_id = $2 AND stattrak`,
+      [targetUid, userId],
+    );
+    return {};
+  },
+);
+
+app.get("/healthz", async () => ({ ok: true }));
+
+const port = Number(process.env.PORT ?? 3000);
+
+async function start() {
+  // CORS handled in the app (like the 5stack api's enableCors) — reflects the
+  // requesting origin and allows credentials, so the panel (any origin/site) can
+  // call the API without any ingress config.
+  const cors = (await import("@fastify/cors")).default;
+  await app.register(cors, { origin: true, credentials: true });
+  await applySchema();
+  await app.listen({ port, host: "0.0.0.0" });
+  // Freshness marker: node --watch in this container is event-based and quietly
+  // misses synced edits, so "my change did nothing" is usually "the process is
+  // still on old code". Compare this mtime against the file you just edited.
+  try {
+    const self = fileURLToPath(new URL("./main.ts", import.meta.url));
+    const { mtime } = await fs.stat(self);
+    app.log.info(`[boot] main.ts last modified ${mtime.toISOString()}`);
+  } catch {
+    /* bundled/compiled — no source to stat */
+  }
+  // Push the invsim block into the game type configs on boot so a deploy alone
+  // fixes them — no admin visit required. Needs a key and a known public URL
+  // (INVSIM_URL env, or remembered from a previous admin request).
+  try {
+    const key = await getServerApiKey();
+    const url = await resolveInvsimUrl();
+    if (key && url) await syncGameConfigs(url, key);
+    else app.log.info(`[invsim-cfg] startup sync skipped (key: ${!!key}, url: ${url ?? "unknown"})`);
+  } catch (error) {
+    app.log.error({ err: error }, "[invsim-cfg] startup sync failed");
+  }
+}
+
+start().catch((error) => {
+  app.log.error(error);
+  process.exit(1);
+});

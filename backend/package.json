@@ -1,0 +1,23 @@
+{
+  "name": "5stack-inventory-plugin-backend",
+  "version": "0.1.0",
+  "description": "Inventory API for the 5stack inventory plugin. Trusts 5stack forward-auth identity headers; owns its own Postgres schema.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts",
+    "dev": "node --watch --experimental-strip-types src/main.ts",
+    "migrate": "node --experimental-strip-types src/migrate.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@ianlucas/cs2-lib": "^8.2.0",
+    "fastify": "^5.2.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,235 @@
+/* Everything the design system needs — tokens, components, utilities, and the
+   base rules scoped to this plugin's root. plugin.css emits no global CSS, so
+   nothing here can reach the host panel's chrome.
+
+   This file used to carry a patched copy of tokens.css (:where()-wrapped tokens
+   plus a global `* { border-color }` re-assert) to undo the damage its own
+   preflight did to the panel sidebar. plugin.css omits preflight entirely, so
+   all of that is gone. Do NOT add `@tailwind base` here.
+
+   Plugin-specific CSS below stays scoped to [data-cs2-inventory], which sits on
+   the same root element as [data-5stack-plugin]. */
+@import "@5stack/ui/plugin.css";
+
+/* Wear slider: the CS2 wear gradient as the track, pin-style thumb. */
+@layer components {
+  [data-cs2-inventory] .wear-range {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 9999px;
+    background: linear-gradient(90deg, #37c46a 0 7%, #8ec44a 7% 15%, #e0b23a 15% 38%, #e07a2a 38% 45%, #e04a3a 45% 100%);
+    outline: none;
+  }
+  [data-cs2-inventory] .wear-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 16px;
+    width: 6px;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
+    cursor: pointer;
+  }
+  [data-cs2-inventory] .wear-range::-moz-range-thumb {
+    height: 16px;
+    width: 6px;
+    border: none;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
+    cursor: pointer;
+  }
+}
+
+
+/* Staggered entrances + equip feedback. These are plain classes (not tailwind
+   utilities) because they lean on a per-element `--i` custom property for the
+   cascade delay — the pattern tailwind's static config can't express. Named
+   animate-* so the reduced-motion override below catches them for free. */
+@layer components {
+  /* Sheet/picker/modal option tiles: rise in as a cascade. `--i` is the
+     element's position in its list; the cap keeps a 100-item catalog from
+     turning into a 2-second parade. */
+  [data-cs2-inventory] .animate-sheet-in {
+    animation: cs2SheetIn 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: min(calc(var(--i, 0) * 14ms), 220ms);
+  }
+  /* Loadout cell art: replays when the occupant changes (team switch, weapon
+     replace) — a wave across the grid instead of 15 images teleporting. */
+  [data-cs2-inventory] .animate-cell-in {
+    animation: cs2CellIn 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation-delay: min(calc(var(--i, 0) * 26ms), 420ms);
+  }
+  /* One accent ring ripples out of a slot the moment something lands in it.
+     The 1px inner ring is the selection ring — kept in the keyframes because
+     a running animation overrides the inline selection shadow. */
+  [data-cs2-inventory] .animate-equip-pulse {
+    animation: cs2EquipPulse 600ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  /* Inventory grid reflow (TransitionGroup move) when filters change. */
+  [data-cs2-inventory] .inv-move {
+    transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}
+@keyframes cs2SheetIn {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cs2CellIn {
+  from { opacity: 0; transform: translateY(5px) scale(0.965); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cs2EquipPulse {
+  0% { box-shadow: 0 0 0 1px var(--acc), 0 0 0 0 color-mix(in srgb, var(--acc) 55%, transparent); }
+  100% { box-shadow: 0 0 0 1px var(--acc), 0 0 0 16px color-mix(in srgb, var(--acc) 0%, transparent); }
+}
+
+/* Loading skeleton: ghost blocks breathe in a slow stagger (`--i` again). */
+@layer components {
+  [data-cs2-inventory] .animate-skeleton {
+    animation: cs2Skeleton 1.2s ease-in-out infinite;
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+  /* Craft preview re-bake: a light band sweeps the artwork while the new
+     render is being composited. */
+  [data-cs2-inventory] .animate-sheen {
+    background: linear-gradient(105deg, transparent 40%, rgba(255, 255, 255, 0.06) 50%, transparent 60%);
+    background-size: 250% 100%;
+    animation: cs2Sheen 1.2s linear infinite;
+  }
+}
+@keyframes cs2Skeleton {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.8; }
+}
+@keyframes cs2Sheen {
+  from { background-position: 125% 0; }
+  to { background-position: -25% 0; }
+}
+
+/* Team accent crossfade. Registering --acc as a real <color> lets the CT↔T
+   flip interpolate — every ring, border and soft fill consuming var(--acc)
+   glides between blue and amber instead of snapping. @property is global by
+   spec (it can't be scoped), but the panel and @5stack/ui define no --acc
+   (verified), so the registration can't collide with host styling. */
+@property --acc {
+  syntax: "<color>";
+  inherits: true;
+  initial-value: transparent;
+}
+[data-cs2-inventory] [data-team] {
+  transition: --acc 400ms ease;
+}
+
+/* Modal/menu motion is decoration, never the thing that makes state legible —
+   so honouring the OS setting costs nothing. Overlays still appear and
+   disappear, they just arrive instantly. */
+@media (prefers-reduced-motion: reduce) {
+  [data-cs2-inventory] [class*="animate-"] {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+  }
+  [data-cs2-inventory] .inv-move {
+    transition: none;
+  }
+}
+
+/* Cheap list virtualization: offscreen cards skip layout/paint entirely.
+   The intrinsic size is a placeholder for unrendered cards, so it has to track
+   whatever the picker grid is actually using — see the compact override. */
+@layer components {
+  [data-cs2-inventory] [data-role="skin"],
+  [data-cs2-inventory] [data-role="inv-item"] {
+    content-visibility: auto;
+    contain-intrinsic-size: 164px 152px;
+  }
+}
+
+/* ---- compact / touch ------------------------------------------------------
+   Keyed to the same 860px breakpoint as `isCompact` in responsive.ts. If you
+   move one, move the other. */
+@media (max-width: 860px) {
+  @layer components {
+    [data-cs2-inventory] [data-role="skin"],
+    [data-cs2-inventory] [data-role="inv-item"] {
+      contain-intrinsic-size: 132px 132px;
+    }
+  }
+  /* The slot menu becomes a thumb-reachable sheet — 8 rows of `py-2` (32px)
+     is a comfortable pointer target and a frustrating finger one. Done here
+     rather than per-button so the desktop menu markup stays untouched. */
+  [data-cs2-inventory] [data-role="slot-menu"] button {
+    padding-top: 0.7rem;
+    padding-bottom: 0.7rem;
+  }
+  /* Clear the home indicator / gesture bar. Written as plain CSS rather than
+     a `pb-[env(...)]` utility because arbitrary bracket values get mangled in
+     this remote's injected CSS — same reason as the fontSize/tracking tokens. */
+  [data-cs2-inventory] [data-role="slot-menu"] {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  /* The compact header is a nowrap scroller, so its groups must keep their
+     intrinsic width — the flex default (shrink: 1) would squash the team and
+     view pills into unreadable slivers instead of letting them scroll. */
+  [data-cs2-inventory] [data-role="app-header"] > * {
+    flex: none;
+  }
+}
+
+/* Bottom-sheet motion. A sheet has TWO parts that must move differently — the
+   backdrop fades, the panel travels — and Vue's <Transition> only classes the
+   root, so the panel is driven from here as a descendant. Exits are shorter
+   and ease-IN to match the modal convention above: gone once you've decided,
+   gentle on arrival. */
+@keyframes cs2SheetUp {
+  from { transform: translateY(100%); }
+  to { transform: none; }
+}
+@keyframes cs2SheetDown {
+  from { transform: none; }
+  to { transform: translateY(100%); }
+}
+[data-cs2-inventory] .animate-sheet-enter {
+  animation: cs2FadeIn 200ms ease-out both;
+}
+[data-cs2-inventory] .animate-sheet-enter > [data-role="slot-menu"],
+[data-cs2-inventory] .animate-sheet-enter > [data-role="filter-sheet"] {
+  animation: cs2SheetUp 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+[data-cs2-inventory] .animate-sheet-leave {
+  animation: cs2FadeOut 180ms ease-in both;
+}
+[data-cs2-inventory] .animate-sheet-leave > [data-role="slot-menu"],
+[data-cs2-inventory] .animate-sheet-leave > [data-role="filter-sheet"] {
+  animation: cs2SheetDown 180ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+/* The blanket reduced-motion rule keys off `animate-` in the class list, which
+   the panels don't carry — they're selected as descendants. Neutralise them
+   explicitly so the sheets still appear, just without the travel. */
+@media (prefers-reduced-motion: reduce) {
+  [data-cs2-inventory] .animate-sheet-enter > [data-role="slot-menu"],
+  [data-cs2-inventory] .animate-sheet-enter > [data-role="filter-sheet"],
+  [data-cs2-inventory] .animate-sheet-leave > [data-role="slot-menu"],
+  [data-cs2-inventory] .animate-sheet-leave > [data-role="filter-sheet"] {
+    animation-duration: 1ms !important;
+  }
+}
+@keyframes cs2FadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes cs2FadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+/* Long-press is our right-click. Without this the gesture also raises iOS's
+   text-selection callout and Android's image menu on top of our own sheet. */
+@media (pointer: coarse) {
+  [data-cs2-inventory] [data-slot] {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}

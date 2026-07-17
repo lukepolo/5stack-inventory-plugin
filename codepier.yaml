@@ -1,0 +1,22 @@
+# Hot-swap EITHER container in-cluster for live dev. `workload` lists both, so
+# `codepier up` lets you pick inventory-backend or inventory-frontend (or pass
+# --deployment <name>). Everything runs behind the real ingress: forward-auth
+# identity, same-origin /api, no env vars, no CORS to configure.
+#
+#   Frontend:  codepier up --deployment inventory-frontend
+#              codepier ssh   ->   yarn dev:ui     (build --watch + serve on :80)
+#
+#   Backend:   codepier up --deployment inventory-backend
+#              codepier ssh   ->   yarn dev:api    (node --watch hot reload)
+namespaces: [5stack]
+image: node:22
+workload:
+  - inventory-backend
+  - inventory-frontend
+workdir: /app
+sync:
+  - .:/app
+ignore:
+  - "/node_modules"
+  - "/dist"
+  - "/backend/node_modules"

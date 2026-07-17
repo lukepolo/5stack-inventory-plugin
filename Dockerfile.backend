@@ -1,0 +1,18 @@
+# debian (glibc), not alpine: the admin "extract models" action runs
+# scripts/extract-models.sh in-process, and that shells out to Source 2 Viewer's
+# CLI — a self-contained .NET binary that won't run on musl. The apt packages
+# are the script's own dependencies (it curls the CLI zip and drives a python
+# pass over the composite-input vmats).
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash ca-certificates curl unzip python3 libicu72 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY backend/package.json ./
+RUN npm install
+COPY backend/ ./
+# Same script the manual/host workflow uses — one copy, one behaviour.
+COPY scripts/extract-models.sh /usr/local/bin/extract-models.sh
+RUN chmod +x /usr/local/bin/extract-models.sh
+EXPOSE 3000
+CMD ["npm", "start"]

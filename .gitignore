@@ -1,0 +1,11 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+*.env
+!*.env.example
+!.env.example
+
+# shader test rig output (regenerated on demand)
+tools/shadertest/snapshots/
