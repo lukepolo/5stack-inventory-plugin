@@ -51,9 +51,22 @@ echo "--- CLI: $CLI"
 
 # ---- 2. Decompile every weapon model to GLB with materials + textures --------
 echo "--- Decompiling weapon models (this takes a few minutes)…"
+# --gltf_export_animations is NOT about playing animations: it is the only way
+# to make VRF emit the SKELETON (skins + bone nodes). Without it the export
+# carries JOINTS_0/WEIGHTS_0 but `skins: 0`, so nothing applies the bone
+# transforms and every animation-only prop renders at its bind-pose parking
+# spot — the Revolver's speed loader floating below the gun, the XM1014's
+# loose shells beside it.
+#
+# Valve hides those props by SCALING THE BONE TO ZERO (verified: every clip in
+# weapon_pist_revolver sets `loader_handle` scale to [0,0,0]). viewer3d applies
+# the `inventory_icon` clip at t=0 to get that pose — the same clip Valve
+# renders its own item icons from. Costs about +4% glb size (revolver
+# 3.70 -> 3.86 MB).
 "$CLI" -i "$VPK" -o "$RAW" -d \
   -f "weapons/models/" -e "vmdl_c" \
-  --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt
+  --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
+  --gltf_export_animations
 
 # ---- 3. Rename to cs2-lib model keys -----------------------------------------
 # The plugin looks up /models/<cs2-lib model key>.glb. Quirks: M4A4's key is

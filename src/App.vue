@@ -61,11 +61,14 @@ import {
 import AdminConsole from "./AdminConsole.vue";
 import ShareMenu from "./ShareMenu.vue";
 import ItemArt from "./ItemArt.vue";
+import ItemName from "./ItemName.vue";
+import TeamDots from "./TeamDots.vue";
+import WearBar from "./WearBar.vue";
 import ItemTile from "./ItemTile.vue";
 import FilterDropdown from "./FilterDropdown.vue";
-import { attachmentsOf, glowStyle, isReadOnly, STEAM_BLUE, stripName, WEAR_GRADIENT } from "./itemVisuals";
+import { attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, WEAR_GRADIENT, wearTier } from "./itemVisuals";
 import { isCompact, isCoarse } from "./responsive";
-import { hasModel, mountViewer, snapshotModel, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { hasModel, mountViewer, snapshotModel, viewersIdle, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import "./style.css";
 
 // `user` plus the host's routing contract (base/path/query/navigate) — see
@@ -320,8 +323,6 @@ const INV_TOOLBAR =
 // one radius, one type size — they drifted into four slightly different pills.
 const FOCUS_ACTION =
   "flex h-9 items-center gap-1.5 rounded-md border px-3.5 text-f11 font-medium uppercase tracking-wider transition-colors";
-const DETAIL_ACTION =
-  "flex h-9 items-center justify-center gap-1.5 rounded-md border border-border text-f10 font-medium uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground";
 function selRing(on: boolean) {
   return on ? { borderColor: "var(--acc)", boxShadow: "0 0 0 1px var(--acc)" } : {};
 }
@@ -352,9 +353,13 @@ const isSkinned = (row?: LoadoutEntry) => !!row?.item_instance_id;
 function skinLabel(pos: string): string {
   const row = rowFor(pos);
   if (!row || !isSkinned(row)) return "Default";
-  const name = row.item?.name ?? "";
-  return name.includes(" | ") ? name.split(" | ").slice(1).join(" | ") : name;
+  return itemName(row.item, { strip: true });
 }
+// The crafted item occupying a cell, or null for a free default-weapon slot.
+// Templates render this through <ItemName>/<WearBar>; skinLabel stays for the
+// plain-string 3D title.
+const cellItem = (pos: string) => (isSkinned(rowFor(pos)) ? rowFor(pos)?.item ?? null : null);
+const cellWear = (pos: string) => (isSkinned(rowFor(pos)) ? rowFor(pos) ?? null : null);
 function rarityOf(pos: string): string | undefined {
   const row = rowFor(pos);
   return isSkinned(row) ? row?.item?.rarity : undefined;
@@ -372,7 +377,11 @@ function specialImage(slot: string): string | undefined {
 }
 function specialLabel(slot: string): string {
   const row = rowFor(slot);
-  if (row?.item) return row.item.name;
+  if (row?.item) return itemName(row.item);
+  return specialFallback(slot);
+}
+// Shown when a gear slot holds nothing crafted.
+function specialFallback(slot: string): string {
   if (slot === "agent") return team.value === "CT" ? "SAS (Default)" : "Phoenix (Default)";
   return specialDefault(slot)?.name ?? "Default";
 }
@@ -522,9 +531,9 @@ const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare
 function sortInstances(list: InventoryItem[], mode: SortMode): InventoryItem[] {
   if (mode === "default") return list;
   const arr = [...list];
-  if (mode === "name") return arr.sort((a, b) => byName(a.item?.name, b.item?.name));
+  if (mode === "name") return arr.sort((a, b) => byName(itemName(a.item), itemName(b.item)));
   if (mode === "wear") return arr.sort((a, b) => (a.wear ?? 1) - (b.wear ?? 1));
-  return arr.sort((a, b) => rarityRank(b.item?.rarity) - rarityRank(a.item?.rarity) || byName(a.item?.name, b.item?.name));
+  return arr.sort((a, b) => rarityRank(b.item?.rarity) - rarityRank(a.item?.rarity) || byName(itemName(a.item), itemName(b.item)));
 }
 function sortSkins(list: Skin[], mode: SortMode): Skin[] {
   if (mode === "default" || mode === "wear") return list; // catalog skins have no wear
@@ -554,7 +563,7 @@ const ownedForSheet = computed(() =>
     inventory.value.filter(
       (i) =>
         i.slot === sheetKey.value &&
-        matchesFilters(i.item?.name, i.item?.rarity) &&
+        matchesFilters(itemName(i.item), i.item?.rarity) &&
         matchesOrigin(i, sheetOrigin.value) &&
         (selected.value !== "agent" || teamOk(i.item?.teams)),
     ),
@@ -565,7 +574,8 @@ const ownedForSheet = computed(() =>
 const craftList = computed(() =>
   sortSkins(
     sheetSkins.value.filter(
-      (s) => matchesFilters(s.name, s.rarity) && (selected.value !== "agent" || teamOk(s.teams)),
+      // itemName folds in the phase, so "ruby" / "phase 2" find the right Doppler.
+      (s) => matchesFilters(itemName(s), s.rarity) && (selected.value !== "agent" || teamOk(s.teams)),
     ),
     sheetSort.value,
   ),
@@ -591,7 +601,7 @@ const replaceOptions = computed(() => {
   }
   const models = new Set(eligible.map((w) => w.model));
   const owned = inventory.value.filter(
-    (i) => i.item?.model && models.has(i.item.model) && matchesFilters(i.item.name, i.item.rarity),
+    (i) => i.item?.model && models.has(i.item.model) && matchesFilters(itemName(i.item), i.item.rarity),
   );
   return { defaults: eligible.filter((w) => matchesFilters(w.name)), owned };
 });
@@ -659,7 +669,7 @@ function undoDelete() {
 const pendingDeleteLabel = computed(() => {
   const items = pendingDelete.value?.items;
   if (!items?.length) return "";
-  return items.length === 1 ? `Deleted “${items[0].item?.name ?? "item"}”` : `Deleted ${items.length} items`;
+  return items.length === 1 ? `Deleted “${itemName(items[0].item) || "item"}”` : `Deleted ${items.length} items`;
 });
 // Equip confirmation: the slot that just received an item ripples an accent
 // ring (grid cell, rail tile and focus-rail mini all bind this). Cleared and
@@ -888,10 +898,23 @@ const craftModel = ref<string | null>(null);
 // Steam-imported items are READ-ONLY (they mirror a real inventory). Editing
 // one opens the same modal as a DUPLICATE: saving creates an editable copy.
 const duplicating = ref(false);
+// Viewing an owned item (/items/<id>/3d) is the SAME modal as editing it, with
+// the form swapped for a readout and the save row for a close row. Two screens
+// that show one item ought to differ in what you can DO, not in where anything
+// is — so the model, the 2D/3D toggle, the name plate and the spec column all
+// keep their positions between view and edit, and "Edit" is a swap of the
+// right-hand column rather than a different page.
+const viewOnly = ref(false);
+// Which owned item the modal is showing, in EITHER mode. `editingId` can't do
+// this job: it's null while duplicating a Steam item, and null is also "brand
+// new craft" — the route watcher needs to tell those apart.
+const craftInstId = ref<number | null>(null);
 const craftBusy = ref(false);
 function openCraft(skin: Skin) {
   editingId.value = null;
   duplicating.value = false;
+  viewOnly.value = false;
+  craftInstId.value = null;
   craftModel.value = isWeaponPos(selected.value) ? occupantModel(selected.value) : null;
   craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: [null, null, null, null, null], patches: [null, null, null, null, null], charm: null };
   craftBaseline = ""; // new craft — no stored render to reuse
@@ -923,6 +946,8 @@ async function restoreDraftRoute(skinId: number) {
     withRouteSync(() => {
       editingId.value = null;
       duplicating.value = false;
+      viewOnly.value = false;
+      craftInstId.value = null;
       craftModel.value = skin.model ?? null;
       craft.value = {
         skin,
@@ -947,6 +972,8 @@ async function restoreDraftRoute(skinId: number) {
 function openEdit(inst: InventoryItem) {
   if (!inst.item) return;
   craftModel.value = inst.item.model ?? null;
+  viewOnly.value = false;
+  craftInstId.value = inst.id;
   duplicating.value = inst.origin === "steam";
   editingId.value = duplicating.value ? null : inst.id;
   const stickers: (Attach | null)[] = [null, null, null, null, null];
@@ -958,7 +985,7 @@ function openEdit(inst: InventoryItem) {
     if (pt && i < 5) patches[i] = { id: pt.id, name: pt.name, image: pt.image };
   });
   craft.value = {
-    skin: { id: inst.item.id, name: inst.item.name, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint },
+    skin: { id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,
     stattrak: inst.stattrak,
@@ -981,6 +1008,35 @@ function openEdit(inst: InventoryItem) {
   }
 }
 
+/**
+ * What /items/<id>/3d opens: the editor shell, populated from the item, with
+ * every control that would CHANGE it suppressed. Deliberately built on openEdit
+ * rather than beside it — one function loads an item into this modal, so a view
+ * can never drift out of sync with what the editor would have shown, and the
+ * "Edit" button is a flag flip, not a reload.
+ *
+ * `withRouteSync` because the caller is the route watcher: openEdit would
+ * otherwise navigate to /craft and bounce us straight back out of view mode.
+ */
+function openView(inst: InventoryItem) {
+  withRouteSync(() => openEdit(inst));
+  viewOnly.value = true;
+}
+/**
+ * The owned item behind the modal. View mode reads its spec column from THIS
+ * rather than from the craft form: the form fills wear/seed with defaults for
+ * items that have neither (agents, graffiti, music kits), which is harmless
+ * while editing — the fields are hidden — but would invent a float for a
+ * sticker capsule if a readout trusted it.
+ */
+const craftInst = computed(() =>
+  craftInstId.value != null ? instanceById(craftInstId.value) ?? null : null,
+);
+/** View → edit, in place. Same item, same modal, form swapped back in. */
+function craftViewEdit() {
+  if (craftInst.value) openEdit(craftInst.value);
+}
+
 /** Close the craft editor and land back where it was opened from. */
 function closeCraft() {
   if (route.value.name === "item" || route.value.name === "draft") {
@@ -989,6 +1045,8 @@ function closeCraft() {
   }
   craft.value = null;
   editingId.value = null;
+  viewOnly.value = false;
+  craftInstId.value = null;
 }
 const rand = (min: number, max: number) => min + Math.random() * (max - min);
 function randomWear() {
@@ -1116,16 +1174,29 @@ async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
     return true;
   }
   renderedIds.add(inst.id);
+  // Stand down while a 3D viewer is onscreen — a bake mounts its own WebGL
+  // context and composites paint for ~1s, which is what made orbiting or
+  // dragging a charm crawl while the loadout backfilled behind it. Waiting
+  // HERE (before the badge flips to "baking") keeps the card honest: it reads
+  // queued, because that is what it is.
+  await viewersIdle();
   renderingIds.value = new Set([...renderingIds.value, inst.id]);
   try {
-    const blob = await snapshotModel(model, {
-      paintMaterial: inst.item?.paintMaterial ?? null,
-      legacyPaint: !!inst.item?.legacyPaint,
-      wear: inst.wear != null ? Number(inst.wear) : null,
-      seed: inst.seed != null ? Number(inst.seed) : null,
-      ...(await stickerGeom(model)),
-      ...instPlacements(inst),
-    });
+    const blob = await snapshotModel(
+      model,
+      {
+        paintMaterial: inst.item?.paintMaterial ?? null,
+        legacyPaint: !!inst.item?.legacyPaint,
+        wear: inst.wear != null ? Number(inst.wear) : null,
+        seed: inst.seed != null ? Number(inst.seed) : null,
+        ...(await stickerGeom(model)),
+        ...instPlacements(inst),
+      },
+      undefined,
+      // Card art backfill — nobody is waiting on it, so let it stand down
+      // while a 3D viewer is onscreen instead of fighting it for the GPU.
+      true,
+    );
     if (!blob) {
       renderedIds.delete(inst.id); // snapshot failed — retry later
       return false;
@@ -1246,8 +1317,12 @@ function openModalRoute(to: string, extra: Record<string, string> = {}) {
  * Close the open modal by returning to the screen underneath.
  *
  * The fallback matters: a cold-loaded deep link (someone pasted
- * /items/1003/craft) has nothing on the stack, so it resolves to the item's own
- * detail view for a sub-modal and the inventory otherwise — never a dead end.
+ * /items/1003/craft) has nothing on the stack, so closing the EDITOR resolves to
+ * viewing that same item — never a dead end.
+ *
+ * Only /craft gets that treatment. /items/<id> and /items/<id>/3d are one screen
+ * now, so falling back from one to the other would close the modal straight into
+ * itself, and a pasted /3d link could never be dismissed.
  */
 function closeModalRoute() {
   const back = modalReturn.value[modalReturn.value.length - 1];
@@ -1257,7 +1332,7 @@ function closeModalRoute() {
     return;
   }
   const r = route.value;
-  if (r.name === "item" && r.modal !== "detail") go(buildPath({ ...r, modal: "detail" }));
+  if (r.name === "item" && r.modal === "craft") go(buildPath({ ...r, modal: "detail" }));
   else go("/items");
 }
 
@@ -1277,10 +1352,11 @@ watch([route, inventory], async () => {
   if (r.name !== "item" && r.name !== "draft") {
     modalReturn.value = [];
     withRouteSync(() => {
-      detailId.value = null;
       if (craft.value) {
         craft.value = null;
         editingId.value = null;
+        viewOnly.value = false;
+        craftInstId.value = null;
       }
     });
     if (loadout3d.value) closeLoadout3d();
@@ -1288,7 +1364,6 @@ watch([route, inventory], async () => {
   }
 
   if (r.name === "draft") {
-    detailId.value = null;
     if (loadout3d.value) closeLoadout3d();
     await restoreDraftRoute(r.skinId);
     return;
@@ -1297,22 +1372,21 @@ watch([route, inventory], async () => {
   const inst = inventory.value.find((i) => String(i.id) === r.id);
   if (!inst) return; // not loaded yet — reruns when inventory arrives
 
-  if (r.modal !== "3d" && loadout3d.value) closeLoadout3d();
-  if (r.modal !== "craft" && craft.value) {
-    withRouteSync(() => {
-      craft.value = null;
-      editingId.value = null;
-    });
-  }
-
-  if (r.modal === "detail") {
-    detailId.value = inst.id;
-  } else if (r.modal === "craft") {
-    detailId.value = null;
-    if (editingId.value !== inst.id || !craft.value) await withRouteSync(() => openEdit(inst));
-  } else {
-    detailId.value = null;
-    if (!loadout3d.value) await open3dForInstance(inst);
+  if (loadout3d.value) closeLoadout3d();
+  // Every /items/<id>[/…] route is now ONE modal in one of two modes, so
+  // nothing is torn down in here — moving between them is a mode swap, and
+  // dropping the modal on the way would throw away a loaded viewer just to
+  // rebuild it a frame later.
+  if (r.modal === "craft") {
+    if (craftInstId.value !== inst.id || viewOnly.value || !craft.value) {
+      await withRouteSync(() => openEdit(inst));
+    }
+  } else if (craftInstId.value !== inst.id || !viewOnly.value || !craft.value) {
+    // "detail" and "3d" both land here — they're the same screen. Both open on
+    // the 3D view when the weapon has an extracted model (the `craft` watcher
+    // decides that from availability and ?d=), and both fall back to the still
+    // render when it doesn't, so /items/<id> is never a worse view than /3d.
+    openView(inst);
   }
 });
 
@@ -1412,7 +1486,11 @@ async function mountModalViewer() {
       legacyPaint: !!craft.value?.skin.legacyPaint,
       wear: craft.value?.wear,
       seed: craft.value?.seed,
-      interactive: true,
+      // View mode isn't interactive in the viewer's sense: no attachment
+      // dragging, and the model idles on a slow auto-rotate the way the old
+      // standalone overlay did. Orbit/pan/zoom are gated on `still`, not this,
+      // so they stay available either way.
+      interactive: !viewOnly.value,
       ...(await stickerGeom(model)),
       stickers: craftStickerPlacements(),
       charm: craftCharmPlacement(),
@@ -1628,7 +1706,7 @@ function runConfirm() {
 function deleteOwned(inst: InventoryItem, after?: () => void) {
   confirmAsk.value = {
     title: "Delete this item?",
-    body: `“${inst.item?.name ?? "This item"}” will be removed from your inventory. Anything it's equipped on falls back to the default.`,
+    body: `“${itemName(inst.item) || "This item"}” will be removed from your inventory. Anything it's equipped on falls back to the default.`,
     confirmLabel: "Delete",
     onConfirm: () => {
       stageDelete([inst]);
@@ -1646,13 +1724,6 @@ async function copyToOtherTeam(pos: string) {
   } catch (e) {
     fail(e);
   }
-}
-function wearTier(w: number): string {
-  if (w < 0.07) return "Factory New";
-  if (w < 0.15) return "Minimal Wear";
-  if (w < 0.38) return "Field-Tested";
-  if (w < 0.45) return "Well-Worn";
-  return "Battle-Scarred";
 }
 // ---- admin console seam -----------------------------------------------------
 // The /admin route owns the server key, cache and extraction UI — including its
@@ -2049,7 +2120,7 @@ const pickerGridStyle = computed(() => {
   return {
     display: "grid",
     gridTemplateColumns: `repeat(auto-fill, minmax(${tile}px, 1fr))`,
-    gridAutoRows: `${Math.round(tile * 1.06)}px`,
+    gridAutoRows: `${tile + CARD_CHROME_PX}px`,
   };
 });
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
@@ -2124,7 +2195,7 @@ const matchesRail = (i: InventoryItem) => {
 const railBase = computed(() => {
   const q = invSearch.value.trim().toLowerCase();
   return inventory.value.filter(
-    (i) => (!q || i.item?.name.toLowerCase().includes(q)) && matchesOrigin(i, invOrigin.value),
+    (i) => (!q || itemName(i.item).toLowerCase().includes(q)) && matchesOrigin(i, invOrigin.value),
   );
 });
 const invRail = computed(() => {
@@ -2183,7 +2254,7 @@ watch(cardSize, (v) => localStorage.setItem("cs2inv.cardSize", String(v)));
 const invGridStyle = computed(() => ({
   display: "grid",
   gridTemplateColumns: `repeat(auto-fill, minmax(${cardSize.value}px, 1fr))`,
-  gridAutoRows: `${Math.round(cardSize.value * 1.02)}px`,
+  gridAutoRows: `${cardSize.value + CARD_CHROME_PX}px`,
 }));
 
 // ---- view state ↔ query -----------------------------------------------------
@@ -2271,7 +2342,7 @@ const filteredInventory = computed(() => {
   return sortInstances(
     inventory.value.filter(
       (i) =>
-        (!q || i.item?.name.toLowerCase().includes(q)) &&
+        (!q || itemName(i.item).toLowerCase().includes(q)) &&
         matchesOrigin(i, invOrigin.value) &&
         (!invRarity.value || i.item?.rarity === invRarity.value) &&
         matchesRail(i),
@@ -2315,19 +2386,25 @@ async function equipFromInventory(i: InventoryItem) {
   await equipInstanceAt(i, pos);
 }
 
-// ---- inventory detail modal -------------------------------------------------
+// ---- opening an item --------------------------------------------------------
 // Clicking a card used to equip it on the spot, which meant the only way to
 // LOOK at a skin was the tiny hover pencil. Now a click opens the item big,
 // with every action on it — equipping is a deliberate button press.
-const detailId = ref<number | null>(null);
-// Resolved from the live list each render so edits/equips made from inside the
-// modal are reflected instead of showing a stale snapshot.
-const detail = computed(() => (detailId.value == null ? null : instanceById(detailId.value) ?? null));
+//
+// There used to be a second, purpose-built "detail" modal here: a still render,
+// the same facts, the same buttons. It existed only because the 3D view had no
+// spec column. Now that it has one, /items/<id> opens the SAME view-mode craft
+// modal /items/<id>/3d does — one screen for looking at an item, which can also
+// spin it, drop to 2D, and hand off to Edit.
+function openDetail(i: InventoryItem) {
+  if (route.value.name === "item" && route.value.id === String(i.id)) return;
+  openModalRoute(`/items/${i.id}`);
+}
 // Where this item would land, spelled out ("Rifles · Slot 2") so the equip
 // button says what it will actually do.
-const detailTarget = computed(() => {
-  const i = detail.value;
-  if (!i || !canEquipInstance(i)) return null;
+const craftEquipTarget = computed(() => {
+  const i = craftInst.value;
+  if (!i || !viewOnly.value || !canEquipInstance(i)) return null;
   const pos = positionForInstance(i);
   if (!pos) return null;
   if (isSpecial(pos)) return { pos, label: ALL_SPECIALS.find((s) => s.slot === pos)?.name ?? pos };
@@ -2335,24 +2412,10 @@ const detailTarget = computed(() => {
   const weapon = occupantWeapon(pos)?.name ?? pos;
   return { pos, label: g ? `${weapon} · ${g.label}` : weapon };
 });
-function openDetail(i: InventoryItem) {
-  if (route.value.name === "item" && route.value.id === String(i.id) && route.value.modal === "detail") {
-    detailId.value = i.id;
-    return;
-  }
-  openModalRoute(`/items/${i.id}`);
-}
-function closeDetail() {
-  if (route.value.name === "item") {
-    closeModalRoute();
-    return;
-  }
-  detailId.value = null;
-}
-async function detailEquip() {
-  const i = detail.value;
+async function craftViewEquip() {
+  const i = craftInst.value;
   if (!i) return;
-  closeDetail();
+  closeCraft();
   await equipFromInventory(i);
 }
 
@@ -2498,10 +2561,12 @@ async function mount3d() {
   }
 }
 
-// ---- 3D overlay straight from the loadout grid (ctx menu → View in 3D) ------
-// instId: the owned instance being viewed, when there is one — a default
-// weapon has no instance and so nothing to inspect.
-const loadout3d = ref<{ pos: string; model: string; name: string; instId: number | null } | null>(null);
+// ---- 3D overlay for a DEFAULT weapon (ctx menu → View in 3D) ----------------
+// Owned items don't come here — they open the craft modal in view mode, which
+// can show their spec and hand off to Edit. This overlay is what's left for a
+// model with no instance behind it: no wear, no attachments, nothing to inspect
+// or edit, so it's a bare stage with a name and a close button.
+const loadout3d = ref<{ pos: string; model: string; name: string } | null>(null);
 const loadout3dEl = ref<HTMLElement | null>(null);
 // Mounting downloads a GLB and composites the paint — seconds on a cold cache,
 // during which the canvas is just empty black. Covered by a spinner instead.
@@ -2515,49 +2580,6 @@ function closeLoadout3d() {
   loadout3d.value = null;
   loadout3dBusy.value = false;
 }
-// The owned instance behind the overlay, when there is one — drives the Edit
-// button and the wear/seed/attachment strip along the bottom of the stage.
-const loadout3dInst = computed(() =>
-  loadout3d.value?.instId != null ? instanceById(loadout3d.value.instId) ?? null : null,
-);
-// Attachment chips for the overlay's spec strip, with enough identity kept
-// (kind + sticker slot) that hovering a sticker can flash its decal on the
-// model — the chip points AT the thing, not just near it.
-const loadout3dAttachments = computed(() => {
-  const inst = loadout3dInst.value;
-  if (!inst) return [];
-  const out: { key: string; name: string; image: string | null; kind: "sticker" | "patch" | "charm"; slot?: number }[] = [];
-  (inst.stickers ?? []).forEach((s, i) => {
-    if (s) out.push({ key: `st${i}`, name: s.name, image: s.image, kind: "sticker", slot: i });
-  });
-  (inst.patches ?? []).forEach((p, i) => {
-    if (p) out.push({ key: `pa${i}`, name: p.name, image: p.image, kind: "patch" });
-  });
-  if (inst.charm) out.push({ key: "charm", name: inst.charm.name, image: inst.charm.image, kind: "charm" });
-  return out;
-});
-function flashLoadout3dAttachment(a: { kind: string; slot?: number }) {
-  if (a.kind === "sticker" && a.slot != null) loadout3dHandle?.flashSticker(a.slot);
-}
-function loadout3dEdit() {
-  const inst = loadout3dInst.value;
-  if (!inst) return;
-  // ONE navigation, not dismiss-then-open. The old two-step (closeModalRoute to
-  // /items/<id>, then openEdit pushing /items/<id>/craft) raced the host
-  // router: when the second push was dropped while the first was in flight, the
-  // route settled on detail and the watcher closed the freshly-opened editor —
-  // Duplicate/Edit on the 3D overlay did nothing. openEdit navigates straight
-  // to /craft; the route watcher closes the 3D overlay itself the moment the
-  // modal segment is no longer "3d".
-  //
-  // The overlay is ALSO torn down here, directly. That's belt-and-braces, not
-  // duplication: closeLoadout3d doesn't navigate, so it can't race anything,
-  // and it means a dropped navigation leaves a visible editor rather than an
-  // overlay sitting on top of one — which is what "the button does nothing"
-  // actually looked like.
-  closeLoadout3d();
-  openEdit(inst);
-}
 /** The ✕ on the 3D overlay: pop back to wherever it was opened from. */
 function dismissLoadout3d() {
   if (route.value.name === "item" && route.value.modal === "3d") {
@@ -2566,8 +2588,8 @@ function dismissLoadout3d() {
   }
   closeLoadout3d();
 }
-async function openViewer3d(model: string, name: string, paint: string | null, inst: InventoryItem | null, legacyPaint = false) {
-  loadout3d.value = { pos: "", model, name, instId: inst?.id ?? null };
+async function openViewer3d(model: string, name: string, paint: string | null, legacyPaint = false) {
+  loadout3d.value = { pos: "", model, name };
   loadout3dBusy.value = true;
   await nextTick();
   if (!loadout3dEl.value) {
@@ -2578,10 +2600,7 @@ async function openViewer3d(model: string, name: string, paint: string | null, i
     const handle = await mountViewer(loadout3dEl.value, model, {
       paintMaterial: paint,
       legacyPaint: legacyPaint,
-      wear: inst?.wear,
-      seed: inst?.seed,
       ...(await stickerGeom(model)),
-      ...instPlacements(inst),
     });
     // Overlay dismissed mid-load — closeLoadout3d already nulled the handle it
     // knew about, so adopting this one would leak it past the close.
@@ -2612,26 +2631,22 @@ async function ctxView3d() {
   }
   const model = occupantModel(pos);
   const name = skinLabel(pos) === "Default" ? occupantWeapon(pos)?.name ?? model : `${occupantWeapon(pos)?.name} | ${skinLabel(pos)}`;
-  await openViewer3d(model, name, isSkinned(row) ? row?.item?.paintMaterial ?? null : null, inst, isSkinned(row) && !!row?.item?.legacyPaint);
+  await openViewer3d(model, name, isSkinned(row) ? row?.item?.paintMaterial ?? null : null, isSkinned(row) && !!row?.item?.legacyPaint);
 }
-/** UI entry point for 3D on an owned item — navigates; the route watcher mounts. */
+/**
+ * UI entry point for 3D on an owned item — navigates; the route watcher mounts.
+ * Lands on the same screen as openDetail: /3d only records that the click asked
+ * for the viewer, which is what a shared link should reopen on.
+ */
 function view3dForInstance(inst: InventoryItem) {
-  if (route.value.name === "item" && route.value.id === String(inst.id) && route.value.modal === "3d") return;
+  if (route.value.name === "item" && route.value.id === String(inst.id)) return;
   openModalRoute(`/items/${inst.id}/3d`);
 }
-// Mounts the overlay. Called by the route watcher, so it must NOT navigate.
-async function open3dForInstance(inst: InventoryItem) {
-  const model = inst.item?.model;
-  if (!model) return;
-  if (!(await hasModel(model))) {
-    notify("No 3D model available for this item yet.", "error");
-    // Nothing to show, so don't strand the user on a /3d URL that renders an
-    // empty overlay — fall back to the item itself.
-    if (route.value.name === "item" && route.value.modal === "3d") closeModalRoute();
-    return;
-  }
-  await openViewer3d(model, inst.item?.name ?? model, inst.item?.paintMaterial ?? null, inst, !!inst.item?.legacyPaint);
-}
+// An OWNED item no longer needs a bespoke overlay: /items/<id>/3d opens the
+// craft modal in view mode (openView), which already carries the model, the
+// spec column and the 2D fallback for weapons with no extracted GLB. The
+// overlay below survives only for the case with no instance behind it — a
+// default weapon straight off the loadout grid, which has nothing to view.
 watch(focus3d, (on) => {
   if (on) mount3d();
   else teardownViewer();
@@ -2713,9 +2728,6 @@ function onGlobalKey(e: KeyboardEvent) {
     } else if (craft.value) {
       closeCraft();
       e.stopPropagation();
-    } else if (detailId.value != null) {
-      closeDetail();
-      e.stopPropagation();
     } else if (view.value === "focus") {
       go("/");
     }
@@ -2726,7 +2738,7 @@ function onGlobalKey(e: KeyboardEvent) {
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const el = e.target as HTMLElement | null;
   if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
-  if (craft.value || picker.value || detailId.value != null || loadout3d.value || ctx.value || itemCtx.value) return;
+  if (craft.value || picker.value || loadout3d.value || ctx.value || itemCtx.value) return;
   if (view.value === "admin") return;
   if (e.key === "/") {
     // "/" drops you into the search that's on screen: inventory's own box
@@ -3425,7 +3437,7 @@ function deleteSelected() {
             show-header
             :selected="selectMode && selectedIds.has(i.id)"
             :hide-actions="selectMode"
-            :title="selectMode ? 'Toggle selection' : i.item?.name ?? 'View item'"
+            :title="selectMode ? 'Toggle selection' : itemName(i.item) || 'View item'"
             @click="selectMode ? toggleSelected(i.id) : openDetail(i)"
             @contextmenu.prevent="openItemCtx(i, $event)"
             @longpress="openItemCtxFor(i)"
@@ -3542,7 +3554,7 @@ function deleteSelected() {
                 :data-slot="s.slot" data-role="rail"
                 class="relative flex flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
                 :class="[
-                  s.slot === 'agent' ? 'col-span-2 min-h-[150px]' : 'min-h-[112px]',
+                  s.slot === 'agent' ? 'col-span-2 min-h-[132px]' : 'min-h-[96px]',
                   selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
                   pulsePos === s.slot && 'animate-equip-pulse',
                 ]"
@@ -3553,7 +3565,7 @@ function deleteSelected() {
                 <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">
                   {{ s.slot === 'agent' ? `Agent · ${team}` : s.name }}
                 </div>
-                <div :key="team" class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center py-1" :style="{ '--i': si }">
+                <div :key="team" :class="['animate-cell-in py-1', CARD_ART]" :style="{ '--i': si }">
                   <img
                     v-if="specialImage(s.slot)"
                     :src="specialImage(s.slot)"
@@ -3562,8 +3574,14 @@ function deleteSelected() {
                   />
                   <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
                 </div>
-                <div class="relative z-[2] truncate text-f11 font-medium" :class="!rowFor(s.slot) && 'text-muted-foreground'">
-                  {{ specialLabel(s.slot) }}
+                <div class="relative z-[2] flex items-end justify-between gap-2">
+                  <ItemName
+                    :item="rowFor(s.slot)?.item"
+                    :fallback="specialFallback(s.slot)"
+                    name-class="text-f11 font-medium"
+                    class="min-w-0 flex-1"
+                  />
+                  <WearBar :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
                 </div>
               </button>
             </div>
@@ -3589,25 +3607,19 @@ function deleteSelected() {
                 <div class="relative z-[2] truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
                   {{ cell.weapon?.name ?? cell.pos }}
                 </div>
-                <!-- Team dots under the model name — same as inventory tiles. -->
-                <div v-if="cellTeams(cell.pos).length" class="relative z-[2] mt-1 flex items-center gap-1">
-                  <span
-                    v-for="t in cellTeams(cell.pos)"
-                    :key="t"
-                    class="h-1.5 w-1.5 rounded-full"
-                    :style="{ background: t === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${t === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
-                    :title="`Equipped on ${t}`"
-                  ></span>
-                </div>
-                <RefreshCw
-                  v-if="cellInstance(cell.pos)?.origin === 'steam'"
-                  class="absolute right-2 top-2 z-[2] h-3 w-3"
-                  :style="{ color: STEAM_BLUE }"
-                  title="Synced from your Steam inventory (read-only)"
-                />
+                <!-- Status cluster: equipped-team dots + the synced mark. -->
+                <span class="absolute right-2 top-2 z-[2] flex items-center gap-1.5">
+                  <TeamDots :teams="cellTeams(cell.pos)" />
+                  <RefreshCw
+                    v-if="cellInstance(cell.pos)?.origin === 'steam'"
+                    class="h-3 w-3"
+                    :style="{ color: STEAM_BLUE }"
+                    title="Synced from your Steam inventory (read-only)"
+                  />
+                </span>
                 <div
                   :key="team + ':' + occupantModel(cell.pos)"
-                  class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center"
+                  :class="['animate-cell-in', CARD_ART]"
                   :style="{ '--i': ci }"
                 >
                   <ItemArt
@@ -3620,9 +3632,9 @@ function deleteSelected() {
                     class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
                   ><Loader2 v-if="renderingIds.has(cellInstance(cell.pos)!.id)" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" /></span>
                 </div>
-                <div class="relative z-[2] truncate text-f11 font-medium">{{ skinLabel(cell.pos) }}</div>
-                <div v-if="isSkinned(cell.row) && cell.row?.wear != null" class="relative z-[2] font-mono text-f8 text-muted-foreground/70">
-                  {{ cell.row!.wear!.toFixed(3) }}<template v-if="cell.row?.seed != null"> · #{{ cell.row!.seed }}</template>
+                <div class="relative z-[2] flex items-end justify-between gap-2">
+                  <ItemName :item="cellItem(cell.pos)" strip fallback="Default" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
+                  <WearBar :wear="cellWear(cell.pos)?.wear" :seed="cellWear(cell.pos)?.seed" mini class="mb-1" />
                 </div>
               </button>
             </div>
@@ -3643,7 +3655,7 @@ function deleteSelected() {
             <button
               v-for="(s, si) in [RAIL[2], RAIL[1]]"
               :key="s.slot"
-              class="relative flex min-h-[104px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
+              class="relative flex min-h-[96px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
               :class="[
                 selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                 pulsePos === s.slot && 'animate-equip-pulse',
@@ -3660,16 +3672,22 @@ function deleteSelected() {
               <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ s.name }}</div>
               <!-- Keyed on team: switching sides re-runs the entrance so the
                    rail joins the same cascade as the weapon columns. -->
-              <div :key="team" class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center" :style="{ '--i': si }">
+              <div :key="team" :class="['animate-cell-in', CARD_ART]" :style="{ '--i': si }">
                 <img v-if="specialImage(s.slot)" :src="specialImage(s.slot)" alt="" :class="cn('max-h-full max-w-full object-contain', !rowFor(s.slot) && 'opacity-60')" />
                 <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
               </div>
-              <div class="relative z-[2] truncate text-f11 font-medium" :class="!rowFor(s.slot) && 'text-muted-foreground'">
-                {{ specialLabel(s.slot) }}
+              <div class="relative z-[2] flex items-end justify-between gap-2">
+                <ItemName
+                  :item="rowFor(s.slot)?.item"
+                  :fallback="specialFallback(s.slot)"
+                  name-class="text-f11 font-medium"
+                  class="min-w-0 flex-1"
+                />
+                <WearBar :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
               </div>
             </button>
             <button
-              class="relative flex min-h-[200px] flex-[1.6] cursor-pointer flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
+              class="relative flex min-h-[132px] flex-[1.6] cursor-pointer flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
               :class="[
                 selected === 'agent' ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                 pulsePos === 'agent' && 'animate-equip-pulse',
@@ -3684,7 +3702,7 @@ function deleteSelected() {
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor('agent')?.item?.rarity, 0.3)"></span>
               <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">Agent · {{ team }}</div>
-              <div :key="team" class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center py-1" :style="{ '--i': 2 }">
+              <div :key="team" :class="['animate-cell-in py-1', CARD_ART]" :style="{ '--i': 2 }">
                 <img
                   v-if="specialImage('agent')"
                   :src="specialImage('agent')"
@@ -3709,7 +3727,7 @@ function deleteSelected() {
                 ]"
                 :style="[selRing(selected === s.slot), dropStyle(s.slot)]"
                 :data-slot="s.slot" data-role="rail"
-                :title="s.name + (rowFor(s.slot)?.item ? ' · ' + rowFor(s.slot)!.item!.name : '')"
+                :title="s.name + (rowFor(s.slot)?.item ? ' · ' + itemName(rowFor(s.slot)!.item) : '')"
                 @click="selectPos(s.slot)"
                 @contextmenu.prevent="openCtx(s.slot, $event)"
                 @dragover="onSlotDragOver(s.slot, $event)"
@@ -3717,7 +3735,7 @@ function deleteSelected() {
                 @drop.prevent="onSlotDrop(s.slot)"
               >
                 <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
-                <div :key="team" class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center" :style="{ '--i': 3 + si }">
+                <div :key="team" :class="['animate-cell-in', CARD_ART]" :style="{ '--i': 3 + si }">
                   <img v-if="specialImage(s.slot)" :src="specialImage(s.slot)" alt="" :class="cn('max-h-full max-w-full object-contain', !rowFor(s.slot) && 'opacity-60')" />
                   <span v-else class="text-f8 uppercase text-muted-foreground/50">—</span>
                 </div>
@@ -3745,7 +3763,7 @@ function deleteSelected() {
                 <button
                   v-for="(cell, ci) in g.cells"
                   :key="cell.pos"
-                  class="group relative flex min-h-[116px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
+                  class="group relative flex min-h-[96px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
                   :data-slot="cell.pos" data-role="weapon"
                   :draggable="!viewerId"
                   :class="[
@@ -3800,22 +3818,17 @@ function deleteSelected() {
                       </template>
                     </span>
                   </div>
-                  <!-- Team dots under the model name — same as inventory tiles. -->
-                  <div v-if="cellTeams(previewPos(cell.pos)).length" class="relative z-[2] mt-1 flex items-center gap-1">
-                    <span
-                      v-for="t in cellTeams(previewPos(cell.pos))"
-                      :key="t"
-                      class="h-1.5 w-1.5 rounded-full"
-                      :style="{ background: t === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${t === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
-                      :title="`Equipped on ${t}`"
-                    ></span>
-                  </div>
-                  <RefreshCw
-                    v-if="cellInstance(previewPos(cell.pos))?.origin === 'steam'"
-                    class="absolute right-2.5 top-2.5 z-[2] h-3 w-3 transition-opacity group-hover:opacity-0"
-                    :style="{ color: STEAM_BLUE }"
-                    title="Synced from your Steam inventory (read-only)"
-                  />
+                  <!-- Status cluster: equipped-team dots + the synced mark.
+                       Both fade for the hover actions, which occupy this corner. -->
+                  <span class="absolute right-2.5 top-2.5 z-[2] flex items-center gap-1.5 transition-opacity group-hover:opacity-0">
+                    <TeamDots :teams="cellTeams(previewPos(cell.pos))" />
+                    <RefreshCw
+                      v-if="cellInstance(previewPos(cell.pos))?.origin === 'steam'"
+                      class="h-3 w-3"
+                      :style="{ color: STEAM_BLUE }"
+                      title="Synced from your Steam inventory (read-only)"
+                    />
+                  </span>
                   <!-- Keyed on team + occupant: switching sides (or replacing
                        the weapon) re-runs the entrance, staggered row-by-row
                        across the three columns — a wave, not a teleport.
@@ -3823,7 +3836,7 @@ function deleteSelected() {
                        pulse ring is the only feedback there. -->
                   <div
                     :key="team + ':' + occupantModel(cell.pos)"
-                    class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center"
+                    :class="['animate-cell-in', CARD_ART]"
                     :style="{ '--i': ci * 3 + gi }"
                   >
                     <ItemArt
@@ -3836,11 +3849,20 @@ function deleteSelected() {
                       class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
                     ><Loader2 v-if="renderingIds.has(cellInstance(cell.pos)!.id)" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" /> {{ renderingIds.has(cellInstance(cell.pos)!.id) ? 'baking' : 'queued' }}</span>
                   </div>
-                  <div class="relative z-[2] flex items-baseline gap-2">
-                    <span class="truncate text-f11 font-medium">{{ skinLabel(previewPos(cell.pos)) }}</span>
-                    <span v-if="isSkinned(rowFor(previewPos(cell.pos))) && rowFor(previewPos(cell.pos))?.wear != null" class="ml-auto flex-none font-mono text-f8 text-muted-foreground/70">
-                      {{ rowFor(previewPos(cell.pos))!.wear!.toFixed(3) }}<template v-if="rowFor(previewPos(cell.pos))?.seed != null"> · #{{ rowFor(previewPos(cell.pos))!.seed }}</template>
-                    </span>
+                  <div class="relative z-[2] flex items-end justify-between gap-2">
+                    <ItemName
+                      :item="cellItem(previewPos(cell.pos))"
+                      strip
+                      fallback="Default"
+                      name-class="text-f11 font-medium"
+                      class="min-w-0 flex-1"
+                    />
+                    <WearBar
+                      :wear="cellWear(previewPos(cell.pos))?.wear"
+                      :seed="cellWear(previewPos(cell.pos))?.seed"
+                      mini
+                      class="mb-1"
+                    />
                   </div>
                 </button>
               </div>
@@ -4301,7 +4323,7 @@ function deleteSelected() {
               :style="{ '--i': 1 }"
               @click="clearSlot(selected)"
             >
-              <div class="flex min-h-0 w-full flex-1 items-center justify-center">
+              <div :class="CARD_ART">
                 <img :src="specialDefault(selected)?.image ?? undefined" alt="" class="max-h-full max-w-full object-contain opacity-80" />
               </div>
               <div class="truncate text-f13 font-medium text-muted-foreground">{{ specialDefault(selected)?.name ?? 'Default' }}</div>
@@ -4315,7 +4337,7 @@ function deleteSelected() {
               :style="{ '--i': 1 }"
               @click="equipDefaultAt(occupantWeapon(selected)!, selected)"
             >
-              <div class="flex min-h-0 w-full flex-1 items-center justify-center">
+              <div :class="CARD_ART">
                 <img :src="occupantWeapon(selected)!.image ?? undefined" alt="" class="max-h-full max-w-full object-contain opacity-70" />
               </div>
               <div class="truncate text-f13 font-medium text-muted-foreground">Default</div>
@@ -4367,10 +4389,10 @@ function deleteSelected() {
                 <span class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 text-f8 uppercase text-[color:var(--acc)] opacity-0 transition-opacity group-hover:opacity-100">
                   <Hammer class="h-2.5 w-2.5" /> Craft
                 </span>
-                <div class="relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center">
+                <div :class="CARD_ART">
                   <img :src="s.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105" />
                 </div>
-                <div class="relative z-[2] truncate text-f13 font-medium">{{ stripName(s.name) }}</div>
+                <ItemName :item="s" strip class="relative z-[2]" />
               </button>
               <div v-if="!craftList.length" class="col-span-full py-8 text-center text-sm text-muted-foreground">
                 No finishes match your filters.
@@ -4388,7 +4410,7 @@ function deleteSelected() {
               :style="{ '--i': idx }"
               @click="equipDefaultAt(w, selected)"
             >
-              <div class="flex min-h-0 w-full flex-1 items-center justify-center">
+              <div :class="CARD_ART">
                 <img :src="w.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain opacity-80" />
               </div>
               <div class="truncate text-f13 font-medium">{{ w.name }}</div>
@@ -4405,11 +4427,11 @@ function deleteSelected() {
             @longpress="openItemCtxFor(i)"
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(i.item?.rarity, 0.22)"></span>
-              <div class="relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center">
+              <div :class="CARD_ART">
                 <img :src="i.item?.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain" />
               </div>
               <div class="relative z-[2] flex items-center gap-1.5">
-                <span class="truncate text-f13 font-medium">{{ i.item?.name }}</span>
+                <span class="truncate text-f13 font-medium">{{ itemName(i.item) }}</span>
                 <span v-if="i.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
               </div>
             </button>
@@ -4449,24 +4471,73 @@ function deleteSelected() {
          so for one frame (or forever, if a navigation is dropped) both are
          mounted — and at equal z the overlay wins on DOM order and swallows the
          editor whole. Ranking them means the editor is always the thing on top. -->
-    <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background p-4" @click.self="closeCraft()">
+    <!-- Translucent + blurred, like every other overlay. It was opaque back when
+         this was only the editor and the page behind it was noise; now that it's
+         also how you LOOK at an item, letting the inventory show through is what
+         says "this is on top of your stuff", not a new page. -->
+    <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm" @click.self="closeCraft()">
       <div class="relative flex h-[min(92vh,860px)] w-[min(96vw,1180px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in">
         <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
-          <span class="text-f13 font-semibold uppercase tracking-cs1">{{ duplicating ? "Duplicate imported item" : editingId != null ? "Edit item" : "Confirm craft" }}</span>
-          <span v-if="duplicating" class="flex items-center gap-1 rounded border border-[#66c0f4]/50 bg-[#66c0f4]/10 px-2 py-0.5 text-f10 uppercase tracking-cs1 text-[#66c0f4]">
-            <RefreshCw class="h-3 w-3" /> synced items are read-only — saving makes a copy
+          <!-- Provenance and where it's equipped belong to the item's IDENTITY,
+               not its spec — "this is your Steam one, and it's on T" is part of
+               answering "which item am I looking at". So they ride with the name
+               rather than sitting in the readout column with wear and pattern. -->
+          <span v-if="viewOnly" class="flex min-w-0 items-center gap-2">
+            <ItemName :item="craft.skin" class="min-w-0 truncate" name-class="text-f13 font-semibold uppercase tracking-cs1" />
+            <!-- Provenance stays an ICON while equip state is dots. It was a dot
+                 too for one revision, and Steam blue (#66c0f4) against CT blue
+                 (#7ea6ff) is not a distinction anyone can make — "synced" read as
+                 a third team dot, or as nothing at all. Different KIND of mark,
+                 not a different shade. -->
+            <RefreshCw
+              v-if="craftInst && isReadOnly(craftInst)"
+              class="h-3 w-3 flex-none"
+              :style="{ color: STEAM_BLUE }"
+              title="Synced from your Steam inventory — read-only"
+            />
+            <Hammer
+              v-else-if="craftInst"
+              class="h-3 w-3 flex-none text-muted-foreground"
+              title="Crafted here"
+            />
+            <span
+              v-for="e in craftInst?.equipped ?? []"
+              :key="e.team + e.slot"
+              class="h-2 w-2 flex-none rounded-full"
+              :style="{
+                background: e.team === 'CT' ? '#7ea6ff' : '#f2c14e',
+                boxShadow: `0 0 6px ${e.team === 'CT' ? '#7ea6ff' : '#f2c14e'}`,
+              }"
+              :title="'Equipped on ' + e.team"
+            ></span>
           </span>
-          <div class="flex items-center gap-3">
+          <span v-else class="text-f13 font-semibold uppercase tracking-cs1">{{ duplicating ? "Craft from imported item" : editingId != null ? "Edit item" : "Confirm craft" }}</span>
+          <span v-if="duplicating && !viewOnly" class="flex items-center gap-1 rounded border border-[#66c0f4]/50 bg-[#66c0f4]/10 px-2 py-0.5 text-f10 uppercase tracking-cs1 text-[#66c0f4]">
+            <RefreshCw class="h-3 w-3" /> synced items are read-only — saving crafts your own copy
+          </span>
+          <div class="flex flex-none items-center gap-3">
             <button
               v-if="!isCoarse"
               class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
-              title="Launch CS2 and inspect exactly what's in the editor right now — saving not required"
-              @click="openCraftInspect"
+              :title="viewOnly ? 'Launch CS2 and inspect this item in-game' : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
+              @click="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"
             >
               <ExternalLink class="h-3 w-3" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
             </button>
             <ShareMenu :links="craftShareLinks" :note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE" />
+            <!-- Destructive, so it keeps its distance from the action row at the
+                 bottom and lives up here beside Close, the way it did on the
+                 detail modal this screen replaced. -->
             <button
+              v-if="viewOnly && craftInst && !viewerId"
+              class="grid h-7 w-7 place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
+              title="Delete from inventory"
+              @click="deleteOwned(craftInst, closeCraft)"
+            >
+              <Trash2 class="h-3.5 w-3.5" />
+            </button>
+            <button
+              v-if="!viewOnly"
               class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
               title="Reset all options"
               @click="resetCraft"
@@ -4530,11 +4601,13 @@ function deleteSelected() {
             <div class="pb-1 text-center">
               <div class="mx-auto mb-1.5 h-px w-28" :style="{ background: `linear-gradient(90deg, transparent, ${craft.skin.rarity}, transparent)` }"></div>
               <div class="text-f11 uppercase tracking-cs1 text-muted-foreground">{{ editingId != null || duplicating ? (weaponByModel.get(craftModel ?? '')?.name ?? sheetWeaponName) : sheetWeaponName }}</div>
-              <div class="text-f13 font-semibold" :style="{ color: craft.skin.rarity }">{{ stripName(craft.skin.name) }}</div>
+              <ItemName :item="craft.skin" strip name-class="text-f13 font-semibold" :style="{ color: craft.skin.rarity }" />
             </div>
           </div>
-          <!-- Options -->
+          <!-- Options (edit) / spec (view). Same column, same boxes, same
+               order — view mode just states what edit mode lets you change. -->
           <div class="flex w-full max-w-[300px] flex-none flex-col gap-2.5">
+            <template v-if="!viewOnly">
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
               <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
               <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
@@ -4728,6 +4801,47 @@ function deleteSelected() {
                 ></span>
               </button>
             </div>
+            </template>
+
+            <!-- Read-only spec. Deliberately the same chrome as the form boxes
+                 above rather than a prettier bespoke panel: switching to Edit
+                 should feel like the numbers became typable, not like the page
+                 changed. -->
+            <template v-else>
+              <div v-if="craftInst && attachmentsOf(craftInst).length" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
+                <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Applied</div>
+                <div class="flex flex-col gap-1.5">
+                  <span
+                    v-for="(a, k) in attachmentsOf(craftInst)"
+                    :key="k"
+                    class="flex items-center gap-2"
+                    :title="a.name"
+                  >
+                    <img :src="a.image ?? undefined" alt="" class="h-7 w-7 flex-none object-contain" />
+                    <span class="min-w-0 flex-1 truncate text-f10 text-foreground/85">{{ a.name }}</span>
+                  </span>
+                </div>
+              </div>
+              <div v-if="craft.nametag" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
+                <span class="min-w-0 flex-1 truncate text-f13 italic">“{{ craft.nametag }}”</span>
+              </div>
+              <div v-if="craftInst?.seed != null" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                <span class="font-mono text-f13">#{{ craftInst.seed }}</span>
+              </div>
+              <div v-if="craftInst?.wear != null" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+                <div class="flex items-baseline gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
+                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ wearTier(craftInst.wear) }}</span>
+                </div>
+                <div class="mt-2"><WearBar :wear="craftInst.wear" /></div>
+              </div>
+              <div v-if="craftInst?.stattrak" class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
+                <span class="text-f10 uppercase tracking-cs1 text-[#f2c14e]">StatTrak™</span>
+              </div>
+            </template>
+
             <!-- Controls legend. Overlaying the model put it on top of the
                  thing being dragged; parked at the column's bottom it sits
                  right above Save, out of the way but still in eyeline. -->
@@ -4735,18 +4849,18 @@ function deleteSelected() {
               v-if="modal3d"
               class="mt-auto flex flex-col gap-1 self-end rounded-md border border-border/60 bg-background/80 px-2.5 py-2"
             >
-              <div class="flex items-center gap-2">
+              <div v-if="!viewOnly" class="flex items-center gap-2">
                 <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">drag</kbd>
                 <span class="text-f9 text-muted-foreground">move sticker or charm</span>
               </div>
               <div class="flex items-center gap-2">
                 <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">{{ isCoarse ? '2 fingers' : 'right-drag' }}</kbd>
-                <span class="text-f9 text-muted-foreground">pan · zoom in for fine placement</span>
+                <span class="text-f9 text-muted-foreground">{{ viewOnly ? 'pan · scroll to zoom' : 'pan · zoom in for fine placement' }}</span>
               </div>
               <!-- Touch has no shift key, so this shortcut is unreachable there.
                    Rotation is still available via the sticker's numeric field —
                    only the hint is hidden, not the capability. -->
-              <div v-if="craft.stickers.some(Boolean) && !isCoarse" class="flex items-center gap-2">
+              <div v-if="craft.stickers.some(Boolean) && !isCoarse && !viewOnly" class="flex items-center gap-2">
                 <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">shift</kbd>
                 <span class="text-f9 text-muted-foreground">+ drag to rotate</span>
               </div>
@@ -4791,7 +4905,7 @@ function deleteSelected() {
               :title="it.name"
               @click="pickAttachment(it)"
             >
-              <div class="flex min-h-0 w-full flex-1 items-center justify-center">
+              <div :class="CARD_ART">
                 <img :src="it.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
               </div>
               <span class="w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm) \| /, '') }}</span>
@@ -4803,9 +4917,35 @@ function deleteSelected() {
         </div>
         </Transition>
 
+        <!-- Same row, same positions in both modes: dismiss on the left, the
+             commit on the right. Editing commits a change to the item; viewing
+             commits it to your loadout — so Equip inherits Save's slot. -->
         <div class="flex items-center justify-end gap-3 border-t border-border px-5 py-3.5">
-          <button class="rounded px-4 py-2 text-f13 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground" @click="closeCraft()">Cancel</button>
+          <button class="rounded px-4 py-2 text-f13 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground" @click="closeCraft()">{{ viewOnly ? 'Close' : 'Cancel' }}</button>
+          <!-- Edit is secondary here: it changes the item, but equipping it is
+               what you came to decide. -->
           <button
+            v-if="viewOnly && !viewerId && craftInst"
+            class="flex items-center gap-1.5 rounded-md border border-border px-4 py-2 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            :title="isReadOnly(craftInst) ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
+            @click="craftViewEdit"
+          >
+            <Copy v-if="isReadOnly(craftInst)" class="h-3.5 w-3.5" /><Pencil v-else class="h-3.5 w-3.5" />
+            {{ isReadOnly(craftInst) ? 'Craft' : 'Edit' }}
+          </button>
+          <button
+            v-if="viewOnly && !viewerId"
+            class="flex items-center gap-1.5 rounded-sm px-5 py-2 text-f13 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 2px 0 rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.22)"
+            :disabled="!craftEquipTarget"
+            :title="craftEquipTarget ? 'Equip on ' + team : 'Not usable by ' + team"
+            @click="craftViewEquip"
+          >
+            <template v-if="craftEquipTarget">Equip · {{ craftEquipTarget.label }}</template>
+            <template v-else>Not usable by {{ team }}</template>
+          </button>
+          <button
+            v-else-if="!viewOnly"
             class="flex items-center gap-1.5 rounded-sm px-5 py-2 text-f13 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:opacity-60"
             style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 2px 0 rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.22)"
             :disabled="craftBusy"
@@ -4952,39 +5092,18 @@ function deleteSelected() {
 
 
 
-    <!-- 3D overlay from the loadout grid -->
+    <!-- 3D overlay for a DEFAULT weapon off the loadout grid. An owned item goes
+         to /items/<id>/3d instead, which opens the craft modal in view mode —
+         so there's no spec strip and no Edit/Inspect/Share here: a default
+         weapon is a model, not an item anyone owns. -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
       <div v-if="loadout3d" class="fixed inset-0 z-[998] flex items-center justify-center bg-background p-6" @click="dismissLoadout3d">
         <div class="relative flex h-[min(88vh,900px)] w-[min(96vw,1400px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in" @click.stop>
           <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
             <span class="truncate text-f11 uppercase tracking-cs3 text-muted-foreground">{{ loadout3d.name }}</span>
-            <span class="flex flex-none items-center gap-2">
-              <button
-                v-if="loadout3dInst && !viewerId"
-                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
-                :title="isReadOnly(loadout3dInst) ? 'Synced from Steam — duplicate it to make an editable copy' : 'Edit this item'"
-                @click="loadout3dEdit"
-              >
-                <Copy v-if="isReadOnly(loadout3dInst)" class="h-3.5 w-3.5" /><Pencil v-else class="h-3.5 w-3.5" />
-                {{ isReadOnly(loadout3dInst) ? 'Duplicate' : 'Edit' }}
-              </button>
-              <button
-                v-if="loadout3d.instId != null && !isCoarse"
-                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
-                title="Launch CS2 and inspect this item in-game"
-                @click="openInspectLink(loadout3d.instId)"
-              >
-                <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect' }}
-              </button>
-              <ShareMenu
-                v-if="loadout3d.instId != null"
-                :links="instanceShareLinks(loadout3d.instId)"
-                :note="ITEM_LINK_NOTE"
-              />
-              <button class="rounded p-1 text-muted-foreground transition-colors hover:text-foreground" @click="dismissLoadout3d">
-                <X class="h-4 w-4" />
-              </button>
-            </span>
+            <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" @click="dismissLoadout3d">
+              <X class="h-4 w-4" />
+            </button>
           </div>
           <div class="relative min-h-0 flex-1">
             <div ref="loadout3dEl" class="h-full w-full"></div>
@@ -4992,237 +5111,6 @@ function deleteSelected() {
               <div class="flex flex-col items-center gap-3 text-muted-foreground">
                 <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
                 <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
-              </div>
-            </div>
-            <!-- The item's full spec, same facts the editor shows — the model
-                 above already WEARS all of it; this is the readable version. -->
-            <div
-              v-if="loadout3dInst && !loadout3dBusy"
-              class="pointer-events-none absolute inset-x-0 bottom-0 z-[3] flex flex-wrap items-end justify-between gap-x-6 gap-y-2 px-4 pb-3"
-            >
-              <div class="flex flex-col gap-1.5 rounded-md border border-border/50 bg-background/60 px-3 py-2 backdrop-blur-sm">
-                <div class="flex items-center gap-3 font-mono text-f11 text-foreground/90">
-                  <span v-if="loadout3dInst.wear != null">wear {{ loadout3dInst.wear.toFixed(4) }}</span>
-                  <span v-if="loadout3dInst.seed != null">pattern #{{ loadout3dInst.seed }}</span>
-                  <span v-if="loadout3dInst.stattrak" class="text-[#f2c14e]">ST™</span>
-                  <span v-if="loadout3dInst.nametag" class="truncate text-muted-foreground">“{{ loadout3dInst.nametag }}”</span>
-                </div>
-                <div v-if="loadout3dInst.wear != null" class="relative h-[3px] w-44 rounded-full" :style="{ background: WEAR_GRADIENT }">
-                  <span
-                    class="absolute -top-[2px] h-[7px] w-[2px] -translate-x-1/2 rounded-sm bg-white"
-                    :style="{ left: Math.min(100, Math.max(0, loadout3dInst.wear * 100)) + '%', boxShadow: '0 0 3px rgba(255,255,255,0.8)' }"
-                  ></span>
-                </div>
-              </div>
-              <!-- Hovering a chip names it — and a sticker chip flashes its
-                   decal on the model, so "which one is that" answers itself. -->
-              <div v-if="loadout3dAttachments.length" class="pointer-events-auto flex items-center gap-1.5">
-                <span
-                  v-for="a in loadout3dAttachments"
-                  :key="a.key"
-                  class="group relative grid h-11 w-11 cursor-default place-items-center rounded-md border border-border/60 bg-background/70 transition-colors hover:border-[color:var(--acc)]"
-                  @mouseenter="flashLoadout3dAttachment(a)"
-                >
-                  <img :src="a.image ?? undefined" alt="" class="max-h-9 max-w-9 object-contain transition-transform duration-150 group-hover:scale-110" />
-                  <span class="pointer-events-none absolute bottom-full right-0 mb-1.5 hidden whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-f10 uppercase tracking-cs1 text-foreground shadow-xl group-hover:block">
-                    {{ a.name }} <span class="text-muted-foreground">· {{ a.kind }}</span>
-                  </span>
-                </span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </Transition>
-
-    <!-- ============ INVENTORY ITEM DETAIL ============
-         Opening an item shouldn't require aiming at a 12px hover icon. A click
-         on any card lands here: the skin large, everything known about it, and
-         every action it supports — equipping included, as a real decision. -->
-    <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-      <div
-        v-if="detail"
-        class="fixed inset-0 z-[997] grid place-items-center bg-background/85 p-6 backdrop-blur-sm"
-        @click.self="closeDetail"
-      >
-        <div
-          class="relative flex w-[min(94vw,900px)] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl animate-pop-in"
-          :style="detail.item?.rarity ? { borderColor: `color-mix(in srgb, ${detail.item.rarity} 40%, hsl(var(--border)))` } : {}"
-        >
-          <!-- Rarity reads as a light bar across the top rather than another chip -->
-          <span
-            v-if="detail.item?.rarity"
-            class="pointer-events-none absolute inset-x-0 top-0 h-px"
-            :style="{ background: `linear-gradient(90deg, transparent, ${detail.item.rarity}, transparent)` }"
-          ></span>
-          <!-- Secondary/destructive actions live up here with Close, not in the
-               action row. Down there they were two icon squares competing for
-               width with three labelled buttons, which squeezed "Duplicate"
-               into its own cell. Up here they're out of that budget entirely. -->
-          <div class="absolute right-3 top-3 z-[4] flex items-center gap-1">
-            <ShareMenu v-if="detail" :links="instanceShareLinks(detail.id)" :note="ITEM_LINK_NOTE" icon />
-            <button
-              v-if="detail && !viewerId"
-              class="grid h-9 w-9 place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
-              title="Delete from inventory"
-              @click="deleteOwned(detail, closeDetail)"
-            >
-              <Trash2 class="h-3.5 w-3.5" />
-            </button>
-            <button
-              class="grid h-9 w-9 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-              title="Close (Esc)"
-              @click="closeDetail"
-            >
-              <X class="h-4 w-4" />
-            </button>
-          </div>
-
-          <div class="grid gap-px bg-border md:grid-cols-[1.1fr_1fr]">
-            <!-- Stage -->
-            <div class="relative grid min-h-[280px] place-items-center bg-card p-6">
-              <span class="pointer-events-none absolute inset-0" :style="glowStyle(detail.item?.rarity, 0.4)"></span>
-              <ItemArt
-                :inst="detail"
-                :image="detail.item?.image"
-                class="relative z-[2] max-h-[300px] w-full object-contain animate-float motion-reduce:animate-none"
-                style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
-              />
-              <div class="absolute bottom-3 left-4 z-[2] flex items-center gap-2">
-                <span
-                  v-if="isReadOnly(detail)"
-                  class="flex items-center gap-1 rounded border border-border/60 bg-background/70 px-1.5 py-0.5 text-f9 uppercase tracking-cs1"
-                  :style="{ color: STEAM_BLUE }"
-                  title="Synced from your Steam inventory — read-only"
-                ><RefreshCw class="h-3 w-3" /> Steam</span>
-                <span
-                  v-else
-                  class="flex items-center gap-1 rounded border border-border/60 bg-background/70 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-muted-foreground"
-                ><Hammer class="h-3 w-3" /> Crafted</span>
-                <span v-if="detail.stattrak" class="rounded border border-[#e0a92e]/60 bg-[#e0a92e]/10 px-1.5 py-0.5 font-mono text-f9 text-[#f2c14e]">
-                  StatTrak™
-                </span>
-              </div>
-            </div>
-
-            <!-- Facts -->
-            <div class="flex flex-col gap-4 bg-card p-6 pr-14">
-              <div>
-                <div class="flex items-center gap-2 text-f9 uppercase tracking-cs3">
-                  <span
-                    v-if="detail.item?.rarity"
-                    class="h-2 w-2 rounded-[1px]"
-                    :style="{ background: detail.item.rarity, boxShadow: `0 0 6px ${detail.item.rarity}` }"
-                  ></span>
-                  <span :style="detail.item?.rarity ? { color: detail.item.rarity } : {}">
-                    {{ rarityName(detail.item?.rarity) }}
-                  </span>
-                  <span class="text-muted-foreground/50">· {{ detail.item?.model ?? detail.slot }}</span>
-                </div>
-                <h2 class="mt-2 text-2xl font-bold leading-tight">{{ detail.item?.name }}</h2>
-                <div v-if="detail.nametag" class="mt-1.5 text-f13 italic text-muted-foreground">
-                  “{{ detail.nametag }}”
-                </div>
-              </div>
-
-              <div v-if="detail.wear != null" class="flex flex-col gap-1.5">
-                <div class="flex items-baseline justify-between">
-                  <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">{{ wearTier(detail.wear) }}</span>
-                  <span class="font-mono text-f13">{{ detail.wear.toFixed(6) }}</span>
-                </div>
-                <div class="relative h-[7px] w-full rounded" :style="{ background: WEAR_GRADIENT }">
-                  <span
-                    class="absolute -top-[3px] h-[13px] w-[3px] -translate-x-1/2 rounded-sm bg-white"
-                    :style="{ left: Math.min(100, Math.max(0, detail.wear * 100)) + '%', boxShadow: '0 0 5px rgba(255,255,255,0.7)', transition: 'left 300ms cubic-bezier(0.22,1,0.36,1)' }"
-                  ></span>
-                </div>
-              </div>
-
-              <div class="flex flex-wrap gap-x-8 gap-y-3">
-                <div v-if="detail.seed != null" class="flex flex-col gap-0.5">
-                  <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Pattern</span>
-                  <span class="font-mono text-f13">#{{ detail.seed }}</span>
-                </div>
-                <div v-if="detail.equipped.length" class="flex flex-col gap-1">
-                  <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Equipped</span>
-                  <span class="flex items-center gap-1.5">
-                    <span
-                      v-for="e in detail.equipped"
-                      :key="e.team + e.slot"
-                      class="rounded-sm border px-1.5 py-0.5 font-mono text-f9"
-                      :style="{
-                        borderColor: e.team === 'CT' ? '#7ea6ff' : '#f2c14e',
-                        color: e.team === 'CT' ? '#7ea6ff' : '#f2c14e',
-                      }"
-                    >{{ e.team }}</span>
-                  </span>
-                </div>
-              </div>
-
-              <div v-if="attachmentsOf(detail).length" class="flex flex-col gap-1.5">
-                <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Applied</span>
-                <div class="flex flex-wrap gap-1.5">
-                  <span
-                    v-for="(a, k) in attachmentsOf(detail)"
-                    :key="k"
-                    class="flex items-center gap-1.5 rounded border border-border/60 bg-secondary/40 py-1 pl-1 pr-2"
-                    :title="a.name"
-                  >
-                    <img :src="a.image ?? undefined" alt="" class="h-5 w-5 flex-none object-contain" />
-                    <span class="max-w-[130px] truncate text-f10 text-muted-foreground">{{ a.name }}</span>
-                  </span>
-                </div>
-              </div>
-
-              <!-- Actions. Equip is the primary and says exactly where it lands. -->
-              <div class="mt-auto flex flex-col gap-2 pt-2">
-                <button
-                  v-if="!viewerId"
-                  class="flex h-10 items-center justify-center gap-2 rounded-md text-f11 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-                  :style="{ background: TACTICAL_CTA }"
-                  :disabled="!detailTarget"
-                  :title="detailTarget ? 'Equip on ' + team : 'Not usable by ' + team"
-                  @click="detailEquip"
-                >
-                  <!-- No icon: the crosshair's glyph is optically centred on its
-                       own box, not on the cap-height of the uppercase label
-                       beside it, so it always sat a hair low. The label alone
-                       says everything the icon did. -->
-                  <template v-if="detailTarget">Equip · {{ detailTarget.label }}</template>
-                  <template v-else>Not usable by {{ team }}</template>
-                </button>
-                <!-- Labelled actions share the row evenly; the two icon-only
-                     ones are fixed 36px squares, so the row stays balanced
-                     whether or not Duplicate/Delete are rendered. -->
-                <!-- A GRID, not three flex-1 buttons: flex refuses to shrink a
-                     box below its content, so the longest label ("Duplicate")
-                     stole width from the others and the row came out ragged.
-                     Equal columns + truncate keeps them identical regardless of
-                     label length — and with share/delete moved to the header,
-                     each column now has a third of the FULL width to sit in. -->
-                <div class="grid grid-cols-3 gap-2">
-                    <button :class="[DETAIL_ACTION, 'min-w-0']" @click="view3dForInstance(detail)">
-                      <Box class="h-3.5 w-3.5 flex-none" /> <span class="truncate">3D</span>
-                    </button>
-                    <button
-                      v-if="!isCoarse"
-                      :class="[DETAIL_ACTION, 'min-w-0']"
-                      title="Launch CS2 and inspect this item in-game"
-                      @click="openInspectLink(detail.id)"
-                    >
-                      <ExternalLink class="h-3.5 w-3.5 flex-none" /> <span class="truncate">Inspect</span>
-                    </button>
-                    <button
-                      v-if="!viewerId"
-                      :class="[DETAIL_ACTION, 'min-w-0']"
-                      :title="isReadOnly(detail) ? 'Synced from Steam — duplicate it to make an editable copy' : 'Edit item'"
-                      @click="openEdit(detail)"
-                    >
-                      <Copy v-if="isReadOnly(detail)" class="h-3.5 w-3.5 flex-none" />
-                      <Pencil v-else class="h-3.5 w-3.5 flex-none" />
-                      <span class="truncate">{{ isReadOnly(detail) ? 'Duplicate' : 'Edit' }}</span>
-                    </button>
-                </div>
               </div>
             </div>
           </div>
@@ -5293,7 +5181,7 @@ function deleteSelected() {
           <span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span>
         </div>
         <div class="truncate border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
-          {{ itemCtx?.inst.item?.name }}
+          <ItemName :item="itemCtx?.inst.item" />
         </div>
         <template v-if="itemCtxTeams === 'shared'">
           <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxEquipTeams(['CT', 'T'])">

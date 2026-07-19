@@ -32,6 +32,10 @@ export interface CatalogWeapon {
 export interface Skin {
   id: number;
   name: string;
+  // Phase/variant for finishes sharing one market name — "Ruby", "Phase 2",
+  // "Emerald". Distinct paint index per phase; the name alone can't tell them
+  // apart, so the picker renders this alongside it.
+  altName?: string | null;
   rarity?: string;
   image: string | null;
   teams?: Team[];
@@ -64,6 +68,8 @@ export interface Catalog {
 export interface CatalogItem {
   id: number;
   name: string;
+  /** Phase/variant — see `Skin.altName`. */
+  altName?: string | null;
   image: string | null;
   rarity?: string;
   model?: string;

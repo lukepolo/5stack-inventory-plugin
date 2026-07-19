@@ -11,8 +11,11 @@ import { computed, inject } from "vue";
 import { Box, Check, Clock, Copy, ExternalLink, Loader2, Pencil, RefreshCw, Trash2 } from "lucide-vue-next";
 import type { InventoryItem } from "./api";
 import ItemArt from "./ItemArt.vue";
-import { attachmentsOf, glowStyle, isReadOnly, STEAM_BLUE, stripName, WEAR_GRADIENT } from "./itemVisuals";
+import { attachmentsOf, CARD_ART, glowStyle, isReadOnly, STEAM_BLUE, weaponName } from "./itemVisuals";
+import TeamDots from "./TeamDots.vue";
 import { isCoarse } from "./responsive";
+import ItemName from "./ItemName.vue";
+import WearBar from "./WearBar.vue";
 
 const props = withDefaults(
   defineProps<{
@@ -88,10 +91,8 @@ const art = inject<{
 const baking = computed(() => !!art?.renderingIds.value.has(props.inst.id));
 const queued = computed(() => !!art?.queuedIds.value.has(props.inst.id));
 const readOnly = computed(() => isReadOnly(props.inst));
-const label = computed(() =>
-  props.stripWeaponName ? stripName(props.inst.item?.name) : props.inst.item?.name ?? "",
-);
 const attachments = computed(() => attachmentsOf(props.inst));
+const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.team));
 </script>
 
 <template>
@@ -151,7 +152,7 @@ const attachments = computed(() => attachmentsOf(props.inst));
       <span
         v-if="readOnly"
         class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-        title="Synced from Steam — duplicate it to make an editable copy"
+        title="Synced from Steam and read-only — craft your own copy of it"
         @click.stop="emit('duplicate')"
       ><Copy class="h-3 w-3" /></span>
       <span
@@ -170,57 +171,41 @@ const attachments = computed(() => attachmentsOf(props.inst));
     <!-- Model + status dots: steam-synced (steam blue), equipped per team
          (CT blue / T amber) — hover any dot for the label. -->
     <div v-if="showHeader" class="relative z-[2] flex items-center justify-between gap-2">
-      <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ inst.item?.model ?? inst.slot }}</span>
+      <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ weaponName(inst.item) || inst.slot }}</span>
+      <span class="flex flex-none items-center gap-1.5">
+        <TeamDots :teams="equippedTeams" />
+        <RefreshCw
+          v-if="readOnly"
+          class="h-3 w-3 flex-none"
+          :style="{ color: STEAM_BLUE }"
+          title="Synced from your Steam inventory (read-only)"
+        />
+      </span>
+    </div>
+    <!-- Headerless tiles (the sheet) park the same cluster where the header
+         would have put it — top right, under the hover actions. -->
+    <span v-if="!showHeader" class="absolute right-2 top-2 z-[2] flex items-center gap-1.5">
+      <TeamDots :teams="equippedTeams" />
       <RefreshCw
         v-if="readOnly"
-        class="h-3 w-3 flex-none"
+        class="h-3 w-3"
         :style="{ color: STEAM_BLUE }"
         title="Synced from your Steam inventory (read-only)"
       />
-    </div>
-    <!-- Headerless tiles (the sheet) keep the synced mark in the same corner
-         the header puts it — top right, under the hover actions. -->
-    <RefreshCw
-      v-if="readOnly && !showHeader"
-      class="absolute right-2 top-2 z-[2] h-3 w-3"
-      :style="{ color: STEAM_BLUE }"
-      title="Synced from your Steam inventory (read-only)"
-    />
-    <!-- Team dots on their own line under the model name, top left — the
-         same spot on every surface (inventory grid, sheet, loadout cells). -->
-    <div v-if="inst.equipped?.length" class="relative z-[2] mt-1 flex items-center gap-1">
-      <span
-        v-for="e in inst.equipped"
-        :key="e.team + e.slot"
-        class="h-1.5 w-1.5 rounded-full"
-        :style="{ background: e.team === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${e.team === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
-        :title="`Equipped on ${e.team}`"
-      ></span>
-    </div>
+    </span>
 
-    <div class="relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center">
+    <div :class="CARD_ART">
       <ItemArt :inst="inst" :image="inst.item?.image" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105" />
     </div>
 
-    <div class="relative z-[2] flex items-center gap-1.5">
-      <span class="truncate text-f13 font-medium">{{ label }}</span>
+    <div class="relative z-[2] flex items-start gap-1.5">
+      <ItemName :item="inst.item" :strip="stripWeaponName" class="flex-1" />
       <span v-if="inst.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
       <span v-if="attachments.length" class="ml-auto flex flex-none items-center gap-0.5">
         <img v-for="(a, k) in attachments.slice(0, 6)" :key="k" :src="a.image ?? undefined" :title="a.name" alt="" class="h-4 w-4 object-contain" />
       </span>
     </div>
 
-    <div v-if="inst.wear != null || inst.seed != null" class="relative z-[2] mt-0.5">
-      <div class="flex items-center justify-between font-mono text-f9 text-foreground/90" style="text-shadow: 0 1px 3px rgba(0,0,0,0.9)">
-        <span v-if="inst.wear != null">{{ inst.wear.toFixed(4) }}</span>
-        <span v-if="inst.seed != null">#{{ inst.seed }}</span>
-      </div>
-      <div v-if="inst.wear != null" class="relative mt-1 h-[3px] w-full rounded-full" :style="{ background: WEAR_GRADIENT }">
-        <span
-          class="absolute -top-[2px] h-[7px] w-[2px] -translate-x-1/2 rounded-sm bg-white"
-          :style="{ left: Math.min(100, Math.max(0, inst.wear * 100)) + '%', boxShadow: '0 0 3px rgba(255,255,255,0.8)', transition: 'left 300ms cubic-bezier(0.22,1,0.36,1)' }"
-        ></span>
-      </div>
-    </div>
+    <WearBar :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
   </button>
 </template>

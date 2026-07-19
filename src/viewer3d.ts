@@ -30,6 +30,7 @@ type ThreeBundle = {
   OrbitControls: typeof import("three/examples/jsm/controls/OrbitControls.js").OrbitControls;
   DecalGeometry: typeof import("three/examples/jsm/geometries/DecalGeometry.js").DecalGeometry;
   RoomEnvironment: typeof import("three/examples/jsm/environments/RoomEnvironment.js").RoomEnvironment;
+  cloneSkeleton: typeof import("three/examples/jsm/utils/SkeletonUtils.js").clone;
 };
 
 let threePromise: Promise<ThreeBundle> | null = null;
@@ -40,12 +41,14 @@ function loadThree(): Promise<ThreeBundle> {
     import("three/examples/jsm/controls/OrbitControls.js"),
     import("three/examples/jsm/geometries/DecalGeometry.js"),
     import("three/examples/jsm/environments/RoomEnvironment.js"),
-  ]).then(([THREE, gltf, orbit, decal, env]) => ({
+    import("three/examples/jsm/utils/SkeletonUtils.js"),
+  ]).then(([THREE, gltf, orbit, decal, env, skel]) => ({
     THREE,
     GLTFLoader: gltf.GLTFLoader,
     OrbitControls: orbit.OrbitControls,
     DecalGeometry: decal.DecalGeometry,
     RoomEnvironment: env.RoomEnvironment,
+    cloneSkeleton: skel.clone,
   }));
   return threePromise;
 }
@@ -165,6 +168,91 @@ async function loadBitmap(url: string): Promise<ImageBitmap> {
   return createImageBitmap(await res.blob());
 }
 
+// Collapse every SkinnedMesh under `root` into a plain Mesh holding the pose
+// its bones currently describe, and swap it in place. Call AFTER the pose has
+// been evaluated and matrices updated; see the call site for why this is worth
+// doing rather than leaving the skeleton live.
+//
+// Each vertex is pushed through the standard linear-blend skin — sum of
+// (boneMatrixWorld * boneInverse) weighted by skinWeight, sandwiched between
+// bindMatrix and bindMatrixInverse — which is precisely what the GPU and
+// three's own raycast do, so the baked surface is the one already on screen.
+// Returns the geometries it created: unlike the cached glTF geometry these are
+// per-viewer clones, so the viewer that made them owns disposing them.
+function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"]) {
+  const owned: import("three").BufferGeometry[] = [];
+  const skinned: import("three").SkinnedMesh[] = [];
+  root.traverse((n) => {
+    if ((n as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) skinned.push(n as import("three").SkinnedMesh);
+  });
+  for (const sm of skinned) {
+    const geom = sm.geometry.clone();
+    const pos = geom.getAttribute("position");
+    const nrm = geom.getAttribute("normal");
+    const si = geom.getAttribute("skinIndex");
+    const sw = geom.getAttribute("skinWeight");
+    if (!pos || !si || !sw) continue;
+    const skin = new THREE.Matrix4();
+    const blend = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const n3 = new THREE.Matrix3();
+    const nv = new THREE.Vector3();
+    for (let i = 0; i < pos.count; i++) {
+      blend.set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      let total = 0;
+      for (let k = 0; k < 4; k++) {
+        const w = sw.getComponent(i, k);
+        if (!w) continue;
+        const bone = sm.skeleton.bones[si.getComponent(i, k)];
+        if (!bone) continue;
+        skin.multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[si.getComponent(i, k)]);
+        for (let e = 0; e < 16; e++) blend.elements[e] += skin.elements[e] * w;
+        total += w;
+      }
+      // An unweighted vertex is already where it belongs — leave it alone
+      // rather than collapsing it onto the origin with a zero matrix.
+      if (total === 0) continue;
+      blend.multiply(sm.bindMatrix).premultiply(sm.bindMatrixInverse);
+      v.fromBufferAttribute(pos, i).applyMatrix4(blend);
+      pos.setXYZ(i, v.x, v.y, v.z);
+      if (nrm) {
+        // Bones that hide a prop are scaled to ZERO, which makes the normal
+        // matrix singular. Those vertices are collapsed to a point and never
+        // shade anything, so keep the bind normal instead of writing NaN.
+        n3.setFromMatrix4(blend);
+        nv.fromBufferAttribute(nrm, i).applyMatrix3(n3);
+        if (nv.lengthSq() > 1e-12) {
+          nv.normalize();
+          nrm.setXYZ(i, nv.x, nv.y, nv.z);
+        }
+      }
+    }
+    pos.needsUpdate = true;
+    if (nrm) nrm.needsUpdate = true;
+    // The skinning attributes are dead weight once baked, and leaving them on
+    // a plain Mesh invites a future reader to think it is still skinned.
+    geom.deleteAttribute("skinIndex");
+    geom.deleteAttribute("skinWeight");
+    geom.computeBoundingBox();
+    geom.computeBoundingSphere();
+    const baked = new THREE.Mesh(geom, sm.material);
+    baked.name = sm.name;
+    baked.userData = sm.userData;
+    baked.visible = sm.visible;
+    baked.renderOrder = sm.renderOrder;
+    // The bake is expressed in the SkinnedMesh's own local space, so its
+    // transform carries over verbatim.
+    baked.position.copy(sm.position);
+    baked.quaternion.copy(sm.quaternion);
+    baked.scale.copy(sm.scale);
+    sm.parent?.add(baked);
+    sm.removeFromParent();
+    owned.push(geom);
+  }
+  root.updateMatrixWorld(true);
+  return owned;
+}
+
 // ---- Sticker / charm placement ------------------------------------------------
 export interface StickerPlacement {
   slot: number; // 0..4
@@ -260,19 +348,63 @@ async function cropToContent(blob: Blob, margin = 0.03): Promise<Blob | null> {
 // contexts until mobile Safari hit its cap and started killing them. One global
 // lane means the offscreen cost is exactly one context no matter who asks.
 let snapshotLane: Promise<unknown> = Promise.resolve();
+
+// Onscreen viewers currently mounted. A live viewer owns a WebGL context, a
+// per-frame rAF loop and the charm's verlet physics, all trying to hold 60fps.
+// A bake mounts a SECOND context, loads a model and composites paint for ~1s —
+// so backfilling a page of card renders while you are orbiting or dragging a
+// charm makes the thing you are actually looking at crawl. Background bakes
+// wait for the last viewer to go away: deferred, never dropped. Foreground
+// snapshots (the craft modal's live 2D preview) are exempt — that preview IS
+// what the user is looking at, and gating it would mean it never renders while
+// its own modal is open.
+let liveViewers = 0;
+let idleWaiters: (() => void)[] = [];
+/** Resolves once no 3D viewer is onscreen. Lets a queue park work that would
+ *  otherwise compete with a viewer for the GPU, and show it as queued rather
+ *  than pretending it is already underway. */
+export const viewersIdle = () =>
+  liveViewers === 0
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => {
+        idleWaiters.push(resolve);
+      });
+function releaseViewer() {
+  if (--liveViewers > 0) return;
+  const waiters = idleWaiters;
+  idleWaiters = [];
+  for (const w of waiters) w();
+}
+
 export function snapshotModel(
   model: string,
   opts: Omit<ViewerOpts, "interactive" | "still">,
   /** Checked once the lane frees up — return false if this result is already
    *  stale (e.g. the user kept dragging the wear slider) to skip the work. */
   stillWanted?: () => boolean,
+  /** Opportunistic cache fill rather than something the user is waiting on —
+   *  hold it until no viewer is onscreen. */
+  background = false,
 ): Promise<Blob | null> {
-  const run = snapshotLane.then(() => (stillWanted && !stillWanted() ? null : snapshotModelNow(model, opts)));
-  snapshotLane = run.catch(() => null);
-  return run;
+  // The idle wait happens BEFORE taking the lane, never inside it: a waiting
+  // background bake that held the lane would block the craft preview behind it
+  // for as long as the craft modal's own viewer stayed open.
+  return (background ? viewersIdle() : Promise.resolve()).then(() => {
+    const run = snapshotLane.then(() => (stillWanted && !stillWanted() ? null : snapshotModelNow(model, opts)));
+    snapshotLane = run.catch(() => null);
+    return run;
+  });
 }
 
+// Offscreen bakes actually RUNNING right now (as opposed to parked behind
+// viewersIdle). A bake mounts its own WebGL context, so while one is in flight
+// it competes with every live viewer for the GPU — which shows up in a viewer
+// as a spiking `draw` with an idle CPU frame, and is otherwise invisible.
+let snapshotsInFlight = 0;
+export const bakesInFlight = () => snapshotsInFlight;
+
 async function snapshotModelNow(model: string, opts: Omit<ViewerOpts, "interactive" | "still">): Promise<Blob | null> {
+  snapshotsInFlight++;
   const holder = document.createElement("div");
   holder.style.cssText = "position:fixed;left:-10000px;top:0;width:640px;height:480px;pointer-events:none;";
   document.body.appendChild(holder);
@@ -286,6 +418,7 @@ async function snapshotModelNow(model: string, opts: Omit<ViewerOpts, "interacti
   } catch {
     return null;
   } finally {
+    snapshotsInFlight--;
     handle?.dispose();
     holder.remove();
   }
@@ -340,9 +473,12 @@ export async function mountViewer(
   model: string,
   opts?: ViewerOpts,
 ): Promise<ViewerHandle> {
-  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment } = await loadThree();
+  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton } = await loadThree();
   // Which body survived the hd/legacy prune below — slot markup is per-variant.
   let bodyVariant = "body_hd";
+  // Per-viewer geometry clones produced by freezePose (the cached glTF ones are
+  // shared and must NOT be disposed; these must).
+  let bakedGeoms: import("three").BufferGeometry[] = [];
   const gltf = await loadGltf(model);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -399,7 +535,69 @@ export async function mountViewer(
   scene.add(rim);
 
   // Clone so cached GLTF scenes are never mutated by a live viewer.
-  const object = gltf.scene.clone(true);
+  // Object3D.clone() does NOT rebind a skeleton: the cloned SkinnedMeshes keep
+  // pointing at the ORIGINAL scene's bones, so posing one viewer would pose
+  // every other viewer sharing the cached glTF (and disposing one would break
+  // the rest). SkeletonUtils.clone() rebuilds the bone graph per clone.
+  const isSkinned = (() => {
+    let found = false;
+    gltf.scene.traverse((n) => {
+      if ((n as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) found = true;
+    });
+    return found;
+  })();
+  const object = isSkinned ? (cloneSkeleton(gltf.scene) as typeof gltf.scene) : gltf.scene.clone(true);
+  // Weapons carry props that only exist for animations — the Revolver's speed
+  // loader, the XM1014's loose shells. Valve hides them by SCALING THE BONE TO
+  // ZERO: every clip in weapon_pist_revolver sets `loader_handle` scale to
+  // [0,0,0] (verified across all 5 clips). Our export used to drop the skeleton
+  // entirely, so nothing applied that scale and the props rendered at their
+  // bind-pose parking spots — a spare cylinder floating under the revolver, a
+  // row of shells beside the XM1014.
+  //
+  // So take the pose from the model itself rather than guessing which geometry
+  // is "extra": apply `inventory_icon` (the clip Valve renders its own item
+  // icons from) at t=0. Falls back to any clip, since all of them zero the
+  // prop bones — they differ only in where the moving parts sit.
+  if (gltf.animations?.length) {
+    const clip =
+      gltf.animations.find((a) => /inventory_icon/i.test(a.name)) ??
+      gltf.animations.find((a) => /inventory_inspect/i.test(a.name)) ??
+      gltf.animations[0];
+    const mixer = new THREE.AnimationMixer(object);
+    mixer.clipAction(clip).play();
+    mixer.update(0); // single evaluation — the pose is static, nothing to tick
+    object.updateMatrixWorld(true);
+    // Box3.setFromObject reads geometry.boundingBox, which is the BIND pose —
+    // it would still reserve room for the parked props and shrink/offset the
+    // framing exactly like the bug we just fixed. SkinnedMesh.computeBoundingBox
+    // re-derives it through the current bones.
+    object.traverse((n) => {
+      const sm = n as unknown as { isSkinnedMesh?: boolean; computeBoundingBox?: () => void; computeBoundingSphere?: () => void };
+      if (sm.isSkinnedMesh) {
+        sm.computeBoundingBox?.();
+        sm.computeBoundingSphere?.();
+      }
+    });
+    // Now BAKE that pose into the vertices and drop the skeleton.
+    //
+    // The pose is evaluated once and never ticked, so nothing downstream wants
+    // a live skeleton — but leaving one costs us twice:
+    //
+    //  - DecalGeometry has NO skinning support. It reads the raw position
+    //    attribute (the bind pose) and the mesh's own matrixWorld. castAt
+    //    raycasts, which three DOES skin, so the projection box gets centred on
+    //    the posed surface while the geometry it clips against is the unposed
+    //    one. That mismatch is stickers appearing off in empty space beside the
+    //    weapon instead of on it.
+    //  - Raycasts stay correct but re-derive every candidate vertex through its
+    //    bone chain on every cast, and the charm alone casts six rays a frame.
+    //
+    // Baking fixes the first outright and makes the second a plain static
+    // intersection. Vertices land in the same local space the skinned ones
+    // occupied, so matrixWorld, framing and the recentre below are unaffected.
+    bakedGeoms = freezePose(object, THREE);
+  }
   // CS2 exports ship BOTH bodies stacked: the CS:GO-era "_legacy" mesh AND the
   // CS2 "_hd" mesh. They are different geometry with DIFFERENT UV unwraps —
   // and paints target a specific one: pre-CS2 finishes (cs2-lib `legacy`) are
@@ -425,6 +623,26 @@ export async function mountViewer(
       });
       drop.forEach((nodeToRemove) => nodeToRemove.parent?.remove(nodeToRemove));
     }
+  }
+  // Some weapon vmdls also carry equipment props that are NOT part of the gun.
+  // The Dual Berettas ship an `eholster` mesh — a 209-vertex flat slab (2.5
+  // units thick against the gun's 21.7) modelling the holster the second
+  // pistol sits in. It has its own unwrap, so the skin composite sampled
+  // through it produced a striped, melted "second gun" floating beside the
+  // real one. It also polluted two things that read the whole object:
+  // `weaponMeshes` (so sticker raycasts could land on the holster) and the
+  // bounding box that drives auto-framing and the AXIS_L/H/S placement space.
+  // Valve's own Dual Berettas render shows two pistols and no holster at all.
+  // `eholster` is the ONLY non-body mesh across all 35 extracted weapon GLBs
+  // (verified by scanning every mesh name on the mount), so this is a narrow,
+  // known case rather than a general "drop anything unrecognised" rule —
+  // sticker_gaps strips are meshes too and must survive.
+  {
+    const props: import("three").Object3D[] = [];
+    object.traverse((node) => {
+      if (/holster/i.test(node.name ?? "")) props.push(node);
+    });
+    props.forEach((p) => p.parent?.remove(p));
   }
   // The sticker_gaps strips carry their own tiny texture — never paint them.
   const isGapMesh = (mesh: import("three").Mesh) => {
@@ -991,8 +1209,86 @@ export async function mountViewer(
   };
   let charm: Charm | null = null;
 
+  // The charm is on a CORD_LEN leash from a pivot that only moves when the user
+  // drags it, and probes a small radius around itself — so every triangle it
+  // can ever hit lies inside one small sphere. stepCharm was rediscovering that
+  // six times a frame by raycasting the whole weapon: every triangle of every
+  // mesh, fully intersected and sorted, 360 times a second, to find at most one
+  // hit. Bake the reachable triangles into a throwaway mesh and collide against
+  // that instead — same hits, a fraction of the work.
+  //
+  // Baked in WORLD space with an identity transform, so hit points and
+  // raycast-computed face normals come back directly comparable to what the
+  // full-mesh cast returned. The weapon is recentered once at load and never
+  // animated afterwards (orbit moves the camera, not the model), so a bake
+  // stays valid until the pivot itself moves.
+  // Slack is pure margin on top of the reach the charm genuinely needs, and it
+  // is CUBED into the triangle count: at sizeL * 0.05 the bake swallowed ~11k
+  // of an M4's 18k triangles and charm physics cost 2ms a frame. The reach
+  // itself (cord + half the sprite + probe) is already ~0.085 * sizeL, so a
+  // small margin is all a rebuild trigger needs — it only has to cover pivot
+  // drift between rebuilds, and a rebuild is cheap next to paying for those
+  // triangles on every one of the six rays, every frame the charm is awake.
+  const colliderSlack = sizeL * 0.015;
+  // Perf HUD counters. The charm's cost is entirely (rays × collider triangles)
+  // plus the occasional rebuild, so surface those directly rather than making
+  // someone infer them from a millisecond figure.
+  const charmCost = { rays: 0, rebuilds: 0, sleptAt: 0, awokeAt: 0 };
+  const charmColliderMat = new THREE.MeshBasicMaterial(); // FrontSide, like the weapon's own
+  let charmCollider: import("three").Mesh | null = null;
+  let charmColliderAt: import("three").Vector3 | null = null;
+  function charmColliderFor(pivot: import("three").Vector3, reach: number) {
+    // Rebuilt only once the pivot leaves the slack margin the last bake covered,
+    // so dragging re-bakes a handful of times instead of once per pointermove.
+    if (charmCollider && charmColliderAt && charmColliderAt.distanceTo(pivot) <= colliderSlack) return charmCollider;
+    const r = reach + colliderSlack;
+    const verts: number[] = [];
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const mid = new THREE.Vector3();
+    for (const mesh of weaponMeshes) {
+      const pos = mesh.geometry.getAttribute("position");
+      if (!pos) continue;
+      const index = mesh.geometry.getIndex();
+      const count = index ? index.count : pos.count;
+      for (let i = 0; i + 2 < count; i += 3) {
+        // getVertexPosition, NOT the raw position attribute: on a SkinnedMesh
+        // three overrides it to push the vertex through its bones, which is
+        // exactly what Raycaster does. Reading the attribute directly would
+        // collide the charm against the bind pose while the eye sees the posed
+        // model — silently, since a miss just reads as "no collision".
+        mesh.getVertexPosition(index ? index.getX(i) : i, a).applyMatrix4(mesh.matrixWorld);
+        mesh.getVertexPosition(index ? index.getX(i + 1) : i + 1, b).applyMatrix4(mesh.matrixWorld);
+        mesh.getVertexPosition(index ? index.getX(i + 2) : i + 2, c).applyMatrix4(mesh.matrixWorld);
+        // Triangle bounding sphere vs the reach sphere — cheap, and unlike a
+        // per-vertex test it never drops a large triangle that spans the reach
+        // without any of its own corners landing inside it.
+        mid.copy(a).add(b).add(c).multiplyScalar(1 / 3);
+        const rad = Math.max(mid.distanceTo(a), mid.distanceTo(b), mid.distanceTo(c));
+        if (mid.distanceTo(pivot) > r + rad) continue;
+        verts.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+      }
+    }
+    charmCollider?.geometry.dispose();
+    const geom = new THREE.BufferGeometry();
+    // Vertex winding is copied verbatim, so the face normals three derives
+    // during a raycast still point out of the body — the push-out relies on it.
+    geom.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+    charmCollider = new THREE.Mesh(geom, charmColliderMat);
+    charmCollider.matrixAutoUpdate = false; // stays identity: already world-space
+    charmColliderAt = pivot.clone();
+    charmCost.rebuilds++;
+    return charmCollider;
+  }
+  /** Reach depends on the sprite's height, so a different charm invalidates it. */
+  const invalidateCharmCollider = () => {
+    charmColliderAt = null;
+  };
+
   function removeCharm() {
     if (!charm) return;
+    invalidateCharmCollider();
     scene.remove(charm.sprite);
     scene.remove(charm.line);
     charm.sprite.material.dispose();
@@ -1188,6 +1484,7 @@ export async function mountViewer(
   let charmAsleep = false;
   const charmLastResolved = new THREE.Vector3();
   function wakeCharm() {
+    if (charmAsleep || !charmCost.awokeAt) charmCost.awokeAt = performance.now();
     charmCalm = 0;
     charmAsleep = false;
   }
@@ -1238,6 +1535,7 @@ export async function mountViewer(
       const cpos = charm.pos.clone();
       cpos.y -= charm.h * 0.5;
       const toPivot = charm.pivot.clone().sub(cpos).normalize();
+      const collider = charmColliderFor(charm.pivot, CORD_LEN + charm.h * 0.5 + rC);
       let best: { nrm: import("three").Vector3; depth: number } | null = null;
       for (const [ax, sign] of [[AXIS_S, 1], [AXIS_S, -1], [AXIS_L, 1], [AXIS_L, -1], [AXIS_H, 1], [AXIS_H, -1]] as [number, number][]) {
         const d = new THREE.Vector3();
@@ -1245,7 +1543,8 @@ export async function mountViewer(
         if (d.dot(toPivot) > 0.6) continue;
         raycaster.set(cpos, d);
         raycaster.far = rC;
-        const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+        charmCost.rays++;
+        const hit = raycaster.intersectObject(collider, false)[0];
         if (hit?.face) {
           // The real keychain anchor is a clip point ON the body, so the
           // surface right next to it is not a penetration — pushing off it
@@ -1281,6 +1580,7 @@ export async function mountViewer(
       if (speed < sizeL * 0.001) charmCalm += contact ? 3 : 1;
       else charmCalm = 0;
       if (charmCalm > 30) {
+        if (!charmAsleep) charmCost.sleptAt = performance.now();
         charmAsleep = true;
         charm.prev.copy(charm.pos);
       }
@@ -1601,14 +1901,108 @@ export async function mountViewer(
   setStickers(opts?.stickers ?? []);
   void setCharm(opts?.charm ?? null);
 
+  // ---- Perf HUD ----------------------------------------------------------------
+  // Opt in with ?perf=1 (sticky via localStorage "viewer3d.perf" so it survives
+  // the reloads you do while chasing a stall). Costs nothing when off: the
+  // timing calls are behind the same flag, so the normal path is untouched.
+  //
+  // It reports per-stage frame time rather than a bare fps number because the
+  // interesting question is always WHICH stage — charm physics, the PBR draw,
+  // or a bake stealing the GPU — owns the frame. The static block reports
+  // skinning too: a skinned weapon makes every raycast re-derive its hit
+  // vertices through the bone chain, and stickers (DecalGeometry, which has no
+  // skinning support) project against the bind pose instead of what you see.
+  const perfOn = (() => {
+    try {
+      const q = new URLSearchParams(location.search).get("perf");
+      if (q === "1") localStorage.setItem("viewer3d.perf", "1");
+      if (q === "0") localStorage.removeItem("viewer3d.perf");
+      return !!localStorage.getItem("viewer3d.perf");
+    } catch {
+      return false;
+    }
+  })();
+  const perfHud = (() => {
+    if (!perfOn || opts?.still) return null;
+    const el = document.createElement("div");
+    // Bottom-left, not top: the 2D/3D toggle owns the top-left corner and was
+    // clipping the first line clean off.
+    el.style.cssText =
+      "position:absolute;bottom:4px;left:4px;z-index:50;pointer-events:none;font:10px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;" +
+      "white-space:pre;color:#9fe8b0;background:rgba(0,0,0,.66);padding:4px 6px;border-radius:3px;text-shadow:0 1px 0 #000";
+    if (getComputedStyle(container).position === "static") container.style.position = "relative";
+    container.appendChild(el);
+    return el;
+  })();
+  const modelStats = (() => {
+    if (!perfHud) return "";
+    let tris = 0;
+    let skinned = 0;
+    for (const m of weaponMeshes) {
+      const p = m.geometry.getAttribute("position");
+      const idx = m.geometry.getIndex();
+      tris += ((idx ? idx.count : p ? p.count : 0) / 3) | 0;
+      if ((m as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) skinned++;
+    }
+    return `${model}\nmesh ${weaponMeshes.length} (skinned ${skinned})  tri ${tris.toLocaleString()}`;
+  })();
+  // Frame times are noisy at 60fps; a one-second window is what the eye reads
+  // as "smooth" or "not", so accumulate and report over exactly that.
+  const acc = { frames: 0, total: 0, ctrl: 0, charm: 0, draw: 0, worst: 0, since: performance.now() };
+  function perfSample(t0: number, tCtrl: number, tCharm: number, tEnd: number) {
+    if (!perfHud) return;
+    acc.frames++;
+    acc.total += tEnd - t0;
+    acc.ctrl += tCtrl - t0;
+    acc.charm += tCharm - tCtrl;
+    acc.draw += tEnd - tCharm;
+    acc.worst = Math.max(acc.worst, tEnd - t0);
+    const span = tEnd - acc.since;
+    if (span < 1000) return;
+    // renderer.info.render resets per frame, so read it here — right after the
+    // draw that produced it, before the next frame clears it.
+    const info = renderer.info.render;
+    const per = (v: number) => (v / acc.frames).toFixed(2);
+    perfHud.textContent =
+      `${modelStats}\n` +
+      `fps ${((acc.frames * 1000) / span).toFixed(0)}  frame ${per(acc.total)}ms  worst ${acc.worst.toFixed(1)}ms\n` +
+      `  ctrl ${per(acc.ctrl)}  charm ${per(acc.charm)}  draw ${per(acc.draw)}\n` +
+      // A charm that never reaches "asleep" pays the physics cost forever, so
+      // report how long settling took (or how long it has been trying).
+      `charm ${charm ? (charmDragging ? "drag" : charmAsleep ? "asleep" : "AWAKE") : "none"}` +
+      (charm && !charmDragging && charmCost.awokeAt
+        ? charmAsleep
+          ? ` (settled ${((charmCost.sleptAt - charmCost.awokeAt) / 1000).toFixed(1)}s)`
+          : ` (${((tEnd - charmCost.awokeAt) / 1000).toFixed(1)}s, calm ${charmCalm}/30)`
+        : "") +
+      `\n` +
+      `  collider ${charmCollider ? ((charmCollider.geometry.getAttribute("position")?.count ?? 0) / 3) | 0 : "-"}tri` +
+      `  rays/f ${(charmCost.rays / acc.frames).toFixed(1)}  rebuilds ${charmCost.rebuilds}\n` +
+      // What the GPU was actually asked to do. A `draw` in the milliseconds
+      // with an idle CPU frame is either too much work per frame (visible as
+      // calls/tris/programs) or contention from an offscreen bake — and those
+      // want opposite fixes, so never guess between them.
+      `draw calls ${info.calls} tri ${info.triangles.toLocaleString()} prog ${renderer.info.programs?.length ?? 0}` +
+      `  dpr ${renderer.getPixelRatio().toFixed(1)}\n` +
+      `bakes ${liveViewers > 0 ? "held" : "free"}${snapshotsInFlight ? `  IN FLIGHT ${snapshotsInFlight}` : ""}`;
+    acc.frames = 0;
+    acc.total = acc.ctrl = acc.charm = acc.draw = acc.worst = 0;
+    acc.since = tEnd;
+    charmCost.rays = 0;
+  }
+
   let raf = 0;
   const renderLoop = () => {
     if (disposed) return;
+    const t0 = perfHud ? performance.now() : 0;
     controls.update();
+    const tCtrl = perfHud ? performance.now() : 0;
     stepCharm();
     updateRing();
+    const tCharm = perfHud ? performance.now() : 0;
     stepFlashes(performance.now());
     renderer.render(scene, camera);
+    if (perfHud) perfSample(t0, tCtrl, tCharm, performance.now());
     raf = requestAnimationFrame(renderLoop);
   };
 
@@ -1633,6 +2027,9 @@ export async function mountViewer(
   const onContextLost = (e: Event) => {
     e.preventDefault();
     disposed = true;
+    // This viewer is dead whether or not the caller ever disposes it — stop
+    // holding the bake queue hostage on a context that will never draw again.
+    release();
     cancelAnimationFrame(raf);
     opts?.onContextLost?.();
   };
@@ -1648,6 +2045,17 @@ export async function mountViewer(
   if (opts?.still) settleLoop();
   else renderLoop();
 
+  // Only onscreen viewers hold back background bakes — a `still` viewer IS a
+  // bake, and counting it would deadlock the queue against itself.
+  let released = !!opts?.still;
+  if (!released) liveViewers++;
+  // dispose() can follow a context-loss teardown, so the release must latch.
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseViewer();
+  };
+
   return {
     setStickers,
     flashSticker,
@@ -1662,6 +2070,7 @@ export async function mountViewer(
     },
     dispose() {
       disposed = true;
+      release();
       cancelAnimationFrame(raf);
       observer.disconnect();
       renderer.domElement.removeEventListener("webglcontextlost", onContextLost);
@@ -1686,6 +2095,9 @@ export async function mountViewer(
       cursor?.destroy();
       for (const slot of new Set([...decals.keys(), ...liveMesh.keys()])) removeDecal(slot);
       removeCharm();
+      perfHud?.remove();
+      charmCollider?.geometry.dispose();
+      charmColliderMat.dispose();
       ring.geometry.dispose();
       ringMat.dispose();
       controls.dispose();
@@ -1704,7 +2116,10 @@ export async function mountViewer(
       renderer.domElement.width = 0;
       renderer.domElement.height = 0;
       // Cloned meshes share cached geometry/materials — don't dispose those;
-      // the LRU owns their lifetime.
+      // the LRU owns their lifetime. The freezePose bakes are the exception:
+      // this viewer created them, so this viewer frees them.
+      for (const g of bakedGeoms) g.dispose();
+      bakedGeoms = [];
     },
   };
 }

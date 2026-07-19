@@ -32,6 +32,10 @@ export interface CatalogSkin {
   name: string;
   rarity: string;
   image: string | null;
+  // Phase/variant for finishes that share one market name — Doppler and Gamma
+  // Doppler ("Ruby", "Phase 2", "Emerald"), Marble Fade, etc. Each is its own
+  // paint index; without this the picker shows N identical rows.
+  altName?: string | null;
 }
 
 // The 36 base (vanilla) weapons. Excludes the C4. `id` is the base economy
@@ -76,6 +80,7 @@ export function getWeaponSkins(model: string): {
     .map((i) => ({
       id: i.id,
       name: i.name,
+      altName: i.altName ?? null,
       rarity: i.rarity as string,
       image: img(i.image),
       paintMaterial: i.paintMaterial ?? null,
@@ -106,6 +111,7 @@ export function getKnives(): CatalogSkin[] {
     .map((k) => ({
       id: k.id,
       name: k.name,
+      altName: k.altName ?? null,
       rarity: k.rarity as string,
       image: img(k.image),
     }));
@@ -296,6 +302,7 @@ export function getItem(id: number) {
     return {
       id: i.id,
       name: i.name,
+      altName: i.altName ?? null,
       image: img(i.image),
       rarity: i.rarity as string,
       model: i.model,
