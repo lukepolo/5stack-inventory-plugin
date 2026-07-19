@@ -750,6 +750,9 @@ void main() {
     // against the raw pattern texture offline before shipping — the earlier
     // multiplicative guess (pm *= a) measured WORSE than baseline.
     if (uStyle == 2 && uHalftone) {
+      // Full-strength threshold on purpose: softening it (swept at 0.65/0.4
+      // against the in-game capture) loses the stripe contrast the reference
+      // has. The dots are REAL — Valve's own renders show them.
       pm = clamp((pm - (1.0 - pattern.a) + 0.05) / 0.1, 0.0, 1.0);
     }
     if (uStyle == 2) pm *= paintEdgeLayers; // spray wears in layers

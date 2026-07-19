@@ -181,11 +181,22 @@ does the build-watch + serve in one command.
 3. **Configure**:
    - `inventory.env` → `INVENTORY_DOMAIN` (e.g. `inventory.yoursite.gg`) and
      `CORS_ALLOW_ORIGIN` (your panel origin, e.g. `https://yoursite.gg`).
-   - `DATABASE_URL` → your cluster Postgres. The plugin creates and owns an
-     **`inventory` schema** (not a separate database) and schema-qualifies every
-     query, so you can reuse your existing Postgres connection string. On a Vault
-     install the `k8s/` package pulls it from the existing `timescaledb` secret;
-     otherwise set it in `inventory-secrets.env`.
+   - `inventory-secrets.env` (copy from `inventory-secrets.env.example`) →
+     `DATABASE_URL`. The plugin creates and owns an **`inventory` schema** (not
+     a separate database) and schema-qualifies every query, so this is normally
+     just a copy of the panel's own connection string:
+     ```bash
+     kubectl -n 5stack get secret -o name | grep timescaledb-secrets
+     kubectl -n 5stack get secret <that-name> \
+       -o jsonpath='{.data.POSTGRES_CONNECTION_STRING}' | base64 -d
+     ```
+     It's copied rather than referenced on purpose. The panel generates
+     `timescaledb-secrets` with kustomize's `secretGenerator`, so its real name
+     carries a content hash (`timescaledb-secrets-dfbc69dbh5`), and `custom.sh`
+     builds this package standalone — with no view of that generator, a
+     reference to the bare name wouldn't be rewritten and would resolve to
+     nothing. Note this means the copy doesn't follow a panel password
+     rotation; re-copy it if you rotate.
 4. **Apply the schema** — `npm run migrate` in `backend/` (or run
    `backend/src/schema.sql`). It only does `CREATE SCHEMA inventory` + its
    tables; no database creation needed. The connecting role must be allowed to

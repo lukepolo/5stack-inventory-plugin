@@ -158,16 +158,17 @@ spec:
           # out so a tagged build can't silently start serving a cached layer.
           imagePullPolicy: Always
           env:
-            # Reuse the panel's existing Postgres password — it's already in the
-            # cluster, so a basic install configures nothing here. The plugin
-            # owns an `inventory` SCHEMA (not its own database) and
-            # schema-qualifies every query, so this one connection string is all
-            # it needs.
+            # From this package's own inventory-secrets.env, NOT the panel's
+            # timescaledb-secrets — see the secretGenerator note in
+            # kustomization.yaml. In practice it's a copy of the panel's
+            # connection string: the plugin owns an `inventory` SCHEMA (not its
+            # own database) and schema-qualifies every query, so pointing at the
+            # panel's existing Postgres is all it needs.
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: timescaledb-secrets
-                  key: POSTGRES_CONNECTION_STRING
+                  name: inventory-secrets
+                  key: DATABASE_URL
             - name: CS2_DIR
               value: /cs2-game/steamapps/common/Counter-Strike Global Offensive
             # Scratch (CLI download + raw decompile) goes on the models mount

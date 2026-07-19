@@ -13,6 +13,12 @@ configMapGenerator:
     envs:
       - inventory.env
 
+secretGenerator:
+  - name: inventory-secrets
+    type: Opaque
+    envs:
+      - inventory-secrets.env
+
 replacements:
   - source:
       kind: ConfigMap
