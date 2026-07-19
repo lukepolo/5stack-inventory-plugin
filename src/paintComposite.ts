@@ -365,14 +365,25 @@ const flt2 = (v: number[] | undefined, i: number) => (v ? (v[i] ?? 0) : 0);
 // /models/<key>.inputs/meta.json + webp/png textures. Optional — the paint's
 // generic defaults are used when absent (worn areas then reveal generic
 // gunmetal instead of the weapon's true base texture).
+// Channel packing depends on F_SEPARATE_CHANNEL_INPUTS in the weapon's
+// composite_inputs vmat. Ground truth, csgo_composite_inputs.slang:
+//   S_SEPARATE_CHANNEL_INPUTS == 1  ("Separate Channels", the HD/CS2 bodies)
+//     g_tAmbientOcclusion: Channel(R, Cavity) Channel(G, AO) Channel(A, NoPaint)
+//   S_SEPARATE_CHANNEL_INPUTS == 0  ("Pre-packed Source1 Input", legacy bodies)
+//     g_tAmbientOcclusion: Channel(RGBA, AmbientOcclusion) — the Source1 pack,
+//     whose B is cavity and A is noPaint.
+// So cavity moves between B and R. Reading the wrong one is not subtle: the HD
+// cavity texture's B is 0.000 across the ENTIRE map (measured), which zeroes the
+// wear-through signal — the weapon never strips at any float.
 export interface WeaponInputs {
-  ao?: string; // R=cavity G=ao A=noPaint
+  ao?: string; // separateChannels ? R=cavity G=ao A=noPaint : Source1 pack (B=cavity A=noPaint)
   masks?: string; // paint-by-number RGB
   color?: string; // base weapon albedo (paint-UV space)
   metalness?: string; // R=roughness G=metalness
   mag?: string; // translucent-magazine UV mask (white = mag texel)
   weaponLength?: number;
   uvScale?: number;
+  separateChannels?: boolean;
 }
 const weaponInputsCache = new Map<string, Promise<WeaponInputs | null>>();
 // Every asset path here degrades silently to a fallback, which is right for
@@ -396,20 +407,35 @@ const warnedModels = new Set<string>();
 export const compositeDiagnostics = (model: string): CompositeDiag | null => diagByModel.get(model) ?? null;
 export const allCompositeDiagnostics = () => [...diagByModel.values()];
 
-export function loadWeaponInputs(model: string): Promise<WeaponInputs | null> {
-  let cached = weaponInputsCache.get(model);
+// Every weapon ships TWO composite_inputs sets, and they are not interchangeable:
+//
+//   legacy  materials/models/weapons/customization/<class>_<key>/…
+//           layer_name_1 -> v_models/<key>.vmat, i.e. authored against the
+//           LEGACY body's unwrap. P90: uvScale 0.537, weaponLength 19.637.
+//   hd      weapons/models/<key>/materials/composite_inputs/…
+//           the CS2-native body. P90: uvScale 0.678, weaponLength 20.381,
+//           F_SEPARATE_CHANNEL_INPUTS=1.
+//
+// Different unwraps, MEASURED: legacy ao.a and HD ao.a agree on only 55% of
+// texels, which is chance for their coverages (0.322 / 0.316). Feeding one set
+// to the other body scatters noPaint/masks/baseColour into unrelated places —
+// bare-metal texels land in the middle of painted panels, and the hardware that
+// should stay bare gets painted.
+//
+// viewer3d picks body_hd vs body_legacy per finish (cs2-lib `item.legacy`), so
+// the input set has to be picked the same way. This used to be keyed on model
+// alone, which meant every CS2-native finish rendered the HD body against
+// legacy inputs.
+export function loadWeaponInputs(model: string, legacy = false): Promise<WeaponInputs | null> {
+  const dir = legacy ? `${model}.inputs` : `${model}.inputs.hd`;
+  let cached = weaponInputsCache.get(dir);
   if (!cached) {
     cached = (async () => {
-      try {
-        const res = await fetch(`${API_ORIGIN}/models/${encodeURIComponent(model)}.inputs/meta.json`);
-        if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) {
-          // No composite inputs on the mount at all: worn areas fall back to a
-          // generic grey and the weapon's real base colour never shows.
-          noteMissing(model, "inputs/meta.json (run model extraction)");
-          return null;
-        }
+      const load = async (d: string): Promise<WeaponInputs | null> => {
+        const res = await fetch(`${API_ORIGIN}/models/${encodeURIComponent(d)}/meta.json`);
+        if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) return null;
         const meta = (await res.json()) as WeaponInputs & { textures?: Record<string, string> };
-        const base = `${API_ORIGIN}/models/${encodeURIComponent(model)}.inputs/`;
+        const base = `${API_ORIGIN}/models/${encodeURIComponent(d)}/`;
         const rel = (p?: string) => (p ? base + p : undefined);
         return {
           ao: rel(meta.textures?.ao),
@@ -419,12 +445,31 @@ export function loadWeaponInputs(model: string): Promise<WeaponInputs | null> {
           mag: rel(meta.textures?.mag),
           weaponLength: meta.weaponLength,
           uvScale: meta.uvScale,
+          separateChannels: !!meta.separateChannels,
         };
+      };
+      try {
+        const got = await load(dir);
+        if (got) return got;
+        // An extraction that predates the HD bundles only has <key>.inputs.
+        // Falling back keeps those weapons rendering as they did rather than
+        // dropping to generic defaults — but it IS the mismatched set, so say so.
+        if (!legacy) {
+          const fallback = await load(`${model}.inputs`);
+          if (fallback) {
+            noteMissing(model, "inputs.hd (HD body rendering against LEGACY inputs — re-run model extraction)");
+            return fallback;
+          }
+        }
+        // No composite inputs on the mount at all: worn areas fall back to a
+        // generic grey and the weapon's real base colour never shows.
+        noteMissing(model, "inputs/meta.json (run model extraction)");
+        return null;
       } catch {
         return null;
       }
     })();
-    weaponInputsCache.set(model, cached);
+    weaponInputsCache.set(dir, cached);
   }
   return cached;
 }
@@ -585,6 +630,9 @@ uniform float uWearAmt, uWearSoft, uColorBrightness;
 uniform int uStyle, uMode; // uMode: 0 = albedo, 1 = rough/metal
 uniform bool uHalftone; // F_SPRAYPAINT_HALFTONE
 uniform bool uHasMag;    // translucent-mag UV mask present
+// F_SEPARATE_CHANNEL_INPUTS from the weapon's composite_inputs vmat: selects
+// which channel of tAO carries cavity (R when separate, B when pre-packed).
+uniform bool uSeparateChannels;
 
 vec2 xf(vec2 uv, vec4 r0, vec4 r1) { return vec2(dot(uv, r0.xy) + r0.w, dot(uv, r1.xy) + r1.w); }
 float maxc(vec3 v) { return max(v.x, max(v.y, v.z)); }
@@ -607,7 +655,10 @@ void main() {
   // cavity map (mean 0.09, near-zero on flats with only crevices bright, which
   // is what the note below describes) and yields 0.2% stripped at Factory New
   // rising smoothly to 27% at Battle-Scarred.
-  float cavity = uHasAo ? ao4.b : CAVITY_NO_MAP;
+  // Cavity channel is packing-dependent — see WeaponInputs.separateChannels.
+  // Separate-channel (HD) maps put cavity in R and leave B at 0; pre-packed
+  // Source1 (legacy) maps put it in B.
+  float cavity = uHasAo ? (uSeparateChannels ? ao4.r : ao4.b) : CAVITY_NO_MAP;
   float flAo = uHasAo ? ao4.g : 1.0;
   // noPaint = the AO map's alpha: the parts that take no paint (sights, muzzle
   // brake, trigger, rails), which stay bare metal at every float.
@@ -622,18 +673,33 @@ void main() {
   // relative contrast with 2.4% dark pixels against a reference of 40.3% / 13.1%;
   // restoring the mask brings that to 30.2% / 6.6%.
   //
-  // ao.a over-marks: besides true hardware it covers large body regions and
-  // the translucent magazine, ALL of which the game paints (verified against
-  // an in-game capture — see tools/shadertest/README.md for the full chain of
-  // rejected models, including rendering mag texels as opaque interior, which
-  // put a bright grey "panel" over the receiver). Bare = ao.a AND strong
-  // metal (barrel, muzzle, printed fittings); everything else takes paint.
-  // The translucent mag is approximated separately below: its texels render
-  // the PAINT seen through smoked plastic, i.e. slightly darkened — not the
-  // opaque interior detail, and not bare.
+  // ao.a was ALSO briefly gated by base metalness — ao.a * smoothstep(0.5, 0.8,
+  // baseRM.g) — on the theory that it over-marks, covering body the game paints
+  // as well as true hardware. That gate is now removed, and it was the cause of
+  // "the black metal parts render as camo".
+  //
+  // Why it was wrong, MEASURED on the P90's real inputs: the gate keys on
+  // METALNESS, but a weapon's unpainted hardware is largely POLYMER — sight
+  // towers, barrel shroud, rails. Median baseRM.g *inside* the ao.a region is
+  // 0.000. So the gate discarded 29.1 of the 32.2 percentage points the mask
+  // marks, leaving noPaint at 1.8% coverage: every polymer part took paint, and
+  // the only texels that survived were the high-metalness printed serial
+  // markings, which then floated on the camo as bare grey glyphs.
+  //
+  // Removing it, measured through runViewer against the CDN reference
+  // (relative contrast / dark-pixel share, reference = 41.3% / 15.4%):
+  //   gated   30.2% / 4.3%   mean luma 113.6
+  //   ungated 33.8% / 8.5%   mean luma 106.7   (reference mean 105.3)
+  // and all 9 fixtures still pass. The earlier in-game sweep that chose 0.5
+  // was run while the HD body was being fed LEGACY composite inputs (see
+  // loadWeaponInputs), so it was tuning a gate to compensate for a mismatched
+  // mask — with the correct inputs the gate is not needed.
+  //
+  // The translucent mag is handled separately below: its texels render the
+  // PAINT seen through smoked plastic, i.e. slightly darkened — not the opaque
+  // interior detail, and not bare.
   vec4 masks = texture(tMasks, vUv);
-  float hwMetal = uHasBaseRM ? smoothstep(0.5, 0.8, texture(tBaseRM, vUv).g) : 0.0;
-  float noPaint = uHasAo ? ao4.a * hwMetal : 0.0;
+  float noPaint = uHasAo ? ao4.a : 0.0;
   float magT = uHasMag ? texture(tMagMask, vUv).r : 0.0;
   float wearTex = texture(tWear, xf(vUv, uWearX0, uWearX1)).r;
   vec4 grungeRaw = texture(tGrunge, xf(vUv, uGrgX0, uGrgX1));
@@ -1080,6 +1146,7 @@ export async function compositePaint(
       uHalftone: { value: false },
       tMagMask: { value: null as unknown as import("three").Texture },
       uHasMag: { value: false },
+      uSeparateChannels: { value: false },
       uMode: { value: 0 },
     },
   });
@@ -1167,6 +1234,9 @@ export async function compositePaint(
   u.uHalftone.value = def.halftone;
   u.tMagMask.value = magTex ?? black;
   u.uHasMag.value = !!magTex;
+  // Only meaningful alongside a real weapon ao map; the generic fallback is a
+  // Source1-style pack.
+  u.uSeparateChannels.value = !!opts.weapon?.ao && !!opts.weapon?.separateChannels;
 
   const scene = new THREE.Scene();
   scene.add(new THREE.Mesh(quadGeom, quadMat));

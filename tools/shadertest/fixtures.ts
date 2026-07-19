@@ -37,8 +37,9 @@ export const FIXTURES: Fixture[] = [
     model: "p90", pm: "/materials/ht_simple_camo_35a9b53a.vcompmat.json",
     wear: 0.11, seed: 637, style: 2, overlay: false,
     ref: "weapon_p90_ht_simple_camo_9da81e0d",
-    note: "noPaint + F_SPRAYPAINT_HALFTONE reference case. noPaint = ao.a gated by " +
-          "base metalness; halftone thresholds pattern channels against the dot screen " +
+    note: "noPaint + F_SPRAYPAINT_HALFTONE reference case. noPaint = ao.a, UNGATED — " +
+          "the old base-metalness gate painted the polymer sights/barrel and left only " +
+          "the serial markings bare (see README); halftone thresholds pattern channels against the dot screen " +
           "in pattern.a (that is where the crisp posterised camo comes from — without " +
           "it the render is soft mid-tone mush at 16% contrast). If this fixture's sat " +
           "drops toward ~23, the halftone gate regressed. Known residual: sight towers " +

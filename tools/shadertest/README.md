@@ -174,10 +174,49 @@ All fixtures currently pass. Remaining smaller gaps:
   script was validated at 94.7% IoU against a PIL reference. Until an
   extraction re-run ships mag.png, the viewer degrades gracefully (no smoke).
 
-  RESIDUALS, both understood: the iron-sight towers and barrel assembly take
-  paint (separate-material geometry in the game model, flattened into one mesh
-  by the GLB export — needs extraction work, not shader work), and overall
-  tone still sits slightly flatter than Valve's lit render.
+  **CLOSED 2026-07-19, and the two conclusions above were WRONG.** Both the
+  "sight towers take paint" residual and the metalness gate that produced it
+  are gone. What was actually happening:
+
+  1. **The gate keyed on the wrong signal.** Unpainted weapon hardware is
+     largely POLYMER, not metal — median `baseRM.g` *inside* the ao.a region is
+     **0.000** on the P90. `smoothstep(0.5, 0.8)` on it discarded 29.1 of the
+     32.2 percentage points ao.a marks, leaving noPaint at 1.8% coverage. Every
+     polymer part took paint, and the only texels that survived were the
+     high-metalness printed serial markings, which floated on the camo as bare
+     grey glyphs. `noPaint = ao.a`, ungated, is correct.
+  2. **The gate was tuned against a mismatched mask.** Desert Halftone is
+     `legacy=false`, so it renders body_hd — but `loadWeaponInputs` was keyed on
+     model alone and always served the LEGACY (`customization/smg_p90`) bundle.
+     The two sets are authored against different unwraps: their noPaint masks
+     agree on only **55%** of texels, chance for their coverages. The in-game
+     sweep that picked 0.5 was compensating a gate for a mask in the wrong
+     place. See `loadWeaponInputs` and extract-models.sh §3b — both bundles are
+     extracted now and picked by the same flag that picks the body.
+
+  The sights/barrel were never separate-material geometry: `p90.glb` has two
+  meshes (body_legacy, body_hd), each ONE primitive with ONE material. There is
+  nothing to recover from the model — the game separates paintable regions
+  purely by texture mask. It was shader/texture work all along.
+
+  Measured through `runViewer` against the CDN reference (relative contrast /
+  dark-pixel share; reference 41.3% / 15.4%):
+
+  | | contrast | dark | mean luma |
+  |---|---|---|---|
+  | gated + legacy inputs (shipped before) | 30.2% | 5.2% | 111.1 |
+  | gated + HD inputs | 30.2% | 4.3% | 113.6 |
+  | **ungated + HD inputs (now)** | **33.8%** | **8.5%** | **106.7** |
+  | reference | 41.3% | 15.4% | 105.3 |
+
+  **Do not judge this one on the numbers alone.** Ungated + LEGACY inputs scores
+  34.6% / 8.3% — the best contrast of any variant — and is visibly the worst
+  render of the set: misplaced bare-metal texels smeared across the stock and
+  receiver, which is exactly what inflates its contrast. Snapshots
+  `p90_gate0_LEGACYinputs.png` vs `p90_gate_0.png` show it immediately.
+
+  RESIDUAL: overall tone still sits slightly flatter than Valve's lit render,
+  and dark-pixel share is still short of the reference (8.5% vs 15.4%).
 
 ## Measuring contrast against a reference
 
@@ -200,6 +239,14 @@ back **linear**, references are **sRGB**. An early version of this comparison
 concluded the composite had "0% dark pixels" purely because of that mismatch.
 
 ## Gotchas that cost real time
+
+- **A better contrast score can be a worse render.** Artifacts have contrast
+  too. Every metric here is a regression tripwire, not a target to maximise —
+  when a change moves them, look at the snapshot before believing it.
+- **Source2Viewer-CLI's `-f` is a path PREFIX match, not a substring match.**
+  `-f "materials/composite_inputs/"` matches zero entries; the real paths start
+  `weapons/models/`. A wrong filter here is silent (it just extracts nothing),
+  which is the same failure that left every weapon on generic inputs for months.
 
 - **Verify what is deployed before debugging behaviour.** Shader source survives
   minification as a string literal, so `grep -c 'ao4.b' app.js` against the live

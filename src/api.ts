@@ -137,7 +137,7 @@ export const fetchCatalog = () => request<Catalog>("/catalog");
 // Version suffix must match the backend's key builder — bumped when the
 // render pipeline changes so stale bakes miss and re-render.
 export const renderKeyFor = (i: { id: number; wear: number | null; seed: number | null }) =>
-  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}-v5.png`;
+  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}-v6.png`;
 // Served via /api (canonical): that ingress path provably reaches the backend
 // pod that stores the files — immune to stale nginx images, CDN-cached 404s,
 // and hostPath node mismatches. Plain <img> tags send session cookies, so the

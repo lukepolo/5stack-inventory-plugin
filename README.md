@@ -115,7 +115,12 @@ invsim_url "https://inventory.5stack.gg"
 invsim_apikey "inv_…"
 invsim_ws_enabled true
 invsim_ws_immediately true
+invsim_require_inventory true
+invsim_spraychanger_enabled true
 ```
+
+The Lan cfg row is intentionally left untouched by the sync — edit it by hand if
+you want the block there.
 
 | Method | Path                             | Auth               |
 | ------ | -------------------------------- | ------------------ |
@@ -123,12 +128,21 @@ invsim_ws_immediately true
 | POST   | `/api/increment-item-stattrak`   | `apiKey` in body   |
 | POST   | `/api/sign-in`                   | `apiKey` in body   |
 
-Two things about this protocol are counter-intuitive and have each cost a
+Three things about this protocol are counter-intuitive and have each cost a
 debugging session:
 
 - **`invsim_ws_*` is not WebSockets.** `ws` means *weapon skin* — the `!ws` chat
   command that re-fetches a player's inventory over plain HTTP. There is no
   WebSocket anywhere in the plugin.
+- **`invsim_require_inventory` is load-bearing, not optional.** Skins are baked
+  into the weapon by a native `GiveNamedItem` detour at the moment the engine
+  creates it — there is no spawn or team hook, and nothing re-evaluates a weapon
+  that already exists. The inventory fetch is async HTTP fired at connect, and
+  5stack auto-assigns a team and force-respawns ~100ms later, which beats the
+  round-trip: the weapons get built vanilla and the player only sees their skins
+  after their first death. This convar defers activation until the fetch lands.
+  The trade-off is that a slow or unreachable backend now hangs players at
+  connect instead of spawning them skinless.
 - **`invsim_apikey` is never an HTTP header**, and the equipped `GET` sends no
   credential at all — it is a bare `GetAsync`. That endpoint must stay publicly
   readable by SteamID64. Putting the ingress' 5stack forward-auth in front of

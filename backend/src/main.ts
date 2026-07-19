@@ -80,13 +80,16 @@ export function renderKeyForRow(row: { id: number | string; wear: number | strin
   // v4 paint+lighting: durability inversion, cavity from ao4.b, the disabled
   // g_bUseOverlay/g_bUseRoughness gates, and the IBL/key/rim scale-down that
   // stopped a white specular term swamping every skin's chroma. v5 crop aspect
-  // cap: slim crops (the Nova) went full-bleed in cards and drew oversized.)
+  // cap: slim crops (the Nova) went full-bleed in cards and drew oversized.
+  // v6 noPaint/composite-inputs: dropped the base-metalness gate on noPaint
+  // that was painting polymer hardware, and started picking the HD vs legacy
+  // composite-input bundle to match the body being rendered.)
   //
   // The key covers id+wear+seed only — NOT the shader — so a compositor fix
   // changes the pixels while the filename stays put, and every card keeps
   // serving the pre-fix bake. Bumping this is the ONLY thing that invalidates
   // them; "clear cache" cannot, because the URL is unchanged.
-  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}-v5.png`;
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}-v6.png`;
 }
 app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) => {
   const identity = await getIdentity(request);
@@ -1244,7 +1247,8 @@ async function getServerApiKey(): Promise<string | null> {
 // generation. A cfg row REPLACES the default file on the game server, so a
 // missing row is seeded from the stock config (same source the panel's
 // get-default-config endpoint uses) before prepending.
-const CFG_TYPES = ["Lan", "Competitive", "Wingman", "Duel"];
+// Lan is deliberately excluded — that cfg is hand-maintained, leave it alone.
+const CFG_TYPES = ["Competitive", "Wingman", "Duel"];
 const CFG_MARKER = "5stack inventory plugin (auto-added)";
 
 function invsimBlock(url: string, key: string): string {
@@ -1254,6 +1258,13 @@ function invsimBlock(url: string, key: string): string {
     `invsim_apikey "${key}"`,
     "invsim_ws_enabled true",
     "invsim_ws_immediately true",
+    // Defers the player's activation until their loadout fetch resolves.
+    // Without it, 5stack auto-assigns a team and force-respawns ~100ms after
+    // connect, which beats this HTTP round-trip — the weapons are then built
+    // vanilla and nothing re-evaluates them until the next spawn, so skins
+    // only show up after the player's first death.
+    "invsim_require_inventory true",
+    "invsim_spraychanger_enabled true",
     "",
   ].join("\n");
 }

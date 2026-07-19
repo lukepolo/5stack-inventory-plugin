@@ -143,6 +143,36 @@ mkdir -p "$RAW_CI"
 "$CLI" -i "$VPK" -o "$RAW_CI" \
   -f "materials/models/weapons/customization/" -e "vmat_c"
 
+# Every weapon ships a SECOND composite_inputs set, and the two are authored
+# against DIFFERENT UV unwraps:
+#
+#   customization/<class>_<key>/   -> layer_name_1 = v_models/<key>.vmat, i.e.
+#                                     the LEGACY body. (the pass above)
+#   weapons/models/<key>/materials/composite_inputs/  -> the HD / CS2-native
+#                                     body, usually F_SEPARATE_CHANNEL_INPUTS=1.
+#
+# MEASURED on the P90: the two noPaint masks agree on only 55% of texels, which
+# is chance for their coverages. The viewer renders body_hd for every CS2-native
+# finish (cs2-lib item.legacy == false), so shipping only the legacy bundle put
+# a mask authored for a different unwrap onto the HD body — bare-metal texels
+# landed mid-panel and the real hardware got painted. Bundle both; the viewer
+# picks by the same flag it picks the body with.
+#
+# -f is a path PREFIX match, not a substring match: filtering on
+# "materials/composite_inputs/" matches nothing (verified — 0 entries), because
+# the real paths start "weapons/models/". So take the whole models-tree vmat set
+# (148 entries, cheap) and let the walk below keep the composite_inputs ones.
+"$CLI" -i "$VPK" -o "$RAW_CI" \
+  -f "weapons/models/" -e "vmat_c"
+
+# The models-tree vmats are named <glb basename>_composite_inputs.vmat_c, so the
+# same MAP that renames the GLBs in step 3 resolves their cs2-lib keys. Hand it
+# to the python below rather than maintaining a second copy that can drift.
+MODEL_KEY_JSON="{"
+for k in "${!MAP[@]}"; do MODEL_KEY_JSON+="\"$k\":\"${MAP[$k]}\","; done
+MODEL_KEY_JSON="${MODEL_KEY_JSON%,}}"
+export MODEL_KEY_JSON
+
 # Parse each composite_inputs vmat for its texture references, decompile
 # exactly those textures, and assemble <key>.inputs/ bundles.
 CLI="$CLI" VPK="$VPK" RAW_CI="$RAW_CI" RAW="$RAW" DEST="$DEST" python3 - <<'PYEOF'
@@ -173,6 +203,19 @@ WANTED = {  # composite param -> served filename
 }
 
 FLOATS = {"g_flWeaponLength1": "weaponLength", "g_flUvScale1": "uvScale"}
+# Channel packing is not fixed — it depends on this feature flag. Ground truth,
+# csgo_composite_inputs.slang:
+#   F_SEPARATE_CHANNEL_INPUTS=1 -> g_tAmbientOcclusion R=Cavity G=AO A=NoPaint
+#   F_SEPARATE_CHANNEL_INPUTS=0 -> the pre-packed Source1 AO texture (B=cavity)
+# The compositor reads cavity from the wrong channel without it, and on an HD
+# map B is 0.000 everywhere, which zeroes wear-through entirely.
+INTS = {"F_SEPARATE_CHANNEL_INPUTS": "separateChannels"}
+MODEL_KEY = json.loads(os.environ.get("MODEL_KEY_JSON") or "{}")
+# The models tree names two things differently from the GLB basenames it is
+# otherwise identical to. Verified by diffing all 36 HD vmat stems against MAP:
+# these are the ONLY discrepancies, so a silent .get() would drop exactly one
+# weapon's HD bundle and nothing would say so.
+MODEL_KEY["weapon_pist_glock"] = "glock"  # GLB is weapon_pist_glock18
 
 # The vmat_c's KV3 payload is compressed, so scanning the raw bytes for strings
 # recovers nothing (confirmed: 36 files dumped, 0 textures found). Ask the CLI
@@ -193,7 +236,7 @@ def scan(path):
     textures, floats, pending = {}, {}, None
     for m in TOKEN.finditer(out):
         tok, is_quoted = (m.group(1), True) if m.group(1) is not None else (m.group(2), False)
-        if is_quoted and (tok in WANTED or tok in FLOATS):
+        if is_quoted and (tok in WANTED or tok in FLOATS or tok in INTS):
             pending = tok
         elif pending is None:
             continue
@@ -202,7 +245,10 @@ def scan(path):
                 textures[pending] = tok
                 pending = None
         elif not is_quoted:
-            floats[FLOATS[pending]] = float(tok)
+            if pending in INTS:
+                floats[INTS[pending]] = bool(int(float(tok)))
+            else:
+                floats[FLOATS[pending]] = float(tok)
             pending = None
     return textures, floats
 
@@ -228,25 +274,41 @@ for vmat_path in sorted(vmats):
     # ssg08 ships a separate scope body; the primary bundle is the one we want
     if "_scope_" in base or "_2_" in base:
         continue
-    stripped = folder
-    for p in CLASS_PREFIX:
-        if stripped.startswith(p):
-            stripped = stripped[len(p):]
-            break
-    key = FOLDER_KEY.get(stripped, stripped)
-    out_dir = os.path.join(dest, f"{key}.inputs")
+    # Two trees, two bundles. The models tree (.../materials/composite_inputs/)
+    # is the HD body's set and lands in <key>.inputs.hd; the customization tree
+    # is the legacy body's and keeps <key>.inputs. See the shell comment above.
+    if folder == "composite_inputs":
+        stem = base[: -len("_composite_inputs.vmat_c")]
+        key = MODEL_KEY.get(stem)
+        if not key:
+            # Knives and test_shape legitimately have no weapon model key (the
+            # plugin does not serve them yet) — those are expected and quiet.
+            # An unmapped weapon_* stem is a real gap and must be reported.
+            if stem.startswith("weapon_"):
+                unmapped.append(f"{stem}.inputs.hd -> (no model key)")
+            continue
+        out_dir = os.path.join(dest, f"{key}.inputs.hd")
+    else:
+        stripped = folder
+        for p in CLASS_PREFIX:
+            if stripped.startswith(p):
+                stripped = stripped[len(p):]
+                break
+        key = FOLDER_KEY.get(stripped, stripped)
+        out_dir = os.path.join(dest, f"{key}.inputs")
 
+    label = os.path.basename(out_dir)
     textures, floats = scan(vmat_path)
     if not textures:
         # Block dump failed or the param names moved — say so per-weapon rather
         # than emit a half-empty bundle.
-        unscannable.append(folder)
+        unscannable.append(label)
         continue
     if not os.path.isfile(os.path.join(dest, f"{key}.glb")):
         # Every bundle must land on a model the plugin actually serves. A key
         # that matches no .glb is a mapping bug, and it fails silently at
         # runtime as a 404 the viewer papers over with generic defaults.
-        unmapped.append(f"{folder} -> {key}")
+        unmapped.append(f"{label} -> {key}")
 
     meta = {"textures": {}, **floats}
     os.makedirs(out_dir, exist_ok=True)
@@ -265,10 +327,10 @@ for vmat_path in sorted(vmats):
         with open(os.path.join(out_dir, "meta.json"), "w") as fh:
             json.dump(meta, fh)
         made += 1
-        print(f"---   {key}: {' '.join(sorted(meta['textures']))}")
+        print(f"---   {label}: {' '.join(sorted(meta['textures']))}")
     else:
         shutil.rmtree(out_dir, ignore_errors=True)
-        unscannable.append(folder)
+        unscannable.append(label)
 
 # ---- Translucent-magazine UV masks --------------------------------------------
 # The P90's magazine is clear plastic: in-game the paint shows THROUGH it,

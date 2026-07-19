@@ -62,6 +62,7 @@ function stat(px: Uint8Array, alphaGate = false): Stat {
 
 export async function runOne(
   model: string, pm: string, wear: number, seed: number, size = 128,
+  legacyPaint = false,
 ): Promise<RigResult> {
   const out: RigResult = { model, pm, wear, seed };
   try {
@@ -78,7 +79,7 @@ export async function runOne(
     out.overlayBlendMode = def.overlayBlendMode;
     out.overlayMaskMode = def.overlayMaskMode;
 
-    const weapon = await loadWeaponInputs(model);
+    const weapon = await loadWeaponInputs(model, !!legacyPaint);
     out.weaponInputs = weapon
       ? Object.keys(weapon).filter((k) => (weapon as any)[k] != null)
       : null;

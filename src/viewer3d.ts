@@ -20,6 +20,7 @@ import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, pai
 // weapon models' own `keychain` attachment. Regenerate on a CS2 update rather
 // than hand-editing — the values are exact, not tuned.
 import CHARM_ANCHORS from "./charmAnchors.json";
+import { createViewerCursor, type CursorMode } from "./viewerCursor";
 
 export { loadPaintDef, type PaintDef } from "./paintComposite";
 
@@ -442,7 +443,9 @@ export async function mountViewer(
     try {
       const [paint, weaponInputs] = await Promise.all([
         loadPaintDef(opts.paintMaterial),
-        loadWeaponInputs(model),
+        // Must match the body chosen below (bodyVariant): the legacy and HD
+        // composite-input sets are authored against different unwraps.
+        loadWeaponInputs(model, !!opts?.legacyPaint),
       ]);
       if (paint) {
         const comp = await compositePaint(THREE, renderer, paint, {
@@ -1331,7 +1334,6 @@ export async function mountViewer(
         charm.sprite.scale.set(charm.w * 1.18, charm.h * 1.18, 1); // picked up — reads as grabbed
         controls.enabled = false;
         el.setPointerCapture(e.pointerId);
-        el.style.cursor = "grabbing";
         return;
       }
     }
@@ -1346,7 +1348,6 @@ export async function mountViewer(
       rotateStartDeg = cur ? (JSON.parse(cur.key) as [string, number | null, number | null, number | null])[3] ?? 0 : 0;
       controls.enabled = false;
       el.setPointerCapture(e.pointerId);
-      el.style.cursor = "grabbing";
     }
   }
 
@@ -1472,7 +1473,6 @@ export async function mountViewer(
     drag = null;
     charmDragging = false;
     controls.enabled = true;
-    el.style.cursor = "";
     try {
       el.releasePointerCapture(e.pointerId);
     } catch {
@@ -1480,11 +1480,121 @@ export async function mountViewer(
     }
   }
 
+  // ---- Cursor ------------------------------------------------------------------
+  // The viewer runs five gestures off one surface (orbit, pan, zoom, drag a
+  // sticker, grab the charm) and the OS cursor set can express about two of
+  // them, so the native cursor is hidden and a reticle drawn instead. It reads
+  // the SAME raycast the drag handlers do, so what it shows is exactly what a
+  // press would grab — a hover that lies is worse than no hover at all.
+  // Gated on `still`, NOT on `interactive`: orbit/pan/zoom exist in every
+  // on-screen viewer, and only the sticker/charm hover states need placement to
+  // be enabled. `still` viewers are offscreen snapshot rigs with no user at all.
+  const cursor = opts?.still ? null : createViewerCursor(container, el);
+  let orbiting = false;
+  let panning = false;
+  let shiftHeld = false;
+  let hoverKind: "sticker" | "charm" | null = null;
+  let hoverRaf = 0;
+
+  function paintCursor() {
+    if (!cursor) return;
+    let mode: CursorMode;
+    if (drag) mode = "grab";
+    else if (panning) mode = "pan";
+    else if (orbiting) mode = "orbit";
+    else if (hoverKind === "sticker") mode = shiftHeld ? "rotate" : "sticker";
+    else if (hoverKind === "charm") mode = "charm";
+    else mode = "idle";
+    cursor.set(mode);
+  }
+
+  function onCursorDown(e: PointerEvent) {
+    shiftHeld = e.shiftKey;
+    // onPointerDown runs first and claims the press if it hit an attachment;
+    // whatever is left is an orbit (left) or a pan (middle/right).
+    if (!drag) {
+      if (e.button === 0) orbiting = true;
+      else panning = true;
+    }
+    paintCursor();
+  }
+
+  function onCursorMove(e: PointerEvent) {
+    cursor?.move(e.clientX, e.clientY);
+    shiftHeld = e.shiftKey;
+    if (drag || orbiting || panning) {
+      paintCursor();
+      return;
+    }
+    // Nothing is grabbable without placement, so skip the raycast entirely —
+    // a view-only viewer never leaves the orbit/pan/zoom states.
+    if (!opts?.interactive) {
+      paintCursor();
+      return;
+    }
+    // Hover resolves at most once per frame — pointermove outruns the display
+    // and every resolve is a raycast.
+    if (hoverRaf) return;
+    hoverRaf = requestAnimationFrame(() => {
+      hoverRaf = 0;
+      if (disposed || drag) return;
+      updatePointer(e);
+      raycaster.setFromCamera(pointerNdc, camera);
+      hoverKind =
+        charm && raycaster.intersectObject(charm.sprite, false)[0]
+          ? "charm"
+          : raycaster.intersectObjects([...liveMesh.values()], false)[0]
+            ? "sticker"
+            : null;
+      paintCursor();
+    });
+  }
+
+  function onCursorUp() {
+    orbiting = false;
+    panning = false;
+    paintCursor();
+  }
+  function onCursorEnter(e: PointerEvent) {
+    cursor?.move(e.clientX, e.clientY);
+    cursor?.show(true);
+  }
+  function onCursorLeave() {
+    cursor?.show(false);
+    orbiting = false;
+    panning = false;
+    hoverKind = null;
+  }
+  function onCursorWheel() {
+    cursor?.set("zoom");
+  }
+  // Shift retargets a sticker drag from move to rotate, so the reticle has to
+  // follow the modifier even when the pointer is perfectly still.
+  function onCursorKey(e: KeyboardEvent) {
+    if (e.key !== "Shift") return;
+    shiftHeld = e.type === "keydown";
+    paintCursor();
+  }
+
   if (opts?.interactive) {
     el.addEventListener("pointerdown", onPointerDown);
     el.addEventListener("pointermove", onPointerMove);
     el.addEventListener("pointerup", onPointerUp);
     el.addEventListener("pointercancel", onPointerUp);
+  }
+
+  if (cursor) {
+    el.addEventListener("pointerdown", onCursorDown);
+    el.addEventListener("pointermove", onCursorMove);
+    el.addEventListener("pointerenter", onCursorEnter);
+    el.addEventListener("pointerleave", onCursorLeave);
+    el.addEventListener("wheel", onCursorWheel, { passive: true });
+    // Releases land wherever the pointer ended up — OrbitControls captures to
+    // its own target, so a listener on the canvas would miss half of them.
+    window.addEventListener("pointerup", onCursorUp);
+    window.addEventListener("pointercancel", onCursorUp);
+    window.addEventListener("keydown", onCursorKey);
+    window.addEventListener("keyup", onCursorKey);
   }
 
   // Initial attachments.
@@ -1561,6 +1671,19 @@ export async function mountViewer(
         el.removeEventListener("pointerup", onPointerUp);
         el.removeEventListener("pointercancel", onPointerUp);
       }
+      if (cursor) {
+        el.removeEventListener("pointerdown", onCursorDown);
+        el.removeEventListener("pointermove", onCursorMove);
+        el.removeEventListener("pointerenter", onCursorEnter);
+        el.removeEventListener("pointerleave", onCursorLeave);
+        el.removeEventListener("wheel", onCursorWheel);
+        window.removeEventListener("pointerup", onCursorUp);
+        window.removeEventListener("pointercancel", onCursorUp);
+        window.removeEventListener("keydown", onCursorKey);
+        window.removeEventListener("keyup", onCursorKey);
+      }
+      cancelAnimationFrame(hoverRaf);
+      cursor?.destroy();
       for (const slot of new Set([...decals.keys(), ...liveMesh.keys()])) removeDecal(slot);
       removeCharm();
       ring.geometry.dispose();
