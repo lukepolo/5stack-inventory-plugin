@@ -2542,9 +2542,20 @@ function flashLoadout3dAttachment(a: { kind: string; slot?: number }) {
 function loadout3dEdit() {
   const inst = loadout3dInst.value;
   if (!inst) return;
-  // Dismiss FIRST: it unwinds the /3d modal route, and the route watcher would
-  // otherwise tear the overlay down underneath the freshly-opened editor.
-  dismissLoadout3d();
+  // ONE navigation, not dismiss-then-open. The old two-step (closeModalRoute to
+  // /items/<id>, then openEdit pushing /items/<id>/craft) raced the host
+  // router: when the second push was dropped while the first was in flight, the
+  // route settled on detail and the watcher closed the freshly-opened editor —
+  // Duplicate/Edit on the 3D overlay did nothing. openEdit navigates straight
+  // to /craft; the route watcher closes the 3D overlay itself the moment the
+  // modal segment is no longer "3d".
+  //
+  // The overlay is ALSO torn down here, directly. That's belt-and-braces, not
+  // duplication: closeLoadout3d doesn't navigate, so it can't race anything,
+  // and it means a dropped navigation leaves a visible editor rather than an
+  // overlay sitting on top of one — which is what "the button does nothing"
+  // actually looked like.
+  closeLoadout3d();
   openEdit(inst);
 }
 /** The ✕ on the 3D overlay: pop back to wherever it was opened from. */
@@ -4434,7 +4445,11 @@ function deleteSelected() {
 
     <!-- Craft confirm modal (inventory-simulator style) -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-    <div v-if="craft" class="fixed inset-0 z-[998] flex items-center justify-center bg-background p-4" @click.self="closeCraft()">
+    <!-- z-999, one above the 3D overlay. The editor is opened FROM that overlay,
+         so for one frame (or forever, if a navigation is dropped) both are
+         mounted — and at equal z the overlay wins on DOM order and swallows the
+         editor whole. Ranking them means the editor is always the thing on top. -->
+    <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background p-4" @click.self="closeCraft()">
       <div class="relative flex h-[min(92vh,860px)] w-[min(96vw,1180px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in">
         <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
           <span class="text-f13 font-semibold uppercase tracking-cs1">{{ duplicating ? "Duplicate imported item" : editingId != null ? "Edit item" : "Confirm craft" }}</span>
