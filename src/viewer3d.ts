@@ -199,6 +199,13 @@ const round = (v: number, p: number) => Number(v.toFixed(p));
 // Crop a snapshot PNG to its visible content (+small margin). The raw frame
 // is 640x480 with large transparent borders — next to tightly-cropped catalog
 // art the gun looked shrunken inside identical <img> boxes.
+//
+// Aspect cap: cards fit these with object-contain, so a crop much wider than
+// its box goes full-bleed while normal crops stop at the height cap — the gun
+// in the slim crop draws ~25% longer than its neighbors. Long guns cluster at
+// ~3.2-3.5; only near-horizontal poses (the Nova) land way above. Padding those
+// back down to the cluster keeps every gun at the same on-screen scale.
+const MAX_CROP_ASPECT = 3.6;
 async function cropToContent(blob: Blob, margin = 0.03): Promise<Blob | null> {
   try {
     const img = await createImageBitmap(blob);
@@ -231,10 +238,11 @@ async function cropToContent(blob: Blob, margin = 0.03): Promise<Blob | null> {
     maxY = Math.min(cv.height - 1, maxY + my);
     const w = maxX - minX + 1;
     const h = maxY - minY + 1;
+    const padY = w / h > MAX_CROP_ASPECT ? Math.ceil((w / MAX_CROP_ASPECT - h) / 2) : 0;
     const out = document.createElement("canvas");
     out.width = w;
-    out.height = h;
-    out.getContext("2d")!.drawImage(cv, minX, minY, w, h, 0, 0, w, h);
+    out.height = h + padY * 2;
+    out.getContext("2d")!.drawImage(cv, minX, minY, w, h, 0, padY, w, h);
     return await new Promise<Blob | null>((resolve) => out.toBlob(resolve, "image/png"));
   } catch {
     return blob;
@@ -347,6 +355,15 @@ export async function mountViewer(
   renderer.domElement.style.height = "100%";
   renderer.domElement.style.display = "block";
   renderer.domElement.style.touchAction = "none";
+  // A long-press drag (charms/stickers on touch) must never start OS text
+  // selection or iOS Live Text on the canvas — that pops the Copy / Look Up /
+  // Translate callout mid-drag. Cover the container too so the selection
+  // can't seed from text right at the canvas edge.
+  for (const target of [renderer.domElement, container]) {
+    target.style.userSelect = "none";
+    target.style.setProperty("-webkit-user-select", "none");
+    target.style.setProperty("-webkit-touch-callout", "none");
+  }
   container.appendChild(renderer.domElement);
 
   const scene = new THREE.Scene();
@@ -513,9 +530,23 @@ export async function mountViewer(
   // Spinning while trying to drag a sticker is misery — static in editors.
   controls.autoRotate = !opts?.interactive && !opts?.still;
   controls.autoRotateSpeed = 0.9;
-  controls.enablePan = false;
-  controls.minDistance = radius * 0.45;
+  // Pan (right-drag / two-finger drag) + a closer zoom floor: precision work
+  // on touch is done by zooming INTO the spot and panning it under your
+  // finger, not by aiming a 1:1 drag across the whole weapon.
+  controls.enablePan = true;
+  controls.screenSpacePanning = true;
+  controls.minDistance = radius * 0.22;
   controls.maxDistance = radius * 4;
+  // Coarse pointers get a slower orbit — a thumb sweep is far larger than a
+  // mouse gesture, so 1:1 rotate speed makes small adjustments overshoot.
+  if (typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches) controls.rotateSpeed = 0.6;
+  // Keep the pan on a leash: clamp the orbit target to the model's own bounds
+  // so the weapon can never be flung off-screen with no way back.
+  controls.addEventListener("change", () => {
+    controls.target.x = clamp(controls.target.x, -radius, radius);
+    controls.target.y = clamp(controls.target.y, -radius, radius);
+    controls.target.z = clamp(controls.target.z, -radius, radius);
+  });
 
   // ---- Placement space ---------------------------------------------------------
   // Weapons lie along their longest axis; height is Y unless Y IS the length.

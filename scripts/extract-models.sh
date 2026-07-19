@@ -145,10 +145,11 @@ mkdir -p "$RAW_CI"
 
 # Parse each composite_inputs vmat for its texture references, decompile
 # exactly those textures, and assemble <key>.inputs/ bundles.
-CLI="$CLI" VPK="$VPK" RAW_CI="$RAW_CI" DEST="$DEST" python3 - <<'PYEOF'
+CLI="$CLI" VPK="$VPK" RAW_CI="$RAW_CI" RAW="$RAW" DEST="$DEST" python3 - <<'PYEOF'
 import json, os, re, shutil, subprocess, sys
 
 cli, vpk, raw, dest = (os.environ[k] for k in ("CLI", "VPK", "RAW_CI", "DEST"))
+raw_models = os.environ["RAW"]  # step-2 vmdl tree — holds the *_mag.glb exports
 
 # The customization tree names folders by weapon CLASS (pist_/rif_/smg_/snip_/
 # shot_/mach_), which is NOT the cs2-lib model key the plugin serves under.
@@ -268,6 +269,81 @@ for vmat_path in sorted(vmats):
     else:
         shutil.rmtree(out_dir, ignore_errors=True)
         unscannable.append(folder)
+
+# ---- Translucent-magazine UV masks --------------------------------------------
+# The P90's magazine is clear plastic: in-game the paint shows THROUGH it,
+# slightly smoked. The viewer approximates that with a per-weapon mask of the
+# magazine's UV islands (mag.png), which the compositor darkens. Baked from the
+# mag's own GLB (same texture atlas as the body) rather than guessed from
+# texture channels — ao.a marks the mag but also marks bare hardware, and no
+# channel separates them (measured; see tools/shadertest/README.md).
+# ONLY weapons whose mag is actually translucent belong here: baking this for
+# an opaque painted mag (AK-47 etc.) would wrongly darken its paint.
+TRANSLUCENT_MAGS = {"p90"}  # models-tree folder == cs2-lib key for these
+
+def bake_mag_mask(glb_path, out_png, size=1024):
+    import zlib, struct as st
+    d = open(glb_path, "rb").read()
+    jlen = st.unpack_from("<I", d, 12)[0]
+    doc = json.loads(d[20:20 + jlen])
+    binoff = 20 + jlen + 8
+    def acc(i):
+        a = doc["accessors"][i]; bv = doc["bufferViews"][a["bufferView"]]
+        off = binoff + bv.get("byteOffset", 0) + a.get("byteOffset", 0)
+        fmt = {5126: "f", 5123: "H", 5125: "I"}[a["componentType"]]
+        n = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}[a["type"]]
+        cnt = a["count"] * n
+        import struct as st2
+        return [st2.unpack_from("<" + fmt * n, d, off + k * st2.calcsize("<" + fmt * n))
+                for k in range(a["count"])]
+    prim = doc["meshes"][0]["primitives"][0]
+    uv = acc(prim["attributes"]["TEXCOORD_0"])
+    idx = [i[0] for i in acc(prim["indices"])]
+    grid = bytearray(size * size)
+    for t in range(0, len(idx), 3):
+        pts = [(uv[idx[t + k]][0] * size, uv[idx[t + k]][1] * size) for k in range(3)]
+        (x1, y1), (x2, y2), (x3, y3) = pts
+        minx, maxx = max(0, int(min(x1, x2, x3))), min(size - 1, int(max(x1, x2, x3)) + 1)
+        miny, maxy = max(0, int(min(y1, y2, y3))), min(size - 1, int(max(y1, y2, y3)) + 1)
+        den = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if abs(den) < 1e-9:
+            continue
+        for py in range(miny, maxy + 1):
+            row = py * size
+            for px in range(minx, maxx + 1):
+                a_ = ((y2 - y3) * (px + 0.5 - x3) + (x3 - x2) * (py + 0.5 - y3)) / den
+                b_ = ((y3 - y1) * (px + 0.5 - x3) + (x1 - x3) * (py + 0.5 - y3)) / den
+                if a_ >= 0 and b_ >= 0 and (1 - a_ - b_) >= 0:
+                    grid[row + px] = 255
+    # minimal grayscale PNG, stdlib only — the game node has no PIL
+    def chunk(tag, data):
+        import zlib as z
+        c = tag + data
+        return st.pack(">I", len(data)) + c + st.pack(">I", z.crc32(c) & 0xFFFFFFFF)
+    rows = b"".join(b"\x00" + bytes(grid[y * size:(y + 1) * size]) for y in range(size))
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", st.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(rows, 6))
+           + chunk(b"IEND", b""))
+    open(out_png, "wb").write(png)
+    return sum(1 for v in grid if v) / len(grid)
+
+for mkey in sorted(TRANSLUCENT_MAGS):
+    inputs_dir = os.path.join(dest, f"{mkey}.inputs")
+    meta_path = os.path.join(inputs_dir, "meta.json")
+    if not os.path.isfile(meta_path):
+        continue
+    import glob as _g
+    cands = [g for g in _g.glob(os.path.join(raw_models, "weapons/models", mkey, "*_mag.glb"))
+             if "_physics" not in g]
+    if not cands:
+        print(f"!! {mkey}: translucent mag expected but no *_mag.glb found", file=sys.stderr)
+        continue
+    cov = bake_mag_mask(cands[0], os.path.join(inputs_dir, "mag.png"))
+    meta = json.load(open(meta_path))
+    meta.setdefault("textures", {})["mag"] = "mag.png"
+    json.dump(meta, open(meta_path, "w"))
+    print(f"---   {mkey}: mag mask baked ({cov*100:.0f}% of atlas)")
 
 print(f"--- Composite inputs for {made} weapons")
 if unscannable:

@@ -26,6 +26,7 @@ import {
   importSteamInventory,
   API_ORIGIN,
   equip,
+  swapLoadout,
   unequip,
   type Team,
   type CatalogWeapon,
@@ -61,6 +62,7 @@ import AdminConsole from "./AdminConsole.vue";
 import ShareMenu from "./ShareMenu.vue";
 import ItemArt from "./ItemArt.vue";
 import ItemTile from "./ItemTile.vue";
+import FilterDropdown from "./FilterDropdown.vue";
 import { attachmentsOf, glowStyle, isReadOnly, STEAM_BLUE, stripName, WEAR_GRADIENT } from "./itemVisuals";
 import { isCompact, isCoarse } from "./responsive";
 import { hasModel, mountViewer, snapshotModel, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
@@ -314,9 +316,10 @@ const accentSoft = "color-mix(in srgb, var(--acc) 16%, transparent)";
 // precisely the 1px jump. flex-wrap still lets both grow on narrow viewports.
 const INV_TOOLBAR =
   "flex min-h-[53px] flex-none flex-wrap items-center gap-2.5 border-b px-6 py-2.5";
-// Shared by every filter control on the inventory toolbar so they line up.
-const FILTER_SELECT =
-  "rounded-md border border-border bg-background px-2 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground outline-none transition-colors hover:text-foreground focus:border-[color:var(--acc)]";
+// Focus view's action row (Inspect / Share / StatTrak / Unequip): one height,
+// one radius, one type size — they drifted into four slightly different pills.
+const FOCUS_ACTION =
+  "flex h-9 items-center gap-1.5 rounded-md border px-3.5 text-f11 font-medium uppercase tracking-wider transition-colors";
 const DETAIL_ACTION =
   "flex h-9 items-center justify-center gap-1.5 rounded-md border border-border text-f10 font-medium uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground";
 function selRing(on: boolean) {
@@ -386,6 +389,13 @@ function instanceById(id: unknown): InventoryItem | undefined {
 function cellInstance(pos: string): InventoryItem | undefined {
   return instanceById(rowFor(pos)?.item_instance_id);
 }
+// Which teams the shown instance is equipped on at this slot — the at-a-glance
+// answer to "did that copy land on both sides or just this one?". Same dots as
+// ItemTile, so the mark reads identically everywhere.
+function cellTeams(pos: string): Team[] {
+  const eq = cellInstance(pos)?.equipped ?? [];
+  return (["CT", "T"] as Team[]).filter((t) => eq.some((e) => e.team === t && e.slot === pos));
+}
 // Grid cells prefer the instance's true render when one exists this session.
 function cellSrc(pos: string): string | undefined {
   const inst = cellInstance(pos);
@@ -441,7 +451,6 @@ async function loadSkins(key: string) {
 watch(sheetKey, (key) => {
   sheetSearch.value = "";
   activeRarity.value = "";
-  rarityOpen.value = false;
   sheetSkins.value = [];
   loadSkins(key);
 });
@@ -449,7 +458,6 @@ watch(sheetKey, (key) => {
 watch(sheetMode, () => {
   sheetSearch.value = "";
   activeRarity.value = "";
-  rarityOpen.value = false;
 });
 function selectPos(pos: string) {
   const changed = selected.value !== pos;
@@ -480,7 +488,16 @@ const rarityFacets = computed(() => {
   // Least → greatest (Consumer first, Covert/★ last), like the game.
   return [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([hex]) => ({ hex, name: rarityName(hex) }));
 });
-const rarityOpen = ref(false);
+// Rarity facets for the Inventory grid — over what's OWNED, not a catalog.
+const invRarity = ref<string>("");
+const invRarityFacets = computed(() => {
+  const seen = new Map<string, number>();
+  for (const i of inventory.value) {
+    const r = i.item?.rarity;
+    if (r) seen.set(r, RARITY_META[r.toLowerCase()]?.rank ?? 8);
+  }
+  return [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([hex]) => ({ hex, name: rarityName(hex) }));
+});
 
 // ---- sorting ----------------------------------------------------------------
 // One control on the Inventory grid, one on the sheet (Owned + Craft share
@@ -740,6 +757,106 @@ function dropStyle(pos: string): Record<string, string> {
   if (dragOverPos.value === pos)
     return { borderColor: "var(--acc)", background: accentSoft, boxShadow: "0 0 0 1px var(--acc)" };
   if (canDropOn(pos)) return { borderColor: "color-mix(in srgb, var(--acc) 45%, transparent)", borderStyle: "dashed" };
+  return { opacity: "0.45" };
+}
+
+// ---- drag-to-reorder (loadout weapon cells) ---------------------------------
+// Grab any weapon cell and drop it on another: the two positions SWAP, so the
+// favourite rifle can move to slot 1 without unequip/re-equip gymnastics.
+// While the hover is live the grid renders the POST-swap layout (art, label,
+// rarity and team dots all trade places), so the drop is a confirmation of
+// what's on screen, not a guess.
+const dragPos = ref<string | null>(null);
+const swapOverPos = ref<string | null>(null);
+function weaponFitsPos(w: CatalogWeapon | undefined, pos: string): boolean {
+  if (!w) return false;
+  if (!catsForPos(pos).includes(w.category)) return false;
+  if (pos === "sp" && !START_PISTOLS.includes(w.model)) return false;
+  if (pos !== "sp" && /^p/.test(pos) && START_PISTOLS.includes(w.model)) return false;
+  return true;
+}
+// Both occupants must be legal in each other's position (start-pistol rules,
+// SMG/heavy vs rifle columns) — otherwise the swap would strand a weapon
+// somewhere the game can't put it.
+function canSwap(a: string | null, b: string): boolean {
+  if (!a || a === b) return false;
+  return weaponFitsPos(occupantWeapon(a), b) && weaponFitsPos(occupantWeapon(b), a);
+}
+function onCellDragStart(pos: string, e: DragEvent) {
+  if (viewerId.value) return;
+  dragPos.value = pos;
+  e.dataTransfer?.setData("text/plain", pos);
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+}
+function onCellDragEnd() {
+  dragPos.value = null;
+  swapOverPos.value = null;
+}
+// Cells accept two different drags — owned tiles from the sheet (equip) and
+// other cells (reorder) — so one set of handlers branches on which is live.
+function onCellDragOver(pos: string, e: DragEvent) {
+  if (dragPos.value) {
+    if (!canSwap(dragPos.value, pos)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    swapOverPos.value = pos;
+  } else {
+    onSlotDragOver(pos, e);
+  }
+}
+function onCellDragLeave(pos: string) {
+  if (swapOverPos.value === pos) swapOverPos.value = null;
+  if (dragOverPos.value === pos) dragOverPos.value = null;
+}
+async function onCellDrop(pos: string) {
+  const src = dragPos.value;
+  if (src) {
+    dragPos.value = null;
+    swapOverPos.value = null;
+    if (canSwap(src, pos)) await swapPositions(src, pos);
+    return;
+  }
+  await onSlotDrop(pos);
+}
+async function swapPositions(a: string, b: string) {
+  // What each side carries into its new slot: the instance if there is one,
+  // else the vanilla occupant (existing default row or the CS2 layout default).
+  const carry = (row: LoadoutEntry | undefined, from: string) =>
+    row?.item_instance_id != null
+      ? { item_instance_id: row.item_instance_id }
+      : { item_id: row?.item_id ?? occupantWeapon(from)!.id };
+  const ra = rowFor(a);
+  const rb = rowFor(b);
+  try {
+    await swapLoadout({
+      team: team.value,
+      a: { slot: b, ...carry(ra, a) },
+      b: { slot: a, ...carry(rb, b) },
+    });
+    await refreshAll();
+    pulseSlot(a);
+    pulseSlot(b);
+  } catch (e) {
+    fail(e);
+  }
+}
+// Where a cell should LOOK like it reads from while a reorder hover is live.
+function previewPos(pos: string): string {
+  const src = dragPos.value;
+  const dst = swapOverPos.value;
+  if (!src || !dst) return pos;
+  return pos === src ? dst : pos === dst ? src : pos;
+}
+function reorderStyle(pos: string): Record<string, string> {
+  if (!dragPos.value) return {};
+  if (swapOverPos.value === pos)
+    return { borderColor: "var(--acc)", borderStyle: "dashed", background: accentSoft, boxShadow: "0 0 0 1px var(--acc)" };
+  if (pos === dragPos.value)
+    // Previewing: the source shows the target's item, so keep it readable.
+    return swapOverPos.value
+      ? { borderColor: "color-mix(in srgb, var(--acc) 60%, transparent)", borderStyle: "dashed" }
+      : { borderColor: "color-mix(in srgb, var(--acc) 60%, transparent)", borderStyle: "dashed", opacity: "0.5" };
+  if (canSwap(dragPos.value, pos)) return { borderColor: "color-mix(in srgb, var(--acc) 45%, transparent)", borderStyle: "dashed" };
   return { opacity: "0.45" };
 }
 // Craft/edit modal (like inventory.cstrike.app/craft): wear, pattern, StatTrak,
@@ -1714,6 +1831,11 @@ async function itemCtxInspect() {
   closeItemCtx();
   if (inst) await openInspectLink(inst.id);
 }
+function itemCtxView3d() {
+  const inst = itemCtx.value?.inst;
+  closeItemCtx();
+  if (inst) view3dForInstance(inst);
+}
 
 // ---- right-click context menu ----------------------------------------------
 const ctx = ref<{ pos: string; x: number; y: number } | null>(null);
@@ -1916,12 +2038,18 @@ function onSheetDragEnd() {
   sheetDrag = null;
 }
 
+// Same adjustable card size as the Inventory grid. The default is roomier
+// than the old fixed 164/132 — tiles now carry a model header + team dots, and
+// the art needs air under the type line. Compact clamps the floor so a phone
+// still fits two columns.
+const sheetCardSize = ref(Number(localStorage.getItem("cs2inv.sheetCardSize")) || 176);
+watch(sheetCardSize, (v) => localStorage.setItem("cs2inv.sheetCardSize", String(v)));
 const pickerGridStyle = computed(() => {
-  const tile = isCompact.value ? 132 : 164;
+  const tile = isCompact.value ? Math.min(sheetCardSize.value, 168) : sheetCardSize.value;
   return {
     display: "grid",
     gridTemplateColumns: `repeat(auto-fill, minmax(${tile}px, 1fr))`,
-    gridAutoRows: `${isCompact.value ? 132 : 152}px`,
+    gridAutoRows: `${Math.round(tile * 1.06)}px`,
   };
 });
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
@@ -2035,11 +2163,17 @@ const invRail = computed(() => {
   };
 });
 const filtersActive = computed(
-  () => !!invSearch.value.trim() || invOrigin.value !== "all" || !!invModels.value.length || !!invTypes.value.length,
+  () =>
+    !!invSearch.value.trim() ||
+    invOrigin.value !== "all" ||
+    !!invRarity.value ||
+    !!invModels.value.length ||
+    !!invTypes.value.length,
 );
 function clearInvFilters() {
   invSearch.value = "";
   invOrigin.value = "all";
+  invRarity.value = "";
   invModels.value = [];
   invTypes.value = [];
 }
@@ -2139,6 +2273,7 @@ const filteredInventory = computed(() => {
       (i) =>
         (!q || i.item?.name.toLowerCase().includes(q)) &&
         matchesOrigin(i, invOrigin.value) &&
+        (!invRarity.value || i.item?.rarity === invRarity.value) &&
         matchesRail(i),
     ),
     invSort.value,
@@ -2262,6 +2397,15 @@ const focusRow = computed(() => rowFor(selected.value));
 
 // ---- 3D viewer (Focus view) -------------------------------------------------
 // Shows a 3D toggle whenever public/models/<weapon-model>.glb exists.
+// 3D is the default stage — focus exists to look at the gun. The ref itself
+// starts false and flips per-slot once availability is known; the PREFERENCE
+// (last explicit 2D/3D pick) lives in localStorage so a slot with no model
+// forcing 2D doesn't overwrite what the user actually chose.
+const focus3dPref = () => localStorage.getItem("cs2inv.focus3d") !== "0";
+function setFocus3d(on: boolean) {
+  focus3d.value = on;
+  localStorage.setItem("cs2inv.focus3d", on ? "1" : "0");
+}
 const focus3d = ref(false);
 const focus3dAvailable = ref(false);
 const focus3dBusy = ref(false);
@@ -2282,7 +2426,14 @@ watch([focusModelKey, focusPaint], async ([key]) => {
   teardownViewer();
   focus3dAvailable.value = key ? await hasModel(key) : false;
   if (!focus3dAvailable.value) focus3d.value = false;
-  else if (focus3d.value) await mount3d();
+  else {
+    // Model exists → land on the preferred stage (3D unless they picked 2D).
+    const wasOn = focus3d.value;
+    focus3d.value = focus3dPref();
+    // The focus3d watcher only mounts on false→true; an already-on viewer
+    // switching slots needs the remount called explicitly.
+    if (focus3d.value && wasOn) await mount3d();
+  }
 });
 // The equipped instance behind the focused slot (own loadout only — public
 // viewer mode has no inventory list, so attachments just don't render there).
@@ -2363,6 +2514,38 @@ function closeLoadout3d() {
   loadout3dHandle = null;
   loadout3d.value = null;
   loadout3dBusy.value = false;
+}
+// The owned instance behind the overlay, when there is one — drives the Edit
+// button and the wear/seed/attachment strip along the bottom of the stage.
+const loadout3dInst = computed(() =>
+  loadout3d.value?.instId != null ? instanceById(loadout3d.value.instId) ?? null : null,
+);
+// Attachment chips for the overlay's spec strip, with enough identity kept
+// (kind + sticker slot) that hovering a sticker can flash its decal on the
+// model — the chip points AT the thing, not just near it.
+const loadout3dAttachments = computed(() => {
+  const inst = loadout3dInst.value;
+  if (!inst) return [];
+  const out: { key: string; name: string; image: string | null; kind: "sticker" | "patch" | "charm"; slot?: number }[] = [];
+  (inst.stickers ?? []).forEach((s, i) => {
+    if (s) out.push({ key: `st${i}`, name: s.name, image: s.image, kind: "sticker", slot: i });
+  });
+  (inst.patches ?? []).forEach((p, i) => {
+    if (p) out.push({ key: `pa${i}`, name: p.name, image: p.image, kind: "patch" });
+  });
+  if (inst.charm) out.push({ key: "charm", name: inst.charm.name, image: inst.charm.image, kind: "charm" });
+  return out;
+});
+function flashLoadout3dAttachment(a: { kind: string; slot?: number }) {
+  if (a.kind === "sticker" && a.slot != null) loadout3dHandle?.flashSticker(a.slot);
+}
+function loadout3dEdit() {
+  const inst = loadout3dInst.value;
+  if (!inst) return;
+  // Dismiss FIRST: it unwinds the /3d modal route, and the route watcher would
+  // otherwise tear the overlay down underneath the freshly-opened editor.
+  dismissLoadout3d();
+  openEdit(inst);
 }
 /** The ✕ on the 3D overlay: pop back to wherever it was opened from. */
 function dismissLoadout3d() {
@@ -2522,8 +2705,6 @@ function onGlobalKey(e: KeyboardEvent) {
     } else if (detailId.value != null) {
       closeDetail();
       e.stopPropagation();
-    } else if (rarityOpen.value) {
-      rarityOpen.value = false;
     } else if (view.value === "focus") {
       go("/");
     }
@@ -3017,9 +3198,15 @@ function deleteSelected() {
             <input
               ref="invSearchEl"
               v-model="invSearch"
-              placeholder="Search inventory…   /"
-              class="h-8 w-full rounded-md border border-border bg-background pl-9 pr-3 text-f13 outline-none focus:border-[color:var(--acc)]"
+              placeholder="Search inventory…"
+              class="h-8 w-full rounded-md border border-border bg-background pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
             />
+            <button
+              v-if="invSearch"
+              class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+              title="Clear search"
+              @click="invSearch = ''; invSearchEl?.focus()"
+            ><X class="h-3.5 w-3.5" /></button>
           </div>
           <!-- Origin filter: same sliding-pill animated tabs as the
                Loadout/Inventory switcher, so filters read as filters, not actions. -->
@@ -3040,19 +3227,27 @@ function deleteSelected() {
               v-for="f in ORIGIN_FILTERS"
               :key="f[0]"
               :ref="(el) => invOriginPill.setRef(f[0], el)"
-              class="relative z-[1] flex items-center gap-1 rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
               :class="invOrigin === f[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="invOrigin = f[0]"
             >
               <RefreshCw v-if="f[0] === 'steam'" class="h-3 w-3" :style="{ color: STEAM_BLUE }" />{{ f[1] }}
             </button>
           </div>
-          <select v-model="invSort" title="Sort" :class="FILTER_SELECT">
-            <option v-for="s in SORTS" :key="s[0]" :value="s[0]">{{ s[0] === 'default' ? 'Newest' : s[1] }}</option>
-          </select>
+          <FilterDropdown
+            v-if="invRarityFacets.length"
+            v-model="invRarity"
+            dots
+            :options="[{ value: '', label: 'All rarities' }, ...invRarityFacets.map((r) => ({ value: r.hex, label: r.name, color: r.hex }))]"
+          />
+          <FilterDropdown
+            v-model="invSort"
+            prefix="Sort"
+            :options="SORTS.map((s) => ({ value: s[0], label: s[0] === 'default' ? 'Newest' : s[1] }))"
+          />
           <button
             v-if="filtersActive"
-            class="flex items-center gap-1 rounded-md px-2 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
+            class="flex h-8 items-center gap-1 rounded-md px-2 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
             title="Clear all filters"
             @click="clearInvFilters"
           >
@@ -3383,6 +3578,22 @@ function deleteSelected() {
                 <div class="relative z-[2] truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
                   {{ cell.weapon?.name ?? cell.pos }}
                 </div>
+                <!-- Team dots under the model name — same as inventory tiles. -->
+                <div v-if="cellTeams(cell.pos).length" class="relative z-[2] mt-1 flex items-center gap-1">
+                  <span
+                    v-for="t in cellTeams(cell.pos)"
+                    :key="t"
+                    class="h-1.5 w-1.5 rounded-full"
+                    :style="{ background: t === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${t === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
+                    :title="`Equipped on ${t}`"
+                  ></span>
+                </div>
+                <RefreshCw
+                  v-if="cellInstance(cell.pos)?.origin === 'steam'"
+                  class="absolute right-2 top-2 z-[2] h-3 w-3"
+                  :style="{ color: STEAM_BLUE }"
+                  title="Synced from your Steam inventory (read-only)"
+                />
                 <div
                   :key="team + ':' + occupantModel(cell.pos)"
                   class="animate-cell-in relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center"
@@ -3517,29 +3728,36 @@ function deleteSelected() {
                 <span class="ml-auto font-mono text-f9 text-muted-foreground/60">{{ g.skinned }}/{{ g.positions.length }}</span>
               </header>
               <div class="flex flex-1 flex-col gap-2 overflow-y-auto pt-2">
+                <!-- Every pos-derived display below reads through
+                     previewPos(): during a reorder hover the two cells render
+                     each other's contents — the drop confirms what you see. -->
                 <button
                   v-for="(cell, ci) in g.cells"
                   :key="cell.pos"
                   class="group relative flex min-h-[116px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
                   :data-slot="cell.pos" data-role="weapon"
+                  :draggable="!viewerId"
                   :class="[
                     selected === cell.pos ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                     pulsePos === cell.pos && 'animate-equip-pulse',
                   ]"
                   :style="[
                     selRing(selected === cell.pos),
-                    rarityOf(cell.pos) ? { borderLeft: `3px solid ${rarityOf(cell.pos)}` } : {},
+                    rarityOf(previewPos(cell.pos)) ? { borderLeft: `3px solid ${rarityOf(previewPos(cell.pos))}` } : {},
                     dropStyle(cell.pos),
+                    reorderStyle(cell.pos),
                   ]"
                   @click="selectPos(cell.pos)"
                   @contextmenu.prevent="openCtx(cell.pos, $event)"
-                  @dragover="onSlotDragOver(cell.pos, $event)"
-                  @dragleave="dragOverPos === cell.pos && (dragOverPos = null)"
-                  @drop.prevent="onSlotDrop(cell.pos)"
+                  @dragstart="onCellDragStart(cell.pos, $event)"
+                  @dragend="onCellDragEnd"
+                  @dragover="onCellDragOver(cell.pos, $event)"
+                  @dragleave="onCellDragLeave(cell.pos)"
+                  @drop.prevent="onCellDrop(cell.pos)"
                 >
-                  <span class="pointer-events-none absolute inset-0" :style="glowStyle(rarityOf(cell.pos), 0.35)"></span>
+                  <span class="pointer-events-none absolute inset-0" :style="glowStyle(rarityOf(previewPos(cell.pos)), 0.35)"></span>
                   <div class="relative z-[2] flex items-center justify-between gap-2">
-                    <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ cell.weapon?.name ?? cell.pos }}</span>
+                    <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ occupantWeapon(previewPos(cell.pos))?.name ?? cell.pos }}</span>
                     <span class="flex flex-none gap-1 opacity-0 transition-opacity group-hover:opacity-100">
                       <span
                         class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
@@ -3553,6 +3771,7 @@ function deleteSelected() {
                           @click.stop="view3dForInstance(cellInstance(cell.pos)!)"
                         ><Box class="h-3 w-3" /></span>
                         <span
+                          v-if="!isCoarse"
                           class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
                           title="Inspect in game"
                           @click.stop="openInspectLink(cellInstance(cell.pos)!.id)"
@@ -3570,6 +3789,22 @@ function deleteSelected() {
                       </template>
                     </span>
                   </div>
+                  <!-- Team dots under the model name — same as inventory tiles. -->
+                  <div v-if="cellTeams(previewPos(cell.pos)).length" class="relative z-[2] mt-1 flex items-center gap-1">
+                    <span
+                      v-for="t in cellTeams(previewPos(cell.pos))"
+                      :key="t"
+                      class="h-1.5 w-1.5 rounded-full"
+                      :style="{ background: t === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${t === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
+                      :title="`Equipped on ${t}`"
+                    ></span>
+                  </div>
+                  <RefreshCw
+                    v-if="cellInstance(previewPos(cell.pos))?.origin === 'steam'"
+                    class="absolute right-2.5 top-2.5 z-[2] h-3 w-3 transition-opacity group-hover:opacity-0"
+                    :style="{ color: STEAM_BLUE }"
+                    title="Synced from your Steam inventory (read-only)"
+                  />
                   <!-- Keyed on team + occupant: switching sides (or replacing
                        the weapon) re-runs the entrance, staggered row-by-row
                        across the three columns — a wave, not a teleport.
@@ -3581,9 +3816,9 @@ function deleteSelected() {
                     :style="{ '--i': ci * 3 + gi }"
                   >
                     <ItemArt
-                      :inst="cellInstance(cell.pos)"
-                      :image="cellImage(cell.pos)"
-                      :class="cn('max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105', !isSkinned(cell.row) && 'opacity-60')"
+                      :inst="cellInstance(previewPos(cell.pos))"
+                      :image="cellImage(previewPos(cell.pos))"
+                      :class="cn('max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105', !isSkinned(rowFor(previewPos(cell.pos))) && 'opacity-60')"
                     />
                     <span
                       v-if="cellInstance(cell.pos) && (renderingIds.has(cellInstance(cell.pos)!.id) || queuedIds.has(cellInstance(cell.pos)!.id))"
@@ -3591,9 +3826,9 @@ function deleteSelected() {
                     ><Loader2 v-if="renderingIds.has(cellInstance(cell.pos)!.id)" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" /> {{ renderingIds.has(cellInstance(cell.pos)!.id) ? 'baking' : 'queued' }}</span>
                   </div>
                   <div class="relative z-[2] flex items-baseline gap-2">
-                    <span class="truncate text-f11 font-medium">{{ skinLabel(cell.pos) }}</span>
-                    <span v-if="isSkinned(cell.row) && cell.row?.wear != null" class="ml-auto flex-none font-mono text-f8 text-muted-foreground/70">
-                      {{ cell.row!.wear!.toFixed(3) }}<template v-if="cell.row?.seed != null"> · #{{ cell.row!.seed }}</template>
+                    <span class="truncate text-f11 font-medium">{{ skinLabel(previewPos(cell.pos)) }}</span>
+                    <span v-if="isSkinned(rowFor(previewPos(cell.pos))) && rowFor(previewPos(cell.pos))?.wear != null" class="ml-auto flex-none font-mono text-f8 text-muted-foreground/70">
+                      {{ rowFor(previewPos(cell.pos))!.wear!.toFixed(3) }}<template v-if="rowFor(previewPos(cell.pos))?.seed != null"> · #{{ rowFor(previewPos(cell.pos))!.seed }}</template>
                     </span>
                   </div>
                 </button>
@@ -3616,9 +3851,20 @@ function deleteSelected() {
               <div class="min-w-0">
                 <div class="text-f9 uppercase tracking-cs4 text-muted-foreground/70">{{ focusSlotLabel }}</div>
                 <h2 class="mt-1.5 truncate font-bold leading-none" :class="isCompact ? 'text-2xl' : 'text-4xl'">{{ sheetWeaponName }}</h2>
-                <div class="mt-1.5 truncate font-medium" :class="isCompact ? 'text-f13' : 'text-base'" style="color: var(--acc)">
-                  {{ isSkinned(focusRow) ? focusRow!.item!.name : '— default finish —' }}
-                  <span v-if="focusRow?.stattrak" class="text-[#f2c14e]">· StatTrak™</span>
+                <div class="mt-1.5 flex min-w-0 flex-wrap items-center gap-2">
+                  <span class="truncate font-medium" :class="isCompact ? 'text-f13' : 'text-base'" style="color: var(--acc)">
+                    {{ isSkinned(focusRow) ? focusRow!.item!.name : '— default finish —' }}
+                    <span v-if="focusRow?.stattrak" class="text-[#f2c14e]">· StatTrak™</span>
+                  </span>
+                  <!-- Rarity rides with the name it describes, not the stage
+                       controls on the far side of the panel. -->
+                  <span
+                    v-if="rarityOf(selected)"
+                    class="inline-flex flex-none items-center gap-1.5 rounded-sm border px-2 py-0.5 text-f10 uppercase tracking-cs2"
+                    :style="{ borderColor: rarityOf(selected), color: rarityOf(selected), background: `color-mix(in srgb, ${rarityOf(selected)} 12%, transparent)` }"
+                  >
+                    <span class="h-1.5 w-1.5 rounded-[1px]" :style="{ background: rarityOf(selected) }"></span>{{ rarityName(rarityOf(selected)) }}
+                  </span>
                 </div>
               </div>
               <!-- Stage controls live in the header, on the same baseline as the
@@ -3630,7 +3876,7 @@ function deleteSelected() {
                     class="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
                     :class="!focus3d ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
                     :style="!focus3d ? { background: accentSoft } : {}"
-                    @click="focus3d = false"
+                    @click="setFocus3d(false)"
                   >
                     <ImageIcon class="h-3.5 w-3.5" /> 2D
                   </button>
@@ -3638,18 +3884,26 @@ function deleteSelected() {
                     class="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
                     :class="focus3d ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
                     :style="focus3d ? { background: accentSoft } : {}"
-                    @click="focus3d = true"
+                    @click="setFocus3d(true)"
                   >
                     <Box class="h-3.5 w-3.5" /> 3D
                   </button>
                 </div>
-                <div
-                  v-if="rarityOf(selected)"
-                  class="inline-flex items-center gap-1.5 rounded-sm border px-3 py-1.5 text-f11 uppercase tracking-cs2"
-                  :style="{ borderColor: rarityOf(selected), color: rarityOf(selected), background: `color-mix(in srgb, ${rarityOf(selected)} 12%, transparent)` }"
+                <!-- Inspect + Share live top right, same corner as every other
+                     surface (3D overlay, craft modal, item detail). -->
+                <button
+                  v-if="isSkinned(focusRow) && !viewerId && focusInstance && !isCoarse"
+                  class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+                  title="Launch CS2 and inspect this item in-game"
+                  @click="openInspectLink(focusInstance.id)"
                 >
-                  <span class="h-2 w-2 rounded-[1px]" :style="{ background: rarityOf(selected) }"></span>{{ rarityName(rarityOf(selected)) }}
-                </div>
+                  <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect' }}
+                </button>
+                <ShareMenu
+                  v-if="isSkinned(focusRow) && !viewerId"
+                  :links="instanceShareLinks(focusInstance?.id)"
+                  :note="ITEM_LINK_NOTE"
+                />
               </div>
             </div>
 
@@ -3685,7 +3939,7 @@ function deleteSelected() {
                 v-if="focus3d && !focus3dBusy"
                 class="pointer-events-none absolute bottom-1 left-1/2 z-[3] -translate-x-1/2 text-f9 uppercase tracking-cs2 text-muted-foreground/50"
               >
-                {{ isCoarse ? 'drag to rotate · pinch to zoom' : 'drag to rotate · scroll to zoom' }}
+                {{ isCoarse ? 'drag to rotate · pinch to zoom · two fingers to pan' : 'drag to rotate · scroll to zoom · right-drag to pan' }}
               </span>
             </div>
 
@@ -3708,27 +3962,17 @@ function deleteSelected() {
                 <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Pattern</span>
                 <span class="font-mono text-f13">{{ focusRow?.seed != null ? '#' + focusRow.seed : '—' }}</span>
               </div>
-              <div v-if="isSkinned(focusRow) && !viewerId" class="ml-auto flex gap-2">
+              <div v-if="isSkinned(focusRow) && !viewerId" class="ml-auto flex items-center gap-2">
                 <button
-                  v-if="focusInstance"
-                  class="flex items-center gap-1.5 rounded border border-border px-3.5 py-2 text-f13 font-medium uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
-                  title="Launch CS2 and inspect this item in-game"
-                  @click="openInspectLink(focusInstance.id)"
-                >
-                  <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect' }}
-                </button>
-                <ShareMenu :links="instanceShareLinks(focusInstance?.id)" :note="ITEM_LINK_NOTE" />
-                <button
-                  class="rounded border px-3.5 py-2 text-f13 font-medium uppercase tracking-wider transition-colors"
-                  :class="focusRow?.stattrak
+                  :class="[FOCUS_ACTION, focusRow?.stattrak
                     ? 'border-[#e0a92e] bg-[#e0a92e]/10 text-[#f2c14e]'
-                    : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground'"
+                    : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground']"
                   @click="toggleStatTrak"
                 >
                   StatTrak™
                 </button>
                 <button
-                  class="rounded border border-border px-3.5 py-2 text-f13 font-medium uppercase tracking-wider text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
+                  :class="[FOCUS_ACTION, 'border-border text-muted-foreground hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]']"
                   @click="clearSlot(selected)"
                 >
                   Unequip
@@ -3783,7 +4027,7 @@ function deleteSelected() {
             ></div>
             <button
               :ref="(el) => sheetPill.setRef('owned', el)"
-              class="relative z-[1] rounded-md px-3 py-1.5 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetMode === 'owned' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="sheetMode = 'owned'"
             >
@@ -3794,7 +4038,7 @@ function deleteSelected() {
             </button>
             <button
               :ref="(el) => sheetPill.setRef('craft', el)"
-              class="relative z-[1] flex items-center gap-1 rounded-md px-3 py-1.5 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetMode === 'craft' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="sheetMode = 'craft'"
             >
@@ -3803,68 +4047,38 @@ function deleteSelected() {
             <button
               v-if="isWeaponPos(selected)"
               :ref="(el) => sheetPill.setRef('replace', el)"
-              class="relative z-[1] flex items-center gap-1 rounded-md px-3 py-1.5 text-f10 uppercase tracking-wider transition-colors"
+              class="relative z-[1] flex h-6 items-center gap-1 rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetMode === 'replace' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               @click="sheetMode = 'replace'"
             >
               <Replace class="h-3 w-3" /> Replace
             </button>
           </div>
-          <!-- Rarity filter: custom dropdown so ranks show their colors,
-               ordered least → greatest. -->
-          <div v-if="sheetMode !== 'replace' && rarityFacets.length && (!isCompact || sheetFiltersOpen)" class="relative">
-            <button
-              class="flex items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-f11 uppercase tracking-wide transition-colors"
-              :class="activeRarity ? 'text-foreground' : 'text-muted-foreground'"
-              :style="rarityOpen ? { borderColor: 'var(--acc)' } : {}"
-              @click="rarityOpen = !rarityOpen"
-            >
-              <span class="h-2 w-2 flex-none rounded-full" :style="{ background: activeRarity || 'transparent', border: activeRarity ? 'none' : '1px solid hsl(var(--border))', boxShadow: activeRarity ? `0 0 6px ${activeRarity}` : 'none' }"></span>
-              {{ activeRarity ? rarityName(activeRarity) : 'All rarities' }}
-              <span aria-hidden="true" class="text-f9 opacity-60">▾</span>
-            </button>
-            <div v-if="rarityOpen" class="fixed inset-0 z-[90]" @click="rarityOpen = false"></div>
-            <div
-              v-if="rarityOpen"
-              class="absolute left-0 top-full z-[91] mt-1 min-w-[176px] overflow-hidden rounded-md border border-border bg-card py-1 shadow-2xl"
-            >
-              <button
-                class="flex w-full items-center gap-2 px-3 py-2 text-left text-f11 uppercase tracking-wide transition-colors hover:bg-muted"
-                :class="!activeRarity ? 'text-foreground' : 'text-muted-foreground'"
-                @click="activeRarity = ''; rarityOpen = false"
-              >
-                <span class="h-2 w-2 flex-none rounded-full border border-border"></span> All rarities
-              </button>
-              <button
-                v-for="r in rarityFacets"
-                :key="r.hex"
-                class="flex w-full items-center gap-2 px-3 py-2 text-left text-f11 uppercase tracking-wide transition-colors hover:bg-muted"
-                :class="activeRarity === r.hex ? 'text-foreground' : 'text-muted-foreground'"
-                @click="activeRarity = r.hex; rarityOpen = false"
-              >
-                <span class="h-2 w-2 flex-none rounded-full" :style="{ background: r.hex, boxShadow: `0 0 6px ${r.hex}` }"></span>
-                <span :style="{ color: r.hex }">{{ r.name }}</span>
-              </button>
-            </div>
-          </div>
+          <!-- Rarity filter: ranks show their colors, ordered least → greatest. -->
+          <FilterDropdown
+            v-if="sheetMode !== 'replace' && rarityFacets.length && (!isCompact || sheetFiltersOpen)"
+            v-model="activeRarity"
+            dots
+            :options="[{ value: '', label: 'All rarities' }, ...rarityFacets.map((r) => ({ value: r.hex, label: r.name, color: r.hex }))]"
+          />
           <!-- Sort — shared by Owned and Craft. "Default" = newest first for
                owned items, catalog order for finishes; Wear only means
-               something on owned items. -->
-          <select
+               something on owned items. The "Sort" prefix matters: bare
+               "Rarity" next to the actual rarity dropdown read as a second,
+               broken rarity filter. -->
+          <FilterDropdown
             v-if="sheetMode !== 'replace' && (!isCompact || sheetFiltersOpen)"
             v-model="sheetSort"
-            title="Sort"
-            class="rounded-md border border-border bg-background px-2 py-2 text-f11 uppercase tracking-wide text-muted-foreground outline-none transition-colors hover:text-foreground focus:border-[color:var(--acc)]"
-          >
-            <option v-for="s in SORTS" :key="s[0]" :value="s[0]" :disabled="s[0] === 'wear' && sheetMode === 'craft'">{{ s[1] }}</option>
-          </select>
+            prefix="Sort"
+            :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
+          />
           <!-- Owned only: same Synced/Crafted filter as the Inventory grid, so
                read-only Steam imports can be kept out of the equip picker. -->
-          <div v-if="sheetMode === 'owned' && (!isCompact || sheetFiltersOpen)" class="flex overflow-hidden rounded-md border border-border">
+          <div v-if="sheetMode === 'owned' && (!isCompact || sheetFiltersOpen)" class="flex h-8 overflow-hidden rounded-md border border-border">
             <button
               v-for="f in ORIGIN_FILTERS"
               :key="f[0]"
-              class="flex items-center gap-1 px-2.5 py-1.5 text-f10 uppercase tracking-wider transition-colors"
+              class="flex h-full items-center gap-1 px-2.5 text-f10 uppercase tracking-wider transition-colors"
               :class="sheetOrigin === f[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
               :style="sheetOrigin === f[0] ? { background: accentSoft } : {}"
               @click="sheetOrigin = f[0]"
@@ -3876,6 +4090,10 @@ function deleteSelected() {
           <span class="ml-auto hidden truncate text-f10 uppercase tracking-cs3 text-muted-foreground/70 md:inline">
             <b style="color: var(--acc)">{{ sheetWeaponName }}</b><template v-if="isShared(selected)"> · CT + T</template>
           </span>
+          <div v-if="!isCompact" class="flex flex-none items-center gap-2 text-muted-foreground" title="Card size">
+            <LayoutGrid class="h-3.5 w-3.5" />
+            <input v-model.number="sheetCardSize" type="range" min="140" max="260" step="4" class="w-24 accent-[#e0a24a]" />
+          </div>
           <!-- Search stays pinned to the right and resets on slot/mode switches -->
           <!-- Compact moves search into the filter sheet: sharing the row with
                the tabs left it ~99px wide and pushed the filter chip onto a
@@ -3885,9 +4103,15 @@ function deleteSelected() {
             <input
               ref="sheetSearchEl"
               v-model="sheetSearch"
-              placeholder="Search…   /"
-              class="w-full rounded-md border border-border bg-background py-2 pl-9 pr-3 text-f13 outline-none focus:border-[color:var(--acc)]"
+              placeholder="Search…"
+              class="h-8 w-full rounded-md border border-border bg-background pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
             />
+            <button
+              v-if="sheetSearch"
+              class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+              title="Clear search"
+              @click="sheetSearch = ''; sheetSearchEl?.focus()"
+            ><X class="h-3.5 w-3.5" /></button>
           </div>
           <!-- Compact-only disclosure for rarity/sort/origin. Badged so a
                filter left on somewhere out of sight is still visible. -->
@@ -3896,7 +4120,7 @@ function deleteSelected() {
                a list you want to search. -->
           <button
             v-if="isCompact"
-            class="ml-auto flex flex-none items-center gap-1.5 rounded-md border px-2.5 py-2 text-f10 uppercase tracking-wider transition-colors"
+            class="ml-auto flex h-8 flex-none items-center gap-1.5 rounded-md border px-2.5 text-f10 uppercase tracking-wider transition-colors"
             :class="sheetFilterCount ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground'"
             :style="sheetFilterCount ? { background: accentSoft } : {}"
             @click="sheetFiltersOpen = true"
@@ -3942,8 +4166,16 @@ function deleteSelected() {
                 <input
                   v-model="sheetSearch"
                   placeholder="Search skins…"
-                  class="w-full rounded-md border border-border bg-background py-2.5 pl-9 pr-3 text-f13 outline-none focus:border-[color:var(--acc)]"
+                  class="w-full rounded-md border border-border bg-background py-2.5 pl-9 pr-9 text-f13 outline-none focus:border-[color:var(--acc)]"
                 />
+                <!-- No refocus on clear: popping the keyboard back up inside
+                     the filter sheet just to empty the field is hostile. -->
+                <button
+                  v-if="sheetSearch"
+                  class="absolute right-1.5 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                  title="Clear search"
+                  @click="sheetSearch = ''"
+                ><X class="h-4 w-4" /></button>
               </div>
 
               <section v-if="sheetMode !== 'replace' && rarityFacets.length" class="flex flex-col gap-2">
@@ -3985,6 +4217,14 @@ function deleteSelected() {
                   >
                     {{ s[1] }}
                   </button>
+                </div>
+              </section>
+
+              <section class="flex flex-col gap-2">
+                <div class="text-f9 uppercase tracking-cs3 text-muted-foreground/60">Card size</div>
+                <div class="flex items-center gap-3 text-muted-foreground">
+                  <LayoutGrid class="h-4 w-4 flex-none" />
+                  <input v-model.number="sheetCardSize" type="range" min="120" max="168" step="4" class="w-full accent-[#e0a24a]" />
                 </div>
               </section>
 
@@ -4070,7 +4310,10 @@ function deleteSelected() {
               <div class="truncate text-f13 font-medium text-muted-foreground">Default</div>
             </button>
             <!-- draggable: drop it on any eligible loadout slot (grid, rail,
-                 focus rail) — clicking still equips into the selected slot. -->
+                 focus rail) — clicking still equips into the selected slot.
+                 On touch a tap opens the action menu instead: instant-equip
+                 plus fingernail-sized hover icons made the tiles a minefield,
+                 and the menu's Equip rows are the same one tap anyway. -->
             <ItemTile
               v-for="(i, idx) in ownedForSheet"
               :key="i.id"
@@ -4081,8 +4324,9 @@ function deleteSelected() {
               @dragstart="onTileDragStart(i, $event)"
               @dragend="onTileDragEnd"
               strip-weapon-name
+              show-header
               :active="String(rowFor(selected)?.item_instance_id) === String(i.id)"
-              @click="equipInstanceAt(i, selected)"
+              @click="isCoarse ? openItemCtxFor(i) : equipInstanceAt(i, selected)"
               @contextmenu.prevent="openItemCtx(i, $event)"
             @longpress="openItemCtxFor(i)"
               @view3d="view3dForInstance(i)"
@@ -4199,6 +4443,7 @@ function deleteSelected() {
           </span>
           <div class="flex items-center gap-3">
             <button
+              v-if="!isCoarse"
               class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
               title="Launch CS2 and inspect exactly what's in the editor right now — saving not required"
               @click="openCraftInspect"
@@ -4479,6 +4724,10 @@ function deleteSelected() {
                 <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">drag</kbd>
                 <span class="text-f9 text-muted-foreground">move sticker or charm</span>
               </div>
+              <div class="flex items-center gap-2">
+                <kbd class="rounded border border-border/70 bg-muted px-1.5 py-0.5 font-mono text-f8 text-muted-foreground">{{ isCoarse ? '2 fingers' : 'right-drag' }}</kbd>
+                <span class="text-f9 text-muted-foreground">pan · zoom in for fine placement</span>
+              </div>
               <!-- Touch has no shift key, so this shortcut is unreachable there.
                    Rotation is still available via the sticker's numeric field —
                    only the hint is hidden, not the capability. -->
@@ -4501,9 +4750,15 @@ function deleteSelected() {
               <input
                 v-model="pickerQuery"
                 placeholder="Search…"
-                class="w-full rounded-md border border-border bg-background py-2 pl-9 pr-3 text-f13 outline-none focus:border-[color:var(--acc)]"
+                class="w-full rounded-md border border-border bg-background py-2 pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
                 autofocus
               />
+              <button
+                v-if="pickerQuery"
+                class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                title="Clear search"
+                @click="pickerQuery = ''"
+              ><X class="h-3.5 w-3.5" /></button>
             </div>
             <button class="text-muted-foreground transition-colors hover:text-foreground" @click="picker = null"><X class="h-4 w-4" /></button>
           </div>
@@ -4647,7 +4902,7 @@ function deleteSelected() {
           <Box class="h-3.5 w-3.5" /> View in 3D
         </button>
         <button
-          v-if="ctx && equippedInstance(ctx.pos)"
+          v-if="ctx && equippedInstance(ctx.pos) && !isCoarse"
           class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
           @click="ctxInspect"
         >
@@ -4690,7 +4945,16 @@ function deleteSelected() {
             <span class="truncate text-f11 uppercase tracking-cs3 text-muted-foreground">{{ loadout3d.name }}</span>
             <span class="flex flex-none items-center gap-2">
               <button
-                v-if="loadout3d.instId != null"
+                v-if="loadout3dInst && !viewerId"
+                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+                :title="isReadOnly(loadout3dInst) ? 'Synced from Steam — duplicate it to make an editable copy' : 'Edit this item'"
+                @click="loadout3dEdit"
+              >
+                <Copy v-if="isReadOnly(loadout3dInst)" class="h-3.5 w-3.5" /><Pencil v-else class="h-3.5 w-3.5" />
+                {{ isReadOnly(loadout3dInst) ? 'Duplicate' : 'Edit' }}
+              </button>
+              <button
+                v-if="loadout3d.instId != null && !isCoarse"
                 class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
                 title="Launch CS2 and inspect this item in-game"
                 @click="openInspectLink(loadout3d.instId)"
@@ -4713,6 +4977,42 @@ function deleteSelected() {
               <div class="flex flex-col items-center gap-3 text-muted-foreground">
                 <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
                 <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
+              </div>
+            </div>
+            <!-- The item's full spec, same facts the editor shows — the model
+                 above already WEARS all of it; this is the readable version. -->
+            <div
+              v-if="loadout3dInst && !loadout3dBusy"
+              class="pointer-events-none absolute inset-x-0 bottom-0 z-[3] flex flex-wrap items-end justify-between gap-x-6 gap-y-2 px-4 pb-3"
+            >
+              <div class="flex flex-col gap-1.5 rounded-md border border-border/50 bg-background/60 px-3 py-2 backdrop-blur-sm">
+                <div class="flex items-center gap-3 font-mono text-f11 text-foreground/90">
+                  <span v-if="loadout3dInst.wear != null">wear {{ loadout3dInst.wear.toFixed(4) }}</span>
+                  <span v-if="loadout3dInst.seed != null">pattern #{{ loadout3dInst.seed }}</span>
+                  <span v-if="loadout3dInst.stattrak" class="text-[#f2c14e]">ST™</span>
+                  <span v-if="loadout3dInst.nametag" class="truncate text-muted-foreground">“{{ loadout3dInst.nametag }}”</span>
+                </div>
+                <div v-if="loadout3dInst.wear != null" class="relative h-[3px] w-44 rounded-full" :style="{ background: WEAR_GRADIENT }">
+                  <span
+                    class="absolute -top-[2px] h-[7px] w-[2px] -translate-x-1/2 rounded-sm bg-white"
+                    :style="{ left: Math.min(100, Math.max(0, loadout3dInst.wear * 100)) + '%', boxShadow: '0 0 3px rgba(255,255,255,0.8)' }"
+                  ></span>
+                </div>
+              </div>
+              <!-- Hovering a chip names it — and a sticker chip flashes its
+                   decal on the model, so "which one is that" answers itself. -->
+              <div v-if="loadout3dAttachments.length" class="pointer-events-auto flex items-center gap-1.5">
+                <span
+                  v-for="a in loadout3dAttachments"
+                  :key="a.key"
+                  class="group relative grid h-11 w-11 cursor-default place-items-center rounded-md border border-border/60 bg-background/70 transition-colors hover:border-[color:var(--acc)]"
+                  @mouseenter="flashLoadout3dAttachment(a)"
+                >
+                  <img :src="a.image ?? undefined" alt="" class="max-h-9 max-w-9 object-contain transition-transform duration-150 group-hover:scale-110" />
+                  <span class="pointer-events-none absolute bottom-full right-0 mb-1.5 hidden whitespace-nowrap rounded-md border border-border bg-card px-2 py-1 text-f10 uppercase tracking-cs1 text-foreground shadow-xl group-hover:block">
+                    {{ a.name }} <span class="text-muted-foreground">· {{ a.kind }}</span>
+                  </span>
+                </span>
               </div>
             </div>
           </div>
@@ -4890,6 +5190,7 @@ function deleteSelected() {
                       <Box class="h-3.5 w-3.5 flex-none" /> <span class="truncate">3D</span>
                     </button>
                     <button
+                      v-if="!isCoarse"
                       :class="[DETAIL_ACTION, 'min-w-0']"
                       title="Launch CS2 and inspect this item in-game"
                       @click="openInspectLink(detail.id)"
@@ -5001,9 +5302,12 @@ function deleteSelected() {
             <Copy class="h-3.5 w-3.5" /> Equip on both teams
           </button>
         </template>
+        <button class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxView3d">
+          <Box class="h-3.5 w-3.5" /> View in 3D
+        </button>
         <button
           v-if="itemCtx && !['agent', 'graffiti', 'musickit'].includes(itemCtx.inst.slot ?? '')"
-          class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
           @click="itemCtxStatTrak"
         >
           <Sparkles class="h-3.5 w-3.5" /> {{ itemCtx.inst.stattrak ? 'Remove' : 'Add' }} StatTrak™
@@ -5011,7 +5315,7 @@ function deleteSelected() {
         <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxEdit">
           <Pencil class="h-3.5 w-3.5" /> Edit…
         </button>
-        <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxInspect">
+        <button v-if="!isCoarse" class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxInspect">
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button

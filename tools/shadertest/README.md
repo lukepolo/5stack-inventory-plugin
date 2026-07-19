@@ -131,39 +131,53 @@ All fixtures currently pass. Remaining smaller gaps:
   1 - noPaint`) degenerate to 1. `M249 | Sage Camo` uses mode 6 and matches its
   reference anyway (sat 9.5 vs 10.3), so this is latent rather than broken —
   but a skin that genuinely needs mode 6 to gate would expose it.
-- **Contrast gap: P90 | Desert Halftone.** Partly closed. Restoring `noPaint`
-  (see below) took it from 26.6% relative contrast / 2.4% dark pixels to
-  30.2% / 6.6%, against a reference of 40.3% / 13.1%. The sights and muzzle
-  brake are now correctly bare metal instead of camo-painted.
+- **P90 | Desert Halftone — closed to the residuals.** Two mechanisms:
+  `noPaint = ao.a` gated by base metalness (paints the receiver panel and
+  magazine block Valve paints, keeps metal hardware bare), and
+  **F_SPRAYPAINT_HALFTONE**: the pattern's alpha is a halftone dot SCREEN and
+  the colour channels are thresholded against `1 - alpha`, print-style, instead
+  of being used as smooth mix weights. That is what produces the reference's
+  crisp posterised camo with dot-dithered edges. Rendered result went from
+  25.7% relative contrast / 2.2% dark pixels to **33.8% / 6.7%** against the
+  reference's 40.3% / 13.1%.
 
-  Remaining: with `noPaint` restored, a large mechanical panel on the P90 body
-  renders as bare grey where the reference shows camo. The mask is binary
-  (61% at 0, 32% at 1) so no threshold separates that panel from the genuine
-  hardware, and the weapon materials are FrontSide, so it is not a backface
-  artifact. Most likely the extracted mask marks interior shell faces that our
-  render is showing but Valve's is not.
+  The threshold direction was chosen by measurement, not taste: `ch vs a`
+  measured 21.5%/3.9%, `ch vs 1-a` 25.2%/11.1% on the raw atlas; the earlier
+  multiplicative guess (`pm *= a`) was WORSE than baseline. Skins whose
+  template does not set F_SPRAYPAINT_HALFTONE (FAMAS, Safari Mesh — also
+  style 2) are unaffected, and the suite confirms it.
 
-  Hypotheses tested against the rig and REJECTED by measurement — do not retry
-  without new evidence:
-  1. reversed-edge `smoothstep` UB in `paintEdgeLayers` — byte-identical output
-     (fixed anyway, it was genuinely undefined behaviour);
-  2. pattern read as sRGB rather than raw — 28.6% / 2.7%, barely moved;
-  3. halftone alpha modulating the selection (`pm *= pattern.a`) — 25.3% / 1.5%,
-     worse;
-  4. pattern scale wrong — swept 1x to 6x, contrast flat at 26-29% throughout;
-  5. **triplanar projection.** Valve's workshop docs say the pattern is "applied
-     via triplanar mapping" and the template ships an unused `g_tPosition`, so
-     this looked strong. Baked a UV->object-position map from the GLB and
-     sampled the pattern triplanar across five scales: 14.3-14.9% albedo
-     contrast versus 16.9% for plain UV. No better.
+  Two further corrections calibrated against an IN-GAME capture
+  (`snapshots/p90_ingame_ref.png`):
+  - **spray pattern scale does not take the weaponLength/36 multiply** that
+    wear and grunge take. With it, P90 stripes rendered ~1.8x too coarse (huge
+    dots); the vmat's own patternScale (2.75 repeats) matches in-game, and the
+    divide-instead hypothesis (x3.37) is visibly too fine. Wear/grunge keep
+    their weapon-length scaling — their response is verified by the sweep.
+  - the hardware metal gate is smoothstep(0.5, 0.8) on baseRM.g, swept at
+    0.05/0.5/0.7 against the in-game shot: 0.5 paints the partial-metal
+    fittings the game paints while keeping strong metal and the printed
+    serial markings bare (faint versions of those markings are visible in
+    Valve's own icon).
 
-  Bisecting the pipeline with debug taps showed contrast is already flat at
-  `cPaint` (15.7%) before grunge, levels and wear — so the ceiling is the
-  paint-by-number mix, not anything downstream. Alternative mixes were also
-  measured: normalised weighted sum 15.4%, hard argmax 19.8%, sharpened
-  channels ~20%. None reach the ~28-30% the reference implies, which suggests
-  the remaining difference is in the *lighting* contrast of Valve's render
-  rather than the albedo.
+  **The translucent magazine, and why the "grey panel" kept coming back:**
+  the P90 ships a separate `weapon_smg_p90_mag.glb` sharing the body's texture
+  atlas; 61% of its texels sit inside ao.a. Rendering those texels as opaque
+  base colour shows the mag's interior (rounds/spring/follower drum) — the
+  bright grey "panel with a circle". Rendering them BARE is also wrong: against
+  the in-game capture the mag reads as paint seen through smoked plastic. The
+  shipped model: paint everything ao.a marks except strong metal
+  (`smoothstep(0.5, 0.8)` on baseRM.g), then darken mag texels by ~0.7 via a
+  per-weapon `mag.png` UV mask baked at extraction from the mag GLB
+  (`TRANSLUCENT_MAGS` in scripts/extract-models.sh — P90 only; an opaque
+  painted mag like the AK's must NOT be smoked). The stdlib rasterizer in the
+  script was validated at 94.7% IoU against a PIL reference. Until an
+  extraction re-run ships mag.png, the viewer degrades gracefully (no smoke).
+
+  RESIDUALS, both understood: the iron-sight towers and barrel assembly take
+  paint (separate-material geometry in the game model, flattened into one mesh
+  by the GLB export — needs extraction work, not shader work), and overall
+  tone still sits slightly flatter than Valve's lit render.
 
 ## Measuring contrast against a reference
 

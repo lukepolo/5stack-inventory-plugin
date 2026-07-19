@@ -83,6 +83,9 @@ export async function paintTextureUrl(path: string): Promise<string> {
 //               -> vmat.json (csgo_customweapon params).
 export interface PaintDef {
   style: number; // F_PAINT_STYLE, CS2 0-based: 0 solid .. 8 gunsmith
+  /** F_SPRAYPAINT_HALFTONE: pattern channels are thresholded against the dot
+   *  screen in pattern.a instead of used as smooth mix weights. */
+  halftone: boolean;
   // Textures (CDN paths). ao/baseColor/baseRM are the *defaults* baked into
   // the paint's vmat — per-weapon composite inputs override them when the
   // model extraction provides them.
@@ -278,6 +281,7 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
     const t = (n: string) => loose.get(n) ?? tex(n);
     return {
       style: int("F_PAINT_STYLE", 0),
+      halftone: int("F_SPRAYPAINT_HALFTONE", 0) !== 0,
       pattern: t("g_tPattern"),
       normal: t("g_tNormal"),
       wearMask: t("g_tWear"),
@@ -366,6 +370,7 @@ export interface WeaponInputs {
   masks?: string; // paint-by-number RGB
   color?: string; // base weapon albedo (paint-UV space)
   metalness?: string; // R=roughness G=metalness
+  mag?: string; // translucent-magazine UV mask (white = mag texel)
   weaponLength?: number;
   uvScale?: number;
 }
@@ -411,6 +416,7 @@ export function loadWeaponInputs(model: string): Promise<WeaponInputs | null> {
           masks: rel(meta.textures?.masks),
           color: rel(meta.textures?.color),
           metalness: rel(meta.textures?.metalness),
+          mag: rel(meta.textures?.mag),
           weaponLength: meta.weaponLength,
           uvScale: meta.uvScale,
         };
@@ -541,7 +547,7 @@ precision highp float;
 in vec2 vUv;
 layout(location = 0) out vec4 outColor;
 
-uniform sampler2D tPattern, tWear, tGrunge, tMasks, tAO, tBaseColor, tBaseRM;
+uniform sampler2D tPattern, tWear, tGrunge, tMasks, tAO, tBaseColor, tBaseRM, tMagMask;
 uniform sampler2D tOverlay, tOverlayMask;
 uniform bool uHasOverlay;
 uniform int uOverlayBlend, uOverlayMaskMode;
@@ -577,6 +583,8 @@ uniform bool uPerColorRough, uPerColorMetal;
 uniform float uPaintRough, uPaintMetal;
 uniform float uWearAmt, uWearSoft, uColorBrightness;
 uniform int uStyle, uMode; // uMode: 0 = albedo, 1 = rough/metal
+uniform bool uHalftone; // F_SPRAYPAINT_HALFTONE
+uniform bool uHasMag;    // translucent-mag UV mask present
 
 vec2 xf(vec2 uv, vec4 r0, vec4 r1) { return vec2(dot(uv, r0.xy) + r0.w, dot(uv, r1.xy) + r1.w); }
 float maxc(vec3 v) { return max(v.x, max(v.y, v.z)); }
@@ -614,11 +622,19 @@ void main() {
   // relative contrast with 2.4% dark pixels against a reference of 40.3% / 13.1%;
   // restoring the mask brings that to 30.2% / 6.6%.
   //
-  // The channel is effectively binary (61% at 0, 32% at 1, nothing between), so
-  // there is no threshold to tune. See tools/shadertest/README.md for the
-  // remaining gap.
-  float noPaint = uHasAo ? ao4.a : 0.0;
+  // ao.a over-marks: besides true hardware it covers large body regions and
+  // the translucent magazine, ALL of which the game paints (verified against
+  // an in-game capture — see tools/shadertest/README.md for the full chain of
+  // rejected models, including rendering mag texels as opaque interior, which
+  // put a bright grey "panel" over the receiver). Bare = ao.a AND strong
+  // metal (barrel, muzzle, printed fittings); everything else takes paint.
+  // The translucent mag is approximated separately below: its texels render
+  // the PAINT seen through smoked plastic, i.e. slightly darkened — not the
+  // opaque interior detail, and not bare.
   vec4 masks = texture(tMasks, vUv);
+  float hwMetal = uHasBaseRM ? smoothstep(0.5, 0.8, texture(tBaseRM, vUv).g) : 0.0;
+  float noPaint = uHasAo ? ao4.a * hwMetal : 0.0;
+  float magT = uHasMag ? texture(tMagMask, vUv).r : 0.0;
   float wearTex = texture(tWear, xf(vUv, uWearX0, uWearX1)).r;
   vec4 grungeRaw = texture(tGrunge, xf(vUv, uGrgX0, uGrgX1));
   vec2 patUv = xf(vUv, uPatX0, uPatX1);
@@ -723,6 +739,19 @@ void main() {
     cPaint = mix(cPaint, uC3, masks.b);
   } else if (uStyle == 1 || uStyle == 4 || uStyle == 2 || uStyle == 5) {
     vec3 pm = pattern.rgb;
+    // F_SPRAYPAINT_HALFTONE: the pattern's alpha is a halftone dot SCREEN and
+    // the colour channels are compared against it, print-style, rather than
+    // used as smooth mix weights. This is what produces the crisp posterised
+    // camo with dot-dithered edges. Without it the raw channels (which never
+    // reach 0 or 1 on these skins) blend every palette entry toward the
+    // middle: P90 | Desert Halftone measured 16.4% relative contrast with 0%
+    // dark pixels vs its reference's dotted stripes; thresholding against
+    // 1-alpha measures 25.2% / 11.1%, matching the official look. Verified
+    // against the raw pattern texture offline before shipping — the earlier
+    // multiplicative guess (pm *= a) measured WORSE than baseline.
+    if (uStyle == 2 && uHalftone) {
+      pm = clamp((pm - (1.0 - pattern.a) + 0.05) / 0.1, 0.0, 1.0);
+    }
     if (uStyle == 2) pm *= paintEdgeLayers; // spray wears in layers
     cPaint = mix(mix(mix(uC0, uC1, pm.r), uC2, pm.g), uC3, pm.b);
     if (uStyle != 2) {
@@ -809,7 +838,9 @@ void main() {
 
   vec3 base = texture(tBaseColor, vUv).rgb;
   // Linear out — the albedo RT is SRGB8 so the GPU encodes on write.
-  outColor = vec4(mix(finalPaint, base, blend), 1.0);
+  // Translucent magazine: the paint shows THROUGH the smoked plastic, so the
+  // whole result darkens slightly there rather than exposing interior detail.
+  outColor = vec4(mix(finalPaint, base, blend) * mix(vec3(1.0), vec3(0.72, 0.70, 0.68), magT), 1.0);
 }
 `;
 
@@ -932,6 +963,7 @@ export async function compositePaint(
   // patina and gunsmith read the pattern as color (sRGB).
   const patternIsColor = def.style === 6 || def.style === 7 || def.style === 8;
   const urlOf = async (p?: string) => (p ? await paintTextureUrl(p) : null);
+  const magUrl = opts.weapon?.mag;
   const [patternUrl, wearUrl, grungeUrl, masksUrl, aoUrl, colorUrl, rmUrl, roughTexUrl, metalTexUrl, overlayUrl, overlayMaskUrl] = await Promise.all([
     urlOf(def.pattern),
     urlOf(def.wearMask),
@@ -945,6 +977,7 @@ export async function compositePaint(
     urlOf(def.overlay),
     urlOf(def.overlayMask),
   ]);
+  const magTex = magUrl ? await loadTex(THREE, magUrl, { srgb: false, wrap: false }) : null;
   const [pattern, wearT, grunge, masks, ao, baseColor, baseRM, roughTex, metalTex, overlayTex, overlayMaskTex] = await Promise.all([
     patternUrl ? loadTex(THREE, patternUrl, { srgb: patternIsColor, wrap: true }) : null,
     wearUrl ? loadTex(THREE, wearUrl, { srgb: false, wrap: true }) : null,
@@ -969,7 +1002,15 @@ export async function compositePaint(
   const weaponLength = opts.weapon?.weaponLength ?? def.weaponLength;
   const uvScale = opts.weapon?.uvScale ?? def.uvScale;
   const sizeScale = def.ignoreWeaponSizeScale ? 1 : def.style === 2 || def.style === 5 ? weaponLength / 36 : uvScale;
-  const patX = texXform(sv.patternRot, def.patternScale * sizeScale, sv.patternOffsetX, sv.patternOffsetY);
+  // Pattern scale does NOT take the weaponLength/36 multiply that wear and
+  // grunge take. Verified against an in-game capture of P90 | Desert Halftone:
+  // with the multiply (x0.545 for the P90) the stripes rendered ~1.8x too
+  // coarse; neutralising it (2.75 repeats, the vmat's own patternScale) matches
+  // the in-game stripe density, and x3.37 (the divide-instead hypothesis) is
+  // visibly too fine. Wear/grunge keep sizeScale — their response verified
+  // separately across the wear sweep.
+  const patSizeScale = def.ignoreWeaponSizeScale ? 1 : def.style === 2 || def.style === 5 ? 1 : uvScale;
+  const patX = texXform(sv.patternRot, def.patternScale * patSizeScale, sv.patternOffsetX, sv.patternOffsetY);
   const wearX = texXform(sv.wearRot, sv.wearScale * sizeScale, sv.wearOffsetX, sv.wearOffsetY);
   const grgX = texXform(sv.grungeRot, sv.grungeScale * sizeScale, sv.grungeOffsetX, sv.grungeOffsetY);
 
@@ -1033,6 +1074,9 @@ export async function compositePaint(
       uWearSoft: { value: 0 },
       uColorBrightness: { value: 1 },
       uStyle: { value: 0 },
+      uHalftone: { value: false },
+      tMagMask: { value: null as unknown as import("three").Texture },
+      uHasMag: { value: false },
       uMode: { value: 0 },
     },
   });
@@ -1117,6 +1161,9 @@ export async function compositePaint(
   u.uWearSoft.value = def.wearSoftness;
   u.uColorBrightness.value = def.colorBrightness;
   u.uStyle.value = def.style;
+  u.uHalftone.value = def.halftone;
+  u.tMagMask.value = magTex ?? black;
+  u.uHasMag.value = !!magTex;
 
   const scene = new THREE.Scene();
   scene.add(new THREE.Mesh(quadGeom, quadMat));

@@ -37,11 +37,12 @@ export const FIXTURES: Fixture[] = [
     model: "p90", pm: "/materials/ht_simple_camo_35a9b53a.vcompmat.json",
     wear: 0.11, seed: 637, style: 2, overlay: false,
     ref: "weapon_p90_ht_simple_camo_9da81e0d",
-    note: "CONTRAST case. Mean colour matches the official render almost exactly; the " +
-          "gap is tonal spread. Restoring noPaint took it from 26.6%/2.4% dark to " +
-          "30.2%/6.6% against a reference of 40.3%/13.1% — the sights and muzzle are " +
-          "bare metal again. Five hypotheses for the rest were measured and rejected " +
-          "(see README) — check there before theorising.",
+    note: "noPaint + F_SPRAYPAINT_HALFTONE reference case. noPaint = ao.a gated by " +
+          "base metalness; halftone thresholds pattern channels against the dot screen " +
+          "in pattern.a (that is where the crisp posterised camo comes from — without " +
+          "it the render is soft mid-tone mush at 16% contrast). If this fixture's sat " +
+          "drops toward ~23, the halftone gate regressed. Known residual: sight towers " +
+          "take paint (geometry, not shader — see README).",
   },
   {
     name: "Five-SeveN | Autumn Thicket",

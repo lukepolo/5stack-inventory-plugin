@@ -79,13 +79,14 @@ export function renderKeyForRow(row: { id: number | string; wear: number | strin
   // renderKeyFor in src/api.ts. (v2 compositor/legacy-body, v3 content-crop,
   // v4 paint+lighting: durability inversion, cavity from ao4.b, the disabled
   // g_bUseOverlay/g_bUseRoughness gates, and the IBL/key/rim scale-down that
-  // stopped a white specular term swamping every skin's chroma.)
+  // stopped a white specular term swamping every skin's chroma. v5 crop aspect
+  // cap: slim crops (the Nova) went full-bleed in cards and drew oversized.)
   //
   // The key covers id+wear+seed only — NOT the shader — so a compositor fix
   // changes the pixels while the filename stays put, and every card keeps
   // serving the pre-fix bake. Bumping this is the ONLY thing that invalidates
   // them; "clear cache" cannot, because the URL is unchanged.
-  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}-v4.png`;
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}-v5.png`;
 }
 app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) => {
   const identity = await getIdentity(request);
@@ -662,9 +663,136 @@ function slotCategories(slot: string): string[] | null {
   return null;
 }
 
+// One equip request, validated but not yet written: what the client asked to
+// put where. Shared by single equips and the two halves of a swap.
+type EquipSpec = { slot: string; item_instance_id?: number | string; item_id?: number };
+type ResolvedEquip =
+  | { error: string }
+  | { error?: undefined; slot: string; instanceId: number | string | null; resolvedItemId: number };
+
+// Validates ownership, slot fit, team, and no duplicate weapon in the loadout.
+// `ignoreSlots`: slots whose CURRENT occupants are excluded from the duplicate
+// check — a swap rewrites both of its slots in one transaction, so what sits
+// in them right now is about to move, not collide.
+async function resolveEquip(
+  steamId: string,
+  team: string,
+  spec: EquipSpec,
+  ignoreSlots: string[] = [],
+): Promise<ResolvedEquip> {
+  const { slot, item_instance_id, item_id } = spec;
+
+  // Resolve the item being equipped. Bigint ids arrive as strings from
+  // Postgres, so item_instance_id may be a numeric string.
+  let resolvedItemId: number;
+  let instanceId: number | string | null = null;
+  if (item_instance_id != null && item_instance_id !== "") {
+    const { rows } = await pool.query<{ item_id: number }>(
+      `SELECT item_id FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+      [item_instance_id, steamId],
+    );
+    if (!rows.length) {
+      return { error: "That item isn't in your inventory — craft it first." };
+    }
+    resolvedItemId = rows[0].item_id;
+    instanceId = item_instance_id;
+  } else if (typeof item_id === "number") {
+    if (!isBaseWeapon(item_id)) {
+      return { error: "Only default (vanilla) weapons can be equipped without crafting." };
+    }
+    resolvedItemId = item_id;
+  } else {
+    return { error: "Nothing to equip — pick a skin or a default weapon." };
+  }
+
+  const item = getItem(resolvedItemId);
+  if (!item) {
+    return { error: "Unknown item." };
+  }
+
+  // Slot-fit validation.
+  if (slot === "knife") {
+    if (item.type !== "melee") {
+      return { error: `${item.name} isn't a knife.` };
+    }
+  } else if (slot === "gloves") {
+    if (item.type !== "glove") {
+      return { error: `${item.name} aren't gloves.` };
+    }
+  } else if (slot === "zeus") {
+    if (item.type !== "weapon" || item.model !== "taser") {
+      return { error: `${item.name} isn't a Zeus x27.` };
+    }
+  } else if (slot === "c4") {
+    if (item.type !== "weapon" || item.category !== "c4") {
+      return { error: `${item.name} isn't a C4.` };
+    }
+  } else if (slot === "musickit") {
+    if (item.type !== "musickit") {
+      return { error: `${item.name} isn't a music kit.` };
+    }
+  } else if (slot === "graffiti") {
+    if (item.type !== "graffiti") {
+      return { error: `${item.name} isn't graffiti.` };
+    }
+  } else if (slot === "agent") {
+    if (item.type !== "agent") {
+      return { error: `${item.name} isn't an agent.` };
+    }
+    if (item.teams.length && !item.teams.includes(team as "CT" | "T")) {
+      return { error: `${item.name} can't play on the ${team} side.` };
+    }
+  } else {
+    if (item.type !== "weapon" || !item.model) {
+      return { error: `${item.name} isn't a weapon.` };
+    }
+    const cats = slotCategories(slot)!;
+    if (!cats.includes(item.category as string)) {
+      return { error: `${item.name} doesn't fit that slot.` };
+    }
+    if (slot === "sp" && !START_PISTOLS.has(item.model as string)) {
+      return { error: "Only a starting pistol (Glock-18, USP-S, P2000) fits that slot." };
+    }
+    if (slot !== "sp" && START_PISTOLS.has(item.model as string)) {
+      return { error: "Starting pistols go in the starting-pistol slot." };
+    }
+    if (item.teams.length && !item.teams.includes(team as "CT" | "T")) {
+      return { error: `${item.name} can't be used by the ${team} side.` };
+    }
+    // No duplicate weapon across the rest of this team's loadout.
+    const skip = [slot, ...ignoreSlots];
+    const { rows: others } = await pool.query<{ slot: string; item_id: number | null }>(
+      `SELECT l.slot, COALESCE(i.item_id, l.item_id) AS item_id
+       FROM inventory.loadout l
+       LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+       WHERE l.steam_id = $1 AND l.team = $2 AND l.slot <> ALL($3::text[])`,
+      [steamId, team, skip],
+    );
+    for (const row of others) {
+      const model = row.item_id != null ? getItem(row.item_id)?.model : null;
+      if (model && model === item.model) {
+        return { error: "That weapon is already in another slot of this loadout." };
+      }
+    }
+  }
+
+  return { slot, instanceId, resolvedItemId };
+}
+
+const UPSERT_LOADOUT = `INSERT INTO inventory.loadout (steam_id, team, slot, item_instance_id, item_id, updated_at)
+     VALUES ($1,$2,$3,$4,$5, now())
+     ON CONFLICT (steam_id, team, slot) DO UPDATE SET
+       item_instance_id = EXCLUDED.item_instance_id, item_id = EXCLUDED.item_id, updated_at = now()`;
+const upsertParams = (steamId: string, team: string, r: Exclude<ResolvedEquip, { error: string }>) => [
+  steamId,
+  team,
+  r.slot,
+  r.instanceId,
+  r.instanceId != null ? null : r.resolvedItemId,
+];
+
 // Equip into a positional slot: either an owned crafted instance
 // (item_instance_id) or a free default weapon (item_id of a vanilla base item).
-// Validates ownership, slot fit, team, and no duplicate weapon in the loadout.
 app.post<{
   Body: { team?: string; slot?: string; item_instance_id?: number | string; item_id?: number };
 }>("/api/loadout", async (request, reply) => {
@@ -676,115 +804,62 @@ app.post<{
   if (!team || !TEAMS.has(team) || !slot || !SLOT_RE.test(slot)) {
     return reply.status(400).send({ error: "A team and a valid loadout slot are required." });
   }
-
-  // Resolve the item being equipped. Bigint ids arrive as strings from
-  // Postgres, so item_instance_id may be a numeric string.
-  let resolvedItemId: number;
-  let instanceId: number | string | null = null;
-  if (item_instance_id != null && item_instance_id !== "") {
-    const { rows } = await pool.query<{ item_id: number }>(
-      `SELECT item_id FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
-      [item_instance_id, identity.steamId],
-    );
-    if (!rows.length) {
-      return reply.status(400).send({ error: "That item isn't in your inventory — craft it first." });
-    }
-    resolvedItemId = rows[0].item_id;
-    instanceId = item_instance_id;
-  } else if (typeof item_id === "number") {
-    if (!isBaseWeapon(item_id)) {
-      return reply
-        .status(400)
-        .send({ error: "Only default (vanilla) weapons can be equipped without crafting." });
-    }
-    resolvedItemId = item_id;
-  } else {
-    return reply.status(400).send({ error: "Nothing to equip — pick a skin or a default weapon." });
+  const r = await resolveEquip(identity.steamId, team, { slot, item_instance_id, item_id });
+  if (r.error != null) {
+    return reply.status(400).send({ error: r.error });
   }
+  await pool.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, r));
+  return { ok: true };
+});
 
-  const item = getItem(resolvedItemId);
-  if (!item) {
-    return reply.status(400).send({ error: "Unknown item." });
+// Swap two positional slots in one transaction. A pair of plain equips can't
+// express this: the duplicate-weapon check would see the first write as a
+// collision with the not-yet-moved second slot ("already in another slot").
+// Here both writes are validated with each other's slots exempted, then land
+// atomically.
+app.post<{
+  Body: { team?: string; a?: EquipSpec; b?: EquipSpec };
+}>("/api/loadout/swap", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
   }
-
-  // Slot-fit validation.
-  if (slot === "knife") {
-    if (item.type !== "melee") {
-      return reply.status(400).send({ error: `${item.name} isn't a knife.` });
-    }
-  } else if (slot === "gloves") {
-    if (item.type !== "glove") {
-      return reply.status(400).send({ error: `${item.name} aren't gloves.` });
-    }
-  } else if (slot === "zeus") {
-    if (item.type !== "weapon" || item.model !== "taser") {
-      return reply.status(400).send({ error: `${item.name} isn't a Zeus x27.` });
-    }
-  } else if (slot === "c4") {
-    if (item.type !== "weapon" || item.category !== "c4") {
-      return reply.status(400).send({ error: `${item.name} isn't a C4.` });
-    }
-  } else if (slot === "musickit") {
-    if (item.type !== "musickit") {
-      return reply.status(400).send({ error: `${item.name} isn't a music kit.` });
-    }
-  } else if (slot === "graffiti") {
-    if (item.type !== "graffiti") {
-      return reply.status(400).send({ error: `${item.name} isn't graffiti.` });
-    }
-  } else if (slot === "agent") {
-    if (item.type !== "agent") {
-      return reply.status(400).send({ error: `${item.name} isn't an agent.` });
-    }
-    if (item.teams.length && !item.teams.includes(team as "CT" | "T")) {
-      return reply.status(400).send({ error: `${item.name} can't play on the ${team} side.` });
-    }
-  } else {
-    if (item.type !== "weapon" || !item.model) {
-      return reply.status(400).send({ error: `${item.name} isn't a weapon.` });
-    }
-    const cats = slotCategories(slot)!;
-    if (!cats.includes(item.category as string)) {
-      return reply.status(400).send({ error: `${item.name} doesn't fit that slot.` });
-    }
-    if (slot === "sp" && !START_PISTOLS.has(item.model as string)) {
-      return reply
-        .status(400)
-        .send({ error: "Only a starting pistol (Glock-18, USP-S, P2000) fits that slot." });
-    }
-    if (slot !== "sp" && START_PISTOLS.has(item.model as string)) {
-      return reply
-        .status(400)
-        .send({ error: "Starting pistols go in the starting-pistol slot." });
-    }
-    if (item.teams.length && !item.teams.includes(team as "CT" | "T")) {
-      return reply.status(400).send({ error: `${item.name} can't be used by the ${team} side.` });
-    }
-    // No duplicate weapon across the rest of this team's loadout.
-    const { rows: others } = await pool.query<{ slot: string; item_id: number | null }>(
-      `SELECT l.slot, COALESCE(i.item_id, l.item_id) AS item_id
-       FROM inventory.loadout l
-       LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
-       WHERE l.steam_id = $1 AND l.team = $2 AND l.slot <> $3`,
-      [identity.steamId, team, slot],
-    );
-    for (const row of others) {
-      const model = row.item_id != null ? getItem(row.item_id)?.model : null;
-      if (model && model === item.model) {
-        return reply
-          .status(400)
-          .send({ error: "That weapon is already in another slot of this loadout." });
-      }
-    }
+  const { team, a, b } = request.body;
+  if (
+    !team || !TEAMS.has(team) ||
+    !a?.slot || !SLOT_RE.test(a.slot) ||
+    !b?.slot || !SLOT_RE.test(b.slot) ||
+    a.slot === b.slot
+  ) {
+    return reply.status(400).send({ error: "A team and two distinct loadout slots are required." });
   }
-
-  await pool.query(
-    `INSERT INTO inventory.loadout (steam_id, team, slot, item_instance_id, item_id, updated_at)
-     VALUES ($1,$2,$3,$4,$5, now())
-     ON CONFLICT (steam_id, team, slot) DO UPDATE SET
-       item_instance_id = EXCLUDED.item_instance_id, item_id = EXCLUDED.item_id, updated_at = now()`,
-    [identity.steamId, team, slot, instanceId, instanceId != null ? null : resolvedItemId],
-  );
+  const ignore = [a.slot, b.slot];
+  const ra = await resolveEquip(identity.steamId, team, a, ignore);
+  if (ra.error != null) {
+    return reply.status(400).send({ error: ra.error });
+  }
+  const rb = await resolveEquip(identity.steamId, team, b, ignore);
+  if (rb.error != null) {
+    return reply.status(400).send({ error: rb.error });
+  }
+  // The exemption above covers what's in the slots NOW — still reject a swap
+  // whose two incoming halves are the same weapon model.
+  const ma = getItem(ra.resolvedItemId)?.model;
+  if (ma && ma === getItem(rb.resolvedItemId)?.model) {
+    return reply.status(400).send({ error: "Both sides of that swap are the same weapon." });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, ra));
+    await client.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, rb));
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
   return { ok: true };
 });
 

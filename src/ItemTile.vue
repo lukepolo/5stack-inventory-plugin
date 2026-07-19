@@ -12,6 +12,7 @@ import { Box, Check, Clock, Copy, ExternalLink, Loader2, Pencil, RefreshCw, Tras
 import type { InventoryItem } from "./api";
 import ItemArt from "./ItemArt.vue";
 import { attachmentsOf, glowStyle, isReadOnly, STEAM_BLUE, stripName, WEAR_GRADIENT } from "./itemVisuals";
+import { isCoarse } from "./responsive";
 
 const props = withDefaults(
   defineProps<{
@@ -131,14 +132,18 @@ const attachments = computed(() => attachmentsOf(props.inst));
       {{ baking ? 'baking' : 'queued' }}
     </span>
 
-    <!-- Hover actions. Imported items can't be edited, only duplicated. -->
-    <span v-if="!hideActions" class="absolute right-1.5 top-1.5 z-[3] flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+    <!-- Hover actions. Imported items can't be edited, only duplicated.
+         Hidden on touch outright: 20px targets are unusable there, and tap /
+         long-press both open the action menu, which has every one of these. -->
+    <span v-if="!hideActions && !isCoarse" class="absolute right-1.5 top-1.5 z-[3] flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
       <span
         class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
         title="View in 3D"
         @click.stop="emit('view3d')"
       ><Box class="h-3 w-3" /></span>
+      <!-- steam:// can't launch CS2 from a phone — hide the dead-end on touch. -->
       <span
+        v-if="!isCoarse"
         class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
         title="Inspect in game"
         @click.stop="emit('inspect')"
@@ -166,21 +171,31 @@ const attachments = computed(() => attachmentsOf(props.inst));
          (CT blue / T amber) — hover any dot for the label. -->
     <div v-if="showHeader" class="relative z-[2] flex items-center justify-between gap-2">
       <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ inst.item?.model ?? inst.slot }}</span>
-      <span class="flex flex-none items-center gap-1.5">
-        <RefreshCw
-          v-if="readOnly"
-          class="h-3 w-3"
-          :style="{ color: STEAM_BLUE }"
-          title="Synced from your Steam inventory (read-only)"
-        />
-        <span
-          v-for="e in inst.equipped"
-          :key="e.team + e.slot"
-          class="h-1.5 w-1.5 rounded-full"
-          :style="{ background: e.team === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${e.team === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
-          :title="`Equipped on ${e.team}`"
-        ></span>
-      </span>
+      <RefreshCw
+        v-if="readOnly"
+        class="h-3 w-3 flex-none"
+        :style="{ color: STEAM_BLUE }"
+        title="Synced from your Steam inventory (read-only)"
+      />
+    </div>
+    <!-- Headerless tiles (the sheet) keep the synced mark in the same corner
+         the header puts it — top right, under the hover actions. -->
+    <RefreshCw
+      v-if="readOnly && !showHeader"
+      class="absolute right-2 top-2 z-[2] h-3 w-3"
+      :style="{ color: STEAM_BLUE }"
+      title="Synced from your Steam inventory (read-only)"
+    />
+    <!-- Team dots on their own line under the model name, top left — the
+         same spot on every surface (inventory grid, sheet, loadout cells). -->
+    <div v-if="inst.equipped?.length" class="relative z-[2] mt-1 flex items-center gap-1">
+      <span
+        v-for="e in inst.equipped"
+        :key="e.team + e.slot"
+        class="h-1.5 w-1.5 rounded-full"
+        :style="{ background: e.team === 'CT' ? '#7ea6ff' : '#f2c14e', boxShadow: `0 0 5px ${e.team === 'CT' ? '#7ea6ff' : '#f2c14e'}` }"
+        :title="`Equipped on ${e.team}`"
+      ></span>
     </div>
 
     <div class="relative z-[2] flex min-h-0 w-full flex-1 items-center justify-center">
@@ -189,13 +204,6 @@ const attachments = computed(() => attachmentsOf(props.inst));
 
     <div class="relative z-[2] flex items-center gap-1.5">
       <span class="truncate text-f13 font-medium">{{ label }}</span>
-      <!-- Without the header row the steam mark rides alongside the name. -->
-      <RefreshCw
-        v-if="readOnly && !showHeader"
-        class="h-3 w-3 flex-none"
-        :style="{ color: STEAM_BLUE }"
-        title="Synced from your Steam inventory (read-only)"
-      />
       <span v-if="inst.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
       <span v-if="attachments.length" class="ml-auto flex flex-none items-center gap-0.5">
         <img v-for="(a, k) in attachments.slice(0, 6)" :key="k" :src="a.image ?? undefined" :title="a.name" alt="" class="h-4 w-4 object-contain" />
