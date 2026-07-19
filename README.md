@@ -113,10 +113,10 @@ editing:
 ```
 invsim_url "https://inventory.5stack.gg"
 invsim_apikey "inv_…"
-invsim_ws_enabled true
-invsim_ws_immediately true
-invsim_require_inventory true
-invsim_spraychanger_enabled true
+invsim_ws_enabled 1
+invsim_ws_immediately 1
+invsim_require_inventory 1
+invsim_spraychanger_enabled 1
 ```
 
 The Lan cfg row is intentionally left untouched by the sync — edit it by hand if

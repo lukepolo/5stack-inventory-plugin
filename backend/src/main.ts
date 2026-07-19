@@ -1256,15 +1256,15 @@ function invsimBlock(url: string, key: string): string {
     `// ${CFG_MARKER}`,
     `invsim_url "${url}"`,
     `invsim_apikey "${key}"`,
-    "invsim_ws_enabled true",
-    "invsim_ws_immediately true",
+    "invsim_ws_enabled 1",
+    "invsim_ws_immediately 1",
     // Defers the player's activation until their loadout fetch resolves.
     // Without it, 5stack auto-assigns a team and force-respawns ~100ms after
     // connect, which beats this HTTP round-trip — the weapons are then built
     // vanilla and nothing re-evaluates them until the next spawn, so skins
     // only show up after the player's first death.
-    "invsim_require_inventory true",
-    "invsim_spraychanger_enabled true",
+    "invsim_require_inventory 1",
+    "invsim_spraychanger_enabled 1",
     "",
   ].join("\n");
 }

@@ -97,10 +97,10 @@ const invsimSnippet = computed(() =>
   [
     `invsim_url "${API_ORIGIN}"`,
     `invsim_apikey "${serverApiKey.value ?? "<generate a key first>"}"`,
-    "invsim_ws_enabled true",
-    "invsim_ws_immediately true",
-    "invsim_require_inventory true",
-    "invsim_spraychanger_enabled true",
+    "invsim_ws_enabled 1",
+    "invsim_ws_immediately 1",
+    "invsim_require_inventory 1",
+    "invsim_spraychanger_enabled 1",
   ].join("\n"),
 );
 
