@@ -163,8 +163,23 @@ if you're looking for it in git history, this section is what it became.
 
 ## Game-server API
 
-Game servers run [`ianlucas/cs2-ss2-inventory-simulator`][invsim] (or the
-byte-identical CounterStrikeSharp build) and talk to us over three endpoints.
+Game servers run one of ianlucas' inventory-simulator plugins and talk to us
+over three endpoints. Pick the build that matches the server's mod framework —
+they speak the same protocol and the same convars, so the rest of this section
+applies to either:
+
+| Server framework   | Plugin                                                     |
+| ------------------ | ---------------------------------------------------------- |
+| Metamod / SourceMod (ss2) | [`ianlucas/cs2-ss2-inventory-simulator`][invsim]    |
+| CounterStrikeSharp | [`ianlucas/cs2-css-inventory-simulator`][invsim-css]        |
+
+Install: grab the latest release zip from that repo, unpack it into the
+server's plugin directory (`addons/` — `sourcemod/`+`metamod/` for the ss2
+build, `counterstrikesharp/plugins/` for the CSS build), and restart. Config
+comes from the convars below, not from a plugin config file. 5stack's own
+server images already ship the plugin; you only need this for servers you
+build yourself.
+
 Settings → generate the server API key writes this block to the top of the
 panel's match config rows automatically, so servers pick it up with no manual
 editing:
@@ -214,6 +229,7 @@ implemented yet** — only relevant if a server enables `invsim_wslogin`
 (defaults off).
 
 [invsim]: https://github.com/ianlucas/cs2-ss2-inventory-simulator
+[invsim-css]: https://github.com/ianlucas/cs2-css-inventory-simulator
 [authdocs]: https://docs.5stack.gg/plugins/backend#optional-forward-auth-at-the-ingress
 
 ## Development (in-cluster, via CodePier)

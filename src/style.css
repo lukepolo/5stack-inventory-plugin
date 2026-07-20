@@ -54,6 +54,12 @@
     animation: cs2SheetIn 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
     animation-delay: min(calc(var(--i, 0) * 14ms), 220ms);
   }
+  /* Once a container has settled (its opening cascade has played), children
+     that mount later — e.g. the craft modal's view↔edit branch swap — appear
+     in place instead of replaying the entrance from opacity:0. */
+  [data-cs2-inventory] .sheet-settled .animate-sheet-in {
+    animation: none;
+  }
   /* Loadout cell art: replays when the occupant changes (team switch, weapon
      replace) — a wave across the grid instead of 15 images teleporting. */
   [data-cs2-inventory] .animate-cell-in {
@@ -70,6 +76,38 @@
   [data-cs2-inventory] .inv-move {
     transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
   }
+  /* Grid <-> focus. The two views are separate DOM trees swapped by v-if, so
+     there is nothing for a Vue <Transition> to cross-fade without collapsing
+     them into one element — which would remount the WebGL viewer. A mount
+     animation on the arriving tree buys the settle for free, and because only
+     the incoming side animates there is no out-in delay before focus responds.
+     The stage rises; the rail slides in from the edge it's docked to. */
+  [data-cs2-inventory] .animate-view-in {
+    animation: cs2ViewIn 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  [data-cs2-inventory] .animate-rail-in {
+    animation: cs2RailIn 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  [data-cs2-inventory] .animate-rail-in-top {
+    animation: cs2RailInTop 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  /* The grid's cells already cascade in on their own (animate-cell-in), so the
+     container only fades — a transform here would fight that wave. */
+  [data-cs2-inventory] .animate-grid-in {
+    animation: cs2FadeIn 220ms ease-out both;
+  }
+}
+@keyframes cs2ViewIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cs2RailIn {
+  from { opacity: 0; transform: translateX(-14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cs2RailInTop {
+  from { opacity: 0; transform: translateY(-14px); }
+  to { opacity: 1; transform: none; }
 }
 @keyframes cs2SheetIn {
   from { opacity: 0; transform: translateY(6px) scale(0.98); }

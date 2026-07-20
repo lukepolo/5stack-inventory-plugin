@@ -73,7 +73,7 @@ const RENDERS_DIR = process.env.RENDERS_DIR ?? "/cs2-models/renders";
 app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_req, body, done) => done(null, body));
 // Key is derived SERVER-SIDE from the caller's own instance row — a client
 // can never write another user's render slot (or an arbitrary path).
-export function renderKeyForRow(row: { id: number | string; wear: number | string | null; seed: number | string | null }) {
+export function renderKeyForRow(row: { id: number | string; wear: number | string | null; seed: number | string | null; stattrak: boolean | null }) {
   // Version suffix = render pipeline version: bumping it makes every older
   // bake miss so cards re-render instead of serving stale art. Must match
   // renderKeyFor in src/api.ts. (v2 compositor/legacy-body, v3 content-crop,
@@ -83,13 +83,20 @@ export function renderKeyForRow(row: { id: number | string; wear: number | strin
   // cap: slim crops (the Nova) went full-bleed in cards and drew oversized.
   // v6 noPaint/composite-inputs: dropped the base-metalness gate on noPaint
   // that was painting polymer hardware, and started picking the HD vs legacy
-  // composite-input bundle to match the body being rendered.)
+  // composite-input bundle to match the body being rendered.
+  // v7 StatTrak module: cards now draw the module, so the ST flag has to be in
+  // the key or toggling it serves the pre-toggle bake.)
   //
-  // The key covers id+wear+seed only — NOT the shader — so a compositor fix
-  // changes the pixels while the filename stays put, and every card keeps
-  // serving the pre-fix bake. Bumping this is the ONLY thing that invalidates
-  // them; "clear cache" cannot, because the URL is unchanged.
-  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}-v6.png`;
+  // The key covers id+wear+seed+stattrak only — NOT the shader — so a
+  // compositor fix changes the pixels while the filename stays put, and every
+  // card keeps serving the pre-fix bake. Bumping this is the ONLY thing that
+  // invalidates them; "clear cache" cannot, because the URL is unchanged.
+  //
+  // Deliberately NOT the kill count: the 2D module renders a blank display, so
+  // the card is identical at 0 kills and 4000. Putting the count here would
+  // re-bake every card on every kill.
+  const st = row.stattrak ? "-st" : "";
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}-v7.png`;
 }
 app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) => {
   const identity = await getIdentity(request);
@@ -101,7 +108,10 @@ app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) =
     return reply.status(400).send({ error: "bad render" });
   }
   const { rows } = await pool.query(
-    `SELECT id, wear, seed FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    // stattrak is part of the render key (the card draws the module), so it has
+    // to be selected here — without it the stored name loses the -st marker
+    // that the client's read URL carries, and every ST card 404s.
+    `SELECT id, wear, seed, stattrak FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
     [Number(request.params.id), identity.steamId],
   );
   if (!rows[0]) {
@@ -285,6 +295,7 @@ interface ItemRow {
   wear: number | null;
   seed: number | null;
   stattrak: boolean;
+  stattrak_count?: number | null;
   nametag: string | null;
   stickers?: unknown[] | null;
   charm_id?: number | null;
@@ -359,6 +370,11 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     wear: row.wear,
     seed: row.seed,
     stattrak: row.stattrak,
+    // Only meaningful when stattrak is set; the 3D module reads it to drive the
+    // digit atlas. The 2D card render deliberately ignores it (blank display),
+    // which is what keeps the count out of renderKeyFor and the card off the
+    // re-bake treadmill every time a kill lands.
+    stattrak_count: row.stattrak ? row.stattrak_count ?? 0 : 0,
     nametag: row.nametag,
     slot: slotForItem(row.item_id),
     item,
@@ -373,7 +389,7 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, origin
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
@@ -631,6 +647,7 @@ app.get("/api/loadout", async (request, reply) => {
     wear: number | null;
     seed: number | null;
     stattrak: boolean;
+    stattrak_count: number;
     nametag: string | null;
   }>(
     `SELECT l.team, l.slot, l.item_instance_id,
@@ -639,6 +656,9 @@ app.get("/api/loadout", async (request, reply) => {
        COALESCE(i.wear, l.wear)         AS wear,
        COALESCE(i.seed, l.seed)         AS seed,
        COALESCE(i.stattrak, l.stattrak) AS stattrak,
+       -- Only owned instances carry a count; loadout defaults have no such
+       -- column, so an unskinned StatTrak default reads 0.
+       COALESCE(i.stattrak_count, 0)    AS stattrak_count,
        COALESCE(i.nametag, l.nametag)   AS nametag
      FROM inventory.loadout l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
@@ -1487,6 +1507,68 @@ async function readExtractState(): Promise<ExtractState> {
   }
 }
 
+// ---- Pipeline version: is what's on the mount what this build expects? ------
+// Two numbers. `extractVersion` is stamped into the models dir by the last
+// successful run; `requiredVersion` is read out of the script we would run
+// right now. Reading the script instead of hardcoding a constant here means
+// there is exactly ONE place to bump (EXTRACT_VERSION in extract-models.sh) and
+// the two can never drift apart in a release.
+const EXTRACT_VERSION_FILE = path.join(MODELS_ROOT, "models", "extract-version.json");
+
+async function readExtractVersion(): Promise<number | null> {
+  try {
+    const raw = await fs.readFile(EXTRACT_VERSION_FILE, "utf8");
+    const { version } = JSON.parse(raw) as { version?: unknown };
+    return typeof version === "number" ? version : null;
+  } catch {
+    return null; // never run, or extracted before versioning existed
+  }
+}
+
+async function readRequiredExtractVersion(): Promise<number | null> {
+  const script = await resolveExtractScript();
+  if (!script) return null;
+  try {
+    const src = await fs.readFile(script, "utf8");
+    const m = src.match(/^EXTRACT_VERSION=(\d+)/m);
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Anything extracted at all? An empty mount isn't stale — it's just a
+// deployment that has never run this, which the panel already says plainly.
+async function hasExtractedModels(): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(path.join(MODELS_ROOT, "models"));
+    return entries.some((e) => e !== "extract-version.json");
+  } catch {
+    return false;
+  }
+}
+
+async function extractVersionInfo() {
+  const [extractVersion, requiredVersion, extracted] = await Promise.all([
+    readExtractVersion(),
+    readRequiredExtractVersion(),
+    hasExtractedModels(),
+  ]);
+  return {
+    extractVersion,
+    requiredVersion,
+    extracted,
+    // Three things all mean "an admin needs to press the button": nothing
+    // extracted at all, output with no version stamp (pre-versioning), and
+    // output behind this build's pipeline. `extracted` tells them apart for
+    // the wording; the flag itself is what lights the badge.
+    //
+    // Gated on knowing requiredVersion: if the script can't be resolved there
+    // is no re-run to ask for, so nagging would be pointless.
+    stale: requiredVersion !== null && (!extracted || (extractVersion ?? 0) < requiredVersion),
+  };
+}
+
 async function writeExtractState(next: ExtractState) {
   try {
     await fs.mkdir(MODELS_ROOT, { recursive: true });
@@ -1583,7 +1665,7 @@ app.get("/api/admin/extract-models", async (request, reply) => {
   // While a run is live the freshest log lives in memory, not the file.
   const status = extractChild ? { ...stored, state: "running" as const, log: extractLog.join("\n") } : stored;
   const logBytes = await fs.stat(EXTRACT_LOG_FILE).then((s) => s.size, () => 0);
-  return { available: true as const, ...status, logBytes };
+  return { available: true as const, ...status, logBytes, ...(await extractVersionInfo()) };
 });
 
 // Full log as a download — the panel only ever shows the tail, and the

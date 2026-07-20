@@ -5,8 +5,8 @@
 //
 // Each side tab is a route (/admin, /admin/assets, /admin/models) — same as
 // settings, where the nav is links rather than in-page anchors.
-import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download } from "lucide-vue-next";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download, AlertTriangle, ChevronRight } from "lucide-vue-next";
 import {
   API_ORIGIN,
   fetchServerApiKey,
@@ -31,6 +31,10 @@ const emit = defineEmits<{
   (e: "notify", message: string, kind: "error" | "success"): void;
   (e: "cfg-sync", cfg: CfgSyncResult | null): void;
   (e: "cache-cleared", scope: "renders" | "paints" | "all"): void;
+  // Extraction hasn't been run, or ran on an older pipeline. App owns the gear
+  // badge, so every status refresh here reports the answer upward — that's
+  // what clears the dot the moment a run finishes.
+  (e: "extract-stale", warn: "missing" | "stale" | null): void;
   (e: "navigate", section: string): void;
   (e: "back"): void;
 }>();
@@ -155,6 +159,8 @@ async function refreshExtractStatus() {
   const wasLive = extractLive.value;
   try {
     extractStatus.value = await fetchExtractStatus();
+    const s = extractStatus.value;
+    emit("extract-stale", s.stale !== true ? null : s.extracted === false ? "missing" : "stale");
   } catch {
     extractStatus.value = null; // older backend — the section says so
   }
@@ -167,6 +173,46 @@ async function refreshExtractStatus() {
     }
   }
 }
+// Presentation of the run state, hoisted out of the template: three ternary
+// chains inline made the markup unreadable and kept drifting apart.
+const extractDot = computed(() => {
+  const s = extractStatus.value?.state;
+  if (extractLive.value) return "animate-pulse bg-[hsl(var(--tac-amber))]";
+  if (s === "succeeded") return "bg-emerald-400";
+  if (s === "failed" || s === "interrupted") return "bg-destructive";
+  return "bg-muted-foreground/50";
+});
+const extractStateLabel = computed(() =>
+  extractStatus.value?.state === "idle" ? "never run" : (extractStatus.value?.state ?? ""),
+);
+// Drives the dot on the "3D Models" side tab, so the tab you aren't looking at
+// can still say it wants something. Version numbers themselves live only in the
+// callout — stating them a second time in the ledger just made two quiet lines.
+const modelsNeedWork = computed(() => extractStatus.value?.stale === true);
+// Elapsed time for a live run. The status only polls every 5s, so the clock
+// ticks locally off startedAt — a multi-minute job with a spinner and nothing
+// else looks identical to a hung one, and this is the cheapest way to tell
+// them apart without the backend reporting progress it doesn't know.
+const nowTick = ref(Date.now());
+let clockTimer: ReturnType<typeof setInterval> | null = null;
+watch(extractLive, (live) => {
+  if (live && !clockTimer) {
+    nowTick.value = Date.now();
+    clockTimer = setInterval(() => (nowTick.value = Date.now()), 1000);
+  } else if (!live && clockTimer) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
+});
+const extractElapsed = computed(() => {
+  const started = extractStatus.value?.startedAt;
+  if (!started || !extractLive.value) return "";
+  const secs = Math.max(0, Math.floor((nowTick.value - new Date(started).getTime()) / 1000));
+  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+});
+
+const logLineCount = computed(() => (extractStatus.value?.log ? extractStatus.value.log.split("\n").length : 0));
+
 async function doStartExtract() {
   if (extractBusy.value) return;
   extractBusy.value = true;
@@ -197,7 +243,16 @@ watch(
   },
   { immediate: true },
 );
-onBeforeUnmount(stopPoll);
+// The tab dot has to be right before you visit the tab it's on, so the status
+// is fetched once on mount too — the per-tab watch above only covers the case
+// where you're already standing on /admin/models.
+onMounted(() => {
+  if (isAdmin.value && activeKey.value !== "models") refreshExtractStatus();
+});
+onBeforeUnmount(() => {
+  stopPoll();
+  if (clockTimer) clearInterval(clockTimer);
+});
 
 // Class strings lifted from the panel's settings components, so this tracks the
 // same look: Card, SettingsSection's amber rule, SettingsSideTabs' ghost items.
@@ -269,6 +324,15 @@ const BTN_DANGER =
             @click="emit('navigate', tab.key)"
           >
             {{ tab.label }}
+            <!-- Same amber dot as the gear badge, one level down: the gear says
+                 "something in settings", this says which tab. Only shown when
+                 there's an action to take — a permanent green "all good" dot on
+                 every tab would be noise you'd learn to stop seeing. -->
+            <span
+              v-if="tab.key === 'models' && modelsNeedWork"
+              class="ml-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle bg-[hsl(var(--tac-amber))] shadow-[0_0_6px_hsl(var(--tac-amber)/0.6)]"
+              :title="extractStatus?.extracted === false ? 'Extraction has never been run' : 'Extraction is out of date'"
+            ></span>
           </button>
         </nav>
       </aside>
@@ -430,16 +494,17 @@ const BTN_DANGER =
                   the models.
                 </p>
               </div>
-            </div>
-
-            <!-- What's already on disk: the extraction output, served as
-                 /models/*. Non-zero here means 3D is live right now. -->
-            <div class="flex items-baseline gap-2 text-sm">
-              <span class="text-muted-foreground">On disk:</span>
-              <span v-if="cacheStats?.models" class="font-mono text-foreground">
-                {{ cacheStats.models.files.toLocaleString() }} files · {{ fmtBytes(cacheStats.models.bytes) }}
-              </span>
-              <span v-else class="text-muted-foreground">nothing extracted yet — 3D toggles stay hidden</span>
+              <!-- State belongs beside the title, not on a line of its own: it
+                   qualifies the whole section, and as a pill it's findable at a
+                   glance instead of being one more sentence to read. -->
+              <div v-if="extractStatus" class="shrink-0 pl-4">
+                <span
+                  class="inline-flex items-center gap-2 rounded-full border border-border bg-background px-2.5 py-1 font-mono text-xs uppercase tracking-wider text-muted-foreground"
+                >
+                  <span class="h-1.5 w-1.5 rounded-full" :class="extractDot"></span>
+                  {{ extractStateLabel }}
+                </span>
+              </div>
             </div>
 
             <p v-if="!extractStatus" class="text-sm text-muted-foreground">
@@ -447,43 +512,128 @@ const BTN_DANGER =
             </p>
 
             <template v-else>
-              <div class="flex flex-wrap items-center gap-2 text-sm">
-                <span
-                  class="h-1.5 w-1.5 rounded-full"
-                  :class="
-                    extractLive
-                      ? 'animate-pulse bg-[hsl(var(--tac-amber))]'
-                      : extractStatus.state === 'succeeded'
-                        ? 'bg-emerald-400'
-                        : extractStatus.state === 'failed' || extractStatus.state === 'interrupted'
-                          ? 'bg-destructive'
-                          : 'bg-muted-foreground/50'
-                  "
-                ></span>
-                <span class="font-mono">
-                  {{ extractStatus.state === "idle" ? "never run" : extractStatus.state }}
-                </span>
-                <span v-if="extractStatus.finishedAt" class="text-muted-foreground">
-                  · finished {{ new Date(extractStatus.finishedAt).toLocaleString() }}
-                </span>
-              </div>
+              <!-- The three facts worth knowing, as a label/value ledger — same
+                   bordered-and-divided list the Cached assets tab uses, so the
+                   two tabs read as one console. Monospace values line up down
+                   the right edge, which is what makes them scannable. -->
+              <dl class="divide-y divide-border rounded-md border border-border">
+                <div class="flex items-center justify-between gap-4 px-4 py-3">
+                  <dt class="text-sm text-muted-foreground">On disk</dt>
+                  <dd v-if="cacheStats?.models?.files" class="font-mono text-sm">
+                    {{ cacheStats.models.files.toLocaleString() }} files
+                    <span class="text-muted-foreground">·</span>
+                    {{ fmtBytes(cacheStats.models.bytes) }}
+                  </dd>
+                  <dd v-else class="text-sm text-muted-foreground">nothing yet — 3D toggles stay hidden</dd>
+                </div>
+                <div class="flex items-center justify-between gap-4 px-4 py-3">
+                  <dt class="text-sm text-muted-foreground">Last run</dt>
+                  <dd class="font-mono text-sm" :class="extractStatus.finishedAt ? '' : 'text-muted-foreground'">
+                    {{ extractStatus.finishedAt ? new Date(extractStatus.finishedAt).toLocaleString() : "never" }}
+                  </dd>
+                </div>
+              </dl>
 
               <p v-if="extractStatus.error" class="text-xs text-destructive">{{ extractStatus.error }}</p>
 
-              <!-- Tail stays up after the run ends: a succeeded run can still
-                   have per-texture failures worth noticing. -->
-              <pre
-                v-if="extractStatus.log"
-                class="max-h-60 overflow-auto whitespace-pre-wrap rounded-md border border-input bg-background px-3 py-2.5 font-mono text-xs text-muted-foreground"
-              >{{ extractStatus.log }}</pre>
-
-              <div class="flex flex-wrap items-center gap-2">
-                <button :class="BTN_PRIMARY" :disabled="extractBusy || extractLive" @click="doStartExtract">
-                  <Loader2 v-if="extractBusy || extractLive" class="h-3.5 w-3.5 animate-spin" />
-                  <Box v-else class="h-3.5 w-3.5" />
-                  {{ extractLive ? "Extraction running…" : "Extract models from game files" }}
-                </button>
+              <!-- Pipeline version. The stale case is the whole point of the
+                   stamp: the extraction "succeeded" and the models render, they
+                   just predate a change to how they're built. Nothing else in
+                   the UI can tell you that. -->
+              <div
+                v-if="extractStatus.stale"
+                class="flex items-start gap-3 rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5"
+              >
+                <AlertTriangle class="mt-0.5 h-3.5 w-3.5 flex-none text-[hsl(var(--tac-amber))]" />
+                <div class="min-w-0 space-y-1">
+                  <p class="text-sm font-medium text-foreground">
+                    {{ extractStatus.extracted === false ? "Extraction never run" : "Re-extraction needed" }}
+                  </p>
+                  <!-- Never run: no versions to compare, just say what's missing. -->
+                  <p v-if="extractStatus.extracted === false" class="text-xs text-muted-foreground">
+                    Nothing has been extracted onto the models mount, so 3D stays hidden everywhere.
+                    Run the extraction below (pipeline
+                    <span class="font-mono">v{{ extractStatus.requiredVersion }}</span>) to turn it on.
+                  </p>
+                  <!-- Ran, but before the stamp existed or before a change to it. -->
+                  <p v-else class="text-xs text-muted-foreground">
+                    The models on the mount were extracted by
+                    <span class="font-mono">{{
+                      extractStatus.extractVersion == null ? "an unversioned pipeline" : "pipeline v" + extractStatus.extractVersion
+                    }}</span>
+                    — this build's script produces
+                    <span class="font-mono">v{{ extractStatus.requiredVersion }}</span>. Re-run the
+                    extraction below to pick up the changes.
+                  </p>
+                </div>
               </div>
+              <!-- Problem and its fix as one block. The button used to sit
+                   below the log, several hundred pixels from the sentence
+                   telling you to press it. -->
+              <div class="flex flex-wrap items-center gap-3">
+                <!-- Running is a first-class state here, not just "disabled":
+                     the button keeps its amber weight, sweeps an indeterminate
+                     bar (there is no percentage to report — the script doesn't
+                     emit one) and counts elapsed time, so a slow run is
+                     visibly distinct from a hung one. -->
+                <button
+                  :class="[
+                    BTN_PRIMARY,
+                    'relative overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--tac-amber))] focus-visible:ring-offset-2 focus-visible:ring-offset-background',
+                    extractLive
+                      ? 'disabled:opacity-100 cursor-progress'
+                      : 'hover:shadow-[0_0_18px_hsl(var(--tac-amber)/0.35)] active:translate-y-px',
+                  ]"
+                  :disabled="extractBusy || extractLive"
+                  :title="extractLive ? 'Extraction in progress — it can\'t be cancelled from here' : undefined"
+                  @click="doStartExtract"
+                >
+                  <span
+                    v-if="extractLive"
+                    aria-hidden="true"
+                    class="pointer-events-none absolute inset-0 animate-sweep bg-gradient-to-r from-transparent via-white/30 to-transparent motion-reduce:hidden"
+                  ></span>
+                  <Loader2 v-if="extractBusy || extractLive" class="relative h-3.5 w-3.5 animate-spin" />
+                  <Box v-else class="relative h-3.5 w-3.5" />
+                  <span class="relative">
+                    {{ extractLive ? "Extracting…" : extractStatus.stale ? "Run extraction" : "Re-extract models" }}
+                  </span>
+                  <!-- Tabular figures: without them the clock jitters the label
+                       sideways every second as digit widths change. -->
+                  <span v-if="extractElapsed" class="relative font-mono text-xs tabular-nums opacity-80">
+                    {{ extractElapsed }}
+                  </span>
+                </button>
+                <!-- Neutral timing note only. The *reason* to press it lives in
+                     the callout above; saying it twice made both quieter. -->
+                <p class="min-w-[16rem] flex-1 text-xs text-muted-foreground">
+                  Takes a few minutes and replaces what's on the mount in place — 3D stays served
+                  throughout.
+                </p>
+              </div>
+
+              <!-- Collapsed by default: the tail is ~200 lines of dump paths
+                   that dominated the card while being the least-read thing on
+                   it. Open on its own when a run is live or has failed, which
+                   are the two times anyone actually wants it. Lines don't wrap
+                   any more — the paths are long and wrapping shredded them
+                   into unreadable ribbons; scroll sideways instead. -->
+              <details
+                v-if="extractStatus.log"
+                :open="extractLive || extractStatus.state === 'failed' || extractStatus.state === 'interrupted'"
+                class="group rounded-md border border-border"
+              >
+                <summary
+                  class="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden"
+                >
+                  <ChevronRight class="h-3.5 w-3.5 transition-transform duration-200 group-open:rotate-90" />
+                  Run log
+                  <span class="font-mono text-xs">last {{ logLineCount.toLocaleString() }} lines</span>
+                </summary>
+                <pre
+                  class="max-h-72 overflow-auto whitespace-pre border-t border-border bg-background px-4 py-3 font-mono text-xs leading-relaxed text-muted-foreground"
+                >{{ extractStatus.log }}</pre>
+              </details>
             </template>
 
             <!-- Outside the v-else on purpose: the last run's log is worth

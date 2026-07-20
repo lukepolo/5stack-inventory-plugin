@@ -101,3 +101,14 @@ export function itemName(
 // Steam imports mirror a real inventory, so the backend rejects edits to them
 // (POST /api/inventory/:id). The UI offers "duplicate to edit" instead.
 export const isReadOnly = (i: InventoryItem) => i.origin === "steam";
+
+// Which cs2-lib types we can actually put on screen in 3D. Guns and knives have
+// extracted GLBs; gloves and agents don't (different VPK trees, and gloves need
+// their own shader path), and music kits / graffiti / stickers have no 3D form
+// at all. Offering a 3D button that silently falls back to the flat image reads
+// as broken, so the button is hidden rather than dead.
+//
+// This is a TYPE-level answer, not a per-file one — an individual model can
+// still be missing from the mount, which the viewer's own HEAD probe catches.
+const TYPES_3D = new Set(["weapon", "melee"]);
+export const supports3d = (item?: { type?: string | null } | null) => !!item?.type && TYPES_3D.has(item.type);

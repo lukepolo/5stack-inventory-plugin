@@ -16,6 +16,24 @@
 # the same Source2Viewer-CLI flags from step 2 in PowerShell.
 set -euo pipefail
 
+# ---- Pipeline version --------------------------------------------------------
+# BUMP THIS whenever a change here makes previously-extracted output wrong or
+# incomplete (new bundle files, changed packing, fixed anchors — anything a
+# re-run would produce differently). The number is stamped into
+# $DEST/extract-version.json at the end of a successful run; the backend
+# compares that stamp against the version declared *in this script* and lights
+# an orange dot on the panel's settings cog when the mount is behind. That's
+# the whole contract — bump the line, and every deployment is told to re-run.
+# v2 (2026-07-20): added g_tPosition + g_tSurface to the composite-input
+# bundles. Styles 2 and 5 need them for the triplanar spray projection; without
+# them those skins fall back to sampling the pattern in paint-UV space, which is
+# the wrong space entirely.
+# v3 (2026-07-20): v2 shipped INCOMPLETE — it wrote `surface` but silently
+# dropped `position` on all 89 weapons, because the copy loop only accepted
+# ".png" and g_tPosition is RGBA16161616F, which the CLI writes as .exr. The
+# loop now probes real extensions and reports anything it fails to recover.
+EXTRACT_VERSION=3
+
 CS2_DIR="${CS2_DIR:-/opt/5stack/game-streamer/steamapps/common/Counter-Strike Global Offensive}"
 VPK="$CS2_DIR/game/csgo/pak01_dir.vpk"
 OUT_DIR="${OUT_DIR:-}"
@@ -63,6 +81,15 @@ echo "--- Decompiling weapon models (this takes a few minutes)…"
 # the `inventory_icon` clip at t=0 to get that pose — the same clip Valve
 # renders its own item icons from. Costs about +4% glb size (revolver
 # 3.70 -> 3.86 MB).
+# NOTE: this step logs thousands of "Failed to get texture inputs ... Only VCS
+# file versions 59 through 70 are supported" lines against current CS2, which
+# ships VCS 71. They are NOISE — do not go fix them. VRF reads the shader to map
+# textures to material slots, and when that fails it falls back to a hardcoded
+# name->slot table which handles every map we care about. VERIFIED on a run with
+# 6822 of these: p90.glb still came out with 6 textures and baseColor/
+# metallicRoughness/normal bound on both materials. The composite inputs in
+# step 3b are unaffected too — they parse with `-b DATA` and never touch a
+# shader. Chasing this costs a from-source VRF build and buys nothing.
 "$CLI" -i "$VPK" -o "$RAW" -d \
   -f "weapons/models/" -e "vmdl_c" \
   --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
@@ -107,6 +134,34 @@ declare -A MAP=(
   [weapon_snip_awp]=awp
   [weapon_snip_g3sg1]=g3sg1
   [weapon_snip_scar20]=scar20
+  # Knives. Keys are cs2-lib's melee `model` values; the vmdl basenames come
+  # from each item's `playerModel` GLB name, which is the only reliable link —
+  # several pairs are unguessable (navaja/gypsy_jackknife, talon/widowmaker,
+  # bowie/survival_bowie, m9/m9_bayonet) and a wrong key just 404s in silence.
+  # Mapping them here (rather than the knives/ passthrough below) also feeds
+  # MODEL_KEY in §3b, so knives get their composite_inputs bundles too.
+  [weapon_knife_default_ct]=knife
+  [weapon_knife_default_t]=knife_t
+  [weapon_knife_bayonet]=bayonet
+  [weapon_knife_bowie]=knife_survival_bowie
+  [weapon_knife_butterfly]=knife_butterfly
+  [weapon_knife_canis]=knife_canis
+  [weapon_knife_cord]=knife_cord
+  [weapon_knife_css]=knife_css
+  [weapon_knife_falchion]=knife_falchion
+  [weapon_knife_flip]=knife_flip
+  [weapon_knife_gut]=knife_gut
+  [weapon_knife_karambit]=knife_karambit
+  [weapon_knife_kukri]=knife_kukri
+  [weapon_knife_m9]=knife_m9_bayonet
+  [weapon_knife_navaja]=knife_gypsy_jackknife
+  [weapon_knife_outdoor]=knife_outdoor
+  [weapon_knife_push]=knife_push
+  [weapon_knife_skeleton]=knife_skeleton
+  [weapon_knife_stiletto]=knife_stiletto
+  [weapon_knife_tactical]=knife_tactical
+  [weapon_knife_talon]=knife_widowmaker
+  [weapon_knife_ursus]=knife_ursus
 )
 
 count=0
@@ -117,7 +172,9 @@ while IFS= read -r -d '' f; do
     cp "$f" "$DEST/$key.glb"
     count=$((count + 1))
   elif [[ "$base" == *knife* || "$base" == *bayonet* || "$base" == *karambit* || "$base" == *daggers* ]]; then
-    cp "$f" "$DEST/knives/$base.glb" # kept raw-named for future knife wiring
+    # Mapped knives now land top-level via MAP; what still falls here is the
+    # _physics collision hulls and stattrak_module_knife — none of them render.
+    cp "$f" "$DEST/knives/$base.glb"
   else
     cp "$f" "$DEST/extra/$base.glb"
   fi
@@ -213,6 +270,20 @@ WANTED = {  # composite param -> served filename
     "g_tMasks": "masks.png",             # paint-by-number RGB
     "g_tColor": "color.png",             # base weapon albedo
     "g_tMetalness": "metalness.png",     # R=rough G=metal
+    # Needed by the PROJECTED paint styles, 2 (Spraypaint) and 5 (Anodized
+    # Airbrushed). Those two do not sample the pattern in paint-UV space at all:
+    # csgo_customweapon combo 293 builds the pattern coordinate in the fragment
+    # shader from g_tPosition via a triplanar projection, weighted by the
+    # object-space normal in g_tSurface. Without these, an airbrushed graphic
+    # authored as a side elevation gets smeared across the whole unwrap —
+    # Desert Eagle | Blaze puts flames on the grip.
+    #
+    # g_tPosition is declared RGBA16161616F. If VRF's default PNG export
+    # quantises it to 8 bits the position will stair-step visibly under the
+    # pattern magnification — check the exported format and prefer 16-bit PNG
+    # or EXR if so.
+    "g_tPosition": "position.png",       # object-space position, paint-UV space
+    "g_tSurface": "surface.png",         # object-space normal, paint-UV space
 }
 
 FLOATS = {"g_flWeaponLength1": "weaponLength", "g_flUvScale1": "uvScale"}
@@ -229,6 +300,16 @@ MODEL_KEY = json.loads(os.environ.get("MODEL_KEY_JSON") or "{}")
 # these are the ONLY discrepancies, so a silent .get() would drop exactly one
 # weapon's HD bundle and nothing would say so.
 MODEL_KEY["weapon_pist_glock"] = "glock"  # GLB is weapon_pist_glock18
+
+# Knives break the naming rule the guns follow. Their GLB keeps the class prefix
+# (weapon_knife_bayonet.glb, so MAP must key on that for the §3 rename) but their
+# vmat DROPS it: .../knife/knife_bayonet/materials/composite_inputs/
+# knife_bayonet_composite_inputs.vmat_c. Keying only on the GLB name silently
+# yields no bundle and knives render on the generic ao/color fallback — visible
+# as uniform wear, not as an error. Alias the prefix-less stem to the same key.
+for _glb_base, _key in list(MODEL_KEY.items()):
+    if _glb_base.startswith("weapon_knife_"):
+        MODEL_KEY[_glb_base[len("weapon_"):]] = _key
 
 # The vmat_c's KV3 payload is compressed, so scanning the raw bytes for strings
 # recovers nothing (confirmed: 36 files dumped, 0 textures found). Ask the CLI
@@ -277,7 +358,7 @@ if not vmats:
           "to generic ao/cavity/baseColor", file=sys.stderr)
 
 made = 0
-unmapped, unscannable = [], []
+unmapped, unscannable, missing_tex = [], [], []
 
 for vmat_path in sorted(vmats):
     base = os.path.basename(vmat_path)
@@ -331,11 +412,28 @@ for vmat_path in sorted(vmats):
             [cli, "-i", vpk, "-o", raw, "-d", "-f", vtex + "_c"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
-        png = os.path.join(raw, vtex[: -len(".vtex")] + ".png")
-        if os.path.isfile(png):
+        # The CLI picks the output container from the texture's FORMAT, so an
+        # 8-bit map lands as .png but a float one does not. g_tPosition is
+        # RGBA16161616F (verified: 1024x1024, decodes to RgbaF32) and comes out
+        # as .exr — which is also how cdn.cstrike.app serves it.
+        #
+        # This loop used to hardcode ".png" and skip anything else in silence.
+        # That is exactly how the v2 run produced 89 bundles with `surface` and
+        # NO `position` while logging nothing at all: 27k lines, zero mentions.
+        # Probe the real extensions and say so loudly when a wanted map yields
+        # nothing.
+        stem = os.path.join(raw, vtex[: -len(".vtex")])
+        src = next((stem + e for e in (".png", ".exr", ".pfm", ".tif", ".tga")
+                    if os.path.isfile(stem + e)), None)
+        if src:
             out_name = WANTED[param]
-            shutil.copyfile(png, os.path.join(out_dir, out_name))
+            # Keep the extension the CLI actually produced; meta.json records the
+            # real filename so the loader never has to guess.
+            out_name = os.path.splitext(out_name)[0] + os.path.splitext(src)[1]
+            shutil.copyfile(src, os.path.join(out_dir, out_name))
             meta["textures"][out_name.split(".")[0]] = out_name
+        else:
+            missing_tex.append(f"{label}:{param}")
     if meta["textures"]:
         with open(os.path.join(out_dir, "meta.json"), "w") as fh:
             json.dump(meta, fh)
@@ -404,21 +502,39 @@ def bake_mag_mask(glb_path, out_png, size=1024):
     return sum(1 for v in grid if v) / len(grid)
 
 for mkey in sorted(TRANSLUCENT_MAGS):
-    inputs_dir = os.path.join(dest, f"{mkey}.inputs")
-    meta_path = os.path.join(inputs_dir, "meta.json")
-    if not os.path.isfile(meta_path):
-        continue
     import glob as _g
     cands = [g for g in _g.glob(os.path.join(raw_models, "weapons/models", mkey, "*_mag.glb"))
              if "_physics" not in g]
     if not cands:
         print(f"!! {mkey}: translucent mag expected but no *_mag.glb found", file=sys.stderr)
         continue
-    cov = bake_mag_mask(cands[0], os.path.join(inputs_dir, "mag.png"))
-    meta = json.load(open(meta_path))
-    meta.setdefault("textures", {})["mag"] = "mag.png"
-    json.dump(meta, open(meta_path, "w"))
-    print(f"---   {mkey}: mag mask baked ({cov*100:.0f}% of atlas)")
+    # Write into BOTH bundles. This used to land only in <key>.inputs, so every
+    # CS2-native finish — which loads <key>.inputs.hd — got uHasMag = false and
+    # no smoked magazine at all. Confirmed against the live mount after the
+    # 2026-07-20 rerun: p90.inputs had mag, p90.inputs.hd did not.
+    #
+    # OPEN: the source *_mag.glb comes from the models (HD) tree, so this mask
+    # is authored against the HD unwrap — which makes the legacy copy the
+    # suspect one, not the HD copy. Legacy and HD unwraps genuinely differ (see
+    # loadWeaponInputs), so if a legacy-finish P90 shows the darkening in the
+    # wrong place, the legacy bundle needs its own bake from the legacy mag
+    # model rather than this one.
+    wrote = []
+    for suffix in (".inputs", ".inputs.hd"):
+        inputs_dir = os.path.join(dest, f"{mkey}{suffix}")
+        meta_path = os.path.join(inputs_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            continue
+        cov = bake_mag_mask(cands[0], os.path.join(inputs_dir, "mag.png"))
+        meta = json.load(open(meta_path))
+        meta.setdefault("textures", {})["mag"] = "mag.png"
+        json.dump(meta, open(meta_path, "w"))
+        wrote.append(f"{suffix.lstrip('.')} {cov*100:.0f}%")
+    if wrote:
+        print(f"---   {mkey}: mag mask baked ({', '.join(wrote)})")
+    else:
+        print(f"!! {mkey}: translucent mag but no composite-input bundle to write into",
+              file=sys.stderr)
 
 print(f"--- Composite inputs for {made} weapons")
 if unscannable:
@@ -429,6 +545,21 @@ if unscannable:
 if unmapped:
     print(f"!! Bundles with no matching .glb (folder -> key): {', '.join(sorted(unmapped))}",
           file=sys.stderr)
+if missing_tex:
+    # Grouped by PARAM, because "every weapon is missing the same one" and "one
+    # weapon is missing everything" are different bugs and the flat list hides
+    # which you have. A param missing across the board means the CLI wrote an
+    # extension this script does not recognise — that is how g_tPosition was
+    # dropped from all 89 bundles in v2 without a single line of output.
+    by_param = {}
+    for item in missing_tex:
+        by_param.setdefault(item.split(":")[-1], []).append(item.split(":")[0])
+    for param, labels in sorted(by_param.items()):
+        print(f"!! {param}: no decompiled file for {len(labels)} weapon(s)"
+              + (" — ALL of them, so the CLI is writing a format this script "
+                 "does not look for; check $RAW for the real extension."
+                 if len(labels) == made else f": {', '.join(sorted(labels)[:8])}"),
+              file=sys.stderr)
 PYEOF
 
 # ---- 3c. Keychain (charm) anchor points --------------------------------------
@@ -587,8 +718,24 @@ for key, found in sorted(anchors.items()):
         continue
     if max_angle > 0.01:
         rotated.append((key, round(max_angle, 3)))
-    model = [kc["origin"][i] + base[i] for i in range(3)]
-    world[key] = {"keychain": [round(model[1] * S, 6), round(model[2] * S, 6), round(model[0] * S, 6)]}
+    # Do NOT fold `base` into the anchor. Two different spaces:
+    #
+    #   our GLB       - attachment origin ONLY. Attachments are parented to
+    #                   `weapon_offset`, which sits at [0,0,0]. The `weapon`
+    #                   bone that `base` comes from is a SIBLING, not an
+    #                   ancestor, so VRF never bakes it into the vertices.
+    #   game offsets  - attachment origin + base, in Source inches.
+    #
+    # Folding base in made the anchor a game-space value that the viewer then
+    # read as a GLB position. On the M4A4 (base x=18.23) that pinned the charm
+    # past the muzzle; confirmed in game that muzzle_flash 18.455 + base 18.235
+    # = 36.69 is the muzzle, so base belongs to the offsets, not the geometry.
+    # The viewer adds/removes it when crossing between the two spaces.
+    o = kc["origin"]
+    world[key] = {
+        "keychain": [round(o[1] * S, 6), round(o[2] * S, 6), round(o[0] * S, 6)],
+        "base": [round(v, 4) for v in base],
+    }
 
 with open(os.path.join(dest, "charm-anchors.json"), "w") as fh:
     json.dump(world, fh, indent=1, sort_keys=True)
@@ -598,7 +745,18 @@ if rotated:
     print("!!! The chain is translation-only — these anchors may be off.")
 PYEOF
 
-# ---- 4. Bundle ---------------------------------------------------------------
+# ---- 4. Stamp the pipeline version -------------------------------------------
+# Written last, and only here: `set -e` means reaching this line is what makes
+# the run a success, so the stamp can never claim output that wasn't produced.
+cat >"$DEST/extract-version.json" <<JSON
+{
+ "version": $EXTRACT_VERSION,
+ "extractedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSON
+echo "--- Stamped extract-version.json (pipeline v$EXTRACT_VERSION)"
+
+# ---- 5. Bundle ---------------------------------------------------------------
 if [[ -n "$OUT_DIR" ]]; then
   echo ""
   echo "=== Done: models written to $DEST ($(du -sh "$DEST" | cut -f1))"

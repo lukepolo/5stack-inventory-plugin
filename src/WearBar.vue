@@ -30,8 +30,15 @@ const props = withDefaults(
      * float lives in the tooltip and on the item/focus screens.
      */
     mini?: boolean;
+    /**
+     * Track only, full size, no numbers. For surfaces that already label the
+     * float themselves — the focus panel prints it under a "Float" heading, so
+     * a second copy under the track would just repeat it. Width comes from the
+     * parent.
+     */
+    bare?: boolean;
   }>(),
-  { wear: null, seed: null, compact: false, inline: false, mini: false },
+  { wear: null, seed: null, compact: false, inline: false, mini: false, bare: false },
 );
 
 const pct = computed(() => Math.min(100, Math.max(0, (props.wear ?? 0) * 100)));
@@ -129,7 +136,7 @@ const tip = computed(() => {
     >
 
     <div
-      v-if="!inline && !mini"
+      v-if="!inline && !mini && !bare"
       class="flex items-center justify-between font-mono tabular-nums"
       :class="[compact ? 'text-f8' : 'text-f9', wear != null && 'mt-1.5']"
     >

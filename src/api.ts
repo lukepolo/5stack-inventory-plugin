@@ -95,6 +95,7 @@ export interface LoadoutEntry {
   wear: number | null;
   seed: number | null;
   stattrak: boolean;
+  stattrak_count: number;
   nametag: string | null;
   item: CatalogItem | null;
 }
@@ -111,6 +112,9 @@ export interface InventoryItem {
   wear: number | null;
   seed: number | null;
   stattrak: boolean;
+  /** Kills recorded on the module. 0 when the item isn't StatTrak. Drives the
+   *  3D digit display only — 2D cards render a blank display on purpose. */
+  stattrak_count: number;
   nametag: string | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
@@ -149,13 +153,18 @@ export const fetchCatalog = () => request<Catalog>("/catalog");
 // Number() guards: pg numerics can arrive as strings — .toFixed on a string throws.
 // Version suffix must match the backend's key builder — bumped when the
 // render pipeline changes so stale bakes miss and re-render.
-export const renderKeyFor = (i: { id: number; wear: number | null; seed: number | null }) =>
-  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}-v6.png`;
+// The ST flag is in the key (cards draw the module) but the kill count is NOT
+// — the 2D module renders a blank display, so a card is identical at 0 kills
+// and 4000. Keying on the count would re-bake every card on every kill.
+// stattrak is REQUIRED, not optional: an omitted flag silently builds a key
+// that disagrees with the one the writer used, and the card 404s forever.
+export const renderKeyFor = (i: { id: number; wear: number | null; seed: number | null; stattrak: boolean | null }) =>
+  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}${i.stattrak ? "-st" : ""}-v7.png`;
 // Served via /api (canonical): that ingress path provably reaches the backend
 // pod that stores the files — immune to stale nginx images, CDN-cached 404s,
 // and hostPath node mismatches. Plain <img> tags send session cookies, so the
 // forward-auth gate passes for signed-in users.
-export const renderUrlFor = (i: { id: number; wear: number | null; seed: number | null }) =>
+export const renderUrlFor = (i: { id: number; wear: number | null; seed: number | null; stattrak: boolean | null }) =>
   `${API_ORIGIN}/api/renders/${renderKeyFor(i)}`;
 export async function uploadRender(instanceId: number, blob: Blob): Promise<{ ok: boolean; error?: string }> {
   try {
@@ -310,6 +319,16 @@ export interface ExtractStatus {
   error?: string | null;
   log?: string; // tail only — the full run log is the download below
   logBytes?: number;
+  // Extraction-pipeline version: what the mount was built by vs. what the
+  // script in this build produces. `stale` covers every "press the button"
+  // case — never extracted, extracted without a version stamp, or extracted
+  // behind this build — and is what lights the gear badge. `extracted`
+  // distinguishes the first from the rest for wording. All absent on older
+  // backends, which is why `stale` is read as falsy-by-default.
+  extractVersion?: number | null;
+  requiredVersion?: number | null;
+  extracted?: boolean;
+  stale?: boolean;
 }
 // Plain <a download> hits this: same cookie-auth path the render <img> tags
 // use, so no token juggling.

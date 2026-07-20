@@ -93,6 +93,10 @@ export interface PaintDef {
    *  Deagle | Heat Treated came out green-and-magenta, which is literally what
    *  its pattern.rgb contains. Requires style 0, 7 or 8 (FeatureRule). */
   caseHardening: boolean;
+  /** Whether the paint's normal map should actually be bound. Keyed off the
+   *  FLAG, never off the texture's presence — these materials ship a real
+   *  g_tNormal even when it is switched off. */
+  useNormalMap: boolean;
   caseHardeningRamp?: string;
   chPatternInfluence: number;
   chGeometricInfluence: number;
@@ -112,6 +116,9 @@ export interface PaintDef {
   overlayMaskMode: number;
   overlayStrength: number;
   overlayBrightness: number;
+  /** g_fOverlayDurability — folds into the wear curve: an overlay can make the
+   *  paint under it wear faster or slower, and in "Layer" mode erodes itself. */
+  overlayDurability: number;
   overlayScale: number;
   overlayRot: number;
   overlayOffset: number[];
@@ -119,6 +126,11 @@ export interface PaintDef {
   overlayUsesUniqueUv: boolean;
   grunge?: string;
   masks?: string;
+  /** True when `masks` came from the skin's own g_tPaintByNumberMasks rather
+   *  than a template default. A skin-authored mask is drawn against THIS
+   *  finish's artwork and must beat the weapon's generic extracted mask —
+   *  see the pick in compositePaint. 269 of 1479 materials ship one. */
+  masksSkinSpecific: boolean;
   ao?: string;
   baseColor?: string;
   baseRM?: string;
@@ -135,6 +147,39 @@ export interface PaintDef {
   colorBrightness: number;
   pearlescent: number;
   patternScale: number;
+  /** g_vSprayBlend / g_bBiasSpray — the projected styles (2, 5) only. The blend
+   *  pair weights the Y and Z planes of the triplanar projection; the bias
+   *  re-applies an sRGB encode to the surface normal before unpacking, which
+   *  pushes every component positive so the spray reads as coming from one
+   *  direction (an airbrush) rather than symmetrically from both sides. */
+  sprayBlend: [number, number];
+  biasSpray: boolean;
+  /** g_nPatternTextureHorizontal/VerticalSampling — Source 2
+   *  RsTextureAddressMode_t (0 wrap, 1 mirror, 2 clamp, 4 mirror-once). Sampler
+   *  STATE: declared in the .slang but never read in its body, which is why a
+   *  pure shader-math port misses it. Only meaningful for the PROJECTED styles,
+   *  where the coordinate leaves [0,1] by design — applying it to paint-UV
+   *  sampling regressed AWP | Fade badly (sat 47.9 -> 18.6). 19 catalog
+   *  materials set one, and they are almost all Fades plus Deagle | Blaze. */
+  patternAddrH: number;
+  patternAddrV: number;
+  /** F_PEARLESCENCE_MASK / g_tPearlescenceMask and friends. The composite does
+   *  NOT shade glitter or pearlescence — those are runtime weapon-shader effects.
+   *  What it must do is write the SFX MASK that gates them into the rough/metal
+   *  map, which the weapon shader reads back. */
+  pearlMask?: string;
+  pearlMaskPatternUv: boolean;
+  pearlOnMetallicOnly: boolean;
+  /** Glitter — a RUNTIME weapon-material effect, not a composite one. These are
+   *  read here only so viewer3d can hand them to the shading material; the
+   *  compositor itself never uses them (they are not even in its constant
+   *  buffer). g_tGlitterNormal is a shared sheet from the paint TEMPLATE, RG =
+   *  a 2-channel normal and A = the flake mask, sampled with a POINT sampler. */
+  glitterNormal?: string;
+  glitterIntensity: number;
+  glitterScale: number;
+  glitterRainbowBalance: number;
+  glitterRainbowSpread: number;
   ignoreWeaponSizeScale: boolean;
   weaponLength: number;
   uvScale: number;
@@ -245,6 +290,28 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       // so a typeof check silently falls through to the template.
       const b = looseVal.get(n)?.m_bValueBoolean;
       if (b != null && b !== "") return b === "0" || b === "false" || b === false ? 0 : 1;
+      // F_* STATIC COMBOS ARE THE TEMPLATE'S, not the skin's — unless the skin
+      // exposes one in its editor UI (m_bExposeExternally), which is how a real
+      // authored override presents.
+      //
+      // A vcompmat also carries BARE F_* integers, and they are per-mutator
+      // plumbing that is almost always 0 — not a value anyone chose. Letting
+      // them win inverted features the skin obviously uses. MEASURED on AK-47 |
+      // Aphrodite: it sets g_bUseOverlay=1, g_bUseOverlayMask=1 and ships a real
+      // g_tOverlayMask, yet its bare loose vars say F_OVERLAY_TEXTURE=0 and
+      // F_OVERLAY_MASK=0 while the compiled template says 1 and 8 (Dedicated).
+      // Taking the 0 turned mask mode into "None" — gate = 1 over the entire
+      // weapon — so a 66%-strength MULTIPLY overlay meant to sit inside a small
+      // mask was multiplied across the whole gun. That is what dragged its white
+      // marble down to olive-brown (measured: cPaint 0.82/0.69/0.57 of patCol,
+      // a warm-biased darkening no other term in the path can produce).
+      //
+      // F_OVERLAY_BLEND_MODE is the counter-example that proves the rule: it IS
+      // exposed (m_bExposeExternally, with a friendly value list) and its 2
+      // (Multiply) is a genuine authored choice that must still win.
+      const lv = looseVal.get(n);
+      const exposed = lv?.m_bExposeExternally != null && lv.m_bExposeExternally !== "";
+      if (n.startsWith("F_") && !exposed) return tmplInt(n, d);
       return looseNum(n, "m_nValueIntX") ?? tmplInt(n, d);
     };
     vec = (n) => {
@@ -292,6 +359,37 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       const t = tmplVec("g_vPaintDurability");
       return t ? [t[0], t[1], t[2], t[3] ?? t[2]] : [1, 1, 1, 1];
     };
+    // An exposed vcompmat slider that was never dragged stores the MIDPOINT of
+    // its own declared bounds — that is the material editor's "untouched"
+    // signature, and it is exactly how a SEED-VARIED envelope presents. Any
+    // other stored value is an authored constant and must be used literally.
+    //
+    // MEASURED over all 24 materials in the catalog that declare
+    // g_flCaseHardeningRampOffset, and the split is clean:
+    //   4 have min == max (0 or 1)     — pinned, not a slider at all
+    //  16 sit exactly on their midpoint — Heat Treated, Case Hardened, ...
+    //   4 sit off it                    — three unrelated skins all storing
+    //                                     0.266 over bounds [0,1] (a copied
+    //                                     constant, not a coincidence) plus
+    //                                     AK-47 | Aphrodite's 0.500949
+    // Reading every one of them as a seed envelope is what made Glock | AXIA
+    // render green-and-gold: its offset is PINNED at 1, and its ramp's blue
+    // lives only in the v=1 row (sampled: (17,129,180) there, (177,182,0) at
+    // v=0.5). Same failure on Aphrodite, whose pastels are the v>=0.5 rows.
+    const authoredOrSeeded = (name: string, seeded: number): number => {
+      const lv = looseVal.get(name);
+      const raw = lv?.m_flValueFloatX;
+      if (raw == null || raw === "") return seeded;
+      const v = Number(raw);
+      const lo = lv?.m_flValueFloatX_Min;
+      const hi = lv?.m_flValueFloatX_Max;
+      if (lo == null || hi == null || lo === "" || hi === "") return v;
+      const min = Number(lo);
+      const max = Number(hi);
+      if (min === max) return v; // pinned by its own bounds
+      // Untouched slider => seed envelope; we don't know the draw order yet.
+      return Math.abs(v - (min + max) / 2) < 1e-4 ? seeded : v;
+    };
     const t = (n: string) => loose.get(n) ?? tex(n);
     return {
       style: int("F_PAINT_STYLE", 0),
@@ -300,6 +398,21 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       // templates': PatternInfluence 0.5, GeometricInfluence 1, RampOffset 0.
       // None of the three declares a Range(), so they are not clamped.
       caseHardening: int("F_CASE_HARDENING", 0) !== 0,
+      // The shader has NO g_bUseNormalMap — the runtime gate is the static
+      // combo F_OVERRIDE_NORMAL; g_bUseNormalMap is the vcompmat's authoring
+      // switch that decides whether the compositor compiles that combo in. So
+      // the skin's switch wins where it exists, template feature otherwise,
+      // which is this loader's normal precedence.
+      //
+      // MEASURED over sampled materials that declare the switch: 10 have it ON
+      // with a real normal, 2 OFF with the flat placeholder — and 9 have it
+      // OFF while still shipping a REAL normal map
+      // (custom_template_pattern_normal). Binding on texture-presence, as
+      // viewer3d did, bump-maps all 9 of those against geometry CS2 shades
+      // flat. Same trap as the g_bUseOverlay placeholder — see the rig README.
+      useNormalMap: looseVal.has("g_bUseNormalMap")
+        ? int("g_bUseNormalMap", 0) !== 0
+        : int("F_OVERRIDE_NORMAL", 0) !== 0,
       caseHardeningRamp: t("g_tCaseHardeningColorRamp"),
       chPatternInfluence: flt("g_flCaseHardeningPatternInfluence", 0.5),
       chGeometricInfluence: flt("g_flCaseHardeningGeometricInfluence", 1),
@@ -328,7 +441,11 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       // the shader, so the decompile cannot supply it — see seededVisuals for
       // the sequence this would have to slot into. Until then every seed of a
       // case-hardened skin renders as the same (correct-family) gun.
-      chRampOffset: 0,
+      //
+      // ...but that reasoning only holds for the ones that ARE seed-varied.
+      // authoredOrSeeded tells the two apart by the midpoint signature, so a
+      // skin with a genuinely fixed offset now gets its real value.
+      chRampOffset: authoredOrSeeded("g_flCaseHardeningRampOffset", 0),
       colorAdjustmentMode: int("g_nColorAdjustmentMode", 0),
       pattern: t("g_tPattern"),
       normal: t("g_tNormal"),
@@ -338,6 +455,7 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       // the vcompmat, and their vmat's g_tMasks is a generic default. Reading
       // g_tMasks first meant those skins coloured against a stand-in mask.
     masks: loose.get("g_tPaintByNumberMasks") ?? t("g_tMasks"),
+      masksSkinSpecific: loose.has("g_tPaintByNumberMasks"),
       // Overlay layer: a second artwork pass composited over the paint. ~10% of
       // finishes use it and ~4% have NO pattern at all, so without this they
       // render as flat white. Declarations below are all from the shader's own
@@ -359,6 +477,7 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       overlayMaskMode: int("F_OVERLAY_MASK", 0),
       overlayStrength: flt("g_fOverlayStrength", 1),
       overlayBrightness: flt("g_fOverlayBrightness", 1),
+      overlayDurability: flt("g_fOverlayDurability", 0),
       overlayScale: flt("g_flOverlayTexCoordScale", 1),
       overlayRot: flt("g_flOverlayTexCoordRotation", 0),
       overlayOffset: vec("g_vOverlayTexCoordOffset") ?? [0, 0],
@@ -395,6 +514,21 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       colorBrightness: flt("g_flColorBrightness", 1),
       pearlescent: flt("g_flPearlescentScale", 0),
       patternScale: flt("g_flPatternTexCoordScale", 1),
+      // Shader default is Default2(1, 1) — see csgo_customweapon.slang.
+      sprayBlend: ((v) => [v?.[0] ?? 1, v?.[1] ?? 1])(vec("g_vSprayBlend")) as [number, number],
+      biasSpray: int("g_bBiasSpray", 0) !== 0,
+      patternAddrH: int("g_nPatternTextureHorizontalSampling", 0),
+      patternAddrV: int("g_nPatternTextureVerticalSampling", 0),
+      // Keyed off the FLAG, never the texture's presence — same trap as
+      // g_bUseOverlay, these materials ship a placeholder mask regardless.
+      pearlMask: int("g_bUsePearlescenceMask", 0) !== 0 ? t("g_tPearlescenceMask") : undefined,
+      pearlMaskPatternUv: int("g_bPearlescenceMaskUsesPatternUVs", 0) !== 0,
+      pearlOnMetallicOnly: int("g_bPearlescentOnMetallicOnly", 0) !== 0,
+      glitterNormal: t("g_tGlitterNormal"),
+      glitterIntensity: flt("g_fGlitterIntensity", 0),
+      glitterScale: flt("g_fGlitterScale", 0),
+      glitterRainbowBalance: flt("g_fGlitterRainbowBalance", 0),
+      glitterRainbowSpread: flt("g_fGlitterRainbowSpread", 0),
       ignoreWeaponSizeScale: int("g_bIgnoreWeaponSizeScale", 0) !== 0,
       weaponLength: flt("g_flWeaponLength1", 36),
       uvScale: flt("g_flUvScale1", 1),
@@ -429,6 +563,14 @@ export interface WeaponInputs {
   color?: string; // base weapon albedo (paint-UV space)
   metalness?: string; // R=roughness G=metalness
   mag?: string; // translucent-magazine UV mask (white = mag texel)
+  /** g_tPosition — per-texel OBJECT-SPACE position in paint-UV space, and
+   *  g_tSurface — the matching object-space normal. Only the PROJECTED paint
+   *  styles (2 Spraypaint, 5 Anodized Airbrushed) use them: those build the
+   *  pattern coordinate from a triplanar projection of the position rather than
+   *  sampling paint UV at all. Extraction v3+ only, and `position` arrives as
+   *  .exr (RGBA16161616F), not .png — always take the filename from meta.json. */
+  position?: string;
+  surface?: string;
   weaponLength?: number;
   uvScale?: number;
   separateChannels?: boolean;
@@ -491,6 +633,8 @@ export function loadWeaponInputs(model: string, legacy = false): Promise<WeaponI
           color: rel(meta.textures?.color),
           metalness: rel(meta.textures?.metalness),
           mag: rel(meta.textures?.mag),
+          position: rel(meta.textures?.position),
+          surface: rel(meta.textures?.surface),
           weaponLength: meta.weaponLength,
           uvScale: meta.uvScale,
           separateChannels: !!meta.separateChannels,
@@ -644,7 +788,7 @@ uniform sampler2D tPattern, tWear, tGrunge, tMasks, tAO, tBaseColor, tBaseRM, tM
 uniform sampler2D tOverlay, tOverlayMask;
 uniform bool uHasOverlay;
 uniform int uOverlayBlend, uOverlayMaskMode;
-uniform float uOverlayStrength, uOverlayBrightness;
+uniform float uOverlayStrength, uOverlayBrightness, uOverlayDurability;
 uniform vec4 uOvX0, uOvX1;
 uniform int uOverlayUv; // 0 = mesh uv, 1 = pattern uv, 2 = the overlay's own xform
 uniform sampler2D tPaintRough, tPaintMetal;
@@ -654,11 +798,42 @@ uniform bool uHasRoughTex, uHasMetalTex;
 // g_tNormal, sampled here ONLY as a curvature signal for the geometric term
 // (most case-hardened skins ship the flat 1x1 default, which makes the edge
 // factor a constant — that is correct, not a missing texture).
+//
+// Encoding caveat: the shader declares g_tNormal as HemiOctIsoRoughness_RG_B
+// (ATI2N), so ITS .x/.y are hemi-octahedral coords, whereas the CDN hands us
+// an already-decoded RGB tangent-space map (verified: |rgb*2-1| = 1.000 +/-
+// 0.001). Identical for the flat default every shipped case-hardened skin
+// uses, so it does not bite today — but a case-hardened skin WITH a real
+// normal would need the RG re-encoded to match Valve's edge term.
 uniform sampler2D tCaseRamp, tPaintNormal;
+uniform sampler2D tPearlMask;
+uniform bool uHasPearlMask, uPearlPatternUv, uPearlOnMetallicOnly;
 uniform bool uCaseHardening;
 uniform float uChPat, uChGeo, uChRampOff;
 uniform int uColorAdjustMode;
 uniform vec4 uPatX0, uPatX1, uWearX0, uWearX1, uGrgX0, uGrgX1;
+// ---- Projected styles (2 Spraypaint, 5 Anodized Airbrushed) --------------------
+// These do NOT sample the pattern in paint-UV space. CONFIRMED from combo 293:
+// the varying every other style uses as the pattern UV is never read, and the
+// coordinate is built in the fragment shader from g_tPosition — a per-texel
+// OBJECT-SPACE position map — through a triplanar projection weighted by the
+// object-space normal in g_tSurface.
+//
+// Sampling paint UV instead smears an airbrushed graphic across the unwrap,
+// which is why Desert Eagle | Blaze had flames on its grip.
+// tSurface shares tPaintNormal's sampler unit. SAFE, and not a hack: the
+// .slang's FeatureRule requires F_CASE_HARDENING to be style 0, 7 or 8, so the
+// paint normal is never bound while a PROJECTED style (2, 5) needs the surface
+// normal — the two can never both be live. Sharing matters because a fragment
+// shader gets only MAX_TEXTURE_IMAGE_UNITS(16) samplers, and adding position,
+// surface and the pearlescence mask as three NEW units hit 17: the program then
+// fails VALIDATE_STATUS and every skin renders black.
+uniform sampler2D tPosition;
+uniform bool uHasPosition, uHasSurface, uBiasSpray;
+uniform vec2 uSprayBlend;
+// Per-axis 1.0 where the address mode is mirror-once (4): mirror about 0 then
+// clamp. The clamp half is the sampler's ClampToEdge, the mirror half is abs().
+uniform vec2 uPatMirrorOnce;
 uniform vec3 uC0, uC1, uC2, uC3;
 // Masks are per-weapon composite inputs. When they're absent the sampler falls
 // back to black, and black means "no paint here" to every mask-gated branch —
@@ -692,8 +867,85 @@ uniform bool uHasMag;    // translucent-mag UV mask present
 uniform bool uSeparateChannels;
 
 vec2 xf(vec2 uv, vec4 r0, vec4 r1) { return vec2(dot(uv, r0.xy) + r0.w, dot(uv, r1.xy) + r1.w); }
+// Valve's 17-tap Poisson disk, transcribed verbatim from combo 293's _2997.
+// The taps are averaged at 1/17 each (0.0588235296…), i.e. an unweighted BLUR of
+// the position map — not a gradient. Scaled by 0.2 at the call site, giving an
+// effective radius of ~0.00083 UV (~1.7 texels at 2k).
+const vec2 POS_BLUR[17] = vec2[17](
+  vec2(-0.00107234, -0.00400203), vec2( 0.00195312, -0.00338291),
+  vec2( 0.00400203, -0.00107234), vec2(-0.00071490, -0.00266802),
+  vec2( 0.00097656, -0.00169146), vec2( 0.00266802, -0.00071490),
+  vec2(-0.00338291, -0.00195312), vec2(-0.00169146, -0.00097656),
+  vec2( 0.00000000,  0.00000000), vec2( 0.00169146,  0.00097656),
+  vec2( 0.00338291,  0.00195312), vec2(-0.00266802,  0.00071490),
+  vec2(-0.00097656,  0.00169146), vec2( 0.00071490,  0.00266802),
+  vec2(-0.00400203,  0.00107234), vec2(-0.00195312,  0.00338291),
+  vec2( 0.00107234,  0.00400202)
+);
+
+/** The blurred object-space position, times 2 — Valve's _11428. */
+vec3 sprayPos() {
+  vec4 acc = vec4(0.0);
+  for (int i = 0; i < 17; i++) acc += texture(tPosition, vUv + POS_BLUR[i] * 0.2) * (1.0 / 17.0);
+  vec3 p = acc.xyz * 2.0;
+  // F_SPRAYPAINT_HALFTONE flips Z before every pattern sample.
+  if (uHalftone) p.z = -p.z;
+  return p;
+}
+
+/** g_bBiasSpray re-applies the sRGB ENCODE to the packed normal before
+ *  unpacking it. srgbEncode(c) >= c, so every component is pushed positive and
+ *  the negative half is compressed — with pow(abs(n), 7) weights that means only
+ *  strongly +Y/+Z faces pick up their plane, i.e. the spray comes from one
+ *  direction. */
+vec3 sprayNormal() {
+  // Without a surface map the sign is unrecoverable, but the weights use
+  // abs(), so a flat +Z normal simply falls back to the base plane.
+  if (!uHasSurface) return vec3(0.0, 0.0, 1.0);
+  vec3 s = texture(tPaintNormal, vUv).xyz;
+  if (uBiasSpray) {
+    s = mix(1.055 * pow(max(s, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055, s * 12.92,
+            vec3(lessThanEqual(s, vec3(0.0031308))));
+  }
+  return normalize(s * 2.0 - 1.0);
+}
+
+/** The three planar projections, blended by the object-space normal.
+ *  CONFIRMED (combo 293): plane A projects along X from pos.yz, B along Y from
+ *  pos.xz, C along Z from pos.yx — note C's axes are SWAPPED, it is .yx not .xy.
+ *  All three go through the same seeded pattern xform, so the seed still moves
+ *  the artwork; it just moves it in position space. */
+vec4 sprayTriplanar(vec3 p, vec3 n, vec4 x0, vec4 x1) {
+  vec4 A = texture(tPattern, mix(xf(p.yz, x0, x1), abs(xf(p.yz, x0, x1)), uPatMirrorOnce));
+  vec4 B = texture(tPattern, mix(xf(p.xz, x0, x1), abs(xf(p.xz, x0, x1)), uPatMirrorOnce));
+  vec4 C = texture(tPattern, mix(xf(p.yx, x0, x1), abs(xf(p.yx, x0, x1)), uPatMirrorOnce));
+  return mix(mix(A, B, vec4(uSprayBlend.x * pow(abs(n.y), 7.0))),
+             C, vec4(uSprayBlend.y * pow(abs(n.z), 7.0)));
+}
+
+/** One tap of the case-hardening ramp for a given pattern.r. Valve averages
+ *  five of these — see the call site. */
+vec4 chRampAt(float geo, float rampV, float pr) {
+  return texture(tCaseRamp, vec2(mix(geo * 2.0, geo + pr, uChPat), rampV));
+}
 float maxc(vec3 v) { return max(v.x, max(v.y, v.z)); }
 float mix4(vec4 v, vec3 m) { return mix(mix(mix(v.x, v.y, m.r), v.z, m.g), v.w, m.b); }
+
+// Valve's "albedo levels" renormalisation, shared by overlay blend modes 1-3.
+// g_vAlbedoLevels is a shader Expression CONSTANT, not a material parameter:
+//   float3(-(-.045), -1.4427*log(max(.0001, 1-.4)), 2-1.15) = (0.045, 0.737, 0.85)
+// The same decode turns g_vPaintAlbedoLevels into (0.045, 1.32193, 1.0) and
+// g_vMetallicPaintAlbedoLevels into (0.08, 1.32193, 1.0) — the two literals the
+// wear path below already uses. That agreement is what validates the decode.
+const vec3 OV_LEVELS = vec3(0.045, 0.737, 0.85);
+const vec3 LUMA709 = vec3(0.2125, 0.7154, 0.0721);
+const float OV_COLOR_BOOST = 63.0; // g_fColorBoostFactor, Expression(64-1)
+vec3 ovLevels(vec3 c, float maxTerm, float lumaBase) {
+  vec3 n = normalize(max(vec3(0.0003), c)) * 1.06;
+  vec3 hi = max((n * OV_LEVELS.x * 1.732) / vec3(length(n)) / vec3(dot(n, LUMA709)),
+                n * mix(OV_LEVELS.x, OV_LEVELS.z, clamp(pow(maxTerm, OV_LEVELS.y), 0.0, 1.0)));
+  return mix(vec3(OV_LEVELS.x), hi, vec3(pow(smoothstep(0.0003, OV_LEVELS.x, lumaBase), 0.5)));
+}
 
 void main() {
   vec4 ao4 = texture(tAO, vUv);       // sRGB-decoded rgb; alpha stays linear
@@ -715,7 +967,14 @@ void main() {
   // Cavity channel is packing-dependent — see WeaponInputs.separateChannels.
   // Separate-channel (HD) maps put cavity in R and leave B at 0; pre-packed
   // Source1 (legacy) maps put it in B.
-  float cavity = uHasAo ? (uSeparateChannels ? ao4.r : ao4.b) : CAVITY_NO_MAP;
+  float cavityRaw = uHasAo ? (uSeparateChannels ? ao4.r : ao4.b) : CAVITY_NO_MAP;
+  // CONFIRMED (combos 293, 1447 and 1529 all use _4306 = pow(ao.x,1.5)*0.96 as
+  // THE cavity for the whole shader — wear curve, grunge blend, patina gate,
+  // grime term). We were applying this form only locally inside the
+  // case-hardening block and feeding raw ao.r everywhere else, which made
+  // cavity ~2.5x too large (0.18 vs 0.073 measured on the ak47) and so
+  // over-stripped paint at every float.
+  float cavity = uSeparateChannels ? pow(cavityRaw, 1.5) * 0.96 : cavityRaw;
   float flAo = uHasAo ? ao4.g : 1.0;
   // noPaint = the AO map's alpha: the parts that take no paint (sights, muzzle
   // brake, trigger, rails), which stay bare metal at every float.
@@ -760,8 +1019,43 @@ void main() {
   float magT = uHasMag ? texture(tMagMask, vUv).r : 0.0;
   float wearTex = texture(tWear, xf(vUv, uWearX0, uWearX1)).r;
   vec4 grungeRaw = texture(tGrunge, xf(vUv, uGrgX0, uGrgX1));
+  // patUv is still needed even on the projected styles: the overlay can be told
+  // to ride the pattern UV (uOverlayUv == 1), and the paint rough/metal textures
+  // sample through it.
   vec2 patUv = xf(vUv, uPatX0, uPatX1);
-  vec4 pattern = texture(tPattern, patUv);
+  bool projected = (uStyle == 2 || uStyle == 5) && uHasPosition;
+  vec4 pattern = projected
+    ? sprayTriplanar(sprayPos(), sprayNormal(), uPatX0, uPatX1)
+    : texture(tPattern, patUv);
+
+  // ---- Overlay sample + mask gate ----------------------------------------------
+  // Sampled HERE, above the wear curve, because the wear curve depends on it:
+  // g_fOverlayDurability is mixed in by the overlay's own masked alpha, so the
+  // paint under an overlay wears at a different rate. Blending happens later.
+  //
+  // Gates CONFIRMED from three decompiled combos — 576 (style 0), 577 (style 1,
+  // the only one carrying mode 7) and 582 (style 6, the only one carrying mode
+  // 8). Each is an ORDERED priority split, not the bare channel read this had.
+  vec2 ovUv = uOverlayUv == 2 ? xf(vUv, uOvX0, uOvX1) : (uOverlayUv == 1 ? patUv : vUv);
+  vec4 ov = texture(tOverlay, ovUv);
+  float ovGate;
+  if (uOverlayMaskMode == 1)      ovGate = 1.0 - maxc(masks.rgb);
+  else if (uOverlayMaskMode == 2) ovGate = masks.r * (1.0 - max(masks.g, masks.b));
+  else if (uOverlayMaskMode == 3) ovGate = masks.g * (1.0 - masks.b);
+  else if (uOverlayMaskMode == 4) ovGate = masks.b;
+  else if (uOverlayMaskMode == 5) ovGate = maxc(masks.rgb);
+  // 7 "Pattern" is NOT pattern.a — it is a masks split, same family as 1-5.
+  else if (uOverlayMaskMode == 7) ovGate = 1.0 - max(masks.g, masks.b);
+  // 8 "Dedicated" samples its mask at the BASE uv, never the overlay's.
+  else if (uOverlayMaskMode == 8) ovGate = texture(tOverlayMask, vUv).r;
+  // 0 "None" and 6 "Paint" have no case in ANY combo: both leave alpha alone.
+  // 6 previously used 1 - noPaint, which masked the overlay off hardware it is
+  // supposed to cover.
+  else                            ovGate = 1.0;
+  // Valve keeps these two separate and they are not interchangeable: the wear
+  // curve uses the masked alpha PRE-strength, the blend uses it POST-strength.
+  float ovA = uHasOverlay ? ov.a * ovGate : 0.0;
+  float oa = clamp(ovA * uOverlayStrength, 0.0, 1.0);
 
   // ---- Case hardening ----------------------------------------------------------
   // CONFIRMED, transcribed from the decompiled S_CASE_HARDENING=1 combos of
@@ -775,32 +1069,89 @@ void main() {
   // 85/86/87) — they tint the ramp, they do not carry the blue/gold.
   //
   // The geometric term reads cavity as pow(cavity, 1.5) * 0.96, which is the
-  // SEPARATE_CHANNEL_INPUTS form of cavity in Valve's shader. Applied locally
-  // rather than to the shared cavity above on purpose: that variable feeds
-  // the wear curve, which was measured against in-game captures in its current
-  // form, and changing it would move every skin's wear, not just these.
+  // SEPARATE_CHANNEL_INPUTS form of cavity in Valve's shader. This used to be
+  // applied LOCALLY here, because the shared cavity was the raw channel — but
+  // the decompile shows _4306 = pow(ao.x,1.5)*0.96 is the cavity for the whole
+  // shader, so it is now applied once at the source and this block just uses it.
+  // Applying it twice (which this line did briefly) squares the exponent and
+  // collapses geo, which drags rampU into the wrong column of the ramp. Only
+  // bites GeometricInfluence > 0 — AXIA is 0 and was unaffected, Aphrodite is 1.
   vec4 chRamp = vec4(1.0);
+  vec3 chBase = pattern.rgb; // ramp gated by masks.g; pattern albedo elsewhere
   if (uCaseHardening) {
-    float chCavity = uSeparateChannels ? pow(cavity, 1.5) * 0.96 : cavity;
-    // min(n, 1-n) is distance-from-extreme per channel; the inverted smoothstep
-    // (edge0 > edge1) turns that into "how close to an edge". Flat default
-    // normal (0.502) => 1.124, i.e. a constant, which is the intended result
-    // for every skin that does not author a paint normal.
+    float chCavity = cavity;
+    // min(n, 1-n) is distance-from-extreme per channel, turned into "how close
+    // to an edge" by a DESCENDING ramp. Written as smoothstep(0.85, 0.20, x)
+    // this was undefined behaviour — the GLSL spec requires edge0 < edge1, so
+    // the GPU was free to return anything. Same trap this file already fixed
+    // once in paintEdgeLayers.
+    //
+    // Valve's own decompiled combo 1529 emits the descending form too, and in
+    // practice every driver evaluates it as clamp((x-e0)/(e1-e0)) — which is
+    // EXACTLY this ascending rewrite (both give 0.562 at x=0.498, hence the
+    // 1.124 the old comment quoted). So this is a well-defined no-op, kept
+    // because relying on UB is not worth the risk.
     vec4 nrm = texture(tPaintNormal, vUv);
-    vec4 edges = smoothstep(vec4(0.85), vec4(0.20), min(nrm, vec4(1.0) - nrm));
+    vec4 edges = vec4(1.0) - smoothstep(vec4(0.20), vec4(0.85), min(nrm, vec4(1.0) - nrm));
     float geo = mix(0.5, pow(chCavity, 0.85), uChGeo)
               * mix(1.0, flAo * (min(edges.x, edges.y) * 2.0), uChGeo);
     // pattern.r drives the colour progression, pattern.g the ramp row.
-    float rampU = mix(geo * 2.0, geo + pattern.r, uChPat);
     float rampV = max(pattern.g * uChPat, (1.0 - flAo) * 0.2 * uChGeo) + uChRampOff;
-    chRamp = texture(tCaseRamp, vec2(rampU, rampV));
+    // CONFIRMED (combo 1529): the ramp is a 5-TAP AVERAGE — the centre plus the
+    // four diagonal neighbours at +/-1/2048 in pattern UV, each fed through the
+    // ramp and averaged. It supersamples the lookup, which matters because
+    // pattern.r -> rampU is a nonlinear indirection that aliases badly on a
+    // single tap. We were taking one tap.
+    // STYLE 8 ONLY, and the gate matters. Combo 1529 (style 8) averages FIVE
+    // ramp taps — centre plus four diagonal neighbours at +/-1/2048 in pattern
+    // UV — which supersamples a lookup that aliases badly, because pattern.r ->
+    // rampU is a nonlinear indirection. Combo 1447 (style 7) takes ONE tap.
+    const float T = 0.00048828125; // 1/2048, Valve's literal tap offset
+    chRamp = uStyle == 8
+      ? (chRampAt(geo, rampV, pattern.r)
+       + chRampAt(geo, rampV, texture(tPattern, patUv + vec2(T, T)).r)
+       + chRampAt(geo, rampV, texture(tPattern, patUv + vec2(-T, -T)).r)
+       + chRampAt(geo, rampV, texture(tPattern, patUv + vec2(-T, T)).r)
+       + chRampAt(geo, rampV, texture(tPattern, patUv + vec2(T, -T)).r)) * 0.2
+      : chRampAt(geo, rampV, pattern.r);
+    // CONFIRMED (combo 1529, _6449 = mix(pattern, rampAvg, masks.g)): on style 8
+    // the ramp does NOT colour the whole weapon — it applies only where masks.g,
+    // and everywhere else the paint's own albedo texture shows through. That is
+    // why Glock | AXIA was blue end to end: its masks.g is just the frame
+    // panels, and the slide is meant to keep the pattern's own steel (which then
+    // reads as polished metal via the masks.r branch in the rough/metal pass).
+    //
+    // Style 7 has NO such mix — combo 1447 uses the ramp everywhere. Applying it
+    // there regressed Deagle | Heat Treated to the exact green-and-magenta
+    // failure this file was built to fix: its masks.g is ~0, so the whole gun
+    // fell through to the raw data texture.
+    chBase = uStyle == 8 ? mix(pattern.rgb, chRamp.rgb, masks.g) : chRamp.rgb;
   }
 
   float dur = mix4(uDurability, masks.rgb);
 
   // Wear-through signal (CS:GO structure + CS2 durability/softness).
-  float blend = noPaint + wearTex * cavity;
+  // CONFIRMED, and the remap is GENERIC — combo 293 (style 5) and combo 1529
+  // (style 8) carry the identical expression, so this is not a style-8 quirk:
+  //   wearTex * mix(smoothstep(0, 0.72, pow(cav, 1.3)),
+  //                 smoothstep(0, 0.40, cav), pow(wear, 1.2))
+  // We multiplied wearTex by RAW cavity. At Factory New pow(wear,1.2) is 0.027,
+  // so this is essentially smoothstep(0, 0.72, pow(cav,1.3)) — which for the
+  // ak47's cavity of 0.073 is 0.005, against our 0.18. We were stripping ~35x
+  // too hard at FN, which is what dragged the AK-47's factory wood-and-metal
+  // through AK-47 | Aphrodite's marble.
+  float cavWear = mix(smoothstep(0.0, 0.72, pow(cavity, 1.3)),
+                      smoothstep(0.0, 0.40, cavity),
+                      pow(uWearAmt, 1.2));
+  // The min(noPaint, 1 - masks.r) clamp is style-8 ONLY — combo 293 uses plain
+  // noPaint, so this must not be applied to the projected styles.
+  float blend = (uStyle == 8 ? min(noPaint, 1.0 - masks.r) : noPaint) + wearTex * cavWear;
   blend *= uWearAmt * 6.0 + 1.0;
+  // Paint under an overlay wears at its own rate. CONFIRMED: the factor is
+  // mixed in by the PRE-strength masked alpha, and sits between the wear
+  // multiplier and the durability multiply.
+  float ovWearRaw = wearTex * cavity * (uWearAmt * 6.0 + 1.0) * uOverlayDurability;
+  if (uHasOverlay) blend *= mix(1.0, uOverlayDurability, ovA);
 
   if (uStyle == 1 || uStyle == 4 || uStyle == 6 || uStyle == 8) {
     float cuttable = 1.0;
@@ -845,10 +1196,31 @@ void main() {
     // Antiqued: paint everywhere the mask says metal, regardless of float.
     blend = 1.0 - step(noPaint, 0.996) * masks.r;
   } else if (uStyle == 8) {
-    blend = mix(smoothstep(0.58 - soft, 0.68 + soft, blend), blend, masks.r);
-    blend = mix(blend, 1.0 - step(preBlend, 0.996), masks.r);
+    // CONFIRMED (combo 1529):
+    //   bool bBare = masks.r > 0.99;
+    //   blend = mix(smoothstep(0.58 - soft, 0.68 + soft, raw), raw, float(bBare));
+    // Two things were wrong here. The masks.r weight is a HARD > 0.99 test, not
+    // a smooth lerp; and the follow-up line
+    //   blend = mix(blend, 1.0 - step(preBlend, 0.996), masks.r);
+    // does not exist in Valve's shader at all — it was invented, and it is what
+    // forced the masks.r zone to read as painted. My earlier
+    // max(smoothstep(...), masks.r) was equally invented: it produced a
+    // roughly-right black slide but by sending blend to 1, which drives
+    // metalness to the weapon's baseRM (0.07 on the glock) and rendered
+    // polished steel as flat grey dielectric. Metalness is handled by the
+    // masks.r branch in the rough/metal pass instead.
+    blend = mix(smoothstep(0.58 - soft, 0.68 + soft, blend), blend, float(masks.r > 0.99));
   } else {
     blend = smoothstep(0.58 - soft, 0.68 + soft, blend);
+  }
+
+  // The overlay's own wear-through, on the same curve but WITHOUT noPaint and
+  // WITHOUT the durability multiply — it describes the overlay eroding, not the
+  // paint. Drives two things: mask mode 0 lets the overlay pull the paint's
+  // wear forward, and blend mode 4 "Layer" fades the overlay out by it.
+  float ovWear = smoothstep(0.58 - soft, 0.68 + soft, ovWearRaw);
+  if (uHasOverlay && uOverlayMaskMode == 0) {
+    blend = max(0.0, mix(blend, min(blend, ovWear), oa));
   }
 
   // Anodized family: chipped edges expose bare metal, paint region = masks.r.
@@ -884,11 +1256,25 @@ void main() {
     return;
   }
 
+  // ---- SFX mask ------------------------------------------------------------
+  // Computed for BOTH outputs so a debug probe and the real write can never
+  // disagree. See the write in the rough/metal branch for the derivation.
+  float sfx;
+  if (uHasPearlMask) {
+    float t = (1.0 - blend) * texture(tPearlMask, uPearlPatternUv ? patUv : vUv).r;
+    sfx = uPearlPatternUv ? t : t * t;
+  } else {
+    sfx = 1.0 - noPaint;
+  }
+  if (uPearlOnMetallicOnly) sfx *= masks.r;
+
   // ---- Rough/metal output ------------------------------------------------------
   if (uMode == 1) {
     float roughPaint = uPerColorRough ? mix4(uRoughPerColor, masks.rgb) : uPaintRough;
     if (uHasRoughTex) roughPaint = texture(tPaintRough, patUv).r;
     float metalPaint = uPerColorMetal ? mix4(uMetalPerColor, masks.rgb) : uPaintMetal;
+    float chMetal = 0.0;
+    bool hasChMetal = false;
     if (uHasMetalTex) metalPaint = texture(tPaintMetal, patUv).r;
     if (uStyle == 3 || uStyle == 4 || uStyle == 5) {
       // anodized dye is metallic; chipped edges are bare rough aluminum
@@ -902,17 +1288,62 @@ void main() {
       // by grunge as wear rises and driven to 1 wherever patina takes over.
       // Without this a case-hardened gun renders with the paint's flat
       // roughness and loses the polished-steel read the ramp colours imply.
+      // Same two terms as the albedo path, which carried the same fabricated
+      // formulas. Kept in sync deliberately — Valve computes each once and
+      // feeds both outputs, so a divergence here is always a bug.
       float chGrungeLum = dot(grunge.rgb, vec3(0.2125, 0.7154, 0.0721));
-      float chOil = smoothstep(0.0, 0.15, clamp(cavity * flAo - uWearAmt * 0.1, 0.0, 1.0) - clamp(grungeRaw.r * grungeRaw.g * grungeRaw.b, 0.0, 1.0) * 0.23 + 0.08);
-      float chPatina = smoothstep(0.1, 0.2, wearTex * flAo * cavity * cavity * uWearAmt);
-      metalPaint = mix(chRamp.a * mix(1.0, sqrt(max(chOil * grunge.a * chGrungeLum, 0.0)), uWearAmt), 1.0, chPatina);
+      float chGrunge = clamp(grungeRaw.r * grungeRaw.g * grungeRaw.b, 0.0, 1.0);
+      float chGrimeX = clamp(pow(cavity, 1.5) * 11.52 * flAo - uWearAmt * chGrunge * 2.0, 0.0, 1.0);
+      float chOil = 1.0 - (1.0 - smoothstep(0.0, max(1e-5, 0.5 * uWearAmt), chGrimeX)) * uWearAmt;
+      float chPatina = smoothstep(0.2, 0.6,
+          (wearTex * flAo) * (wearTex * smoothstep(0.2, 0.3, cavity)) * uWearAmt);
+      // CONFIRMED: the metalness base is mix(1.0, chAlpha, masks.g), NOT the raw
+      // ramp alpha — where masks.g is 0 (the whole bare-metal zone) Valve's
+      // value is exactly 1.0.
+      float chAlpha = uStyle == 8 ? mix(pattern.a, chRamp.a, masks.g) : chRamp.a;
+      chMetal = mix(mix(1.0, chAlpha, masks.g) * mix(1.0, sqrt(max(chOil * grunge.a * chGrungeLum, 0.0)), uWearAmt), 1.0, chPatina);
+      hasChMetal = true;
     }
     vec4 baseRM = texture(tBaseRM, vUv);
     float wornRough = uHasBaseRM ? baseRM.r : 0.75; // bare metal is fairly rough
     float wornMetal = uHasBaseRM ? baseRM.g : metalPaint;
     float rough = mix(min(1.0, roughPaint + (1.0 - grunge.a) * uWearAmt * uWearAmt * 0.5), wornRough, blend);
-    float metal = mix(metalPaint, wornMetal, blend);
-    outColor = vec4(0.0, rough, metal, 1.0);
+    // CONFIRMED (combo 1529): the case-hardening metalness is selected by
+    // masks.r: mix(mix(paintMetal, baseRM.y, blend), chMetal, masks.r).
+    // OUTSIDE masks.r it is the paint's OWN metalness, not the ramp's.
+    //
+    // We were applying chMetal everywhere, which drove Glock | AXIA's blue frame
+    // (masks.g, so masks.r = 0) to metalness ~1 because its ramp alpha is 255.
+    // A fully metallic surface has no diffuse, so the frame rendered dark and
+    // desaturated: measured (22,103,140) against the official render's
+    // (44,153,193). The frame is a dielectric glitter paint, not polished metal.
+    // metalPaint, NOT the uPaintMetal scalar: combo 1529 carries no
+    // S_METALNESS_TEXTURE so its g_flPaintMetalness IS the paint metalness, but
+    // AXIA's real combo has one, and metalPaint already folds it in. Using the
+    // scalar (0) stripped the artist's per-texel metalness and turned the grip
+    // and magazine floorplate from black polymer into light grey.
+    float metal = hasChMetal
+      ? mix(mix(metalPaint, wornMetal, blend), chMetal, masks.r)
+      : mix(metalPaint, wornMetal, blend);
+    // ---- SFX mask -----------------------------------------------------------
+    // CONFIRMED (combo 1529 lines 119-144, and the weapon shader reads it back
+    // as g_tMetalness.z). The composite does NOT shade glitter, pearlescence or
+    // iridescence — all three are RUNTIME weapon-shader effects, and their
+    // uniforms (g_fGlitterIntensity, g_flPearlescentScale, ...) are not even in
+    // this shader's constant buffer. What the composite owes them is this gate.
+    //
+    //   sfx = (1 - blend) * pearlMask(patternUV or meshUV)
+    //   ...SQUARED in the mesh-UV branch only — the asymmetry is real, verified
+    //   line by line, not a transcription slip.
+    //   if (g_bPearlescentOnMetallicOnly) sfx *= masks.r
+    // With no mask the ch7 default is plain paint coverage, 1 - noPaint.
+    //
+    // Valve writes it to .z and sRGB-encodes the whole rgb on the way out
+    // because THEIR rough/metal target is sRGB-formatted. Ours is linear
+    // (makeRT(false)) and three reads .g/.b for roughness/metalness, so we put
+    // it in the free .r and skip the encode — copying that 1/12.92 scale would
+    // crush the mask.
+    outColor = vec4(sfx, rough, metal, 1.0);
     return;
   }
 
@@ -954,13 +1385,37 @@ void main() {
     // pattern ONLY when case hardening is off — otherwise it is the ramp,
     // pre-scaled by colour brightness. Everything else here is shared.
     vec3 patCol = uCaseHardening
-      ? mix(chRamp.rgb, chRamp.rgb * uColorBrightness, max(masks.r, float(uColorAdjustMode)))
+      ? mix(chBase, chBase * uColorBrightness, max(masks.r, float(uColorAdjustMode)))
       : pattern.rgb;
-    float flGrunge = grungeRaw.r * grungeRaw.g * grungeRaw.b;
-    float patinaBlend = smoothstep(0.1, 0.2, wearTex * flAo * cavity * cavity * uWearAmt);
-    // The grunge term carries a 0.23 scale that this line used to drop, which
-    // pushed oilRub dark far too early. CONFIRMED from the same decompile.
-    float oilRub = smoothstep(0.0, 0.15, clamp(cavity * flAo - uWearAmt * 0.1, 0.0, 1.0) - clamp(flGrunge, 0.0, 1.0) * 0.23 + 0.08);
+    float flGrunge = clamp(grungeRaw.r * grungeRaw.g * grungeRaw.b, 0.0, 1.0);
+    // CONFIRMED (combos 1529 and 1447, where _6896/_5609/_8353 are byte-identical
+    // — so this is shared by styles 7 and 8):
+    //   _6896 = smoothstep(0.5*wear, 0.0, clamp(pow(cav,1.5)*11.52*flAo
+    //                                          - wear*grunge*2.0, 0, 1)) * wear
+    //   _5609 = 1 - _6896          <- what our oilRub stands for
+    //
+    // The old line here was fabricated, and its comment claimed the 0.23 was
+    // "CONFIRMED from the same decompile". It is not: 0.23, +0.08 and the
+    // -wear*0.1 term appear ZERO times in either combo (grepped). Four errors
+    // in one expression — an ascending smoothstep where Valve's descends, fixed
+    // edges where Valve's edge0 tracks wear, a missing 11.52x cavity
+    // amplification, and critically a missing trailing multiply by wearAmt.
+    //
+    // That last one is the whole AK-47 | Aphrodite bug. Valve HARD-CAPS the
+    // grime at wearAmt, so at Factory New (0.05) brown can contribute at most
+    // 5%. Ours was unbounded on [0,1] and measured mean 0.60 / p10 0.04 — i.e.
+    // ~40% brown across the gun and near-total brown in the darkest decile,
+    // which is exactly the olive/brown cast over what should be white marble.
+    float grimeX = clamp(pow(cavity, 1.5) * 11.52 * flAo - uWearAmt * flGrunge * 2.0, 0.0, 1.0);
+    // Valve's descending smoothstep(0.5*wear, 0, x), written ascending so it is
+    // defined; max() guards the degenerate edge pair at wear 0.
+    float grime = (1.0 - smoothstep(0.0, max(1e-5, 0.5 * uWearAmt), grimeX)) * uWearAmt;
+    float oilRub = 1.0 - grime;
+    // CONFIRMED: wearTex is SQUARED (not cavity), the cavity term is a hard
+    // smoothstep(0.2, 0.3) gate, and the outer edges are 0.2/0.6 — this read
+    // smoothstep(0.1, 0.2, wearTex*flAo*cavity*cavity*wear).
+    float patinaBlend = smoothstep(0.2, 0.6,
+        (wearTex * flAo) * (wearTex * smoothstep(0.2, 0.3, cavity)) * uWearAmt);
     vec3 cPatina = mix(uC1, uC2, uWearAmt);
     vec3 cOilRub = mix(uC1, uC3, sqrt(uWearAmt));
     cPatina = mix(cOilRub, cPatina, oilRub) * patCol;
@@ -991,29 +1446,35 @@ void main() {
   // one worth checking against a real .vcs decompile, but it now matches the
   // reference art instead of contradicting it.
   if (uHasOverlay) {
-    vec2 ovUv = uOverlayUv == 2 ? xf(vUv, uOvX0, uOvX1) : (uOverlayUv == 1 ? patUv : vUv);
-    vec4 ov = texture(tOverlay, ovUv);
-    float gate;
-    if (uOverlayMaskMode == 0)      gate = 1.0;
-    else if (uOverlayMaskMode == 1) gate = (1.0 - masks.r) * (1.0 - masks.g) * (1.0 - masks.b);
-    else if (uOverlayMaskMode == 2) gate = masks.r;
-    else if (uOverlayMaskMode == 3) gate = masks.g;
-    else if (uOverlayMaskMode == 4) gate = masks.b;
-    else if (uOverlayMaskMode == 5) gate = max(masks.r, max(masks.g, masks.b));
-    else if (uOverlayMaskMode == 6) gate = 1.0 - noPaint;
-    else if (uOverlayMaskMode == 7) gate = pattern.a;
-    else                            gate = texture(tOverlayMask, ovUv).r;
-    float oa = clamp(gate * ov.a * uOverlayStrength, 0.0, 1.0);
+    // ov / ovUv / oa are computed above the wear curve — see the overlay
+    // sample block, which the wear curve depends on.
+    // "Layer" erodes the overlay itself as the surface wears.
+    if (uOverlayBlend == 4) oa *= clamp(1.0 - ovWear, 0.0, 1.0);
     vec3 src = ov.rgb * uOverlayBrightness;
     vec3 blended;
-    if (uOverlayBlend == 2) blended = cPaint * src;
-    else if (uOverlayBlend == 3) blended = cPaint + src;
-    else if (uOverlayBlend == 1) {
-      // W3C "luminosity": keep the paint's colour, take the overlay's light/dark.
-      float lumB = dot(cPaint, vec3(0.3, 0.59, 0.11));
-      float lumS = dot(src, vec3(0.3, 0.59, 0.11));
-      blended = clamp(cPaint + (lumS - lumB), 0.0, 1.0);
-    } else blended = src;
+    if (uOverlayBlend == 1) {
+      // "Color" is NOT a W3C colour/luminosity blend — that was the standing
+      // guess and it is wrong. It is a MULTIPLY fed through ovLevels, differing
+      // from mode 2 only in that the two scalar terms are taken from the paint
+      // rather than from the product.
+      blended = ovLevels(src * cPaint, maxc(cPaint), dot(clamp(cPaint, 0.0, 1.0), LUMA709));
+    } else if (uOverlayBlend == 2) {
+      vec3 prod = cPaint * src;
+      blended = ovLevels(prod, maxc(prod), dot(clamp(prod, 0.0, 1.0), LUMA709));
+    } else if (uOverlayBlend == 3) {
+      // Add carries an extra colour-boost term the other modes do not.
+      vec3 sum = cPaint + src;
+      float lum = dot(clamp(sum * 2.0, 0.0, 1.0), LUMA709);
+      vec3 n = normalize(max(vec3(0.0003), sum)) * 1.06;
+      vec3 hi = max((n * OV_LEVELS.x * 1.732) / vec3(length(n)) / vec3(dot(n, LUMA709)),
+                    n * mix(OV_LEVELS.x, OV_LEVELS.z, clamp(pow(maxc(sum) * 2.0, OV_LEVELS.y), 0.0, 1.0)));
+      hi = mix(hi, min(vec3(OV_LEVELS.z), hi + vec3(lum) * 2.0), 1.0 / OV_COLOR_BOOST);
+      blended = mix(vec3(OV_LEVELS.x), hi, vec3(pow(smoothstep(0.0003, OV_LEVELS.x, lum), 0.5)));
+    } else {
+      // 0 "Normal" and 4 "Layer" are the SAME straight lerp here; Layer differs
+      // only in the alpha erosion applied above.
+      blended = src;
+    }
     cPaint = mix(cPaint, blended, oa);
   }
 
@@ -1046,15 +1507,62 @@ void main() {
 // One shared cache across composites; colorSpace flags follow the shader's
 // SrgbRead() declarations so the GPU linearizes exactly what the game does.
 const texCache = new Map<string, Promise<import("three").Texture | null>>();
-function loadTex(THREE: THREE, url: string, opts: { srgb: boolean; wrap: boolean }): Promise<import("three").Texture | null> {
-  const key = `${url}|${opts.srgb ? "s" : "l"}|${opts.wrap ? "w" : "c"}`;
+
+/** g_tPosition ships as RGBA16161616F, which the extractor hands us as .exr —
+ *  TextureLoader cannot read it. Loaded through three's EXRLoader and sampled
+ *  linear/clamped, matching Valve's g_sTrilinearClamp. Kept in the same cache so
+ *  one weapon's position map is fetched once per session. */
+function loadExr(THREE: THREE, url: string): Promise<import("three").Texture | null> {
+  const key = `${url}|exr`;
+  let cached = texCache.get(key);
+  if (!cached) {
+    cached = import("three/examples/jsm/loaders/EXRLoader.js")
+      .then((m) => new m.EXRLoader().loadAsync(url))
+      .then((t) => {
+        t.colorSpace = THREE.NoColorSpace; // position data, never colour
+        t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+        t.minFilter = t.magFilter = THREE.LinearFilter;
+        t.generateMipmaps = false;
+        t.flipY = false;
+        return t;
+      })
+      .catch(() => {
+        failedUrls.add(url);
+        return null;
+      });
+    texCache.set(key, cached);
+  }
+  return cached;
+}
+/** Source 2 RsTextureAddressMode_t -> three wrap constant. Mirror-once (4) has
+ *  no three equivalent; ClampToEdge plus an abs() on the coordinate reproduces
+ *  it, and the shader does the abs() half. Border (3) is unused by any paint. */
+function wrapForAddr(THREE: THREE, addr: number) {
+  if (addr === 1) return THREE.MirroredRepeatWrapping;
+  if (addr === 2 || addr === 4) return THREE.ClampToEdgeWrapping;
+  return THREE.RepeatWrapping;
+}
+
+function loadTex(
+  THREE: THREE,
+  url: string,
+  opts: { srgb: boolean; wrap: boolean; addr?: [number, number] },
+): Promise<import("three").Texture | null> {
+  // Address mode is part of the key: paints share pattern textures and disagree.
+  const akey = opts.addr ? `a${opts.addr[0]}_${opts.addr[1]}` : "";
+  const key = `${url}|${opts.srgb ? "s" : "l"}|${opts.wrap ? "w" : "c"}${akey}`;
   let cached = texCache.get(key);
   if (!cached) {
     cached = new THREE.TextureLoader()
       .loadAsync(url)
       .then((t) => {
         t.colorSpace = opts.srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-        t.wrapS = t.wrapT = opts.wrap ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+        if (opts.addr) {
+          t.wrapS = wrapForAddr(THREE, opts.addr[0]);
+          t.wrapT = wrapForAddr(THREE, opts.addr[1]);
+        } else {
+          t.wrapS = t.wrapT = opts.wrap ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+        }
         t.flipY = false;
         return t;
       })
@@ -1154,7 +1662,7 @@ export async function compositePaint(
   const wear = Math.min(Math.max(opts.wear, 0), 1);
   const seed = Math.max(0, Math.trunc(opts.seed));
   const wkey = opts.weapon ? (opts.weapon.color ?? "w") : "";
-  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}|${def.caseHardening ? `ch${def.caseHardeningRamp ?? "-"}` : ""}`;
+  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}|${def.caseHardening ? `ch${def.caseHardeningRamp ?? "-"}${def.chRampOffset}` : ""}|a${def.patternAddrH}_${def.patternAddrV}`;
   const cache = cacheFor(renderer);
   const hit = cache.get(key);
   if (hit) {
@@ -1171,14 +1679,42 @@ export async function compositePaint(
   // Case hardening is the exception inside those styles: g_tPattern declares
   // SrgbRead(false) there because it is a lookup coordinate, not a colour.
   // Decoding it as sRGB bends the ramp lookup and shifts every colour band.
-  const patternIsColor = (def.style === 6 || def.style === 7 || def.style === 8) && !def.caseHardening;
+  // Whether g_tPattern is ARTWORK (sRGB) or a data texture (linear).
+  //
+  // Case hardening splits by style, because the two styles use the pattern
+  // differently. On style 8 the pattern IS the albedo wherever masks.g is 0
+  // (combo 1529), so it must decode as sRGB — read linear it is far too bright,
+  // and Glock | AXIA's slide rendered as white chrome instead of dark steel.
+  // On style 7 the ramp supplies every pixel (combo 1447 has no such mix) and
+  // the pattern is purely a lookup coordinate, so it stays LINEAR — decoding it
+  // as colour bends the ramp lookup, and Deagle | Heat Treated is measured
+  // against the linear form.
+  const patternIsColor =
+    def.style === 6 || def.style === 8 || (def.style === 7 && !def.caseHardening);
   const urlOf = async (p?: string) => (p ? await paintTextureUrl(p) : null);
   const magUrl = opts.weapon?.mag;
-  const [patternUrl, wearUrl, grungeUrl, masksUrl, aoUrl, colorUrl, rmUrl, roughTexUrl, metalTexUrl, overlayUrl, overlayMaskUrl, caseRampUrl, paintNormalUrl] = await Promise.all([
+  const [patternUrl, wearUrl, grungeUrl, masksUrl, aoUrl, colorUrl, rmUrl, roughTexUrl, metalTexUrl, overlayUrl, overlayMaskUrl, caseRampUrl, paintNormalUrl, pearlMaskUrl] = await Promise.all([
     urlOf(def.pattern),
     urlOf(def.wearMask),
     urlOf(def.grunge),
-    opts.weapon?.masks ?? urlOf(def.masks),
+    // A CASE-HARDENED skin that authors its own mask WINS over the weapon's
+    // extracted one. The weapon mask is generic (which parts of this gun are
+    // metal/polymer/grip); a g_tPaintByNumberMasks is drawn for THIS finish and
+    // says which parts the finish leaves factory — which is what the style-8
+    // zone branch keys off. With the generic mask, Glock | AXIA's black slide
+    // and floorplate came out blue along with everything else.
+    //
+    // Scoped tightly (case hardening AND style 8) rather than applied to every
+    // skin-authored mask — 269 of 1479 materials ship one — because widening it
+    // moves skins that were measured against the weapon mask:
+    //   - all skin-authored masks: Five-SeveN | Autumn Thicket (style 0) fell
+    //     from sat 9.8 to 6.7, under the rig's grey floor.
+    //   - case hardening alone: Deagle | Heat Treated (style 7) drifted
+    //     12.5 -> 13.6 for no established reason.
+    // Style 8 + case hardening is exactly the set this is evidenced for.
+    (def.masksSkinSpecific && def.caseHardening && def.style === 8 ? await urlOf(def.masks) : null) ??
+      opts.weapon?.masks ??
+      (await urlOf(def.masks)),
     opts.weapon?.ao ?? urlOf(def.ao),
     opts.weapon?.color ?? urlOf(def.baseColor),
     opts.weapon?.metalness ?? urlOf(def.baseRM),
@@ -1188,10 +1724,25 @@ export async function compositePaint(
     urlOf(def.overlayMask),
     urlOf(def.caseHardening ? def.caseHardeningRamp : undefined),
     urlOf(def.caseHardening ? def.normal : undefined),
+    urlOf(def.pearlMask),
   ]);
   const magTex = magUrl ? await loadTex(THREE, magUrl, { srgb: false, wrap: false }) : null;
-  const [pattern, wearT, grunge, masks, ao, baseColor, baseRM, roughTex, metalTex, overlayTex, overlayMaskTex, caseRampTex, paintNormalTex] = await Promise.all([
-    patternUrl ? loadTex(THREE, patternUrl, { srgb: patternIsColor, wrap: true }) : null,
+  // Projected styles only — no point fetching a 1MB EXR for the other seven.
+  const wantsProjection = def.style === 2 || def.style === 5;
+  const posTex = wantsProjection && opts.weapon?.position ? await loadExr(THREE, opts.weapon.position) : null;
+  const surfTex =
+    wantsProjection && opts.weapon?.surface
+      ? await loadTex(THREE, opts.weapon.surface, { srgb: false, wrap: false })
+      : null;
+  const [pattern, wearT, grunge, masks, ao, baseColor, baseRM, roughTex, metalTex, overlayTex, overlayMaskTex, caseRampTex, paintNormalTex, pearlMaskTex] = await Promise.all([
+    // Address mode applies ONLY to the projected styles — see PaintDef.
+    patternUrl
+      ? loadTex(THREE, patternUrl, {
+          srgb: patternIsColor,
+          wrap: true,
+          addr: wantsProjection ? [def.patternAddrH, def.patternAddrV] : undefined,
+        })
+      : null,
     wearUrl ? loadTex(THREE, wearUrl, { srgb: false, wrap: true }) : null,
     grungeUrl ? loadTex(THREE, grungeUrl, { srgb: true, wrap: true }) : null,
     masksUrl ? loadTex(THREE, masksUrl, { srgb: false, wrap: false }) : null,
@@ -1207,6 +1758,8 @@ export async function compositePaint(
     // g_sTrilinearClamp — the clamp matters, the ramp must not wrap.
     caseRampUrl ? loadTex(THREE, caseRampUrl, { srgb: true, wrap: false }) : null,
     paintNormalUrl ? loadTex(THREE, paintNormalUrl, { srgb: false, wrap: true }) : null,
+    // g_tPearlescenceMask declares SrgbRead(false) and samples g_sTrilinearWrap.
+    pearlMaskUrl ? loadTex(THREE, pearlMaskUrl, { srgb: false, wrap: true }) : null,
   ]);
 
   // Solid-style paints legitimately have no pattern; anything else without
@@ -1218,14 +1771,33 @@ export async function compositePaint(
   const weaponLength = opts.weapon?.weaponLength ?? def.weaponLength;
   const uvScale = opts.weapon?.uvScale ?? def.uvScale;
   const sizeScale = def.ignoreWeaponSizeScale ? 1 : def.style === 2 || def.style === 5 ? weaponLength / 36 : uvScale;
-  // Pattern scale does NOT take the weaponLength/36 multiply that wear and
-  // grunge take. Verified against an in-game capture of P90 | Desert Halftone:
-  // with the multiply (x0.545 for the P90) the stripes rendered ~1.8x too
-  // coarse; neutralising it (2.75 repeats, the vmat's own patternScale) matches
-  // the in-game stripe density, and x3.37 (the divide-instead hypothesis) is
-  // visibly too fine. Wear/grunge keep sizeScale — their response verified
-  // separately across the wear sweep.
-  const patSizeScale = def.ignoreWeaponSizeScale ? 1 : def.style === 2 || def.style === 5 ? 1 : uvScale;
+  // CONFIRMED from Valve's own source — cs_custom_weapon_visualsdata_processor
+  // .cpp builds all three transforms from ONE scale:
+  //   flWeaponSizeScale = (spray || ano_air) ? (ignore ? 1 : weaponLength/36)
+  //                                          : (ignore ? 1 : uvScale);
+  //   flPatternScale = visualsData.flPatternScale * flWeaponSizeScale;
+  //   flWearScale    = ... * flWeaponSizeScale;
+  //   flGrungeScale  = ... * flWeaponSizeScale;
+  // so the pattern takes exactly the same size scale as wear and grunge.
+  //
+  // This used to be special-cased to 1 for styles 2/5, tuned against an in-game
+  // P90 | Desert Halftone capture. That measurement was taken while style 2 was
+  // sampling in PAINT-UV space — the wrong space entirely — so it was
+  // compensating for the missing projection, and it does not survive the move to
+  // position space. Valve's single scale is now used for all three.
+  const patSizeScale = sizeScale;
+  // The position map is NORMALISED to ~[0,1]: measured over the deagle's body
+  // texels, x 0.44-0.56, y 0.02-0.93, z 0.22-0.77 at the 1st/99th percentile.
+  // (Raw min/max look like +/-14 because the UV gutters hold garbage — always
+  // percentile these, never min/max.) The shader doubles it, so plane A spans
+  // u = p.y - 0.3 in [-0.3, 1.56] at scale 1. NO extra normalisation is needed;
+  // an earlier 1/36 guess here drove the whole gun into one texel.
+  //
+  // What IS needed is the pattern sampler's ADDRESS MODE, which finally makes
+  // sense in this space: Deagle | Blaze sets horizontal=2 (clamp), so u<0 pins
+  // to the flame sheet's solid gold band and u>1 to its solid green band (which
+  // the palette maps to black) — gold muzzle, flames on the slide, black frame.
+  // Wrapping instead tiles the flames onto the grip.
   const patX = texXform(sv.patternRot, def.patternScale * patSizeScale, sv.patternOffsetX, sv.patternOffsetY);
   const wearX = texXform(sv.wearRot, sv.wearScale * sizeScale, sv.wearOffsetX, sv.wearOffsetY);
   const grgX = texXform(sv.grungeRot, sv.grungeScale * sizeScale, sv.grungeOffsetX, sv.grungeOffsetY);
@@ -1272,6 +1844,7 @@ export async function compositePaint(
       uOverlayMaskMode: { value: 0 },
       uOverlayStrength: { value: 1 },
       uOverlayBrightness: { value: 1 },
+      uOverlayDurability: { value: 0 },
       uOverlayUv: { value: 0 },
       uOvX0: { value: new THREE.Vector4(1, 0, 0, 0) },
       uOvX1: { value: new THREE.Vector4(0, 1, 0, 0) },
@@ -1293,6 +1866,16 @@ export async function compositePaint(
       uHalftone: { value: false },
       tMagMask: { value: null as unknown as import("three").Texture },
       uHasMag: { value: false },
+      tPosition: { value: null },
+      uHasPosition: { value: false },
+      uHasSurface: { value: false },
+      uBiasSpray: { value: false },
+      uSprayBlend: { value: new THREE.Vector2(1, 1) },
+      uPatMirrorOnce: { value: new THREE.Vector2() },
+      tPearlMask: { value: null },
+      uHasPearlMask: { value: false },
+      uPearlPatternUv: { value: false },
+      uPearlOnMetallicOnly: { value: false },
       uSeparateChannels: { value: false },
       tCaseRamp: { value: null as unknown as import("three").Texture },
       tPaintNormal: { value: null as unknown as import("three").Texture },
@@ -1351,6 +1934,7 @@ export async function compositePaint(
   u.uOverlayMaskMode.value = def.overlayMaskMode;
   u.uOverlayStrength.value = def.overlayStrength;
   u.uOverlayBrightness.value = def.overlayBrightness;
+  u.uOverlayDurability.value = def.overlayDurability;
   u.uOverlayUv.value = def.overlayUsesUniqueUv ? 2 : def.overlayUsesPatternUv ? 1 : 0;
   {
     // Overlay placement is authored per-skin, not seeded — the seed pipeline
@@ -1391,6 +1975,18 @@ export async function compositePaint(
   u.uHalftone.value = def.halftone;
   u.tMagMask.value = magTex ?? black;
   u.uHasMag.value = !!magTex;
+  u.tPosition.value = posTex ?? black;
+  // Shares the tPaintNormal unit — see the uniform declaration.
+  if (surfTex) u.tPaintNormal.value = surfTex;
+  u.uHasPosition.value = !!posTex;
+  u.uHasSurface.value = !!surfTex;
+  u.uBiasSpray.value = def.biasSpray;
+  u.uSprayBlend.value.fromArray(def.sprayBlend);
+  u.uPatMirrorOnce.value.set(def.patternAddrH === 4 ? 1 : 0, def.patternAddrV === 4 ? 1 : 0);
+  u.tPearlMask.value = pearlMaskTex ?? black;
+  u.uHasPearlMask.value = !!pearlMaskTex;
+  u.uPearlPatternUv.value = def.pearlMaskPatternUv;
+  u.uPearlOnMetallicOnly.value = def.pearlOnMetallicOnly;
   // Only meaningful alongside a real weapon ao map; the generic fallback is a
   // Source1-style pack.
   u.uSeparateChannels.value = !!opts.weapon?.ao && !!opts.weapon?.separateChannels;

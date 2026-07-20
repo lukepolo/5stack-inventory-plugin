@@ -4,6 +4,12 @@ Runs the **real** compositor (`src/paintComposite.ts`) and the real paint-defini
 loader against real CDN assets in a real browser, then reads the resulting albedo
 back off the GPU as pixels.
 
+> **Chasing a skin that renders wrong? Read [DEBUGGING-SKINS.md](DEBUGGING-SKINS.md)
+> first.** This README covers the rig; that one covers the method — where to get
+> ground-truth shader math instead of guessing, how to bisect the pipeline, the
+> measurement mistakes that produce confidently wrong answers, and a catalogue of
+> traps in the material format. Keep it updated as you learn more.
+
 ## Why this exists
 
 Skins rendered grey for a long time and every "fix" appeared to change nothing.

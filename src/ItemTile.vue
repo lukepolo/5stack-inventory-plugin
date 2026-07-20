@@ -8,13 +8,13 @@
 // Steam-synced items are read-only server-side, so they get a Duplicate action
 // where crafted items get Edit — never both.
 import { computed, inject } from "vue";
-import { Box, Check, Clock, Copy, ExternalLink, Loader2, Pencil, RefreshCw, Trash2 } from "lucide-vue-next";
+import { Check, Clock, Loader2, RefreshCw } from "lucide-vue-next";
 import type { InventoryItem } from "./api";
 import ItemArt from "./ItemArt.vue";
 import { attachmentsOf, CARD_ART, glowStyle, isReadOnly, STEAM_BLUE, weaponName } from "./itemVisuals";
 import TeamDots from "./TeamDots.vue";
-import { isCoarse } from "./responsive";
 import ItemName from "./ItemName.vue";
+import TileActions from "./TileActions.vue";
 import WearBar from "./WearBar.vue";
 
 const props = withDefaults(
@@ -133,40 +133,16 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       {{ baking ? 'baking' : 'queued' }}
     </span>
 
-    <!-- Hover actions. Imported items can't be edited, only duplicated.
-         Hidden on touch outright: 20px targets are unusable there, and tap /
-         long-press both open the action menu, which has every one of these. -->
-    <span v-if="!hideActions && !isCoarse" class="absolute right-1.5 top-1.5 z-[3] flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-      <span
-        class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-        title="View in 3D"
-        @click.stop="emit('view3d')"
-      ><Box class="h-3 w-3" /></span>
-      <!-- steam:// can't launch CS2 from a phone — hide the dead-end on touch. -->
-      <span
-        v-if="!isCoarse"
-        class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-        title="Inspect in game"
-        @click.stop="emit('inspect')"
-      ><ExternalLink class="h-3 w-3" /></span>
-      <span
-        v-if="readOnly"
-        class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-        title="Synced from Steam and read-only — craft your own copy of it"
-        @click.stop="emit('duplicate')"
-      ><Copy class="h-3 w-3" /></span>
-      <span
-        v-else
-        class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-        title="Edit item"
-        @click.stop="emit('edit')"
-      ><Pencil class="h-3 w-3" /></span>
-      <span
-        class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-[#ff7a6a]"
-        title="Delete from inventory"
-        @click.stop="emit('remove')"
-      ><Trash2 class="h-3 w-3" /></span>
-    </span>
+    <!-- Hover actions. Shared with the loadout rail's equipment tiles. -->
+    <TileActions
+      v-if="!hideActions"
+      :inst="inst"
+      @view3d="emit('view3d')"
+      @inspect="emit('inspect')"
+      @edit="emit('edit')"
+      @duplicate="emit('duplicate')"
+      @remove="emit('remove')"
+    />
 
     <!-- Model + status dots: steam-synced (steam blue), equipped per team
          (CT blue / T amber) — hover any dot for the label. -->

@@ -45,6 +45,13 @@ module.exports = {
           from: { opacity: "0", transform: "scale(0.96)" },
           to: { opacity: "1", transform: "none" },
         },
+        // Indeterminate progress sweep for long jobs with no percentage to
+        // report (model extraction). Travels the full width and keeps going —
+        // the point is "still working", not "this far along".
+        sweep: {
+          from: { transform: "translateX(-100%)" },
+          to: { transform: "translateX(100%)" },
+        },
       },
       animation: {
         float: "float 6s ease-in-out infinite",
@@ -54,6 +61,7 @@ module.exports = {
         "fade-in": "fadeIn 160ms ease-out both",
         "fade-out": "fadeOut 130ms ease-in both",
         "menu-in": "menuIn 110ms cubic-bezier(0.22,1,0.36,1) both",
+        sweep: "sweep 1.6s cubic-bezier(0.4,0,0.6,1) infinite",
       },
       // Named tracking tokens — arbitrary `tracking-[0.14em]` classes break in
       // this remote's injected CSS (the escaped decimal point is mangled), so we

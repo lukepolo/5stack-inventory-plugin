@@ -9,6 +9,9 @@
 import { ref, onBeforeUnmount } from "vue";
 import { Share2, Check, Link2 } from "lucide-vue-next";
 import type { ShareLink } from "./routes";
+import Tooltip from "./Tooltip.vue";
+// TEMPORARY — overlay tracing, remove with the rest of the mdebug wiring.
+import { traceLayer } from "./mdebug";
 
 const props = defineProps<{
   links: ShareLink[];
@@ -20,6 +23,9 @@ const props = defineProps<{
 }>();
 
 const open = ref(false);
+// This popover puts a full-screen click-catcher at z-1000, so it can swallow
+// the next click anywhere — worth seeing in the same timeline as the modals.
+traceLayer("share", open, () => ({ links: props.links.length }));
 const copied = ref<string | null>(null);
 const failed = ref(false);
 let copiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -47,19 +53,20 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
 
 <template>
   <div class="relative">
-    <button
-      :class="[
-        props.icon
-          ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground'
-          : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground',
-        open ? 'border-[color:var(--acc)] text-foreground' : 'border-border',
-      ]"
-      title="Copy a link to this"
-      @click.stop="open = !open"
-    >
-      <Share2 class="h-3.5 w-3.5" />
-      <span v-if="!props.icon">{{ props.label ?? "Share" }}</span>
-    </button>
+    <Tooltip text="Copy a link to this">
+      <button
+        :class="[
+          props.icon
+            ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground'
+            : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground',
+          open ? 'border-[color:var(--acc)] text-foreground' : 'border-border',
+        ]"
+        @click.stop="open = !open"
+      >
+        <Share2 class="h-3.5 w-3.5" />
+        <span v-if="!props.icon">{{ props.label ?? "Share" }}</span>
+      </button>
+    </Tooltip>
 
     <!-- Full-viewport catcher, the same dismissal pattern as the context menus. -->
     <div v-if="open" class="fixed inset-0 z-[1000]" @click="open = false" @contextmenu.prevent="open = false"></div>

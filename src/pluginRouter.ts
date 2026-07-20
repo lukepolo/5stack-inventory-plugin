@@ -12,7 +12,7 @@
 // Standalone (`npm run dev`, no host) there are no such props, so we fall back to
 // the History API against the real URL. Same call sites, both modes.
 
-import { computed, onBeforeUnmount, ref, type ComputedRef } from "vue";
+import { computed, onBeforeUnmount, ref, watch, type ComputedRef } from "vue";
 
 export type QueryValue = string | (string | null)[] | null | undefined;
 export type Query = Record<string, QueryValue>;
@@ -97,12 +97,95 @@ export function usePluginRouter(props: HostRouting): PluginRouter {
   window.addEventListener("popstate", syncFromUrl);
   onBeforeUnmount(() => window.removeEventListener("popstate", syncFromUrl));
 
+  // Embedded, `props.path` is the host's ECHO of a navigation we asked for, and
+  // it lands a tick or more after go() returns. Anything reading the path inside
+  // that window sees the old route — and a watcher that flushes after the same
+  // click that navigated (say, one mirroring state into the query with
+  // `replace`) will then write against the route we just left and silently undo
+  // the navigation. Hold the requested path until the flush is over; the echo
+  // has taken over by then, so this only papers over the synchronous gap.
+  const pendingPath = ref<string | null>(null);
+  // The query needs the same hold as the path, or the two tear: during the gap
+  // the route flips synchronously while the query is still the old echo, and a
+  // watcher keying off both sees a hybrid state that never existed — e.g.
+  // "loadout route, but no ?slot yet" on modal close, which reset the selected
+  // slot and collapsed the rail behind the closing modal.
+  const pendingQuery = ref<Record<string, string> | null>(null);
   const path = computed(() =>
-    embedded.value ? normalize(props.path ?? "/") : localPath.value,
+    embedded.value ? pendingPath.value ?? normalize(props.path ?? "/") : localPath.value,
   );
   const query = computed(() =>
-    embedded.value ? flatten(props.query ?? {}) : localQuery.value,
+    embedded.value
+      ? pendingQuery.value ?? flatten(props.query ?? {})
+      : localQuery.value,
   );
+
+  // Releasing the hold is the whole ballgame, and it CANNOT be done on a timer.
+  //
+  // This used to release on nextTick(), on the reasoning that watchers queued by
+  // the navigating click had run by then and the echo had taken over. The first
+  // half is true; the second is not. The echo is a round-trip through the host's
+  // router and measured 20-60ms — thousands of times longer than a microtask. In
+  // the gap between release and echo, `path` fell back to `props.path`, which
+  // still held the route we had just LEFT. So a close navigated to /items, the
+  // path snapped back to /items/<id>/craft, and the route watcher — correctly,
+  // against a route that was lying — reopened the modal it had just torn down,
+  // rebuilding the 3D viewer in the process. That was the flicker.
+  //
+  // So: hold until the host actually speaks. Any CHANGE to the echo means it
+  // landed, and that's the release condition rather than an exact match on what
+  // we asked for — the host is entitled to redirect, normalise a trailing slash,
+  // or land somewhere else entirely, and none of those would equal our target.
+  // Waiting for an exact match would hold a stale value forever.
+  //
+  // Path and query are held SEPARATELY because the host echoes them separately,
+  // up to a frame apart. Releasing both the moment the path echo lands drops the
+  // query hold while the query echo is still in flight, and `query` falls back to
+  // the pre-navigation echo for that frame. That tear is not cosmetic: closing a
+  // modal back to the loadout produced one frame of "route is /, but ?slot is
+  // still absent", and the slot watcher reads an absent ?slot as the DEFAULT —
+  // so it reset the focused slot and collapsed the rail behind the closing modal.
+  type Hold = { stop: (() => void) | null; timer: ReturnType<typeof setTimeout> | undefined };
+  const holds: Record<"path" | "query", Hold> = {
+    path: { stop: null, timer: undefined },
+    query: { stop: null, timer: undefined },
+  };
+  const clearHold = (which?: "path" | "query") => {
+    for (const k of which ? [which] : (["path", "query"] as const)) {
+      holds[k].stop?.();
+      holds[k].stop = null;
+      clearTimeout(holds[k].timer);
+      holds[k].timer = undefined;
+    }
+  };
+  /**
+   * Hold `pending` until the corresponding host prop changes.
+   *
+   * `read` must return a comparable snapshot of the echo (a string), so the
+   * query can be compared by value rather than by object identity — the host
+   * hands us a fresh object on every render and identity alone would fire
+   * instantly, releasing the hold before anything actually changed.
+   */
+  function holdUntilEcho(
+    which: "path" | "query",
+    read: () => string,
+    release: () => void,
+  ) {
+    // A second navigation supersedes the first; only the newest hold matters.
+    clearHold(which);
+    const before = read();
+    const done = () => {
+      clearHold(which);
+      release();
+    };
+    holds[which].stop = watch(read, (now) => { if (now !== before) done(); }, { flush: "sync" });
+    // Backstop: a navigation the host drops on the floor (blocked, or deduped as
+    // a same-path no-op) produces no echo at all, and a navigation that doesn't
+    // change the query produces no query echo. Without this the hold would pin
+    // the route to a state we never actually reached.
+    holds[which].timer = setTimeout(done, 1500);
+  }
+  onBeforeUnmount(clearHold);
 
   const href = (to: string, q?: Record<string, unknown>) =>
     `${window.location.origin}${normalize(`${props.base ?? ""}${to}`)}${toSearch(
@@ -112,6 +195,44 @@ export function usePluginRouter(props: HostRouting): PluginRouter {
   const go: PluginRouter["go"] = (to, options = {}) => {
     const target = normalize(to);
     if (embedded.value) {
+      // Only a push moves the route; a replace stays put, so letting it claim
+      // `pendingPath` would let the query-sync watcher clobber a push that is
+      // still in flight.
+      if (!options.replace) {
+        // Query FIRST, path second. Both are refs, so each assignment is
+        // independently observable by a sync watcher — and assigning the path
+        // first published a state of "new path, old query" that never existed
+        // as far as the caller was concerned. Setting the query first means the
+        // only intermediate state is "old path, new query", which no consumer
+        // keys off (the query is read as belonging to whatever path it arrives
+        // with, and that path is about to change in the same statement).
+        //
+        // Mirror toSearch's semantics (drop null/undefined/empty) so the held
+        // query equals what the echo will eventually say.
+        if (options.query) {
+          const held: Record<string, string> = {};
+          for (const [k, v] of Object.entries(options.query)) {
+            if (v === undefined || v === null || v === "") continue;
+            held[k] = String(v);
+          }
+          pendingQuery.value = held;
+          holdUntilEcho(
+            "query",
+            () => JSON.stringify(flatten(props.query ?? {})),
+            () => {
+              if (pendingQuery.value === held) pendingQuery.value = null;
+            },
+          );
+        }
+        pendingPath.value = target;
+        holdUntilEcho(
+          "path",
+          () => normalize(props.path ?? "/"),
+          () => {
+            if (pendingPath.value === target) pendingPath.value = null;
+          },
+        );
+      }
       props.navigate!(target, options);
       return;
     }

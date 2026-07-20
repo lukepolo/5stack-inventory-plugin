@@ -94,6 +94,28 @@ export const FIXTURES: Fixture[] = [
     note: "Style 7 (antiqued) patina path, at high float.",
   },
   {
+    name: "AWP | Fade",
+    model: "awp", pm: "/materials/aa_awp_fade_d4e56f14.vcompmat.json",
+    wear: 0.02, seed: 512, style: 5, overlay: false,
+    ref: "weapon_awp_aa_awp_fade_37fc2d27",
+    note: "Style 5 (anodized airbrushed) — the ONLY fixture for it, and style 5 is " +
+          "one of two styles that scale pattern/wear/grunge by weaponLength/36 " +
+          "instead of uvScale, so a regression there shows up nowhere else. " +
+          "Style 3 (plain anodized) has NO fixture on purpose: 0 skins out of 700 " +
+          "sampled paint materials use it, so there is nothing to pin.",
+  },
+  {
+    name: "XM1014 | XoooM",
+    model: "xm1014", pm: "/materials/soe_yellow_xm_1efd28be.vcompmat.json",
+    wear: 0.22, seed: 404, style: 0, overlay: true,
+    ref: "weapon_xm1014_soe_yellow_xm_4f5c9280",
+    note: "The ONLY overlay fixture that exercises a non-trivial blend mode. " +
+          "Autumn Thicket and Sage Camo both resolve to mode 0 (their vcompmats " +
+          "override the template's mode 1 with a loose F_OVERLAY_BLEND_MODE), so " +
+          "modes 1-3 — the ovLevels path — ran untested until this was added. " +
+          "This one is mode 2 (Multiply + albedo-levels renormalise).",
+  },
+  {
     name: "Desert Eagle | Heat Treated",
     model: "deagle", pm: "/materials/aq_deagle_case_hardened_2_cceae3a3.vcompmat.json",
     wear: 0.415, seed: 0, style: 7, overlay: false,
@@ -129,6 +151,50 @@ export const FIXTURES: Fixture[] = [
           "0.5 vs the HD map's 0.306 / 27.7%) this skin barely wore at all — Battle-Scarred " +
           "looked almost like Factory New. Do NOT 'fix' a low number here by restoring the " +
           "old inputs; check the wear sweep instead.",
+  },
+  {
+    name: "Desert Eagle | Blaze",
+    model: "deagle", pm: "/materials/aa_flames_a07bc177.vcompmat.json",
+    wear: 0.05, seed: 1, style: 5, overlay: false,
+    ref: "weapon_deagle_aa_flames_1662b4fe",
+    note: "The PROJECTED-styles guard. Styles 2 and 5 do not sample the pattern in " +
+          "paint-UV space at all — combo 293 builds the coordinate from g_tPosition " +
+          "(per-texel object-space position, extraction v3+, arrives as .exr) through " +
+          "a triplanar projection weighted by g_tSurface's object-space normal.\n" +
+          "AWP | Fade is style 5 too but is a smooth gradient and passes either way, " +
+          "so it does NOT guard this — Blaze does, because its artwork is a single " +
+          "side elevation that smears unmistakably when projected wrong.\n" +
+          "Two things are load-bearing: (1) the position map is normalised ~[0,1] " +
+          "(percentile it — raw min/max read +/-14 because the UV gutters hold " +
+          "garbage), so NO extra scale normalisation belongs here; (2) the pattern " +
+          "address mode finally matters in this space — horizontal=2 (clamp) pins " +
+          "u<0 to the flame sheet's gold band and u>1 to its green band, which the " +
+          "palette maps to black. Wrapping tiles flames onto the grip.\n" +
+          "CAUTION: the rig's checks are statistical and will NOT catch a wrong " +
+          "projection here — this fixture guards against a total collapse only. " +
+          "Judge Blaze visually against the reference.",
+  },
+  {
+    name: "Glock-18 | AXIA",
+    model: "glock", pm: "/materials/gsch_axia_glock_0ce97f9e.vcompmat.json",
+    wear: 0.05, seed: 1, style: 8, overlay: false,
+    ref: "weapon_glock_gsch_axia_glock_5087f75d",
+    note: "REGRESSION GUARD for style 8 + F_CASE_HARDENING, transcribed from static " +
+          "combo 1529 (see tools/shadertest/groundtruth/ch8.glsl). Four things are " +
+          "load-bearing here and each one broke this skin on the way in:\n" +
+          "1. chBase = mix(pattern.rgb, rampAvg, masks.g) — the ramp colours ONLY the " +
+          "masks.g region (the frame panels). Without it the whole gun goes blue.\n" +
+          "2. the ramp is a 5-TAP average on style 8 (one tap on style 7).\n" +
+          "3. g_tPattern reads as sRGB on style 8 + CH (it IS the albedo where masks.g " +
+          "is 0) but LINEAR on style 7 + CH. Read linear here, the slide renders as " +
+          "white chrome instead of dark steel.\n" +
+          "4. blend = mix(smoothstep(..), raw, float(masks.r > 0.99)) — a HARD test. " +
+          "Forcing blend to 1 in the masks.r zone fakes a black slide but drives " +
+          "metalness to the weapon's baseRM (0.07), turning polished steel into flat " +
+          "grey dielectric. The slide is dark because it is METAL.\n" +
+          "None of these may be applied to style 7 — doing so returns Deagle | Heat " +
+          "Treated to the green-and-magenta failure. KNOWN GAP: the glitter layer is " +
+          "not implemented, so the frame is flat blue where the real one sparkles.",
   },
 ];
 

@@ -97,7 +97,14 @@ export function screenFor(route: Route): "grid" | "focus" | "inventory" | "admin
 
 // View state that should follow you between screens: which side you're looking
 // at, which slot is focused, how the inventory is filtered.
-export const STICKY_QUERY_KEYS = ["team", "slot", "q", "origin", "sort", "cat", "wep"] as const;
+//
+// `from` names the screen an item modal was opened over. Without it the path
+// alone decides, and every /items/<id> path reads as the inventory (see
+// screenFor) — so opening an item from the LOADOUT repainted the screen behind
+// the modal, and closing it dropped you on the inventory. Router-owned rather
+// than foreign so it's stripped on the way out to a plain screen instead of
+// trailing ?from=loadout around the app.
+export const STICKY_QUERY_KEYS = ["team", "slot", "q", "origin", "sort", "cat", "wep", "from"] as const;
 
 // State belonging to one screen only. Navigating away drops these — otherwise a
 // half-finished draft's wear would ride along onto the admin page.
