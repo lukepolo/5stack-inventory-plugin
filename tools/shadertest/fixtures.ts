@@ -94,6 +94,17 @@ export const FIXTURES: Fixture[] = [
     note: "Style 7 (antiqued) patina path, at high float.",
   },
   {
+    name: "Desert Eagle | Heat Treated",
+    model: "deagle", pm: "/materials/aq_deagle_case_hardened_2_cceae3a3.vcompmat.json",
+    wear: 0.415, seed: 0, style: 7, overlay: false,
+    ref: "weapon_deagle_aq_deagle_case_hardened_2_7c85c37a",
+    note: "REGRESSION GUARD: F_CASE_HARDENING=1. g_tPattern here is a DATA texture " +
+          "(green/magenta), not albedo — the style-7 path used to multiply the palette " +
+          "by it directly and rendered the raw data. Colour must come from " +
+          "g_tCaseHardeningColorRamp (blue/gold/white). If this goes green or magenta, " +
+          "case hardening regressed to reading pattern.rgb as colour.",
+  },
+  {
     name: "P90 | Tangled",
     model: "p90", pm: "/materials/gs_p90_tangled_9ba92d28.vcompmat.json",
     wear: 0.265, seed: 311, style: 8, overlay: false, lowChroma: true,

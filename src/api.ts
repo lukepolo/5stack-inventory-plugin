@@ -84,6 +84,13 @@ export interface LoadoutEntry {
   team: Team;
   slot: string;
   item_instance_id: number | null;
+  /**
+   * Crafted skin (as opposed to a free default weapon picked for the slot).
+   * Its own field rather than `item_instance_id != null` because the public
+   * player-loadout endpoint withholds the instance id — someone else's row
+   * handle — while still needing to say the cell holds a real skin.
+   */
+  skinned: boolean;
   item_id: number;
   wear: number | null;
   seed: number | null;

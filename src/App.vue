@@ -22,7 +22,6 @@ import {
   fetchDraftInspectLink,
   fetchServerApiKey,
   fetchPlayerLoadout,
-  copyLoadoutFrom,
   importSteamInventory,
   API_ORIGIN,
   equip,
@@ -357,8 +356,11 @@ function occupantModel(pos: string, t: Team = team.value): string {
 function occupantWeapon(pos: string): CatalogWeapon | undefined {
   return weaponByModel.value.get(occupantModel(pos));
 }
-// A row equipping a crafted skin (vs a free default-weapon row).
-const isSkinned = (row?: LoadoutEntry) => !!row?.item_instance_id;
+// A row equipping a crafted skin (vs a free default-weapon row). Reads the
+// server's `skinned` flag, NOT the instance id: viewing another player, the id
+// is withheld on purpose, and testing it made every one of their cells look
+// unskinned — right art, but "Default" names and a base-model focus view.
+const isSkinned = (row?: LoadoutEntry) => !!row?.skinned;
 function skinLabel(pos: string): string {
   const row = rowFor(pos);
   if (!row || !isSkinned(row)) return "Default";
@@ -2819,32 +2821,18 @@ onMounted(() => {
 });
 
 // ---- viewer actions ----
-const copyBusy = ref(false);
-async function copyViewerLoadout() {
-  if (!viewerId.value || viewingSelf.value || copyBusy.value) return;
-  copyBusy.value = true;
-  try {
-    const { copied } = await copyLoadoutFrom(viewerId.value);
-    notify(`Copied ${copied} loadout slots into your inventory.`, "success");
-    // Embedded, exitViewer() can't do its job: the host's navigate only carries
-    // the path, so ?player survives and we'd stay in viewer mode anyway. Leave
-    // the tab where it is — the toast already confirmed the copy.
-    if (!embedMode.value) exitViewer();
-  } catch (e) {
-    fail(e);
-  } finally {
-    copyBusy.value = false;
-  }
+// Only one: leaving the profile tab for the full page. Viewer mode itself is
+// entered and left from the player page that hosts it.
+//
+// The href is the fallback, not the mechanism — a full document load of a
+// federated remote means re-downloading the host app to render one tab's worth
+// of change. Modified clicks and non-primary buttons are left alone so the
+// browser's own open-in-new-tab/window still works.
+function onEditClick(e: MouseEvent) {
+  if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+  if (router.goApp("/")) e.preventDefault();
 }
-function exitViewer() {
-  // Dropping ?player is a navigation now — the watcher below reloads.
-  // Deliberately router.go and not go(): viewQuery() rebuilds the query from
-  // the CURRENT one, which still has ?player in it, so going through the
-  // wrapper would helpfully put back the exact key we're trying to remove.
-  const to = view.value === "admin" ? "/" : router.path.value;
-  const { player: _dropped, ...rest } = viewQuery(to, transientQuery());
-  router.go(to, { replace: true, query: rest });
-}
+//
 // The URL is the source of truth for viewer mode, so back/forward between two
 // shared loadouts (or out of one) reloads instead of stranding the old player.
 watch(playerParam, (id) => {
@@ -3066,30 +3054,23 @@ function deleteSelected() {
            floating at equal distance. All three controls are 36px tall (the
            pill is h-7 + p-1), so they share a baseline. -->
       <div class="ml-auto flex items-center" :class="isCompact ? 'gap-1.5' : 'gap-3'">
-        <!-- Embedded, the viewer banner below is suppressed and its one action
-             lands here instead — a full-width bar cost ~40px of a 70dvh tab to
-             say something the tab's own title already implies. Matched to the
+        <!-- Embedded on your own profile: the one way out, to the full page
+             where the loadout is editable. Stays an <a> with a real href so
+             middle-click and "open in new tab" work, but a plain left click
+             hands off to the host router — see onEditClick. Matched to the
              Focus button's metrics so the header keeps a single baseline. -->
         <a
           v-if="embedMode && viewingSelf && !loading && !error"
           :href="router.href('/', {})"
           class="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3.5 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
           title="Edit your loadout in the full inventory page"
+          @click="onEditClick"
         >
           <Pencil class="h-3.5 w-3.5" />
           <span v-if="!isCompact">Edit</span>
         </a>
-        <button
-          v-else-if="embedMode && viewerId && !loading && !error"
-          class="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3.5 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
-          :disabled="copyBusy"
-          title="Copy this loadout into your own inventory"
-          @click="copyViewerLoadout"
-        >
-          <Loader2 v-if="copyBusy" class="h-3.5 w-3.5 animate-spin" />
-          <Copy v-else class="h-3.5 w-3.5" />
-          <span v-if="!isCompact">Copy</span>
-        </button>
+        <!-- Nothing here for someone else's loadout: it is a read-only look at
+             their profile, not a starting point for your own. -->
 
         <div v-if="user && !embedMode" class="flex items-center gap-1.5">
           <ShareMenu icon :links="viewShareLinks" />
@@ -3150,33 +3131,9 @@ function deleteSelected() {
       </div>
     </header>
 
-    <!-- Viewer banner. Suppressed when embedded — its action moved into the
-         header above, and a full-width explanatory bar is redundant on a page
-         that already says whose profile you are on. -->
-    <div
-      v-if="viewerId && !loading && !error && !embedMode"
-      class="flex flex-none flex-wrap items-center gap-3 border-b border-border px-6 py-2"
-      :style="{ background: accentSoft }"
-    >
-      <!-- Only reachable un-embedded, where viewerId is always someone else —
-           load() drops viewer mode when ?player is you. -->
-      <span class="text-f13">Viewing the loadout of <b class="font-mono">{{ viewerId }}</b> — read-only.</span>
-      <button
-        class="ml-auto flex items-center gap-1.5 rounded-sm px-3.5 py-1.5 text-f11 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:opacity-60"
-        style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16))"
-        :disabled="copyBusy"
-        @click="copyViewerLoadout"
-      >
-        <Loader2 v-if="copyBusy" class="h-3 w-3 animate-spin" />
-        <Copy v-else class="h-3 w-3" /> Copy this loadout
-      </button>
-      <button
-        class="rounded-md border border-border px-3 py-1.5 text-f11 uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
-        @click="exitViewer"
-      >
-        Back to mine
-      </button>
-    </div>
+    <!-- No viewer banner. Someone else's loadout is only ever reached from
+         their player page, which already says whose it is and owns the way
+         back out — a full-width bar here would only repeat the page. -->
 
     <!-- Loading: a ghost of the loadout screen, breathing. Same skeleton for
          both views — the shape says "your loadout is coming" either way, and

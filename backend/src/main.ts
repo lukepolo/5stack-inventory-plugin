@@ -626,6 +626,7 @@ app.get("/api/loadout", async (request, reply) => {
     team: string;
     slot: string;
     item_instance_id: number | null;
+    skinned: boolean;
     item_id: number | null;
     wear: number | null;
     seed: number | null;
@@ -633,6 +634,7 @@ app.get("/api/loadout", async (request, reply) => {
     nametag: string | null;
   }>(
     `SELECT l.team, l.slot, l.item_instance_id,
+       (l.item_instance_id IS NOT NULL) AS skinned,
        COALESCE(i.item_id, l.item_id)   AS item_id,
        COALESCE(i.wear, l.wear)         AS wear,
        COALESCE(i.seed, l.seed)         AS seed,
@@ -895,11 +897,12 @@ app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request
     return reply.status(400).send({ error: "invalid steam id" });
   }
   const { rows } = await pool.query<{
-    team: string; slot: string; item_id: number | null;
+    team: string; slot: string; item_id: number | null; skinned: boolean;
     wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
   }>(
     `SELECT l.team, l.slot,
        COALESCE(i.item_id, l.item_id) AS item_id,
+       (l.item_instance_id IS NOT NULL) AS skinned,
        COALESCE(i.wear, l.wear) AS wear, COALESCE(i.seed, l.seed) AS seed,
        COALESCE(i.stattrak, l.stattrak) AS stattrak, COALESCE(i.nametag, l.nametag) AS nametag
      FROM inventory.loadout l
@@ -907,6 +910,11 @@ app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request
      WHERE l.steam_id = $1`,
     [steamId],
   );
+  // The instance id stays null — it is someone else's row handle and a viewer
+  // has no business acting on it. `skinned` carries the one bit the client
+  // actually needed from it: crafted skin vs. free default weapon. Without it a
+  // viewer saw every cell as unskinned, so names read "Default" and the focus
+  // view fell back to the base model even though the art was right.
   return rows
     .filter((row) => row.item_id != null)
     .map((row) => ({ ...row, item_instance_id: null, item: getItem(row.item_id as number) }));

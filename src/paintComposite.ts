@@ -86,6 +86,20 @@ export interface PaintDef {
   /** F_SPRAYPAINT_HALFTONE: pattern channels are thresholded against the dot
    *  screen in pattern.a instead of used as smooth mix weights. */
   halftone: boolean;
+  /** F_CASE_HARDENING — Case Hardened, Heat Treated, Blue Gem. Changes what
+   *  g_tPattern MEANS: it stops being albedo and becomes the lookup coordinate
+   *  into g_tCaseHardeningColorRamp, which supplies all the colour. Read the
+   *  pattern of one of these as colour and you render the raw data texture:
+   *  Deagle | Heat Treated came out green-and-magenta, which is literally what
+   *  its pattern.rgb contains. Requires style 0, 7 or 8 (FeatureRule). */
+  caseHardening: boolean;
+  caseHardeningRamp?: string;
+  chPatternInfluence: number;
+  chGeometricInfluence: number;
+  chRampOffset: number;
+  /** g_nColorAdjustmentMode: when 1, colour brightness applies everywhere
+   *  rather than only inside the paint mask. */
+  colorAdjustmentMode: number;
   // Textures (CDN paths). ao/baseColor/baseRM are the *defaults* baked into
   // the paint's vmat — per-weapon composite inputs override them when the
   // model extraction provides them.
@@ -282,6 +296,40 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
     return {
       style: int("F_PAINT_STYLE", 0),
       halftone: int("F_SPRAYPAINT_HALFTONE", 0) !== 0,
+      // Defaults are the SHADER's own (csgo_customweapon.slang), not the paint
+      // templates': PatternInfluence 0.5, GeometricInfluence 1, RampOffset 0.
+      // None of the three declares a Range(), so they are not clamped.
+      caseHardening: int("F_CASE_HARDENING", 0) !== 0,
+      caseHardeningRamp: t("g_tCaseHardeningColorRamp"),
+      chPatternInfluence: flt("g_flCaseHardeningPatternInfluence", 0.5),
+      chGeometricInfluence: flt("g_flCaseHardeningGeometricInfluence", 1),
+      // NOT read from the material, deliberately. This is the Blue Gem knob:
+      // the ramp offset picks which row of the ramp — which colour family —
+      // a given item lands on, and on Case Hardened it is SEED-VARIED, which
+      // is why two Case Hardened AKs of the same float look nothing alike.
+      //
+      // The vcompmat's stored 0.5 is the material editor's SLIDER POSITION,
+      // not the applied value: it is exactly the midpoint of its own declared
+      // bounds (0..1), as is PatternInfluence (0.315 of 0.2..0.43). The
+      // params that are genuinely fixed carry m_bExposedVariableIsFixedRange
+      // — GeometricInfluence and PatternTexCoordScale do, these two do not,
+      // which is the same shape this loader already treats as a seed envelope
+      // for g_vPatternTexCoordOffset and g_flPatternTexCoordRotation.
+      //
+      // Taking 0.5 literally samples the ramp's washed-out middle rows.
+      // MEASURED against the official Heat Treated render, hue histogram over
+      // 8 buckets (ours -> reference): at 0.5, blue 10.5 -> 23.9 and magenta
+      // 12.4 -> 3.8, i.e. the two dominant colours inverted. At 0, blue 21.3,
+      // magenta 3.3, grey 49.5 vs 51.1 — every bucket lands. 0 is also the
+      // shader's own declared default (no Default() in the .slang).
+      //
+      // So: pin to the neutral default until the seed DRAW ORDER is known.
+      // That order lives in cs_custom_weapon_visualsdata_processor.cpp, not in
+      // the shader, so the decompile cannot supply it — see seededVisuals for
+      // the sequence this would have to slot into. Until then every seed of a
+      // case-hardened skin renders as the same (correct-family) gun.
+      chRampOffset: 0,
+      colorAdjustmentMode: int("g_nColorAdjustmentMode", 0),
       pattern: t("g_tPattern"),
       normal: t("g_tNormal"),
       wearMask: t("g_tWear"),
@@ -601,6 +649,15 @@ uniform vec4 uOvX0, uOvX1;
 uniform int uOverlayUv; // 0 = mesh uv, 1 = pattern uv, 2 = the overlay's own xform
 uniform sampler2D tPaintRough, tPaintMetal;
 uniform bool uHasRoughTex, uHasMetalTex;
+// Case hardening (F_CASE_HARDENING). tCaseRamp is the 2D colour LUT that
+// supplies every colour these finishes have; tPaintNormal is the paint's own
+// g_tNormal, sampled here ONLY as a curvature signal for the geometric term
+// (most case-hardened skins ship the flat 1x1 default, which makes the edge
+// factor a constant — that is correct, not a missing texture).
+uniform sampler2D tCaseRamp, tPaintNormal;
+uniform bool uCaseHardening;
+uniform float uChPat, uChGeo, uChRampOff;
+uniform int uColorAdjustMode;
 uniform vec4 uPatX0, uPatX1, uWearX0, uWearX1, uGrgX0, uGrgX1;
 uniform vec3 uC0, uC1, uC2, uC3;
 // Masks are per-weapon composite inputs. When they're absent the sampler falls
@@ -706,6 +763,39 @@ void main() {
   vec2 patUv = xf(vUv, uPatX0, uPatX1);
   vec4 pattern = texture(tPattern, patUv);
 
+  // ---- Case hardening ----------------------------------------------------------
+  // CONFIRMED, transcribed from the decompiled S_CASE_HARDENING=1 combos of
+  // csgo_customweapon_vulkan_50_ps.vcs (VcsVersion 71). Identical in the plain
+  // combo (S_PAINT_STYLE=7, id 1159) and the one matching Heat Treated's full
+  // feature set (+SEPARATE_CHANNEL_INPUTS/ROUGHNESS_TEXTURE/PEARLESCENCE_MASK/
+  // OVERLAY_TEXTURE, id 2131), so none of the surrounding features perturb it.
+  //
+  // The colour comes ENTIRELY from the ramp. g_vColor0..3 on these skins are
+  // near-greyscale on purpose (Heat Treated: white, white, 208/201/191,
+  // 85/86/87) — they tint the ramp, they do not carry the blue/gold.
+  //
+  // The geometric term reads cavity as pow(cavity, 1.5) * 0.96, which is the
+  // SEPARATE_CHANNEL_INPUTS form of cavity in Valve's shader. Applied locally
+  // rather than to the shared cavity above on purpose: that variable feeds
+  // the wear curve, which was measured against in-game captures in its current
+  // form, and changing it would move every skin's wear, not just these.
+  vec4 chRamp = vec4(1.0);
+  if (uCaseHardening) {
+    float chCavity = uSeparateChannels ? pow(cavity, 1.5) * 0.96 : cavity;
+    // min(n, 1-n) is distance-from-extreme per channel; the inverted smoothstep
+    // (edge0 > edge1) turns that into "how close to an edge". Flat default
+    // normal (0.502) => 1.124, i.e. a constant, which is the intended result
+    // for every skin that does not author a paint normal.
+    vec4 nrm = texture(tPaintNormal, vUv);
+    vec4 edges = smoothstep(vec4(0.85), vec4(0.20), min(nrm, vec4(1.0) - nrm));
+    float geo = mix(0.5, pow(chCavity, 0.85), uChGeo)
+              * mix(1.0, flAo * (min(edges.x, edges.y) * 2.0), uChGeo);
+    // pattern.r drives the colour progression, pattern.g the ramp row.
+    float rampU = mix(geo * 2.0, geo + pattern.r, uChPat);
+    float rampV = max(pattern.g * uChPat, (1.0 - flAo) * 0.2 * uChGeo) + uChRampOff;
+    chRamp = texture(tCaseRamp, vec2(rampU, rampV));
+  }
+
   float dur = mix4(uDurability, masks.rgb);
 
   // Wear-through signal (CS:GO structure + CS2 durability/softness).
@@ -807,6 +897,16 @@ void main() {
     }
     if (uStyle == 7) metalPaint = max(metalPaint, masks.r);
     if (uStyle == 8) metalPaint = max(metalPaint, masks.r * (1.0 - blend));
+    if (uCaseHardening) {
+      // CONFIRMED: the ramp's ALPHA is the metalness for these finishes, dulled
+      // by grunge as wear rises and driven to 1 wherever patina takes over.
+      // Without this a case-hardened gun renders with the paint's flat
+      // roughness and loses the polished-steel read the ramp colours imply.
+      float chGrungeLum = dot(grunge.rgb, vec3(0.2125, 0.7154, 0.0721));
+      float chOil = smoothstep(0.0, 0.15, clamp(cavity * flAo - uWearAmt * 0.1, 0.0, 1.0) - clamp(grungeRaw.r * grungeRaw.g * grungeRaw.b, 0.0, 1.0) * 0.23 + 0.08);
+      float chPatina = smoothstep(0.1, 0.2, wearTex * flAo * cavity * cavity * uWearAmt);
+      metalPaint = mix(chRamp.a * mix(1.0, sqrt(max(chOil * grunge.a * chGrungeLum, 0.0)), uWearAmt), 1.0, chPatina);
+    }
     vec4 baseRM = texture(tBaseRM, vUv);
     float wornRough = uHasBaseRM ? baseRM.r : 0.75; // bare metal is fairly rough
     float wornMetal = uHasBaseRM ? baseRM.g : metalPaint;
@@ -850,15 +950,24 @@ void main() {
   } else if (uStyle == 6) {
     cPaint = pattern.rgb;
   } else if (uStyle == 7 || uStyle == 8) {
+    // The decompile calls the texture this modulates _17842, and it is the
+    // pattern ONLY when case hardening is off — otherwise it is the ramp,
+    // pre-scaled by colour brightness. Everything else here is shared.
+    vec3 patCol = uCaseHardening
+      ? mix(chRamp.rgb, chRamp.rgb * uColorBrightness, max(masks.r, float(uColorAdjustMode)))
+      : pattern.rgb;
     float flGrunge = grungeRaw.r * grungeRaw.g * grungeRaw.b;
     float patinaBlend = smoothstep(0.1, 0.2, wearTex * flAo * cavity * cavity * uWearAmt);
-    float oilRub = smoothstep(0.0, 0.15, clamp(cavity * flAo - uWearAmt * 0.1, 0.0, 1.0) - flGrunge + 0.08);
+    // The grunge term carries a 0.23 scale that this line used to drop, which
+    // pushed oilRub dark far too early. CONFIRMED from the same decompile.
+    float oilRub = smoothstep(0.0, 0.15, clamp(cavity * flAo - uWearAmt * 0.1, 0.0, 1.0) - clamp(flGrunge, 0.0, 1.0) * 0.23 + 0.08);
     vec3 cPatina = mix(uC1, uC2, uWearAmt);
     vec3 cOilRub = mix(uC1, uC3, sqrt(uWearAmt));
-    cPatina = mix(cOilRub, cPatina, oilRub) * pattern.rgb;
-    float patternLum = dot(pattern.rgb, vec3(0.3, 0.59, 0.11));
+    cPatina = mix(cOilRub, cPatina, oilRub) * patCol;
+    // Rec.709 luma, per the decompile — this was Rec.601 weights.
+    float patternLum = dot(patCol, vec3(0.2125, 0.7154, 0.0721));
     cPatina = mix(cPatina, uC0 * patternLum, patinaBlend);
-    cPaint = uStyle == 7 ? cPatina : mix(pattern.rgb, cPatina, masks.r);
+    cPaint = uStyle == 7 ? cPatina : mix(patCol, cPatina, masks.r);
   }
 
   // ---- Overlay layer -----------------------------------------------------------
@@ -1045,7 +1154,7 @@ export async function compositePaint(
   const wear = Math.min(Math.max(opts.wear, 0), 1);
   const seed = Math.max(0, Math.trunc(opts.seed));
   const wkey = opts.weapon ? (opts.weapon.color ?? "w") : "";
-  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}`;
+  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}|${def.caseHardening ? `ch${def.caseHardeningRamp ?? "-"}` : ""}`;
   const cache = cacheFor(renderer);
   const hit = cache.get(key);
   if (hit) {
@@ -1058,10 +1167,14 @@ export async function compositePaint(
 
   // Per-style pattern colorspace: mask styles read linear; custom paint jobs,
   // patina and gunsmith read the pattern as color (sRGB).
-  const patternIsColor = def.style === 6 || def.style === 7 || def.style === 8;
+  //
+  // Case hardening is the exception inside those styles: g_tPattern declares
+  // SrgbRead(false) there because it is a lookup coordinate, not a colour.
+  // Decoding it as sRGB bends the ramp lookup and shifts every colour band.
+  const patternIsColor = (def.style === 6 || def.style === 7 || def.style === 8) && !def.caseHardening;
   const urlOf = async (p?: string) => (p ? await paintTextureUrl(p) : null);
   const magUrl = opts.weapon?.mag;
-  const [patternUrl, wearUrl, grungeUrl, masksUrl, aoUrl, colorUrl, rmUrl, roughTexUrl, metalTexUrl, overlayUrl, overlayMaskUrl] = await Promise.all([
+  const [patternUrl, wearUrl, grungeUrl, masksUrl, aoUrl, colorUrl, rmUrl, roughTexUrl, metalTexUrl, overlayUrl, overlayMaskUrl, caseRampUrl, paintNormalUrl] = await Promise.all([
     urlOf(def.pattern),
     urlOf(def.wearMask),
     urlOf(def.grunge),
@@ -1073,9 +1186,11 @@ export async function compositePaint(
     urlOf(def.paintMetalnessTex),
     urlOf(def.overlay),
     urlOf(def.overlayMask),
+    urlOf(def.caseHardening ? def.caseHardeningRamp : undefined),
+    urlOf(def.caseHardening ? def.normal : undefined),
   ]);
   const magTex = magUrl ? await loadTex(THREE, magUrl, { srgb: false, wrap: false }) : null;
-  const [pattern, wearT, grunge, masks, ao, baseColor, baseRM, roughTex, metalTex, overlayTex, overlayMaskTex] = await Promise.all([
+  const [pattern, wearT, grunge, masks, ao, baseColor, baseRM, roughTex, metalTex, overlayTex, overlayMaskTex, caseRampTex, paintNormalTex] = await Promise.all([
     patternUrl ? loadTex(THREE, patternUrl, { srgb: patternIsColor, wrap: true }) : null,
     wearUrl ? loadTex(THREE, wearUrl, { srgb: false, wrap: true }) : null,
     grungeUrl ? loadTex(THREE, grungeUrl, { srgb: true, wrap: true }) : null,
@@ -1088,6 +1203,10 @@ export async function compositePaint(
     // g_tOverlay declares SrgbRead(true); g_tOverlayMask declares SrgbRead(false).
     overlayUrl ? loadTex(THREE, overlayUrl, { srgb: true, wrap: true }) : null,
     overlayMaskUrl ? loadTex(THREE, overlayMaskUrl, { srgb: false, wrap: true }) : null,
+    // g_tCaseHardeningColorRamp declares SrgbRead(true) and samples through
+    // g_sTrilinearClamp — the clamp matters, the ramp must not wrap.
+    caseRampUrl ? loadTex(THREE, caseRampUrl, { srgb: true, wrap: false }) : null,
+    paintNormalUrl ? loadTex(THREE, paintNormalUrl, { srgb: false, wrap: true }) : null,
   ]);
 
   // Solid-style paints legitimately have no pattern; anything else without
@@ -1175,6 +1294,13 @@ export async function compositePaint(
       tMagMask: { value: null as unknown as import("three").Texture },
       uHasMag: { value: false },
       uSeparateChannels: { value: false },
+      tCaseRamp: { value: null as unknown as import("three").Texture },
+      tPaintNormal: { value: null as unknown as import("three").Texture },
+      uCaseHardening: { value: false },
+      uChPat: { value: 0.5 },
+      uChGeo: { value: 1 },
+      uChRampOff: { value: 0 },
+      uColorAdjustMode: { value: 0 },
       uMode: { value: 0 },
     },
   });
@@ -1185,6 +1311,9 @@ export async function compositePaint(
   // Shader defaults: cavity 0.5, ao 1, noPaint 0 / rough 0.5, metal 0.
   const aoDefault = fallbackTex(THREE, [188, 255, 128, 0], true);
   const rmDefault = fallbackTex(THREE, [128, 0, 0, 255], false);
+  // Valve's own default_normal is a 1x1 (128,128,255,0) — matching it exactly
+  // keeps the case-hardening edge term at the constant the shader produces.
+  const flatNormal = fallbackTex(THREE, [128, 128, 255, 0], false);
   const grayDefault = fallbackTex(THREE, [110, 110, 112, 255], true);
   // Name every fallback. `pattern` missing turns a skin white; `baseColor`
   // missing means worn metal is a flat grey that is nothing like the weapon.
@@ -1265,6 +1394,18 @@ export async function compositePaint(
   // Only meaningful alongside a real weapon ao map; the generic fallback is a
   // Source1-style pack.
   u.uSeparateChannels.value = !!opts.weapon?.ao && !!opts.weapon?.separateChannels;
+  // The ramp IS the colour on these finishes, so a missing one is not a
+  // degraded render, it is the wrong render — fall back to no case hardening
+  // and say so rather than sampling white and silently producing greyscale.
+  if (def.caseHardening && !caseRampTex) noteMissing(modelKey, "caseHardening colour ramp (skin renders greyscale)");
+  u.uCaseHardening.value = def.caseHardening && !!caseRampTex;
+  u.tCaseRamp.value = caseRampTex ?? white;
+  // Flat default normal => the edge term is a constant, matching the shader.
+  u.tPaintNormal.value = paintNormalTex ?? flatNormal;
+  u.uChPat.value = def.chPatternInfluence;
+  u.uChGeo.value = def.chGeometricInfluence;
+  u.uChRampOff.value = def.chRampOffset;
+  u.uColorAdjustMode.value = def.colorAdjustmentMode;
 
   const scene = new THREE.Scene();
   scene.add(new THREE.Mesh(quadGeom, quadMat));

@@ -26,6 +26,15 @@ export interface HostRouting {
     to: string,
     options?: { replace?: boolean; query?: Record<string, unknown> },
   ) => unknown;
+  /**
+   * Navigate the HOST app to an absolute panel path, leaving wherever the
+   * plugin is mounted. Distinct from `navigate`, which moves the plugin WITHIN
+   * its mount point — inside a profile tab that's local state that never leaves
+   * the page, which is exactly what a "go to the full app" link must do. Absent
+   * standalone, and absent from hosts that predate it; callers fall back to the
+   * plain href, so a missing prop costs a page load, not a dead link.
+   */
+  navigateApp?: (to: string) => unknown;
 }
 
 export interface PluginRouter {
@@ -37,6 +46,12 @@ export interface PluginRouter {
   go: (to: string, options?: { replace?: boolean; query?: Record<string, unknown> }) => void;
   /** Absolute href for a plugin-relative path — for <a> tags and share links. */
   href: (to: string, query?: Record<string, unknown>) => string;
+  /**
+   * Leave the plugin's mount point for the plugin's own page in the host app.
+   * Returns false when the host offers no such channel, so an <a> handler can
+   * decline to preventDefault and let the browser do the navigation instead.
+   */
+  goApp: (to: string, query?: Record<string, unknown>) => boolean;
   /** True when mounted inside the panel (as opposed to standalone dev). */
   embedded: ComputedRef<boolean>;
 }
@@ -107,5 +122,17 @@ export function usePluginRouter(props: HostRouting): PluginRouter {
     syncFromUrl();
   };
 
-  return { path, query, go, href, embedded };
+  const goApp: PluginRouter["goApp"] = (to, q) => {
+    if (typeof props.navigateApp !== "function") return false;
+    // Host-absolute, unlike go()'s plugin-relative `to`: the host router is
+    // being asked to leave for a different page entirely. Query defaults to
+    // NOTHING rather than the current one — the caller is exiting this mount
+    // point, so carrying ?player/?embed along would land them back in it.
+    props.navigateApp(
+      `${normalize(`${props.base ?? ""}${to}`)}${toSearch(q ?? {})}`,
+    );
+    return true;
+  };
+
+  return { path, query, go, href, goApp, embedded };
 }
