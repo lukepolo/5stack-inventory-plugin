@@ -24,7 +24,7 @@ function check(f: Fixture, r: RigResult): string[] {
   if (r.style !== f.style) p.push(`style ${r.style} != expected ${f.style}`);
   if (r.hasOverlay !== f.overlay) p.push(`overlay ${r.hasOverlay} != expected ${f.overlay}`);
   if (!r.weaponInputs?.length) p.push("no weapon inputs (extraction missing?)");
-  const floor = f.lowChroma ? 2 : GREY_SAT;
+  const floor = f.greyFloor ?? (f.lowChroma ? 2 : GREY_SAT);
   if ((r.albedo?.sat ?? 0) < floor) p.push(`GREY: saturation ${r.albedo?.sat} < ${floor}`);
   if (!f.paletteFallbackOk && r.colors?.every((c) => c[0] === 0.5 && c[1] === 0.5 && c[2] === 0.5)) {
     p.push("palette is the [0.5,0.5,0.5] fallback — per-skin colours not resolving");

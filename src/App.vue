@@ -62,7 +62,7 @@ import AdminConsole from "./AdminConsole.vue";
 import ShareMenu from "./ShareMenu.vue";
 import ItemArt from "./ItemArt.vue";
 import ItemName from "./ItemName.vue";
-import TeamDots from "./TeamDots.vue";
+import SlotStatus from "./SlotStatus.vue";
 import WearBar from "./WearBar.vue";
 import ItemTile from "./ItemTile.vue";
 import FilterDropdown from "./FilterDropdown.vue";
@@ -3562,6 +3562,7 @@ function deleteSelected() {
                 @click="selectPos(s.slot)"
               >
                 <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
+                <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" />
                 <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">
                   {{ s.slot === 'agent' ? `Agent · ${team}` : s.name }}
                 </div>
@@ -3607,16 +3608,7 @@ function deleteSelected() {
                 <div class="relative z-[2] truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
                   {{ cell.weapon?.name ?? cell.pos }}
                 </div>
-                <!-- Status cluster: equipped-team dots + the synced mark. -->
-                <span class="absolute right-2 top-2 z-[2] flex items-center gap-1.5">
-                  <TeamDots :teams="cellTeams(cell.pos)" />
-                  <RefreshCw
-                    v-if="cellInstance(cell.pos)?.origin === 'steam'"
-                    class="h-3 w-3"
-                    :style="{ color: STEAM_BLUE }"
-                    title="Synced from your Steam inventory (read-only)"
-                  />
-                </span>
+                <SlotStatus :teams="cellTeams(cell.pos)" :inst="cellInstance(cell.pos)" />
                 <div
                   :key="team + ':' + occupantModel(cell.pos)"
                   :class="['animate-cell-in', CARD_ART]"
@@ -3669,6 +3661,7 @@ function deleteSelected() {
               @drop.prevent="onSlotDrop(s.slot)"
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
+              <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" />
               <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ s.name }}</div>
               <!-- Keyed on team: switching sides re-runs the entrance so the
                    rail joins the same cascade as the weapon columns. -->
@@ -3701,6 +3694,7 @@ function deleteSelected() {
               @drop.prevent="onSlotDrop('agent')"
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor('agent')?.item?.rarity, 0.3)"></span>
+              <SlotStatus :teams="cellTeams('agent')" :inst="cellInstance('agent')" />
               <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">Agent · {{ team }}</div>
               <div :key="team" :class="['animate-cell-in py-1', CARD_ART]" :style="{ '--i': 2 }">
                 <img
@@ -3735,6 +3729,7 @@ function deleteSelected() {
                 @drop.prevent="onSlotDrop(s.slot)"
               >
                 <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
+                <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" compact />
                 <div :key="team" :class="['animate-cell-in', CARD_ART]" :style="{ '--i': 3 + si }">
                   <img v-if="specialImage(s.slot)" :src="specialImage(s.slot)" alt="" :class="cn('max-h-full max-w-full object-contain', !rowFor(s.slot) && 'opacity-60')" />
                   <span v-else class="text-f8 uppercase text-muted-foreground/50">—</span>
@@ -3818,17 +3813,12 @@ function deleteSelected() {
                       </template>
                     </span>
                   </div>
-                  <!-- Status cluster: equipped-team dots + the synced mark.
-                       Both fade for the hover actions, which occupy this corner. -->
-                  <span class="absolute right-2.5 top-2.5 z-[2] flex items-center gap-1.5 transition-opacity group-hover:opacity-0">
-                    <TeamDots :teams="cellTeams(previewPos(cell.pos))" />
-                    <RefreshCw
-                      v-if="cellInstance(previewPos(cell.pos))?.origin === 'steam'"
-                      class="h-3 w-3"
-                      :style="{ color: STEAM_BLUE }"
-                      title="Synced from your Steam inventory (read-only)"
-                    />
-                  </span>
+                  <!-- Fades for the hover actions, which occupy this corner. -->
+                  <SlotStatus
+                    :teams="cellTeams(previewPos(cell.pos))"
+                    :inst="cellInstance(previewPos(cell.pos))"
+                    class="!right-2.5 !top-2.5 transition-opacity group-hover:opacity-0"
+                  />
                   <!-- Keyed on team + occupant: switching sides (or replacing
                        the weapon) re-runs the entrance, staggered row-by-row
                        across the three columns — a wave, not a teleport.
@@ -4476,7 +4466,7 @@ function deleteSelected() {
          also how you LOOK at an item, letting the inventory show through is what
          says "this is on top of your stuff", not a new page. -->
     <div v-if="craft" class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 p-4 backdrop-blur-sm" @click.self="closeCraft()">
-      <div class="relative flex h-[min(92vh,860px)] w-[min(96vw,1180px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in">
+      <div class="relative flex h-[min(92vh,940px)] w-[min(96vw,1320px)] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl animate-pop-in">
         <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
           <!-- Provenance and where it's equipped belong to the item's IDENTITY,
                not its spec — "this is your Steam one, and it's on T" is part of

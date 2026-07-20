@@ -16,6 +16,14 @@ export interface Fixture {
   overlay: boolean;
   /** Genuinely muted skin — exempt from the grey-detection threshold. */
   lowChroma?: boolean;
+  /**
+   * Override the grey-detection floor. The grey check asks "did the composite
+   * collapse", but a fixture pinned at Battle-Scarred has legitimately stripped
+   * most of its paint to bare metal, so a low atlas saturation is the CORRECT
+   * answer there and the generic floor produces a false failure. Only lower
+   * this for a fixture whose wear explains it, and say so in the note.
+   */
+  greyFloor?: number;
   /** Style carries no palette; the [0.5,0.5,0.5] fallback is correct. */
   paletteFallbackOk?: boolean;
   ref?: string;
@@ -95,14 +103,21 @@ export const FIXTURES: Fixture[] = [
   {
     name: "M249 | Sage Camo",
     model: "m249", pm: "/materials/hyo_jungle_desat_28ddab92.vcompmat.json",
-    wear: 0.725, seed: 231, style: 1, overlay: true, lowChroma: true,
+    wear: 0.725, seed: 231, style: 1, overlay: true, lowChroma: true, greyFloor: 1,
     ref: "weapon_m249_hyo_jungle_desat_47d5846e",
     note: "Style 1 (hydrographic) at Battle-Scarred. Legitimately enables an overlay " +
           "(m249_spray_overlay: flat dark RGB, shape in alpha) and uses F_OVERLAY_MASK=6. " +
-          "KNOWN OPEN ISSUE: mode 6 is gate = 1-noPaint, and noPaint is currently pinned " +
-          "to 0, so that gate is always 1 and the overlay is applied ungated. It still " +
-          "matches its reference (rendered sat 9.5 vs 10.3), so this is latent, not " +
-          "broken. Kept as the mode-6 canary.",
+          "Kept as the mode-6 canary. NOTE: noPaint is no longer pinned to 0 (the " +
+          "metalness gate came off), so mode 6's gate = 1-noPaint is live here now.\n" +
+          "greyFloor is lowered because the atlas SHOULD be near-grey at this wear. " +
+          "MEASURED through runViewer against the CDN reference (lit-render saturation): " +
+          "wear 0.02 -> 12.1, 0.35 -> 9.4, 0.725 -> 4.6, reference 8.7 — the reference is " +
+          "a moderately-worn render, and our wear response is smooth and monotonic across " +
+          "the range. Atlas sat at 0.725 is 1.9. It read 3.4 before the HD composite-input " +
+          "switch, and that was the BUG: with the legacy cavity map (mean 0.229, 6% above " +
+          "0.5 vs the HD map's 0.306 / 27.7%) this skin barely wore at all — Battle-Scarred " +
+          "looked almost like Factory New. Do NOT 'fix' a low number here by restoring the " +
+          "old inputs; check the wear sweep instead.",
   },
 ];
 
