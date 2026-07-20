@@ -168,23 +168,41 @@ async function loadBitmap(url: string): Promise<ImageBitmap> {
   return createImageBitmap(await res.blob());
 }
 
-// Collapse every SkinnedMesh under `root` into a plain Mesh holding the pose
-// its bones currently describe, and swap it in place. Call AFTER the pose has
-// been evaluated and matrices updated; see the call site for why this is worth
-// doing rather than leaving the skeleton live.
+// Replace every SkinnedMesh under `root` with a plain Mesh carrying the pose
+// its bones currently describe, with the animation props removed outright.
+// Call AFTER the clip has been evaluated.
 //
-// Each vertex is pushed through the standard linear-blend skin — sum of
-// (boneMatrixWorld * boneInverse) weighted by skinWeight, sandwiched between
-// bindMatrix and bindMatrixInverse — which is precisely what the GPU and
-// three's own raycast do, so the baked surface is the one already on screen.
+// The pose has to be RENDERED: `inventory_icon` is not just prop-hiding, it
+// carries the weapon's display orientation. At the bind pose the guns lie on
+// their side. (We tried bind-pose rendering to keep coordinates honest — it
+// turned every weapon sideways.)
+//
+// But the pose is also why charm placement is wrong in-game, so this returns
+// `poseXform`: the bind→posed transform of the most heavily weighted bone,
+// i.e. the rigid motion the clip applies to the weapon BODY. Weapons are rigid
+// props, so for the body that transform is exact, and inverting it converts a
+// picked world point back to the model space the game consumes. See
+// gameXform at the call site.
+//
+// Props are DROPPED rather than collapsed by their zero-scaled bones: same
+// result on screen, but the bounding box becomes the true silhouette, so
+// auto-framing needs no help.
+//
 // Returns the geometries it created: unlike the cached glTF geometry these are
 // per-viewer clones, so the viewer that made them owns disposing them.
-function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"]) {
+function bakePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"]) {
   const owned: import("three").BufferGeometry[] = [];
+  let droppedTris = 0;
+  let hiddenBones = 0;
+  let poseXform: import("three").Matrix4 | null = null;
+  let bestWeight = -1;
   const skinned: import("three").SkinnedMesh[] = [];
   root.traverse((n) => {
     if ((n as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) skinned.push(n as import("three").SkinnedMesh);
   });
+  const scale = new THREE.Vector3();
+  const pos3 = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
   for (const sm of skinned) {
     const geom = sm.geometry.clone();
     const pos = geom.getAttribute("position");
@@ -192,6 +210,41 @@ function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"])
     const si = geom.getAttribute("skinIndex");
     const sw = geom.getAttribute("skinWeight");
     if (!pos || !si || !sw) continue;
+    // A prop bone is scaled to zero by the clip. Read it off matrixWorld, not
+    // the local scale: a zero-scaled PARENT hides its children just as
+    // effectively, and only the world matrix reflects that.
+    const hidden = new Set<number>();
+    sm.skeleton.bones.forEach((bone, bi) => {
+      bone.matrixWorld.decompose(pos3, quat, scale);
+      if (Math.min(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z)) < 1e-4) hidden.add(bi);
+    });
+    hiddenBones += hidden.size;
+
+    // Which bone carries the body? Total weight per bone, ignoring the hidden
+    // prop bones. Its bind→posed matrix is the weapon's rigid display motion.
+    const boneWeight = new Map<number, number>();
+    for (let i = 0; i < pos.count; i++) {
+      for (let k = 0; k < 4; k++) {
+        const w = sw.getComponent(i, k);
+        if (!w) continue;
+        const bi = si.getComponent(i, k);
+        if (hidden.has(bi)) continue;
+        boneWeight.set(bi, (boneWeight.get(bi) ?? 0) + w);
+      }
+    }
+    for (const [bi, w] of boneWeight) {
+      if (w <= bestWeight) continue;
+      const bone = sm.skeleton.bones[bi];
+      if (!bone) continue;
+      bestWeight = w;
+      // Same sandwich the skin uses, so this is exactly what the body's
+      // vertices underwent — expressed in the mesh's local space.
+      poseXform = new THREE.Matrix4()
+        .multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[bi])
+        .multiply(sm.bindMatrix)
+        .premultiply(sm.bindMatrixInverse);
+    }
+
     const skin = new THREE.Matrix4();
     const blend = new THREE.Matrix4();
     const v = new THREE.Vector3();
@@ -203,9 +256,10 @@ function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"])
       for (let k = 0; k < 4; k++) {
         const w = sw.getComponent(i, k);
         if (!w) continue;
-        const bone = sm.skeleton.bones[si.getComponent(i, k)];
+        const bi = si.getComponent(i, k);
+        const bone = sm.skeleton.bones[bi];
         if (!bone) continue;
-        skin.multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[si.getComponent(i, k)]);
+        skin.multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[bi]);
         for (let e = 0; e < 16; e++) blend.elements[e] += skin.elements[e] * w;
         total += w;
       }
@@ -216,9 +270,6 @@ function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"])
       v.fromBufferAttribute(pos, i).applyMatrix4(blend);
       pos.setXYZ(i, v.x, v.y, v.z);
       if (nrm) {
-        // Bones that hide a prop are scaled to ZERO, which makes the normal
-        // matrix singular. Those vertices are collapsed to a point and never
-        // shade anything, so keep the bind normal instead of writing NaN.
         n3.setFromMatrix4(blend);
         nv.fromBufferAttribute(nrm, i).applyMatrix3(n3);
         if (nv.lengthSq() > 1e-12) {
@@ -229,8 +280,33 @@ function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"])
     }
     pos.needsUpdate = true;
     if (nrm) nrm.needsUpdate = true;
-    // The skinning attributes are dead weight once baked, and leaving them on
-    // a plain Mesh invites a future reader to think it is still skinned.
+
+    // Drop the prop triangles. Dominant influence, not "any influence": a
+    // vertex can carry a stray near-zero weight to a hidden bone without
+    // belonging to the prop, and dropping on that would punch holes in the gun.
+    const vertexHidden = (vi: number) => {
+      let w = 0;
+      for (let k = 0; k < 4; k++) {
+        if (hidden.has(si.getComponent(vi, k))) w += sw.getComponent(vi, k);
+      }
+      return w > 0.5;
+    };
+    const index = geom.getIndex();
+    const count = index ? index.count : pos.count;
+    const keep: number[] = [];
+    for (let i = 0; i + 2 < count; i += 3) {
+      const a = index ? index.getX(i) : i;
+      const b = index ? index.getX(i + 1) : i + 1;
+      const c = index ? index.getX(i + 2) : i + 2;
+      if (vertexHidden(a) || vertexHidden(b) || vertexHidden(c)) {
+        droppedTris++;
+        continue;
+      }
+      keep.push(a, b, c);
+    }
+    geom.setIndex(keep);
+    // Dead weight once there is no skeleton, and leaving them on a plain Mesh
+    // invites a future reader to think it is still skinned.
     geom.deleteAttribute("skinIndex");
     geom.deleteAttribute("skinWeight");
     geom.computeBoundingBox();
@@ -240,8 +316,6 @@ function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"])
     baked.userData = sm.userData;
     baked.visible = sm.visible;
     baked.renderOrder = sm.renderOrder;
-    // The bake is expressed in the SkinnedMesh's own local space, so its
-    // transform carries over verbatim.
     baked.position.copy(sm.position);
     baked.quaternion.copy(sm.quaternion);
     baked.scale.copy(sm.scale);
@@ -250,7 +324,7 @@ function freezePose(root: import("three").Object3D, THREE: ThreeBundle["THREE"])
     owned.push(geom);
   }
   root.updateMatrixWorld(true);
-  return owned;
+  return { owned, droppedTris, hiddenBones, poseXform };
 }
 
 // ---- Sticker / charm placement ------------------------------------------------
@@ -476,9 +550,15 @@ export async function mountViewer(
   const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton } = await loadThree();
   // Which body survived the hd/legacy prune below — slot markup is per-variant.
   let bodyVariant = "body_hd";
-  // Per-viewer geometry clones produced by freezePose (the cached glTF ones are
+  // Per-viewer geometry clones produced by flattenToBindPose (the cached glTF ones are
   // shared and must NOT be disposed; these must).
   let bakedGeoms: import("three").BufferGeometry[] = [];
+  // What the prop cull removed — if this reads 0 tris on the Revolver or
+  // XM1014, the bone-scale detection missed and the floating props are back.
+  let propStats = "no skin";
+  // Bind→posed motion of the weapon body. Null when the model has no skeleton,
+  // in which case rendered space already IS model space and nothing to undo.
+  let poseXform: import("three").Matrix4 | null = null;
   const gltf = await loadGltf(model);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -566,37 +646,19 @@ export async function mountViewer(
       gltf.animations[0];
     const mixer = new THREE.AnimationMixer(object);
     mixer.clipAction(clip).play();
-    mixer.update(0); // single evaluation — the pose is static, nothing to tick
+    // Evaluate once. We want the posed bone SCALES (they identify the props),
+    // not the posed vertex positions — see flattenToBindPose for why baking the
+    // pose into the geometry breaks every coordinate we hand to the game.
+    mixer.update(0);
     object.updateMatrixWorld(true);
-    // Box3.setFromObject reads geometry.boundingBox, which is the BIND pose —
-    // it would still reserve room for the parked props and shrink/offset the
-    // framing exactly like the bug we just fixed. SkinnedMesh.computeBoundingBox
-    // re-derives it through the current bones.
-    object.traverse((n) => {
-      const sm = n as unknown as { isSkinnedMesh?: boolean; computeBoundingBox?: () => void; computeBoundingSphere?: () => void };
-      if (sm.isSkinnedMesh) {
-        sm.computeBoundingBox?.();
-        sm.computeBoundingSphere?.();
-      }
-    });
-    // Now BAKE that pose into the vertices and drop the skeleton.
-    //
-    // The pose is evaluated once and never ticked, so nothing downstream wants
-    // a live skeleton — but leaving one costs us twice:
-    //
-    //  - DecalGeometry has NO skinning support. It reads the raw position
-    //    attribute (the bind pose) and the mesh's own matrixWorld. castAt
-    //    raycasts, which three DOES skin, so the projection box gets centred on
-    //    the posed surface while the geometry it clips against is the unposed
-    //    one. That mismatch is stickers appearing off in empty space beside the
-    //    weapon instead of on it.
-    //  - Raycasts stay correct but re-derive every candidate vertex through its
-    //    bone chain on every cast, and the charm alone casts six rays a frame.
-    //
-    // Baking fixes the first outright and makes the second a plain static
-    // intersection. Vertices land in the same local space the skinned ones
-    // occupied, so matrixWorld, framing and the recentre below are unaffected.
-    bakedGeoms = freezePose(object, THREE);
+    // Drop the props and the skeleton, keeping the bind pose. This also settles
+    // the framing problem the bounding boxes used to paper over: the parked
+    // props are removed outright, so geometry.boundingBox IS the silhouette and
+    // Box3.setFromObject needs no help.
+    const flat = bakePose(object, THREE);
+    bakedGeoms = flat.owned;
+    poseXform = flat.poseXform;
+    propStats = `props -${flat.droppedTris}tri / ${flat.hiddenBones} bones`;
   }
   // CS2 exports ship BOTH bodies stacked: the CS:GO-era "_legacy" mesh AND the
   // CS2 "_hd" mesh. They are different geometry with DIFFERENT UV unwraps —
@@ -1335,18 +1397,37 @@ export async function mountViewer(
   // frame (x forward/muzzle, y left, z up). The GLB is that frame swizzled and
   // scaled, so the conversion both ways is the node matrix's permutation.
   const SRC_TO_M = 0.0254;
-  const offsetToWorld = (c: { x?: number | null; y?: number | null; z?: number | null }) =>
-    new THREE.Vector3((c.y ?? 0) * SRC_TO_M, (c.z ?? 0) * SRC_TO_M, (c.x ?? 0) * SRC_TO_M);
-  const worldToOffset = (v: import("three").Vector3) => ({
-    x: v.z / SRC_TO_M,
-    y: v.x / SRC_TO_M,
-    z: v.y / SRC_TO_M,
-  });
+  // The swizzle alone is NOT the whole conversion once a pose is rendered.
+  // `inventory_icon` moves the body off the bind pose — that is what makes the
+  // weapon stand upright instead of lying on its side — so a point picked off
+  // the rendered surface is in POSED space, while the game reads model (bind)
+  // space. Undo the body's rigid pose motion on the way out and re-apply it on
+  // the way in. Weapons are rigid props, so for the body poseXform is exact.
+  //
+  // This is why charm placement broke in-game while stickers kept working:
+  // stickers report through UV1, a per-vertex property no pose can move.
+  const poseInv = poseXform ? poseXform.clone().invert() : null;
+  const offsetToWorld = (c: { x?: number | null; y?: number | null; z?: number | null }) => {
+    const v = new THREE.Vector3((c.y ?? 0) * SRC_TO_M, (c.z ?? 0) * SRC_TO_M, (c.x ?? 0) * SRC_TO_M);
+    return poseXform ? v.applyMatrix4(poseXform) : v;
+  };
+  const worldToOffset = (v: import("three").Vector3) => {
+    const m = poseInv ? v.clone().applyMatrix4(poseInv) : v;
+    return {
+      x: m.z / SRC_TO_M,
+      y: m.x / SRC_TO_M,
+      z: m.y / SRC_TO_M,
+    };
+  };
 
   const charmAnchor = (() => {
     const a = (CHARM_ANCHORS as Record<string, { keychain: number[] } | undefined>)[model];
     if (!a || a.keychain.length !== 3) return null;
-    return new THREE.Vector3(a.keychain[0], a.keychain[1], a.keychain[2]).sub(center);
+    // The keychain attachment is authored in model space, so it has to ride the
+    // pose too — otherwise the anchor we preview sits where the gun used to be.
+    const p = new THREE.Vector3(a.keychain[0], a.keychain[1], a.keychain[2]);
+    if (poseXform) p.applyMatrix4(poseXform);
+    return p.sub(center);
   })();
 
   // The anchor CS2 gives us is a clip point, which on some weapons sits just
@@ -1944,7 +2025,23 @@ export async function mountViewer(
       tris += ((idx ? idx.count : p ? p.count : 0) / 3) | 0;
       if ((m as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) skinned++;
     }
-    return `${model}\nmesh ${weaponMeshes.length} (skinned ${skinned})  tri ${tris.toLocaleString()}`;
+    // The pose transform in human terms. If charm placement is off in-game,
+    // this is the number that decides whether the conversion is even engaged:
+    // "pose none" on a weapon that renders upright means poseXform never got
+    // picked up and every offset we send is raw posed-space.
+    let pose = "pose none";
+    if (poseXform) {
+      const p = new THREE.Vector3();
+      const q = new THREE.Quaternion();
+      const s = new THREE.Vector3();
+      poseXform.decompose(p, q, s);
+      const deg = (2 * Math.acos(Math.min(1, Math.abs(q.w))) * 180) / Math.PI;
+      pose = `pose rot ${deg.toFixed(1)}deg  mov ${(p.length() / 0.0254).toFixed(2)}in`;
+    }
+    return (
+      `${model}\nmesh ${weaponMeshes.length} (skinned ${skinned})  tri ${tris.toLocaleString()}\n` +
+      `${propStats}\n${pose}`
+    );
   })();
   // Frame times are noisy at 60fps; a one-second window is what the eye reads
   // as "smooth" or "not", so accumulate and report over exactly that.
@@ -2116,7 +2213,7 @@ export async function mountViewer(
       renderer.domElement.width = 0;
       renderer.domElement.height = 0;
       // Cloned meshes share cached geometry/materials — don't dispose those;
-      // the LRU owns their lifetime. The freezePose bakes are the exception:
+      // the LRU owns their lifetime. The flattenToBindPose clones are the exception:
       // this viewer created them, so this viewer frees them.
       for (const g of bakedGeoms) g.dispose();
       bakedGeoms = [];

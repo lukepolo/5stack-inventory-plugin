@@ -774,6 +774,26 @@ void main() {
   // roughness boost).
   vec4 grunge = mix(vec4(1.0), grungeRaw, pow(1.0 - cavity, 4.0) * 0.25 + 0.75 * uWearAmt);
 
+  // ---- Debug output ------------------------------------------------------------
+  // uMode 2 emits the pattern EXACTLY as sampled through the seeded UV
+  // transform, before any palette, mask or wear stage touches it. It exists to
+  // answer one question that no downstream statistic can: did the seed actually
+  // move the pattern? A low-contrast skin whose composite barely changes
+  // between seeds looks identical to a skin whose pattern never moved at all,
+  // and only this output tells the two apart.
+  if (uMode == 2) {
+    outColor = vec4(pattern.rgb, 1.0);
+    return;
+  }
+  if (uMode == 3) {
+    outColor = vec4(vec3(pattern.a), 1.0);
+    return;
+  }
+  if (uMode == 4) {
+    outColor = vec4(masks.rgb, 1.0);
+    return;
+  }
+
   // ---- Rough/metal output ------------------------------------------------------
   if (uMode == 1) {
     float roughPaint = uPerColorRough ? mix4(uRoughPerColor, masks.rgb) : uPaintRough;
@@ -948,6 +968,8 @@ function fallbackTex(THREE: THREE, rgba: [number, number, number, number], srgb:
 export interface CompositeResult {
   albedo: import("three").Texture;
   rm: import("three").Texture; // G = roughness, B = metalness (three's packing)
+  /** Only present when opts.debug was set — see compositePaint. Test rig only. */
+  debug?: import("three").Texture;
   release: () => void;
 }
 
@@ -1011,13 +1033,19 @@ export async function compositePaint(
   three: THREE,
   renderer: import("three").WebGLRenderer,
   def: PaintDef,
-  opts: { wear: number; seed: number; weapon?: WeaponInputs | null; model?: string },
+  opts: {
+    wear: number; seed: number; weapon?: WeaponInputs | null; model?: string;
+    /** Test-rig only: also render a debug pass (2 = pattern.rgb as sampled
+     *  through the seeded UV transform, 3 = pattern.a) into `result.debug`.
+     *  Part of the cache key so a debug render never satisfies a normal one. */
+    debug?: 2 | 3 | 4;
+  },
 ): Promise<CompositeResult | null> {
   const THREE = three;
   const wear = Math.min(Math.max(opts.wear, 0), 1);
   const seed = Math.max(0, Math.trunc(opts.seed));
   const wkey = opts.weapon ? (opts.weapon.color ?? "w") : "";
-  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}`;
+  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}`;
   const cache = cacheFor(renderer);
   const hit = cache.get(key);
   if (hit) {
@@ -1271,14 +1299,27 @@ export async function compositePaint(
   u.uMode.value = 1;
   renderer.setRenderTarget(rmRT);
   renderer.render(scene, camera);
+  let debugRT: import("three").WebGLRenderTarget | null = null;
+  if (opts.debug) {
+    debugRT = makeRT(true);
+    u.uMode.value = opts.debug;
+    renderer.setRenderTarget(debugRT);
+    renderer.render(scene, camera);
+    u.uMode.value = 0;
+  }
   renderer.setRenderTarget(prevRT);
 
   const dispose = () => {
     albedoRT.dispose();
     rmRT.dispose();
+    debugRT?.dispose();
     for (const t of [white, black, aoDefault, rmDefault, grayDefault]) t.dispose();
   };
-  const entry: CacheEntry = { result: { albedo: albedoRT.texture, rm: rmRT.texture }, refs: 1, dispose };
+  const entry: CacheEntry = {
+    result: { albedo: albedoRT.texture, rm: rmRT.texture, debug: debugRT?.texture },
+    refs: 1,
+    dispose,
+  };
   cache.set(key, entry);
   evictIfNeeded(cache);
   return { ...entry.result, release: makeRelease(cache, key) };

@@ -41,10 +41,6 @@ import {
   renderUrlFor,
   type CfgSyncResult,
 } from "./api";
-// The "View CS2 Loadout" chip on /players/:steamid is parked for now — it
-// floats over the host's own UI and gets in the way. `./profileLink` is left
-// intact; re-enable by restoring this import and the installProfileLink call
-// in onMounted.
 import { usePluginRouter, type HostRouting } from "./pluginRouter";
 import {
   parsePath,
@@ -97,6 +93,19 @@ const playerParam = computed(() => {
   return p && /^\d{17}$/.test(p) ? p : null;
 });
 const viewerId = ref<string | null>(playerParam.value);
+// Embed mode: ?embed=1 means we're mounted inside a host page (the Inventory tab
+// on /players/:steamid) rather than owning the screen at /apps/inventory. Note
+// this is NOT `router.embedded` — that's "mounted in the panel at all", which is
+// true for both. Here the host page already supplies the framing, so we drop our
+// own full-viewport height and header chrome.
+const embedMode = computed(() => router.query.value.embed === "1");
+// In a profile tab we stay read-only even on our OWN profile, so "is this me?"
+// is a separate question from "is this read-only?" — it's what suppresses the
+// copy-to-my-inventory action, which would otherwise offer to copy your loadout
+// onto itself.
+const viewingSelf = computed(
+  () => !!viewerId.value && viewerId.value === props.user?.steam_id,
+);
 const team = ref<Team>("CT");
 
 // ---- routes -----------------------------------------------------------------
@@ -2680,7 +2689,13 @@ function queueLoadoutRenders() {
 async function load() {
   loading.value = true;
   error.value = "";
-  if (viewerId.value && viewerId.value === props.user?.steam_id) viewerId.value = null;
+  // At /apps/inventory, ?player=<me> should drop into your real editable
+  // inventory rather than a read-only view of yourself. In a profile tab it must
+  // NOT: the tab is a showcase, and editing belongs on the full page. Keeping
+  // viewer mode on here is what makes every `!viewerId` guard below (the
+  // owned/craft/replace picker sheet, drag-to-equip, the slot menus) apply to
+  // your own profile too, instead of each one needing its own embed check.
+  if (!embedMode.value && viewerId.value === props.user?.steam_id) viewerId.value = null;
   try {
     if (viewerId.value) {
       const [catalog, theirs] = await Promise.all([fetchCatalog(), fetchPlayerLoadout(viewerId.value)]);
@@ -2806,12 +2821,15 @@ onMounted(() => {
 // ---- viewer actions ----
 const copyBusy = ref(false);
 async function copyViewerLoadout() {
-  if (!viewerId.value || copyBusy.value) return;
+  if (!viewerId.value || viewingSelf.value || copyBusy.value) return;
   copyBusy.value = true;
   try {
     const { copied } = await copyLoadoutFrom(viewerId.value);
     notify(`Copied ${copied} loadout slots into your inventory.`, "success");
-    exitViewer();
+    // Embedded, exitViewer() can't do its job: the host's navigate only carries
+    // the path, so ?player survives and we'd stay in viewer mode anyway. Leave
+    // the tab where it is — the toast already confirmed the copy.
+    if (!embedMode.value) exitViewer();
   } catch (e) {
     fail(e);
   } finally {
@@ -2969,8 +2987,14 @@ function deleteSelected() {
        rules); data-cs2-inventory scopes this plugin's own CSS in style.css. -->
   <div data-5stack-plugin data-cs2-inventory style="display: contents">
   <div
-    class="mx-auto flex h-[calc(100dvh-6rem)] w-full max-w-[1560px] flex-col overflow-hidden text-foreground"
-    :class="!isCompact && 'min-h-[560px]'"
+    class="mx-auto flex w-full max-w-[1560px] flex-col overflow-hidden text-foreground"
+    :class="[
+      // Embedded we're one tab among several on a page that scrolls itself, so
+      // 100dvh would push the rest of the profile off-screen. Take a bounded
+      // slice instead and let the host own the page scroll.
+      embedMode ? 'h-[70dvh] min-h-[480px]' : 'h-[calc(100dvh-6rem)]',
+      !isCompact && !embedMode && 'min-h-[560px]',
+    ]"
     :data-team="team"
     :style="{ '--acc': accent }"
   >
@@ -3042,7 +3066,32 @@ function deleteSelected() {
            floating at equal distance. All three controls are 36px tall (the
            pill is h-7 + p-1), so they share a baseline. -->
       <div class="ml-auto flex items-center" :class="isCompact ? 'gap-1.5' : 'gap-3'">
-        <div v-if="user" class="flex items-center gap-1.5">
+        <!-- Embedded, the viewer banner below is suppressed and its one action
+             lands here instead — a full-width bar cost ~40px of a 70dvh tab to
+             say something the tab's own title already implies. Matched to the
+             Focus button's metrics so the header keeps a single baseline. -->
+        <a
+          v-if="embedMode && viewingSelf && !loading && !error"
+          :href="router.href('/', {})"
+          class="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3.5 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+          title="Edit your loadout in the full inventory page"
+        >
+          <Pencil class="h-3.5 w-3.5" />
+          <span v-if="!isCompact">Edit</span>
+        </a>
+        <button
+          v-else-if="embedMode && viewerId && !loading && !error"
+          class="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3.5 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
+          :disabled="copyBusy"
+          title="Copy this loadout into your own inventory"
+          @click="copyViewerLoadout"
+        >
+          <Loader2 v-if="copyBusy" class="h-3.5 w-3.5 animate-spin" />
+          <Copy v-else class="h-3.5 w-3.5" />
+          <span v-if="!isCompact">Copy</span>
+        </button>
+
+        <div v-if="user && !embedMode" class="flex items-center gap-1.5">
           <ShareMenu icon :links="viewShareLinks" />
           <button
             v-if="user?.role === 'administrator' && !viewerId"
@@ -3060,8 +3109,8 @@ function deleteSelected() {
         </div>
         <!-- The divider earns its keep at desktop spacing; at compact gaps it's
              just another 13px between two already-distinct pills. -->
-        <span v-if="user && !isCompact" class="h-5 w-px flex-none bg-border"></span>
-        <div :ref="(el) => viewPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted p-1">
+        <span v-if="user && !isCompact && !embedMode" class="h-5 w-px flex-none bg-border"></span>
+        <div v-if="!embedMode" :ref="(el) => viewPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted p-1">
           <div
             v-show="viewPill.w.value > 0"
             class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
@@ -3101,12 +3150,16 @@ function deleteSelected() {
       </div>
     </header>
 
-    <!-- Viewer banner -->
+    <!-- Viewer banner. Suppressed when embedded — its action moved into the
+         header above, and a full-width explanatory bar is redundant on a page
+         that already says whose profile you are on. -->
     <div
-      v-if="viewerId && !loading && !error"
+      v-if="viewerId && !loading && !error && !embedMode"
       class="flex flex-none flex-wrap items-center gap-3 border-b border-border px-6 py-2"
       :style="{ background: accentSoft }"
     >
+      <!-- Only reachable un-embedded, where viewerId is always someone else —
+           load() drops viewer mode when ?player is you. -->
       <span class="text-f13">Viewing the loadout of <b class="font-mono">{{ viewerId }}</b> — read-only.</span>
       <button
         class="ml-auto flex items-center gap-1.5 rounded-sm px-3.5 py-1.5 text-f11 font-bold uppercase tracking-cs1 text-black shadow-sm transition-[filter] hover:brightness-110 disabled:opacity-60"

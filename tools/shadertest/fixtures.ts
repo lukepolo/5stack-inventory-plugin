@@ -123,3 +123,9 @@ export const FIXTURES: Fixture[] = [
 
 /** Wear values swept per fixture when checking that wear actually does something. */
 export const WEAR_SWEEP = [0.0, 0.11, 0.38, 0.62, 0.95];
+
+/** Seeds swept per fixture when checking that the pattern seed does something.
+ *  0 and 1 are deliberately NOT both here: CUniformRandomStream maps them to the
+ *  same stream (idum = -seed, then idum <= 0 is forced to 1), so a 0-vs-1 pair
+ *  renders identically by design and would read as a false failure. */
+export const SEED_SWEEP = [1, 387, 661, 955];

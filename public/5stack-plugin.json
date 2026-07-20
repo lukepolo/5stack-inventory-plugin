@@ -7,5 +7,6 @@
   "scope": "inventory",
   "module": "./App",
   "requiredRole": "verified_user",
+  "profileTabLabel": "Inventory",
   "deployments": ["inventory-frontend", "inventory-backend"]
 }

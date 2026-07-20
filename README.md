@@ -78,11 +78,70 @@ the way the panel's own settings nav works. Screens are
 truth, so tabs, deep links and the back button can't disagree.
 
 > Host side: `web/pages/apps/[...slug].vue` — one catch-all page that splits the
-> segments itself (first = plugin slug, rest = plugin path). Two gotchas worth
-> keeping: a nested optional catch-all (`[slug]/[[...path]].vue`) is mis-parsed by
-> Nuxt into `/apps/:slug()/:path(.*)*]` and matches nothing; and the page must
-> watch the **slug** only — watching `route.params` remounts the remote on every
-> route the plugin navigates to itself.
+> segments itself (first = plugin slug, rest = plugin path). It delegates the
+> actual federation load to `web/components/plugins/PluginRemote.vue`, which the
+> player-profile tab (below) reuses. Two gotchas worth keeping: a nested optional
+> catch-all (`[slug]/[[...path]].vue`) is mis-parsed by Nuxt into
+> `/apps/:slug()/:path(.*)*]` and matches nothing; and the loader must watch the
+> **slug** only — watching `route.params` remounts the remote on every route the
+> plugin navigates to itself.
+
+## The player-profile tab
+
+A plugin can also mount as a tab on the panel's player pages. Set
+`profileTabLabel` in `5stack-plugin.json` (admins can override it per-site in
+Settings → Application → Plugins); the panel then renders a tab with that label
+on `/players/:steamid`, beside Combat, and mounts the remote inside it.
+
+In that position the host passes two extra query keys:
+
+| Query | Meaning |
+| --- | --- |
+| `player` | the steam64 of the profile being viewed — **not** the logged-in user |
+| `embed` | `"1"` — you are inside someone else's page, not at `/apps/<slug>` |
+
+Both matter, and for different reasons:
+
+- **`player`** is the same flag the shareable `?player=` link already uses, so
+  viewer mode needed no new code — `src/App.vue` loads that player's loadout
+  read-only and blanks `inventory`. Nothing writable is reachable while it's set.
+- **`embed`** is about framing, not permissions. It is *not* the same as
+  `router.embedded` (which only means "mounted in the panel at all", true for
+  both positions). Embedded, the host page already supplies the chrome and owns
+  the page scroll, so we drop the `100dvh` height, the share menu, and the
+  Loadout/Inventory view pill — a lone "Loadout" button pointing at the screen
+  you are already on is just noise.
+
+The tab is read-only **including on your own profile**. At `/apps/inventory`,
+`?player=<me>` deliberately drops you into your real editable inventory; in a
+tab it must not, because the tab is a showcase and the bottom picker sheet
+(owned / craft / replace), drag-to-equip and the slot menus all belong on the
+full page. `load()` skips the usual "that's me, exit viewer mode" shortcut when
+`embed=1`, which is what makes every existing `!viewerId` guard apply here too —
+one condition instead of an embed check on each of them. On your own profile the
+banner links out to the full editor.
+
+Only the **equipped loadout** is shown, never owned items: `GET /api/inventory`
+is hard-scoped to the caller, and the only public per-player endpoints are
+`/api/loadout/:steamId` and `/api/equipped/v5/:steamId`. Showing someone else's
+full collection would need a new endpoint *and* a decision about whether an
+owned-item list should be public at all.
+
+The navigation contract is unchanged, but the host wires it differently:
+`navigate` writes **local state** instead of doing a `router.push`. That's the
+whole trick — a push would send the viewer to `/apps/<slug>` the moment they
+clicked anything inside the tab. Only `?tab=<slug>` ever reaches the host URL, so
+plugin sub-navigation stays inside the tab and the profile page never unmounts.
+
+> Host side: `web/pages/players/[id].vue` renders one tab per plugin in
+> `profileTabPlugins` (filtered from `visiblePlugins`, so the plugins master
+> switch, `enabled` and `required_role` all still gate it). The remote is
+> `v-if`-gated on the active tab so a second app isn't fetched over the network
+> until someone asks for it.
+
+This replaced `src/profileLink.ts`, which used to float a "View CS2 Loadout" chip
+onto player pages by monkey-patching `history.pushState`. That file is gone —
+if you're looking for it in git history, this section is what it became.
 
 ## How the inventory works
 

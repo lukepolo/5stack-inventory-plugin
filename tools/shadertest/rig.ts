@@ -30,6 +30,14 @@ export interface RigResult {
   overlayBlendMode?: number;
   overlayMaskMode?: number;
   weaponInputs?: string[] | null;
+  /** Seed envelopes from the vcompmat. When all three collapse to a single
+   *  point the seed CANNOT move the pattern — that is legitimate for authored
+   *  skins (custom paintjob, gunsmith) and a data bug for anything else, so the
+   *  caller needs them to tell "seed does nothing" from "seed can't do
+   *  anything here". */
+  seedRanges?: { offsetX: [number, number]; offsetY: [number, number]; rotation: [number, number] };
+  /** True when every seed envelope is degenerate, i.e. the seed is a no-op. */
+  seedInert?: boolean;
   albedo?: Stat;
   /**
    * 8x8 luma thumbprint of the albedo. Comparing these across wear levels
@@ -60,9 +68,38 @@ function stat(px: Uint8Array, alphaGate = false): Stat {
   };
 }
 
+// ONE renderer for every runOne call, for two reasons:
+//
+//  - compositePaint's LRU is keyed PER RENDERER (the render targets it caches
+//    are owned by a single GL context). A renderer per call meant the cache
+//    could never hit, so every sweep recomposited from scratch — two 2K render
+//    targets and a full texture re-upload per seed. Sweeps took minutes.
+//  - Chrome caps live WebGL contexts (~16) and just stops granting new ones
+//    past that. renderer.dispose() does not hand the context back, so a sweep
+//    of more than ~16 renders would stall partway with no error at all.
+//
+// The composite cache key includes wear, seed and debug mode, so sharing the
+// renderer across a sweep is safe: different seeds still get different entries.
+let shared: import("three").WebGLRenderer | null = null;
+function sharedRenderer(THREE: any, size: number): import("three").WebGLRenderer {
+  if (!shared) shared = new THREE.WebGLRenderer({ antialias: false });
+  shared!.setSize(size, size);
+  return shared!;
+}
+/** Drops the shared context. Call when a page is done with the rig. */
+export function disposeRig(): void {
+  shared?.forceContextLoss();
+  shared?.dispose();
+  shared = null;
+}
+
 export async function runOne(
   model: string, pm: string, wear: number, seed: number, size = 128,
   legacyPaint = false,
+  /** When set, read back the debug pass (2 = pattern.rgb as sampled, 3 =
+   *  pattern.a) instead of the albedo, so the pattern can be inspected before
+   *  the palette and mask stages flatten it. */
+  debug?: 2 | 3 | 4,
 ): Promise<RigResult> {
   const out: RigResult = { model, pm, wear, seed };
   try {
@@ -78,19 +115,18 @@ export async function runOne(
     out.hasOverlay = !!def.overlay;
     out.overlayBlendMode = def.overlayBlendMode;
     out.overlayMaskMode = def.overlayMaskMode;
+    out.seedRanges = { offsetX: def.offsetX, offsetY: def.offsetY, rotation: def.rotation };
+    const flat = (r: [number, number]) => r[0] === r[1];
+    out.seedInert = flat(def.offsetX) && flat(def.offsetY) && flat(def.rotation);
 
     const weapon = await loadWeaponInputs(model, !!legacyPaint);
     out.weaponInputs = weapon
       ? Object.keys(weapon).filter((k) => (weapon as any)[k] != null)
       : null;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: false });
-    renderer.setSize(size, size);
-    const comp = await compositePaint(THREE, renderer, def, { wear, seed, weapon, model });
-    if (!comp) {
-      renderer.dispose();
-      return { ...out, error: "compositePaint returned null" };
-    }
+    const renderer = sharedRenderer(THREE, size);
+    const comp = await compositePaint(THREE, renderer, def, { wear, seed, weapon, model, debug });
+    if (!comp) return { ...out, error: "compositePaint returned null" };
 
     // Blit the composited albedo through a basic material so the readback works
     // no matter how the result is wired internally.
@@ -99,7 +135,7 @@ export async function runOne(
     const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     scene.add(new THREE.Mesh(
       new THREE.PlaneGeometry(2, 2),
-      new THREE.MeshBasicMaterial({ map: (comp as any).albedo }),
+      new THREE.MeshBasicMaterial({ map: debug ? (comp as any).debug : (comp as any).albedo }),
     ));
     renderer.setRenderTarget(target);
     renderer.render(scene, cam);
@@ -138,7 +174,6 @@ export async function runOne(
 
     (comp as any).release?.();
     target.dispose();
-    renderer.dispose();
     return out;
   } catch (e: any) {
     return { ...out, error: String(e?.stack ?? e) };
