@@ -1456,13 +1456,56 @@ async function assetCdnStamp(): Promise<{ version: number | null; gameBuild: num
  *  would quietly serve another build's skins rather than 404 — wrong pixels are
  *  far harder to notice than missing ones. Extraction is deterministic for a
  *  given pipeline+build, so equal keys really do mean identical bytes. */
+/** What this deployment's assets ARE — or WOULD be if it extracted right now.
+ *
+ *  The projected case is the important one. A brand-new install has never
+ *  extracted, so it has no stamp; keying only on the stamp meant the CDN could
+ *  never engage for exactly the deployment that needs it most. What it *would*
+ *  produce is knowable without running anything: the pipeline version baked into
+ *  this build's script, against the CS2 build the mounted install reports. */
+async function localAssetKey(): Promise<{ version: number | null; gameBuild: number | null; projected: boolean }> {
+  const stamp = await readExtractStamp();
+  if (stamp.version != null && stamp.gameBuild != null) {
+    return { version: stamp.version, gameBuild: stamp.gameBuild, projected: false };
+  }
+  const [required, current] = await Promise.all([readRequiredExtractVersion(), readCurrentGameVersion()]);
+  return { version: required, gameBuild: current.gameBuild, projected: true };
+}
+
+/** True once this deployment has completed its own extraction. The stamp is
+ *  written last, on success, so its presence is the honest signal. */
+async function hasLocalAssets(): Promise<boolean> {
+  return (await readExtractStamp()).version != null;
+}
+
 async function assetOrigin(): Promise<string> {
-  if (!(await assetCdnEnabled())) return "";
-  const mine = await readExtractStamp();
-  if (mine.version == null || mine.gameBuild == null) return "";
+  // Two ways to end up on the CDN:
+  //
+  //   1. The operator opted in.
+  //   2. This box has NOTHING of its own yet — no completed extraction — so the
+  //      alternative is blank icons and white skins.
+  //
+  // Case 2 is deliberately not "silently using someone else's assets", which is
+  // the thing removing cdn.cstrike.app was about. That was a third party
+  // REPLACING assets the server already had. This is a first-party CDN filling
+  // a void, it only applies while the void exists, it stops the moment an
+  // extraction completes, and the panel says so plainly.
+  const enabled = await assetCdnEnabled();
+  if (!enabled && (await hasLocalAssets())) return "";
   const theirs = await assetCdnStamp();
-  const match = theirs.version === mine.version && theirs.gameBuild === mine.gameBuild;
-  return match ? ASSET_CDN_BASE : "";
+  // Nothing published (or unreachable) — never hand out an origin we can't
+  // confirm is serving anything.
+  if (theirs.version == null || theirs.gameBuild == null) return "";
+  const mine = await localAssetKey();
+  // Pipeline version must agree: a different version means a different output
+  // format, not just different bytes.
+  if (mine.version != null && theirs.version !== mine.version) return "";
+  // CS2 build must agree WHEN WE KNOW OURS. A deployment with no game files
+  // mounted has no build to compare, and no way to extract either — refusing
+  // there would leave it with no assets at all, which is strictly worse than
+  // serving the CDN's. The panel says the build is unverified in that case.
+  if (mine.gameBuild != null && theirs.gameBuild !== mine.gameBuild) return "";
+  return ASSET_CDN_BASE;
 }
 
 // ---- Server API key (panel-generated; used as invsim_apikey by game servers) --
@@ -1631,22 +1674,37 @@ async function requireAdmin(request: Parameters<typeof getIdentity>[0]) {
 app.get("/api/admin/asset-cdn", async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
-  const { version, gameBuild } = await readExtractStamp();
   const enabled = await assetCdnEnabled();
-  const origin = version != null && gameBuild != null ? ASSET_CDN_BASE : null;
-  // Report exactly what the client gate decides on, so the panel can never say
-  // "available" while assetOrigin quietly refuses it.
-  const theirs = origin ? await assetCdnStamp() : { version: null, gameBuild: null };
-  const available = origin ? theirs.version === version && theirs.gameBuild === gameBuild : null;
+  const mine = await localAssetKey();
+  const theirs = await assetCdnStamp();
+  // Report exactly what assetOrigin() decides, so the panel can never say
+  // "available" while the client gate quietly refuses it.
+  const origin = await assetOrigin();
+  const hasLocal = await hasLocalAssets();
+  const available = origin !== "";
+  const wouldMatch =
+    theirs.version != null &&
+    theirs.gameBuild != null &&
+    (mine.version == null || theirs.version === mine.version) &&
+    (mine.gameBuild == null || theirs.gameBuild === mine.gameBuild);
   return {
     enabled,
     base: ASSET_CDN_BASE,
-    origin,
-    available,
-    extractVersion: version,
-    gameBuild,
+    origin: theirs.version != null ? ASSET_CDN_BASE : null,
+    available: enabled ? available : wouldMatch,
+    /** Serving from the CDN right now WITHOUT being opted in, because this box
+     *  has no extraction of its own. Ends as soon as one completes. */
+    usingFallback: !enabled && origin !== "",
+    hasLocalAssets: hasLocal,
+    extractVersion: mine.version,
+    gameBuild: mine.gameBuild,
     cdnVersion: theirs.version,
     cdnGameBuild: theirs.gameBuild,
+    /** True when this box has never extracted, so the key above is what it
+     *  WOULD produce rather than what it has. */
+    projected: mine.projected,
+    /** No CS2 install to read a build from — the build cannot be verified. */
+    buildUnknown: mine.gameBuild == null,
   };
 });
 

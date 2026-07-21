@@ -662,12 +662,22 @@ const BTN_DANGER =
                 <!-- Say whether it can actually serve THIS build before someone
                      flips it on and finds every skin missing. -->
                 <div class="border-t border-border px-4 py-2.5 text-xs">
-                  <span v-if="!assetCdn.origin" class="text-muted-foreground">
-                    Nothing extracted yet, so there is no pipeline + build to match against.
+                  <!-- Loudest case first: assets are coming from the CDN right
+                       now even though nobody switched it on. Never leave that
+                       implicit — an unexplained asset source is the exact
+                       problem removing the third-party CDN was about. -->
+                  <span v-if="assetCdn.usingFallback" class="text-[hsl(var(--tac-amber))]">
+                    Currently serving from the CDN as a fallback — nothing has been extracted on this server yet.
+                    Run the extraction and it switches back automatically.
+                  </span>
+                  <span v-else-if="!assetCdn.origin" class="text-muted-foreground">
+                    The CDN is not reachable or has nothing published.
                   </span>
                   <span v-else-if="assetCdn.available === true" class="text-[hsl(var(--tac-cyan))]">
                     ✓ Serving <span class="font-mono">v{{ assetCdn.extractVersion }}-{{ assetCdn.gameBuild }}</span> —
-                    same pipeline and CS2 build as this server.
+                    <template v-if="assetCdn.buildUnknown">pipeline matches; no CS2 install here to verify the build against.</template>
+                    <template v-else-if="assetCdn.projected">matches what this server would extract.</template>
+                    <template v-else>same pipeline and CS2 build as this server.</template>
                   </span>
                   <span v-else-if="assetCdn.available === false" class="text-[hsl(var(--tac-amber))]">
                     Build mismatch — this server is

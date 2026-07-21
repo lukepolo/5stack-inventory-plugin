@@ -474,6 +474,14 @@ export type AssetCdnStatus = {
   /** What the CDN reports, for showing the mismatch rather than just denying. */
   cdnVersion?: number | null;
   cdnGameBuild?: number | null;
+  /** Key is what this box WOULD extract, not what it has. */
+  projected?: boolean;
+  /** No CS2 install mounted, so the build can't be verified. */
+  buildUnknown?: boolean;
+  /** Serving from the CDN without being opted in, because nothing is extracted
+   *  here yet. Stops on the first successful extraction. */
+  usingFallback?: boolean;
+  hasLocalAssets?: boolean;
 };
 export const fetchAssetCdn = () => request<AssetCdnStatus>("/admin/asset-cdn");
 export const setAssetCdn = (enabled: boolean) =>
