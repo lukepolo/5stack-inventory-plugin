@@ -58,7 +58,9 @@ const TEAMS = new Set(["CT", "T"]);
 // ---- Catalog (CS2 item data; no auth needed, it's public reference data) ----
 
 app.get("/api/catalog", async () => {
-  return { weapons: getWeapons(), agents: getAgents(), defaults: getDefaults() };
+  // assetVersion rides along here because the client needs it before it can
+  // request a single paint file, and this is the one call it always makes first.
+  return { weapons: getWeapons(), agents: getAgents(), defaults: getDefaults(), assetVersion: await assetVersion() };
 });
 
 // Paint-chain files and econ icons are extracted from the instance's own CS2
@@ -157,7 +159,12 @@ function serveAssetDir(routePrefix: string, dir: string) {
       //    by every extraction. Caching those for a day meant a browser kept a
       //    material referencing textures the new run had renamed — every one
       //    404'd and the skin rendered white long after the mount was correct.
-      const immutable = type !== "application/json";
+      //
+      // So a material is only immutable once the client has stamped the
+      // extraction version on it (see withAssetVersion). Unversioned requests
+      // still revalidate, which keeps old clients and hand-typed URLs correct.
+      const versioned = (request.query as { v?: string } | undefined)?.v != null;
+      const immutable = type !== "application/json" || versioned;
       reply.header("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
       return reply.type(type).send(buf);
     } catch {
@@ -1714,7 +1721,12 @@ async function readExtractVersion(): Promise<number | null> {
 // The full stamp written by the last successful run: the pipeline version plus
 // the CS2 build the assets were extracted against. Tolerant of old stamps that
 // predate the game fields (they read back as null).
-type ExtractStamp = { version: number | null; durationSeconds: number | null; steps: Record<string, number> | null } & GameVersion;
+type ExtractStamp = {
+  version: number | null;
+  durationSeconds: number | null;
+  steps: Record<string, number> | null;
+  extractedAt: string | null;
+} & GameVersion;
 const EMPTY_STAMP: ExtractStamp = {
   version: null,
   gameBuild: null,
@@ -1722,6 +1734,7 @@ const EMPTY_STAMP: ExtractStamp = {
   gameDate: null,
   durationSeconds: null,
   steps: null,
+  extractedAt: null,
 };
 async function readExtractStamp(): Promise<ExtractStamp> {
   try {
@@ -1736,6 +1749,7 @@ async function readExtractStamp(): Promise<ExtractStamp> {
       // "unknown", never as zero.
       durationSeconds: typeof p.durationSeconds === "number" ? p.durationSeconds : null,
       steps: p.steps && typeof p.steps === "object" ? (p.steps as Record<string, number>) : null,
+      extractedAt: typeof p.extractedAt === "string" ? p.extractedAt : null,
     };
   } catch {
     return EMPTY_STAMP;
@@ -1869,6 +1883,21 @@ async function readExtractProgress(): Promise<ExtractProgress | null> {
   } catch {
     return null;
   }
+}
+
+/** A token that changes whenever the extracted assets might have. Paint MATERIAL
+ *  filenames are fixed by cs2-lib, so their URLs can't self-version the way our
+ *  content-hashed textures do — a client that cached one kept pointing at
+ *  texture names a later run had replaced. Hanging this on the URL gives those
+ *  files a version to bust on, so they can be cached hard again.
+ *
+ *  Built from the pipeline version, the CS2 build and when the run finished:
+ *  re-running the SAME pipeline can still change output (a game patch, or a
+ *  half-finished previous run), so the timestamp has to be in it. */
+async function assetVersion(): Promise<string> {
+  const { version, gameBuild, extractedAt } = await readExtractStamp();
+  const stamp = extractedAt ? Date.parse(extractedAt) : NaN;
+  return [version ?? 0, gameBuild ?? 0, Number.isFinite(stamp) ? Math.floor(stamp / 1000) : 0].join("-");
 }
 
 /** PID of a still-live extraction, or null.

@@ -20,7 +20,7 @@
 // - transforms quantized to 2 decimals (%.2f / floor((x+.005)*100)/100)
 // - pattern & wear & grunge scale all multiply weaponLength/36 for
 //   spray/anodized-air styles, uvScale for everything else
-import { API_ORIGIN } from "./api";
+import { API_ORIGIN, withAssetVersion } from "./api";
 
 type THREE = typeof import("three");
 
@@ -40,15 +40,20 @@ export class PaintAssetMissing extends Error {
 }
 
 export async function paintFetch(path: string): Promise<Response> {
+  // Versioned: these are the MATERIALS, whose filenames are fixed by cs2-lib
+  // and so cannot self-version. See withAssetVersion.
   // Callers immediately .json() the result, so a 404 has to throw here or it
   // surfaces as an unrelated JSON parse error.
-  const res = await fetch(PAINT_SELF + path).catch(() => {
+  const res = await fetch(withAssetVersion(PAINT_SELF + path)).catch(() => {
     throw new PaintAssetMissing(path);
   });
   if (!res.ok) throw new PaintAssetMissing(path);
   return res;
 }
 
+// Deliberately NOT versioned: texture filenames already carry a content hash we
+// generate, so the URL changes whenever the bytes do. Adding a version would
+// re-download all ~8k of them after every extraction for nothing.
 export function paintTextureUrl(path: string): string {
   return PAINT_SELF + path;
 }

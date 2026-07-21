@@ -64,6 +64,8 @@ export interface Catalog {
   weapons: CatalogWeapon[];
   agents: Skin[];
   defaults?: DefaultsMap;
+  /** Changes whenever the extracted assets might have. See assetVersion below. */
+  assetVersion?: string;
 }
 
 export interface CatalogItem {
@@ -177,7 +179,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return resolveAssetPaths(await response.json()) as T;
 }
 
-export const fetchCatalog = () => request<Catalog>("/catalog");
+// Cache-buster for paint MATERIALS. Their filenames come from cs2-lib and are
+// fixed, so unlike our content-hashed textures the URL can't change when the
+// contents do — a browser held one for a day and kept asking for texture names
+// a later extraction had replaced, so every one 404'd and the skin rendered
+// white. Stamping the extraction's version on the query gives them something to
+// bust on, which is what lets them be cached hard instead of revalidated.
+//
+// Empty until the catalog lands; an unversioned URL is still correct, it just
+// revalidates (the server only marks a response immutable when `v` is present).
+let assetVersion = "";
+export const getAssetVersion = () => assetVersion;
+export const withAssetVersion = (url: string) =>
+  assetVersion ? `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(assetVersion)}` : url;
+
+export const fetchCatalog = async () => {
+  const c = await request<Catalog>("/catalog");
+  if (c.assetVersion) assetVersion = c.assetVersion;
+  return c;
+};
 
 // Cached true-render card images (client 3D snapshots stored on the mount).
 // Number() guards: pg numerics can arrive as strings — .toFixed on a string throws.
