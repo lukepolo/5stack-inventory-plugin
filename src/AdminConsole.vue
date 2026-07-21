@@ -6,7 +6,7 @@
 // Each side tab is a route (/admin, /admin/assets, /admin/models) — same as
 // settings, where the nav is links rather than in-page anchors.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download, AlertTriangle, Info, ChevronRight } from "lucide-vue-next";
+import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download, Info, ChevronRight } from "lucide-vue-next";
 import SkinTests from "./SkinTests.vue";
 import {
   API_ORIGIN,
@@ -31,7 +31,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "notify", message: string, kind: "error" | "success"): void;
   (e: "cfg-sync", cfg: CfgSyncResult | null): void;
-  (e: "cache-cleared", scope: "renders" | "paints" | "all"): void;
+  (e: "cache-cleared", scope: "renders"): void;
   // Extraction hasn't been run, or ran on an older pipeline. App owns the gear
   // badge, so every status refresh here reports the answer upward — that's
   // what clears the dot the moment a run finishes.
@@ -110,20 +110,50 @@ const invsimSnippet = computed(() =>
   ].join("\n"),
 );
 
+// ---- extraction run time ----------------------------------------------------
+const fmtDuration = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`);
+// Prefer this mount's OWN measured time over a generic estimate — it varies a
+// lot with the node. "A few minutes" was badly wrong; it is tens of minutes.
+const extractDurationHint = computed(() => {
+  const secs = extractStatus.value?.lastRunSeconds;
+  return secs != null ? `Took ${fmtDuration(secs)} last time.` : "Can take up to ~30 minutes.";
+});
+// The two heaviest steps, which is the actionable part — a bare total tells you
+// the run is long but not which stage to blame.
+const slowestSteps = computed(() => {
+  const steps = extractStatus.value?.lastRunSteps;
+  if (!steps) return "";
+  const top = Object.entries(steps)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .filter(([, secs]) => secs > 0);
+  return top.length ? `mostly ${top.map(([name, secs]) => `${name} ${fmtDuration(secs)}`).join(", ")}` : "";
+});
+
 // ---- asset cache ------------------------------------------------------------
 const cacheStats = ref<CacheStats | null>(null);
 const cacheBusy = ref(false);
 const fmtBytes = (b: number) =>
   b > 1048576 * 900 ? `${(b / 1073741824).toFixed(2)} GB` : b > 900 ? `${(b / 1048576).toFixed(1)} MB` : `${b} B`;
-// Only the two real caches — things you can safely clear and have rebuilt on
-// demand. Extracted models are NOT a cache (clearing them just breaks 3D until
-// someone re-extracts), so their size is reported on the 3D Models tab instead.
+// Exactly ONE row is a cache: card renders are client bakes of items the user
+// owns, so binning one costs a re-render. Everything below it is extracted from
+// this server's CS2 install with nothing upstream to re-fetch from — deleting
+// those breaks rendering outright until someone re-extracts, which is why they
+// are shown for confidence ("is the mount actually populated?") and have no
+// clear button. "Mirrored paints" used to sit in the cache list and read as
+// disposable; it was neither.
 const cacheRows = computed(() => {
   const s = cacheStats.value;
   if (!s) return [];
+  return [{ key: "renders", label: "Card renders", hint: "Baked item cards — cleared safely, re-render on view", ...s.renders }];
+});
+const extractedRows = computed(() => {
+  const s = cacheStats.value;
+  if (!s) return [];
   return [
-    { key: "renders", label: "Card renders", ...s.renders },
-    { key: "paints", label: "Mirrored paints", ...s.paints },
+    { key: "models", label: "3D models", hint: "Weapon GLBs + composite inputs", ...(s.models ?? { files: 0, bytes: 0 }) },
+    { key: "paints", label: "Paint materials", hint: "Skin finishes — without these, skins render white", ...s.paints },
+    { key: "images", label: "Item icons", hint: "Flat catalog art for every item", ...(s.images ?? { files: 0, bytes: 0 }) },
   ];
 });
 async function refreshCacheStats() {
@@ -133,13 +163,13 @@ async function refreshCacheStats() {
     cacheStats.value = null;
   }
 }
-async function doClearCache(scope: "renders" | "paints" | "all") {
+async function doClearCache() {
   if (cacheBusy.value) return;
   cacheBusy.value = true;
   try {
-    await clearCache(scope);
-    emit("cache-cleared", scope);
-    emit("notify", `Cleared ${scope === "all" ? "render + paint" : scope} cache — assets rebuild on demand.`, "success");
+    await clearCache();
+    emit("cache-cleared", "renders");
+    emit("notify", "Cleared card renders — each one re-bakes when it is next viewed.", "success");
     await refreshCacheStats();
   } catch (e) {
     fail(e);
@@ -167,7 +197,7 @@ async function refreshExtractStatus() {
     extractStatus.value = null; // older backend — the section says so
   }
   if (extractLive.value && !extractPoll) {
-    extractPoll = setInterval(refreshExtractStatus, 5000);
+    extractPoll = setInterval(pollTick, 5000);
   } else if (!extractLive.value && extractPoll) {
     stopPoll();
     if (wasLive && extractStatus.value?.state === "succeeded") {
@@ -175,6 +205,17 @@ async function refreshExtractStatus() {
     }
   }
 }
+// One tick of the live poll. Status every 5s; the on-disk ledger every third
+// tick, because it is far more expensive than it looks — the backend walks and
+// stats EVERY file under models + paints + images (~45k once populated), and
+// doing that every 5 seconds would have the panel competing with the extraction
+// for the same disk. 15s is still visibly "growing" for a run this long.
+let cacheTick = 0;
+async function pollTick() {
+  await refreshExtractStatus();
+  if (cacheTick++ % 3 === 0) await refreshCacheStats();
+}
+
 // Presentation of the run state, hoisted out of the template: three ternary
 // chains inline made the markup unreadable and kept drifting apart.
 const extractDot = computed(() => {
@@ -206,6 +247,50 @@ watch(extractLive, (live) => {
     clockTimer = null;
   }
 });
+// Live progress from the running script. Unit counts where a step knows them
+// (icons, paint textures), otherwise "step 4 of 7" — a bar that only ever moved
+// seven times told you almost nothing during a 20-minute icon pass.
+// The script's step ids are kebab-case internals. Nobody reading a progress
+// list wants to decode "composite-inputs" — say what is happening. Unknown ids
+// fall through to the raw name so a new step never renders as a blank row.
+const STEP_LABELS: Record<string, string> = {
+  "decompile-models": "Decompiling weapon models",
+  "rename-models": "Mapping models to catalog keys",
+  "composite-inputs": "Extracting composite inputs",
+  "charm-anchors": "Reading charm anchors",
+  "sticker-markup": "Reading sticker slots",
+  "econ-icons": "Extracting item icons",
+  "paint-chain": "Extracting paint chain",
+  stamp: "Recording the build",
+};
+
+const extractProgress = computed(() => {
+  const steps = extractStatus.value?.progress?.steps;
+  if (!steps?.length || !extractLive.value) return null;
+  return steps.map((s, i) => ({
+    ...s,
+    label: STEP_LABELS[s.name] ?? s.name,
+    last: i === steps.length - 1,
+    // Only steps that report a unit count get a real percentage. A running step
+    // without one is genuinely indeterminate — showing 0% would read as stuck.
+    pct: s.total ? Math.min(100, Math.round(((s.done ?? 0) / s.total) * 100)) : null,
+    // One metric per state, assembled HERE so the template can't recombine the
+    // parts wrongly: a done step kept its last done/total and was rendering
+    // "1m 24s · 85%", which claims it stopped short.
+    detail:
+      s.state === "running"
+        ? [
+            s.total != null ? `${(s.done ?? 0).toLocaleString()} / ${s.total.toLocaleString()}` : "",
+            s.total ? `${Math.min(100, Math.round(((s.done ?? 0) / s.total) * 100))}%` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ")
+        : s.state === "done" && s.seconds != null
+          ? fmtDuration(s.seconds)
+          : "",
+  }));
+});
+
 const extractElapsed = computed(() => {
   const started = extractStatus.value?.startedAt;
   if (!started || !extractLive.value) return "";
@@ -236,12 +321,16 @@ watch(
   (key) => {
     if (!isAdmin.value) return;
     if (key === "") loadKey();
-    else if (key === "assets") refreshCacheStats();
-    else if (key === "models") {
+    else if (key === "assets") {
+      refreshCacheStats();
+      // Also needed here to learn whether a run is live: the asset counts climb
+      // during an extraction, and this tab is where you watch them.
+      refreshExtractStatus();
+    } else if (key === "models") {
       refreshExtractStatus();
       refreshCacheStats(); // for the on-disk size of what's already extracted
     }
-    if (key !== "models") stopPoll();
+    if (key !== "models" && key !== "assets") stopPoll();
   },
   { immediate: true },
 );
@@ -437,49 +526,73 @@ const BTN_DANGER =
             <div class="flex items-start gap-3">
               <span :class="RULE" />
               <div class="min-w-0 flex-1 space-y-0.5">
-                <h3 class="text-sm font-semibold uppercase tracking-wider text-foreground">Cached assets</h3>
+                <h3 class="text-sm font-semibold uppercase tracking-wider text-foreground">Assets on disk</h3>
                 <p class="text-sm text-muted-foreground">
-                  Baked card renders, mirrored paint textures and extracted models on disk.
+                  What this server has generated or extracted onto the models mount.
                 </p>
               </div>
             </div>
 
-            <div v-if="cacheRows.length" class="divide-y divide-border rounded-md border border-border">
-              <div
-                v-for="row in cacheRows"
-                :key="row.key"
-                class="flex items-center justify-between gap-4 px-4 py-3"
-              >
-                <span class="text-sm text-muted-foreground">{{ row.label }}</span>
-                <span class="font-mono text-sm">
-                  {{ row.files.toLocaleString() }} files
-                  <span class="text-muted-foreground">·</span>
-                  {{ fmtBytes(row.bytes) }}
-                </span>
-              </div>
-            </div>
-            <p v-else class="text-sm text-muted-foreground">
-              Cache stats unavailable — older backend, or the mount is missing.
-            </p>
-
-            <div class="space-y-3">
-              <div class="flex flex-wrap gap-2">
-                <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache('renders')">
+            <template v-if="cacheStats">
+              <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Cache</p>
+                <div class="divide-y divide-border rounded-md border border-border">
+                  <div
+                    v-for="row in cacheRows"
+                    :key="row.key"
+                    class="flex items-center justify-between gap-4 px-4 py-3"
+                  >
+                    <span class="min-w-0">
+                      <span class="block text-sm text-foreground">{{ row.label }}</span>
+                      <span class="block text-xs text-muted-foreground">{{ row.hint }}</span>
+                    </span>
+                    <span class="whitespace-nowrap font-mono text-sm">
+                      {{ row.files.toLocaleString() }} files
+                      <span class="text-muted-foreground">·</span>
+                      {{ fmtBytes(row.bytes) }}
+                    </span>
+                  </div>
+                </div>
+                <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache()">
                   <Loader2 v-if="cacheBusy" class="h-3.5 w-3.5 animate-spin" /><Trash2 v-else class="h-3.5 w-3.5" />
                   Clear renders
                 </button>
-                <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache('paints')">
-                  <Trash2 class="h-3.5 w-3.5" /> Clear paints
-                </button>
-                <button :class="BTN_DANGER" :disabled="cacheBusy" @click="doClearCache('all')">
-                  <Trash2 class="h-3.5 w-3.5" /> Clear all
-                </button>
+                <p class="text-xs text-muted-foreground">
+                  Clearing forces every card to re-bake — the go-to move after a rendering fix, so stale
+                  bakes can't hide it.
+                </p>
               </div>
-              <p class="text-xs text-muted-foreground">
-                Clearing forces fresh generation everywhere — the go-to move after a rendering fix, so
-                stale bakes can't hide it.
-              </p>
-            </div>
+
+              <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                  Extracted from this server's CS2 install
+                </p>
+                <div class="divide-y divide-border rounded-md border border-border">
+                  <div
+                    v-for="row in extractedRows"
+                    :key="row.key"
+                    class="flex items-center justify-between gap-4 px-4 py-3"
+                  >
+                    <span class="min-w-0">
+                      <span class="block text-sm text-foreground">{{ row.label }}</span>
+                      <span class="block text-xs text-muted-foreground">{{ row.hint }}</span>
+                    </span>
+                    <span class="whitespace-nowrap font-mono text-sm">
+                      <span :class="row.files ? '' : 'text-destructive'">{{ row.files.toLocaleString() }} files</span>
+                      <span class="text-muted-foreground">·</span>
+                      {{ fmtBytes(row.bytes) }}
+                    </span>
+                  </div>
+                </div>
+                <p class="text-xs text-muted-foreground">
+                  These are not a cache and cannot be cleared here — nothing re-downloads them. If a row
+                  reads 0, rendering is broken until the model extraction is re-run.
+                </p>
+              </div>
+            </template>
+            <p v-else class="text-sm text-muted-foreground">
+              Asset stats unavailable — older backend, or the mount is missing.
+            </p>
           </div>
         </section>
 
@@ -560,57 +673,39 @@ const BTN_DANGER =
                         → now {{ extractStatus.currentGameBuild }}
                       </span>
                     </template>
-                    <!-- No stamped build (assets predate version stamping): still
-                         show what the live install reports, so the field is useful. -->
+                    <!-- No stamped build (assets predate version stamping): show
+                         the live install's build plainly. It reads as the build
+                         either way, so the qualifier was just noise. -->
                     <template v-else-if="extractStatus.currentGameBuild != null">
-                      <span class="text-muted-foreground">install reports</span> {{ extractStatus.currentGameBuild }}
+                      {{ extractStatus.currentGameBuild }}
                       <span v-if="extractStatus.currentGamePatch" class="text-muted-foreground">· {{ extractStatus.currentGamePatch }}</span>
                     </template>
                     <template v-else>unknown</template>
+                  </dd>
+                </div>
+                <!-- How long the last run took. Absent on pre-v5 stamps, and a
+                     re-extract is a ~15 minute commitment, so it is worth saying
+                     before someone presses the button rather than after. -->
+                <div v-if="extractStatus.lastRunSeconds != null" class="flex items-center justify-between gap-4 px-4 py-3">
+                  <dt class="text-sm text-muted-foreground">Last run took</dt>
+                  <dd class="text-right">
+                    <span class="font-mono text-sm">{{ fmtDuration(extractStatus.lastRunSeconds) }}</span>
+                    <span v-if="slowestSteps" class="mt-0.5 block text-xs text-muted-foreground">{{ slowestSteps }}</span>
                   </dd>
                 </div>
               </dl>
 
               <p v-if="extractStatus.error" class="text-xs text-destructive">{{ extractStatus.error }}</p>
 
-              <!-- Pipeline version. The stale case is the whole point of the
-                   stamp: the extraction "succeeded" and the models render, they
-                   just predate a change to how they're built. Nothing else in
-                   the UI can tell you that. -->
-              <div
-                v-if="extractStatus.stale"
-                class="flex items-start gap-3 rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5"
-              >
-                <AlertTriangle class="mt-0.5 h-3.5 w-3.5 flex-none text-[hsl(var(--tac-amber))]" />
-                <div class="min-w-0 space-y-1">
-                  <p class="text-sm font-medium text-foreground">
-                    {{ extractStatus.extracted === false ? "Extraction never run" : "Re-extraction needed" }}
-                  </p>
-                  <!-- Never run: no versions to compare, just say what's missing. -->
-                  <p v-if="extractStatus.extracted === false" class="text-xs text-muted-foreground">
-                    Nothing has been extracted onto the models mount, so 3D stays hidden everywhere.
-                    Run the extraction below (pipeline
-                    <span class="font-mono">v{{ extractStatus.requiredVersion }}</span>) to turn it on.
-                  </p>
-                  <!-- Ran, but before the stamp existed or before a change to it. -->
-                  <p v-else class="text-xs text-muted-foreground">
-                    The models on the mount were extracted by
-                    <span class="font-mono">{{
-                      extractStatus.extractVersion == null ? "an unversioned pipeline" : "pipeline v" + extractStatus.extractVersion
-                    }}</span>
-                    — this build's script produces
-                    <span class="font-mono">v{{ extractStatus.requiredVersion }}</span>. Re-run the
-                    extraction below to pick up the changes.
-                  </p>
-                </div>
-              </div>
-
               <!-- Game version drift. Deliberately a softer, blue/muted notice —
                    not the amber re-extract alert above. The game moving on is
                    informational: most CS2 patches don't touch weapon models, so
-                   this is a "re-run if skins look wrong" hint, not a demand. -->
+                   this is a "re-run if skins look wrong" hint, not a demand.
+                   Suppressed while `stale` is showing: both notices ask for the
+                   same single action, and stacking them made one re-extraction
+                   look like two separate problems. -->
               <div
-                v-if="extractStatus.gameUpdated"
+                v-if="extractStatus.gameUpdated && !extractStatus.stale"
                 class="flex items-start gap-3 rounded-md border border-[hsl(var(--tac-cyan)/0.4)] bg-[hsl(var(--tac-cyan)/0.08)] px-3 py-2.5"
               >
                 <Info class="mt-0.5 h-3.5 w-3.5 flex-none text-[hsl(var(--tac-cyan))]" />
@@ -674,13 +769,85 @@ const BTN_DANGER =
                     {{ extractElapsed }}
                   </span>
                 </button>
-                <!-- Neutral timing note only. The *reason* to press it lives in
-                     the callout above; saying it twice made both quieter. -->
-                <p class="min-w-[16rem] flex-1 text-xs text-muted-foreground">
-                  Takes a few minutes and replaces what's on the mount in place — 3D stays served
-                  throughout.
+                <!-- The reason to press it sits WITH the button rather than in
+                     its own callout above: one action, one place. A separate
+                     banner made a single re-run read as a second problem. -->
+                <p class="min-w-[16rem] flex-1 space-y-0.5 text-xs">
+                  <span v-if="extractStatus.stale" class="block font-medium text-[hsl(var(--tac-amber))]">
+                    {{
+                      extractStatus.extracted === false
+                        ? "Never run — item art and 3D stay hidden until it does."
+                        : `Out of date — the mount has ${extractStatus.extractVersion == null ? "an unversioned pipeline" : "v" + extractStatus.extractVersion}, this build produces v${extractStatus.requiredVersion}.`
+                    }}
+                  </span>
+                  <span class="block text-muted-foreground">
+                    {{ extractDurationHint }} Replaces what's on the mount in place — 3D stays served
+                    throughout.
+                  </span>
                 </p>
               </div>
+
+              <!-- Live progress: the pipeline as a vertical spine, one node per
+                   step. The spine is the point — it shows the whole sequence at
+                   once, so you can see how many stages remain and how big the
+                   current one is. A single bar could say neither, and a bar on
+                   every row was just noise: a finished step is fully described
+                   by a filled node and its duration.
+
+                   Two steps lit at once would read as parallel work, which is
+                   why state lives on the node rather than in the ordering. -->
+              <ol v-if="extractProgress" class="space-y-0">
+                <li v-for="s in extractProgress" :key="s.name" class="flex gap-3">
+                  <!-- Gutter: node + the connector to the next step. -->
+                  <span class="relative flex w-3 flex-none justify-center" aria-hidden="true">
+                    <span
+                      v-if="!s.last"
+                      class="absolute top-3 bottom-0 w-px"
+                      :class="s.state === 'done' ? 'bg-[hsl(var(--tac-amber)/0.35)]' : 'bg-border'"
+                    ></span>
+                    <!-- Squares, not dots: the panel's vocabulary is angular
+                         (corner brackets, ◢) and a circle reads as foreign. -->
+                    <span
+                      class="relative mt-[7px] h-1.5 w-1.5 flex-none rotate-45"
+                      :class="{
+                        'bg-[hsl(var(--tac-amber)/0.45)]': s.state === 'done',
+                        'bg-[hsl(var(--tac-amber))] shadow-[0_0_8px_hsl(var(--tac-amber)/0.7)]': s.state === 'running',
+                        'border border-border bg-transparent': s.state === 'pending',
+                      }"
+                    ></span>
+                  </span>
+
+                  <div class="min-w-0 flex-1 pb-3">
+                    <div class="flex items-baseline justify-between gap-3">
+                      <span
+                        class="truncate text-xs"
+                        :class="{
+                          'font-medium text-foreground': s.state === 'running',
+                          'text-muted-foreground': s.state === 'done',
+                          'text-muted-foreground/45': s.state === 'pending',
+                        }"
+                      >{{ s.label }}</span>
+                      <span
+                        v-if="s.detail"
+                        class="flex-none font-mono text-xs tabular-nums"
+                        :class="s.state === 'running' ? 'text-[hsl(var(--tac-amber))]' : 'text-muted-foreground/70'"
+                      >
+                        {{ s.detail }}
+                      </span>
+                    </div>
+                    <!-- Only the running step gets a bar. An indeterminate one
+                         pulses full-width rather than sitting at 0%, which reads
+                         as stalled rather than "working, length unknown". -->
+                    <div v-if="s.state === 'running'" class="mt-1.5 h-0.5 overflow-hidden rounded-full bg-border">
+                      <div
+                        class="h-full rounded-full bg-[hsl(var(--tac-amber))] shadow-[0_0_6px_hsl(var(--tac-amber)/0.6)]"
+                        :class="s.pct == null ? 'w-full animate-pulse' : 'transition-[width] duration-700 ease-out'"
+                        :style="s.pct != null ? { width: Math.max(2, s.pct) + '%' } : undefined"
+                      ></div>
+                    </div>
+                  </div>
+                </li>
+              </ol>
 
               <!-- Collapsed by default: the tail is ~200 lines of dump paths
                    that dominated the card while being the least-read thing on

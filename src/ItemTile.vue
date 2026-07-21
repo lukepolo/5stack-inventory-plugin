@@ -86,10 +86,17 @@ function onClickCapture(e: MouseEvent) {
 const art = inject<{
   renderingIds: { value: Set<number> };
   queuedIds: { value: Set<number> };
+  /** An extraction is still populating the mount, so bakes are being refused
+   *  rather than caching white guns. */
+  assetsPending: { value: boolean };
 } | null>("itemArt", null);
 
 const baking = computed(() => !!art?.renderingIds.value.has(props.inst.id));
 const queued = computed(() => !!art?.queuedIds.value.has(props.inst.id));
+// Distinct from `queued`: the bake didn't just lose its turn, it was refused
+// because the skin's textures aren't extracted yet. Says so rather than
+// implying the queue is merely slow.
+const preparing = computed(() => !!art?.assetsPending.value && !baking.value);
 const readOnly = computed(() => isReadOnly(props.inst));
 const attachments = computed(() => attachmentsOf(props.inst));
 const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.team));
@@ -126,11 +133,11 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
 
     <!-- Bake status (true-render generation) -->
     <span
-      v-if="baking || queued"
+      v-if="baking || queued || preparing"
       class="absolute left-1.5 top-1.5 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
     >
       <Loader2 v-if="baking" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" />
-      {{ baking ? 'baking' : 'queued' }}
+      {{ baking ? 'baking' : preparing ? 'preparing' : 'queued' }}
     </span>
 
     <!-- Hover actions. Shared with the loadout rail's equipment tiles. -->

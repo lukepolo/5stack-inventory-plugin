@@ -65,7 +65,12 @@ const MODELS_DIR = process.env.MODELS_DIR
   ?? resolve(process.env.HOME ?? "", "Downloads/cs2-model-extract/models");
 const hasLocalModels = existsSync(MODELS_DIR);
 
-// Standalone rig: serves tools/shadertest, the paint CDN, and the weapon models.
+const ASSET_HOST = process.env.ASSET_HOST ?? "https://inventory.5stack.gg";
+
+// Standalone rig: serves tools/shadertest plus the paint chain and models. Every
+// asset route points at OUR deployment (or a local extraction) — the rig must
+// exercise the same assets production does, and there is no third-party mirror
+// to borrow from anymore. Point ASSET_HOST at another instance if needed.
 export default defineConfig({
   root: "tools/shadertest",
   plugins: [snapshotSink(), ...(hasLocalModels ? [localModels(MODELS_DIR)] : [])],
@@ -74,14 +79,17 @@ export default defineConfig({
     port: 5199,
     fs: { allow: [resolve(HERE, "../.."), MODELS_DIR] },
     proxy: {
-      "/materials": { target: "https://cdn.cstrike.app", changeOrigin: true },
-      "/textures": { target: "https://cdn.cstrike.app", changeOrigin: true },
-      "/images": { target: "https://cdn.cstrike.app", changeOrigin: true },
+      // The rig loads paint assets by their mirror-relative path
+      // ("/materials/...", "/textures/..."), which our host serves under
+      // /paints — rewrite rather than expecting a bare-rooted layout.
+      "/materials": { target: ASSET_HOST, changeOrigin: true, rewrite: (p) => `/paints${p}` },
+      "/textures": { target: ASSET_HOST, changeOrigin: true, rewrite: (p) => `/paints${p}` },
+      "/images": { target: ASSET_HOST, changeOrigin: true },
       // Only fall back to the deployed host for models when there is no local
       // extraction to serve.
-      ...(hasLocalModels ? {} : { "/models": { target: "https://inventory.5stack.gg", changeOrigin: true } }),
-      "/paints": { target: "https://inventory.5stack.gg", changeOrigin: true },
-      "/api": { target: "https://inventory.5stack.gg", changeOrigin: true },
+      ...(hasLocalModels ? {} : { "/models": { target: ASSET_HOST, changeOrigin: true } }),
+      "/paints": { target: ASSET_HOST, changeOrigin: true },
+      "/api": { target: ASSET_HOST, changeOrigin: true },
     },
   },
 });

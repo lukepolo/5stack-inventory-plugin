@@ -8,9 +8,10 @@ Models are NOT bundled — they're served from a hostPath mount on the node:
 output of `scripts/extract-models.sh`). If the mount is missing or empty every
 lookup 404s and the UI simply never shows a 3D toggle — that's the gate.
 
-The same mount also carries self-hosted skin paints at `<mount>/paints/`
-(populate with `backend/scripts/mirror-paints.mjs`); `/paints/*` serves them and
-the 3D viewer prefers them, falling back to cdn.cstrike.app per missing file.
+The same mount also carries the skin paint chain at `<mount>/paints/` and econ
+item icons at `<mount>/images/`, both extracted from this instance's own CS2
+install. `/paints/*` and `/images/*` serve them. There is **no upstream
+fallback**: a file that isn't on the mount 404s, and the viewer reports it.
 
 The extraction also emits `<key>.inputs/` per weapon (composite input
 textures: cavity/AO/noPaint, paint-by-number masks, base color, base

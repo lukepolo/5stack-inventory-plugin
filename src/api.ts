@@ -43,9 +43,10 @@ export interface Skin {
   // Pre-CS2 finish: pattern is authored against the LEGACY body's UV unwrap,
   // so the 3D viewer must render the legacy mesh for it to align.
   legacyPaint?: boolean;
-  // Only /catalog/items (id lookup) fills these — a shared craft link knows an
-  // id and nothing else, so rehydrating it needs the weapon model to mount 3D
-  // and the type to tell a sticker from a charm.
+  // `model` comes back from /catalog/skins for weapon and knife finishes too —
+  // the craft editor needs it to mount 3D on a finish nobody owns yet. `type`
+  // is /catalog/items only (id lookup): a shared craft link knows an id and
+  // nothing else, and the type is what tells a sticker from a charm.
   model?: string | null;
   type?: string;
 }
@@ -125,6 +126,35 @@ export interface InventoryItem {
   origin?: "crafted" | "steam" | "copied";
 }
 
+// Item artwork lives on our own mount, served under /images by the plugin host
+// — the same origin as /api. The backend emits ROOT-RELATIVE paths because it
+// can't know that origin (this bundle runs inside the PANEL's origin, so a bare
+// "/images/..." would resolve against the wrong host). Resolving here, at the
+// single door every API response comes through, means no view has to remember
+// to do it — and swapping artwork onto a shared CDN later is a one-line change.
+export const ASSET_ORIGIN = API_ORIGIN;
+export const assetUrl = (path: string) => `${ASSET_ORIGIN}${path}`;
+
+/** Rewrite every "/images/..." string in a decoded response body in place.
+ *  Item art appears under a dozen different keys (item, skin, stickers[],
+ *  patches[], charm, agents, collections...), so a walk is materially safer
+ *  than enumerating them and silently missing one the next time a shape grows. */
+function resolveAssetPaths(node: unknown): unknown {
+  if (typeof node === "string") {
+    return node.startsWith("/images/") ? assetUrl(node) : node;
+  }
+  if (Array.isArray(node)) {
+    for (let i = 0; i < node.length; i++) node[i] = resolveAssetPaths(node[i]);
+    return node;
+  }
+  if (node && typeof node === "object") {
+    const obj = node as Record<string, unknown>;
+    for (const k in obj) obj[k] = resolveAssetPaths(obj[k]);
+    return obj;
+  }
+  return node;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}/api${path}`, {
     credentials: "include",
@@ -144,7 +174,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message);
   }
-  return (await response.json()) as T;
+  return resolveAssetPaths(await response.json()) as T;
 }
 
 export const fetchCatalog = () => request<Catalog>("/catalog");
@@ -388,14 +418,19 @@ export const importSteamInventory = () =>
   });
 
 // Admin: cached-asset stats + clearing (renders / paints on the mount).
+export type DirStat = { files: number; bytes: number };
 export type CacheStats = {
-  renders: { files: number; bytes: number };
-  paints: { files: number; bytes: number };
-  models?: { files: number; bytes: number }; // absent on older backends
+  renders: DirStat;
+  paints: DirStat;
+  images?: DirStat; // absent on older backends
+  models?: DirStat;
 };
 export const fetchCacheStats = () => request<CacheStats>("/admin/cache");
-export const clearCache = (scope: "renders" | "paints" | "all") =>
-  request<{ cleared: Record<string, number> }>(`/admin/cache?scope=${scope}`, { method: "DELETE" });
+// Renders only. Paints and icons are extracted from the server's own CS2
+// install with no upstream to re-fetch from, so deleting them breaks rendering
+// until someone re-extracts — the backend rejects any other scope.
+export const clearCache = () =>
+  request<{ cleared: Record<string, number> }>("/admin/cache?scope=renders", { method: "DELETE" });
 
 // Admin: model extraction (pulls weapon GLBs + composite inputs from the
 // node's CS2 install straight onto the models mount). Runs as a child process
@@ -419,6 +454,17 @@ export interface ExtractStatus {
   requiredVersion?: number | null;
   extracted?: boolean;
   stale?: boolean;
+  /** Wall-clock of the last successful run, and the per-step breakdown of it.
+   *  Null on mounts stamped before v5 — "unknown", not zero. */
+  lastRunSeconds?: number | null;
+  lastRunSteps?: Record<string, number> | null;
+  /** Live progress while a run is going: every step of the pipeline with its
+   *  own state, plus a unit count for the steps that know one. The whole list
+   *  is present from the start so the panel can show what's still to come. */
+  progress?: {
+    steps: { name: string; state: "pending" | "running" | "done"; done?: number; total?: number; seconds?: number }[];
+    at: string;
+  } | null;
   // CS2 game build. The first three are the build the assets were extracted
   // against (from the stamp); the `current*` ones are read live from the
   // mounted install's steam.inf. `gameUpdated` is a soft "the game moved on"

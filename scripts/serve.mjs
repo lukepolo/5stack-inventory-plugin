@@ -14,11 +14,14 @@ const modelsDir = process.env.MODELS_DIR ?? "/cs2-models/models";
 const paintsDir = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const rendersDir = process.env.RENDERS_DIR ?? "/cs2-models/renders";
 const testsDir = process.env.TESTS_DIR ?? "/cs2-models/tests";
-// Production nginx falls back to the backend when /paints|/renders miss the
-// mount (`try_files $uri @paints`), and that miss is exactly what drives the
-// backend's lazy CDN mirror. Without the same fallback here, dev hot-swap 404s
-// every unmirrored paint FOREVER: our mount is read-only, so the backend is the
-// only thing that can populate it, and it never hears about the request.
+// Econ item icons, extracted from this instance's own CS2 install. Must be
+// served here as well as in nginx.conf: the hot-swap deployment runs THIS file
+// rather than nginx, so an nginx-only route leaves every tile blank in dev.
+const imagesDir = process.env.IMAGES_DIR ?? "/cs2-models/images";
+// Production nginx falls back to the backend when a mount-backed path misses
+// (`try_files $uri @backend`), for the case where the frontend and backend pods
+// land on different nodes and only one of them can see the file. Mirror that
+// here so dev behaves the same.
 const backendOrigin = process.env.BACKEND_ORIGIN ?? "http://inventory-backend:3000";
 const port = Number(process.env.PORT ?? 80);
 
@@ -57,6 +60,9 @@ createServer(async (req, res) => {
     } else if (pathname.startsWith("/tests/")) {
       base = testsDir;
       pathname = pathname.slice("/tests".length);
+    } else if (pathname.startsWith("/images/")) {
+      base = imagesDir;
+      pathname = pathname.slice("/images".length);
     }
     const file = normalize(join(base, pathname));
     if (!file.startsWith(base + sep) && file !== join(root, "index.html")) {
@@ -70,7 +76,7 @@ createServer(async (req, res) => {
     } catch {
       // Mount miss on a backend-backed path — hand it to the backend, which
       // serves it and mirrors it so the next request comes off the mount.
-      if (base === paintsDir || base === rendersDir || base === testsDir) {
+      if (base === paintsDir || base === rendersDir || base === testsDir || base === imagesDir) {
         try {
           const upstream = await fetch(backendOrigin + req.url);
           if (upstream.ok) {

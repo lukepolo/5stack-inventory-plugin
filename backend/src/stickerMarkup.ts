@@ -12,15 +12,19 @@
 // keys, and StickerMarkup isn't on it — which is why our own extraction pass
 // (which DID recover the keychain attachment) came up empty here.
 //
-// Rather than add a third decompile pass, read cs2-lib's CDN: it publishes the
-// whole parsed model KV as JSON beside the GLB it ships, keyed off the
-// `playerModel` field already in the catalog. No extraction run, no new infra.
-import { getWeaponPlayerModel } from "./catalog.ts";
+// This used to be read from cs2-lib's CDN, which publishes the whole parsed
+// model KV as JSON. That third party is gone, so extract-models.sh §3d now
+// recovers it from the game archive itself — `-b DATA` prints the vmdl_c's DATA
+// block verbatim, sidestepping the ModelExtract whitelist — and writes one
+// aggregate `sticker-markup.json` keyed by cs2-lib model key.
+//
+// Aggregate rather than a file per weapon because it is 51 KB for all 35
+// stickerable weapons, and because it matches the charm-anchors sidecar next to
+// it. Knives are absent from it by design: they have no sticker slots at all.
+import path from "node:path";
+import { readFile, stat } from "node:fs/promises";
 
-const CDN = "https://cdn.cstrike.app";
-// Hand-authored data that only moves when Valve ships a model change; a day is
-// plenty, and a miss degrades to bounds-only rather than breaking placement.
-const TTL_MS = 24 * 60 * 60 * 1000;
+const MODELS_DIR = process.env.MODELS_DIR ?? "/cs2-models/models";
 
 export interface StickerSlot {
   /** The game's own slot index — this is what the protobuf `slot` field wants. */
@@ -37,61 +41,67 @@ export interface StickerSlot {
   special?: string;
 }
 
-type Entry = { at: number; slots: StickerSlot[] };
-const cache = new Map<string, Entry>();
-const inflight = new Map<string, Promise<StickerSlot[]>>();
+const FILE = path.join(MODELS_DIR, "sticker-markup.json");
 
-function parse(kv: unknown): StickerSlot[] {
-  const markup = (kv as { StickerMarkup?: unknown[] } | undefined)?.StickerMarkup;
-  if (!Array.isArray(markup)) return [];
+type Markup = Record<string, StickerSlot[]>;
+// Keyed on mtime rather than a clock: the file only changes when an extraction
+// runs, and picking that up immediately is the difference between a re-run
+// fixing placement and it appearing not to.
+let cache: { mtimeMs: number; markup: Markup } | null = null;
+let inflight: Promise<Markup> | null = null;
+
+/** Drop anything malformed rather than trusting the file wholesale — a
+ *  truncated write would otherwise surface as NaN offsets, which the viewer
+ *  renders as a sticker parked at the origin instead of not at all. */
+function validate(raw: unknown): StickerSlot[] {
+  if (!Array.isArray(raw)) return [];
   const out: StickerSlot[] = [];
-  for (const raw of markup) {
-    const e = raw as Record<string, unknown>;
-    // Offsets arrive as strings in the KV dump.
-    const off = (e.Offset as unknown[] | undefined)?.map((v) => Number(v));
+  for (const item of raw) {
+    const e = item as Record<string, unknown>;
+    const off = Array.isArray(e.offset) ? (e.offset as unknown[]).map(Number) : null;
+    const index = Number(e.index);
+    const scale = Number(e.scale);
     if (!off || off.length !== 2 || off.some((v) => !Number.isFinite(v))) continue;
-    const index = Number(e.Index);
-    const scale = Number(e.Scale);
     if (!Number.isFinite(index) || !Number.isFinite(scale)) continue;
     out.push({
       index,
-      mesh: String(e.Mesh ?? "body_hd"),
+      mesh: String(e.mesh ?? "body_hd"),
       offset: [off[0], off[1]],
       scale,
-      rotation: Number(e.Rotation) || 0,
-      special: e.SpecialIdentifier ? String(e.SpecialIdentifier) : undefined,
+      rotation: Number(e.rotation) || 0,
+      special: e.special ? String(e.special) : undefined,
     });
   }
   return out;
 }
 
-/** Slot markup for a weapon model key, or [] when unavailable. Never throws. */
-export async function getStickerMarkup(model: string): Promise<StickerSlot[]> {
-  const hit = cache.get(model);
-  if (hit && Date.now() - hit.at < TTL_MS) return hit.slots;
-  const running = inflight.get(model);
-  if (running) return running;
-
-  const job = (async () => {
+async function load(): Promise<Markup> {
+  const { mtimeMs } = await stat(FILE);
+  if (cache && cache.mtimeMs === mtimeMs) return cache.markup;
+  if (inflight) return inflight;
+  inflight = (async () => {
     try {
-      const playerModel = getWeaponPlayerModel(model);
-      if (!playerModel) return [];
-      // "/models/weapon_rif_ak47_025c0af3.glb" -> same stem, .json
-      const url = `${CDN}${playerModel.replace(/\.glb$/, ".json")}`;
-      const res = await fetch(url);
-      if (!res.ok) return [];
-      const doc = (await res.json()) as { m_modelInfo?: { m_keyValueText?: unknown } };
-      const slots = parse(doc?.m_modelInfo?.m_keyValueText);
-      cache.set(model, { at: Date.now(), slots });
-      return slots;
-    } catch {
-      return []; // offline / CDN hiccup — callers fall back to bounds
+      const doc = JSON.parse(await readFile(FILE, "utf8")) as Record<string, unknown>;
+      const markup: Markup = {};
+      for (const [model, slots] of Object.entries(doc)) markup[model] = validate(slots);
+      cache = { mtimeMs, markup };
+      return markup;
     } finally {
-      inflight.delete(model);
+      inflight = null;
     }
   })();
-  inflight.set(model, job);
-  return job;
+  return inflight;
+}
+
+/** Slot markup for a weapon model key, or [] when unavailable. Never throws.
+ *  Empty is the honest answer for a knife (no sticker slots exist) and for a
+ *  mount that predates extract-models.sh v5 — callers fall back to bounds. */
+export async function getStickerMarkup(model: string): Promise<StickerSlot[]> {
+  try {
+    return (await load())[model] ?? [];
+  } catch {
+    return [];
+  }
 }
 
 /** How many sticker slots this weapon really has — 4, 5 or 6, never a fixed 5. */

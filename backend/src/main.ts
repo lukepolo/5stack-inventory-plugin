@@ -61,12 +61,10 @@ app.get("/api/catalog", async () => {
   return { weapons: getWeapons(), agents: getAgents(), defaults: getDefaults() };
 });
 
-// Lazy self-populating paint cache: first request for a paint-chain file
-// fetches it from the public CDN, writes it to the shared hostPath mount
-// (the filesystem IS the "already mirrored" state — no extra bookkeeping),
-// and serves it. Every later request is a plain file read, and nginx serves
-// the file directly once present (try_files falls back here only on miss).
-// scripts/mirror-paints.mjs remains as an optional bulk pre-warm.
+// Paint-chain files and econ icons are extracted from the instance's own CS2
+// install onto the shared hostPath mount (scripts/extract-models.sh) and
+// served straight off it — see serveAssetDir below. Nothing is fetched at
+// request time, from anywhere.
 // Rendered item cards (client snapshots of the painted 3D model) live on the
 // same mount; nginx serves /renders/* statically. Upload is 5stack-session
 // authed — no extra keys.
@@ -128,47 +126,47 @@ app.post<{ Params: { id: string } }>("/api/render/:id", async (request, reply) =
 });
 
 const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
-const PAINT_CDN = "https://cdn.cstrike.app";
-const PAINT_TYPES: Record<string, string> = {
+const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
+const ASSET_TYPES: Record<string, string> = {
   ".json": "application/json",
   ".webp": "image/webp",
   ".png": "image/png",
 };
-app.get<{ Params: { "*": string } }>("/paints/*", async (request, reply) => {
-  const rel = request.params["*"] ?? "";
-  const ext = path.extname(rel).toLowerCase();
-  const type = PAINT_TYPES[ext];
-  if (!type || rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+$/.test(rel)) {
-    return reply.status(404).send({ error: "not found" });
-  }
-  reply.header("Access-Control-Allow-Origin", "*");
-  const dest = path.join(PAINTS_DIR, rel);
-  try {
-    const cached = await fs.readFile(dest);
-    reply.header("Cache-Control", "public, max-age=86400");
-    return reply.type(type).send(cached);
-  } catch {
-    /* not mirrored yet */
-  }
-  try {
-    const res = await fetch(`${PAINT_CDN}/${rel}`, { signal: AbortSignal.timeout(30000) });
-    if (!res.ok) {
+// Static asset mounts, populated ONLY by our own extractor from the instance's
+// own CS2 install (scripts/extract-models.sh). A miss is a 404 and stays a
+// 404: there is no upstream to fall back to by design, so an unpopulated or
+// out-of-date mount shows up as a visible error instead of silently serving
+// someone else's copy. nginx serves these directly; these routes only back its
+// static-miss fallback (frontend/backend pods can land on different nodes).
+function serveAssetDir(routePrefix: string, dir: string) {
+  app.get<{ Params: { "*": string } }>(`${routePrefix}/*`, async (request, reply) => {
+    const rel = request.params["*"] ?? "";
+    const type = ASSET_TYPES[path.extname(rel).toLowerCase()];
+    if (!type || rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+$/.test(rel)) {
       return reply.status(404).send({ error: "not found" });
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    // Best-effort persist — if the mount is absent (dev), we still proxy through.
+    reply.header("Access-Control-Allow-Origin", "*");
     try {
-      await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.writeFile(dest, buf);
+      const buf = await fs.readFile(path.join(dir, rel));
+      // Two very different lifetimes behind one route:
+      //
+      //  - TEXTURES and ICONS carry a content hash in the filename, so a given
+      //    URL never changes meaning. Cache them hard.
+      //  - MATERIAL JSON does NOT: the filename comes from cs2-lib and is fixed,
+      //    while the content (and the texture names it points at) is rewritten
+      //    by every extraction. Caching those for a day meant a browser kept a
+      //    material referencing textures the new run had renamed — every one
+      //    404'd and the skin rendered white long after the mount was correct.
+      const immutable = type !== "application/json";
+      reply.header("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
+      return reply.type(type).send(buf);
     } catch {
-      /* read-only or missing mount */
+      return reply.status(404).send({ error: "not extracted" });
     }
-    reply.header("Cache-Control", "public, max-age=86400");
-    return reply.type(type).send(buf);
-  } catch {
-    return reply.status(502).send({ error: "paint fetch failed" });
-  }
-});
+  });
+}
+serveAssetDir("/paints", PAINTS_DIR);
+serveAssetDir("/images", IMAGES_DIR);
 
 // Serve renders directly too — nginx falls back here when its mount copy
 // misses (e.g. frontend/backend pods on different nodes).
@@ -334,8 +332,8 @@ for (const route of ["/api/tests/img/:key", "/tests/:key"]) {
 // Sticker placement envelope for a weapon model (drives the 3D drag editor).
 // Bounds AND the real per-slot UV anchors. Bounds alone can only rule a
 // placement out; the anchors are what let the viewer put a sticker where the
-// game will actually draw it. Markup is fetched from cs2-lib's CDN and cached,
-// so a miss degrades to the old bounds-only behaviour rather than failing.
+// game will actually draw it. Markup is read off the extracted mount, so an
+// un-extracted mount (or a knife) degrades to bounds-only rather than failing.
 app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", async (request) => {
   const model = request.params.model;
   const [bounds, slots] = await Promise.all([
@@ -1516,8 +1514,17 @@ async function syncGameConfigs(url: string, key: string): Promise<{ updated: str
   return { updated, failed };
 }
 
-// ---- Cached-asset admin: sizes + clearing (renders = baked cards, paints =
-// mirrored CDN files). Clearing is safe — both repopulate lazily on demand.
+// ---- Cached-asset admin: sizes + clearing.
+//
+// Only CARD RENDERS are a cache. They are client bakes of items the user owns,
+// so clearing one costs a re-render and nothing else.
+//
+// Paints and icons used to belong here too, back when a miss was lazily
+// re-fetched from a public CDN. That fallback is gone — they are extracted from
+// the instance's own CS2 install now — so deleting them is unrecoverable
+// without a full re-extraction, and every skin renders white in the meantime.
+// That is exactly what happened once. They are reported here but NOT clearable;
+// re-running the extraction is the way to rebuild them.
 async function dirStats(dir: string): Promise<{ files: number; bytes: number }> {
   let files = 0;
   let bytes = 0;
@@ -1552,26 +1559,52 @@ app.get("/api/admin/cache", async (request, reply) => {
   // models = extracted GLBs + composite inputs on the mount (read-only here;
   // populated by the extraction Job / manual script). Handy truth-check when
   // the 3D toggle "disappears" — 0 files means the mount is empty, not a bug.
-  const modelsDir = path.join(path.dirname(RENDERS_DIR), "models");
-  return {
-    renders: await dirStats(RENDERS_DIR),
-    paints: await dirStats(PAINTS_DIR),
-    models: await dirStats(modelsDir),
-  };
+  return await cachedDirStats();
 });
+
+// dirStats walks and stats EVERY file under four directories — ~45k of them
+// once the mount is populated. The panel polls this while an extraction runs
+// (to show the counts climbing), and that walk competes with the extraction for
+// the same disk. Memoised briefly so a polling tab, or several admins watching
+// at once, cost one walk rather than one each.
+const DIR_STATS_TTL_MS = 8_000;
+let dirStatsMemo: { at: number; value: Promise<Record<string, { files: number; bytes: number }>> } | null = null;
+function cachedDirStats() {
+  if (dirStatsMemo && Date.now() - dirStatsMemo.at < DIR_STATS_TTL_MS) return dirStatsMemo.value;
+  const modelsDir = path.join(path.dirname(RENDERS_DIR), "models");
+  const value = (async () => {
+    const [renders, paints, images, models] = await Promise.all([
+      dirStats(RENDERS_DIR),
+      dirStats(PAINTS_DIR),
+      dirStats(IMAGES_DIR),
+      dirStats(modelsDir),
+    ]);
+    return { renders, paints, images, models };
+  })();
+  // Don't let a failed walk stick around as a poisoned memo.
+  value.catch(() => {
+    if (dirStatsMemo?.value === value) dirStatsMemo = null;
+  });
+  dirStatsMemo = { at: Date.now(), value };
+  return value;
+}
 app.delete<{ Querystring: { scope?: string } }>("/api/admin/cache", async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
-  const scope = request.query.scope === "paints" ? ["paints"] : request.query.scope === "all" ? ["renders", "paints"] : ["renders"];
-  const cleared: Record<string, number> = {};
-  for (const which of scope) {
-    const dir = which === "paints" ? PAINTS_DIR : RENDERS_DIR;
-    const before = await dirStats(dir);
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-    await fs.mkdir(dir, { recursive: true }).catch(() => {});
-    cleared[which] = before.files;
+  // Renders only, whatever is asked for. "paints"/"all" used to be valid and
+  // are refused rather than silently downgraded, so an old client (or a stale
+  // bookmarked request) can't quietly wipe the paint chain again.
+  const scope = request.query.scope ?? "renders";
+  if (scope !== "renders") {
+    return reply.status(400).send({
+      error:
+        "Only card renders can be cleared. Paints and icons are extracted from this server's CS2 install — re-run the model extraction to rebuild them.",
+    });
   }
-  return { cleared };
+  const before = await dirStats(RENDERS_DIR);
+  await fs.rm(RENDERS_DIR, { recursive: true, force: true }).catch(() => {});
+  await fs.mkdir(RENDERS_DIR, { recursive: true }).catch(() => {});
+  return { cleared: { renders: before.files } };
 });
 
 // ---- Model extraction (admins) ----------------------------------------------
@@ -1681,18 +1714,31 @@ async function readExtractVersion(): Promise<number | null> {
 // The full stamp written by the last successful run: the pipeline version plus
 // the CS2 build the assets were extracted against. Tolerant of old stamps that
 // predate the game fields (they read back as null).
-async function readExtractStamp(): Promise<{ version: number | null } & GameVersion> {
+type ExtractStamp = { version: number | null; durationSeconds: number | null; steps: Record<string, number> | null } & GameVersion;
+const EMPTY_STAMP: ExtractStamp = {
+  version: null,
+  gameBuild: null,
+  gamePatch: null,
+  gameDate: null,
+  durationSeconds: null,
+  steps: null,
+};
+async function readExtractStamp(): Promise<ExtractStamp> {
   try {
     const raw = await fs.readFile(EXTRACT_VERSION_FILE, "utf8");
-    const p = JSON.parse(raw) as Partial<{ version: number } & GameVersion>;
+    const p = JSON.parse(raw) as Partial<ExtractStamp>;
     return {
       version: typeof p.version === "number" ? p.version : null,
       gameBuild: typeof p.gameBuild === "number" ? p.gameBuild : null,
       gamePatch: typeof p.gamePatch === "string" ? p.gamePatch : null,
       gameDate: typeof p.gameDate === "string" ? p.gameDate : null,
+      // Stamps written before v5 have neither — an absent duration reads as
+      // "unknown", never as zero.
+      durationSeconds: typeof p.durationSeconds === "number" ? p.durationSeconds : null,
+      steps: p.steps && typeof p.steps === "object" ? (p.steps as Record<string, number>) : null,
     };
   } catch {
-    return { version: null, gameBuild: null, gamePatch: null, gameDate: null };
+    return EMPTY_STAMP;
   }
 }
 
@@ -1743,11 +1789,15 @@ async function extractVersionInfo() {
     hasExtractedModels(),
     readCurrentGameVersion(),
   ]);
-  const { version: extractVersion, gameBuild, gamePatch, gameDate } = stamp;
+  const { version: extractVersion, gameBuild, gamePatch, gameDate, durationSeconds, steps } = stamp;
   return {
     extractVersion,
     requiredVersion,
     extracted,
+    // How long the last successful run took, and where it went. Surfaced so
+    // "press this button" comes with an idea of what you're committing to.
+    lastRunSeconds: durationSeconds,
+    lastRunSteps: steps,
     // CS2 build the assets were extracted against vs. what the install reports
     // now. `gameUpdated` is a soft, informational signal — it deliberately does
     // NOT feed `stale`/the re-extract badge, since most CS2 patches don't touch
@@ -1782,24 +1832,132 @@ async function writeExtractState(next: ExtractState) {
   }
 }
 
-app.post("/api/admin/extract-models", async (request, reply) => {
-  const denied = await requireAdmin(request);
-  if (denied) return reply.status(denied.code).send({ error: denied.error });
-  if (extractChild) return reply.status(409).send({ error: "Extraction is already running." });
+// A run outlives the process that started it: the bash child is reparented when
+// node restarts (which `node --watch` does on every edit), so `extractChild`
+// being null does NOT mean nothing is running. Without this, a restart during a
+// run starts a SECOND extraction writing to the same mount — observed once.
+const EXTRACT_LOCK_FILE = path.join(MODELS_ROOT, "extract.lock");
+
+// Written by the script as it works (see its `progress` helper). Read rather
+// than parsed out of the child's stdout so it still works for a run this process
+// didn't start, and survives `node --watch` restarting us mid-run.
+const EXTRACT_PROGRESS_FILE = path.join(MODELS_ROOT, "extract-progress.json");
+type ExtractStep = {
+  name: string;
+  state: "pending" | "running" | "done";
+  done?: number;
+  total?: number;
+  seconds?: number;
+};
+type ExtractProgress = { steps: ExtractStep[]; at: string };
+async function readExtractProgress(): Promise<ExtractProgress | null> {
+  try {
+    const p = JSON.parse(await fs.readFile(EXTRACT_PROGRESS_FILE, "utf8")) as Partial<ExtractProgress>;
+    if (!Array.isArray(p.steps)) return null;
+    const steps = p.steps.flatMap((s): ExtractStep[] => {
+      if (!s || typeof s.name !== "string") return [];
+      const state = s.state === "running" || s.state === "done" ? s.state : "pending";
+      return [{
+        name: s.name,
+        state,
+        ...(typeof s.done === "number" ? { done: s.done } : {}),
+        ...(typeof s.total === "number" ? { total: s.total } : {}),
+        ...(typeof s.seconds === "number" ? { seconds: s.seconds } : {}),
+      }];
+    });
+    return { steps, at: typeof p.at === "string" ? p.at : "" };
+  } catch {
+    return null;
+  }
+}
+
+/** PID of a still-live extraction, or null.
+ *
+ *  A bare "does this pid exist" check is NOT enough: the lock lives on the
+ *  mount, which outlives the pod, and pids restart from 1 in a new container.
+ *  A stale lock naming pid 66 would then match some unrelated process and
+ *  report a phantom run forever, blocking every future extraction. So confirm
+ *  the process is actually our script before believing the lock. */
+async function liveExtractionPid(): Promise<number | null> {
+  try {
+    const { pid } = JSON.parse(await fs.readFile(EXTRACT_LOCK_FILE, "utf8")) as { pid?: number };
+    if (typeof pid !== "number") return null;
+    // Signal 0 tests for existence without touching the process.
+    process.kill(pid, 0);
+    const cmdline = await fs.readFile(`/proc/${pid}/cmdline`, "utf8").catch(() => "");
+    // No /proc (non-Linux dev box): fall back to trusting the pid, since the
+    // pod-restart collision this guards against can't happen there anyway.
+    if (cmdline && !cmdline.includes("extract-models")) {
+      await fs.rm(EXTRACT_LOCK_FILE, { force: true }).catch(() => {});
+      return null;
+    }
+    return pid;
+  } catch {
+    return null; // no lock, unreadable, or the pid is gone (ESRCH)
+  }
+}
+
+/** Create the lock exclusively. Returns why it failed rather than throwing, and
+ *  clears a lock whose owner is gone so a killed run can't wedge this forever. */
+async function acquireExtractLock(): Promise<{ ok: true } | { ok: false; error: string }> {
+  for (const attempt of [0, 1]) {
+    try {
+      const fh = await fs.open(EXTRACT_LOCK_FILE, "wx");
+      await fh.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+      await fh.close();
+      return { ok: true };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+        return { ok: false, error: `Could not claim the extraction lock: ${(e as Error).message}` };
+      }
+      const owner = await liveExtractionPid();
+      if (owner !== null) {
+        return { ok: false, error: `Extraction is already running (pid ${owner}).` };
+      }
+      // Owner is gone — a killed run, or a pod restart that left the file
+      // behind. Clear it here rather than relying on liveExtractionPid, which
+      // only unlinks when the pid belongs to some OTHER process; a pid that
+      // simply no longer exists would otherwise wedge extraction forever.
+      await fs.rm(EXTRACT_LOCK_FILE, { force: true }).catch(() => {});
+      if (attempt === 1) return { ok: false, error: "Extraction lock is held by a process that no longer exists." };
+    }
+  }
+  return { ok: false, error: "Could not claim the extraction lock." };
+}
+
+/** Launch the extraction. Returns an error shape instead of throwing so both
+ *  the admin route and the boot-time auto-run can report it their own way. */
+async function startExtraction(): Promise<{ started: true } | { code: number; error: string }> {
+  if (extractChild) return { code: 409, error: "Extraction is already running." };
+  // Claim the lock ATOMICALLY, before any of the async checks below. A
+  // check-then-write lock is a race: the admin pressing the button and the
+  // boot auto-run both passed the "is anything running?" test and spawned two
+  // extractions a second apart, both writing the same mount. `wx` makes the
+  // create fail if the file exists, so exactly one caller can win.
+  const claimed = await acquireExtractLock();
+  if (!claimed.ok) return { code: 409, error: claimed.error };
+  // From here on, any early return must release the lock or nothing will ever
+  // run again.
+  const fail = async (code: number, error: string) => {
+    await fs.rm(EXTRACT_LOCK_FILE, { force: true }).catch(() => {});
+    return { code, error };
+  };
 
   // Fail loudly up front rather than spawning something that can't work: these
   // two paths are exactly what the deployment has to mount.
   const vpk = path.join(CS2_DIR, "game", "csgo", "pak01_dir.vpk");
   if (!(await fs.access(vpk).then(() => true, () => false))) {
-    return reply.status(412).send({
-      error: `CS2 install not readable at ${CS2_DIR} (looked for game/csgo/pak01_dir.vpk). Mount the game dir into the backend and/or set CS2_DIR.`,
-    });
+    return await fail(
+      412,
+      `CS2 install not readable at ${CS2_DIR} (looked for game/csgo/pak01_dir.vpk). Mount the game dir into the backend and/or set CS2_DIR.`,
+    );
   }
   const script = await resolveExtractScript();
   if (!script) {
-    return reply.status(412).send({
-      error: `Extraction script not found. Looked in: ${EXTRACT_SCRIPT_CANDIDATES.join(", ")} (override with EXTRACT_SCRIPT).`,
-    });
+    return await fail(
+      412,
+      `Extraction script not found. Looked in: ${EXTRACT_SCRIPT_CANDIDATES.join(", ")} (override with EXTRACT_SCRIPT).`,
+    );
   }
 
   const startedAt = new Date().toISOString();
@@ -1812,12 +1970,18 @@ app.post("/api/admin/extract-models", async (request, reply) => {
   // Scratch defaults onto the models mount: it's already there, it's real node
   // disk with room, and the raw decompile pass is several GB.
   const workDir = process.env.EXTRACT_WORK_DIR ?? path.join(MODELS_ROOT, ".work");
+  // Deliberately NOT detached: a run is tied to the process that started it, so
+  // restarting the backend stops it. Simple and predictable — the alternative
+  // leaves orphaned multi-GB jobs nobody is tracking.
   const child = spawn("bash", [script], {
     env: { ...process.env, CS2_DIR, OUT_DIR: MODELS_ROOT, WORK_DIR: workDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
   extractChild = child;
-  app.log.info(`[extract-models] started: script=${script} CS2_DIR=${CS2_DIR} OUT_DIR=${MODELS_ROOT} WORK_DIR=${workDir}`);
+  // Record the CHILD's pid in the lock we already hold — it is the thing that
+  // survives a restart of this process.
+  await fs.writeFile(EXTRACT_LOCK_FILE, JSON.stringify({ pid: child.pid, startedAt })).catch(() => {});
+  app.log.info(`[extract-models] started: pid=${child.pid} script=${script} CS2_DIR=${CS2_DIR} OUT_DIR=${MODELS_ROOT} WORK_DIR=${workDir}`);
   await writeExtractState({ ...IDLE_STATE, state: "running", startedAt });
 
   // Everything goes to the file; only the tail is kept in memory, since that's
@@ -1835,6 +1999,7 @@ app.post("/api/admin/extract-models", async (request, reply) => {
   const settle = async (exitCode: number | null, error: string | null) => {
     if (extractChild !== child) return; // superseded; ignore late events
     extractChild = null;
+    await fs.rm(EXTRACT_LOCK_FILE, { force: true }).catch(() => {});
     const ok = exitCode === 0 && !error;
     app.log.info(`[extract-models] finished: exit=${exitCode} error=${error ?? "none"}`);
     logStream.end(`# extract-models finished ${new Date().toISOString()} exit=${exitCode}${error ? ` error=${error}` : ""}\n`);
@@ -1860,16 +2025,64 @@ app.post("/api/admin/extract-models", async (request, reply) => {
   child.on("close", (code) => void settle(code, null));
 
   return { started: true };
+}
+
+app.post("/api/admin/extract-models", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const result = await startExtraction();
+  if ("code" in result) return reply.status(result.code).send({ error: result.error });
+  return result;
 });
+
+// Self-heal on boot. A mount that is empty or behind the pipeline means blank
+// item art and white skins — there is nothing an admin would do about it except
+// press the button, so press it for them. Set INVENTORY_AUTO_EXTRACT=0 to
+// disable (e.g. a node where the ~30 minute run is unwelcome at startup).
+async function autoExtractIfStale() {
+  if (process.env.INVENTORY_AUTO_EXTRACT === "0") return;
+  try {
+    const info = await extractVersionInfo();
+    if (!info.stale) return;
+    // Already running, started by a process that has since been replaced —
+    // `node --watch` restarts on every edit, and without this the auto-run
+    // stacks a second extraction on top of the live one.
+    const running = await liveExtractionPid();
+    if (running !== null) {
+      app.log.info(`[extract-models] already running (pid ${running}) — not auto-starting another`);
+      return;
+    }
+    // A previous run that FAILED is not something to retry on every restart —
+    // a crash-looping pod would spawn a multi-GB job each time, and the failure
+    // wants a human. Manual re-run still works.
+    const prior = await readExtractState();
+    if (prior.state === "failed") {
+      app.log.warn("[extract-models] mount is stale but the last run failed — not auto-running; re-run it from the panel");
+      return;
+    }
+    app.log.info(
+      `[extract-models] mount is stale (has v${info.extractVersion ?? "none"}, script produces v${info.requiredVersion}) — starting automatically`,
+    );
+    const result = await startExtraction();
+    if ("code" in result) {
+      app.log.warn(`[extract-models] auto-run could not start: ${result.error}`);
+    }
+  } catch (e) {
+    app.log.warn(`[extract-models] auto-run check failed: ${(e as Error).message}`);
+  }
+}
 
 app.get("/api/admin/extract-models", async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
   const stored = await readExtractState();
-  // While a run is live the freshest log lives in memory, not the file.
-  const status = extractChild ? { ...stored, state: "running" as const, log: extractLog.join("\n") } : stored;
+  // A run can be owned by a process we replaced, so "is it running" is the lock,
+  // not just our own child handle.
+  const live = extractChild != null || (await liveExtractionPid()) !== null;
+  const status = live ? { ...stored, state: "running" as const, log: extractLog.join("\n") } : stored;
   const logBytes = await fs.stat(EXTRACT_LOG_FILE).then((s) => s.size, () => 0);
-  return { available: true as const, ...status, logBytes, ...(await extractVersionInfo()) };
+  const progress = live ? await readExtractProgress() : null;
+  return { available: true as const, ...status, logBytes, progress, ...(await extractVersionInfo()) };
 });
 
 // Full log as a download — the panel only ever shows the tail, and the
@@ -2104,6 +2317,7 @@ async function start() {
   await app.register(cors, { origin: true, credentials: true });
   await applySchema();
   await app.listen({ port, host: "0.0.0.0" });
+  void autoExtractIfStale();
   // Freshness marker: node --watch in this container is event-based and quietly
   // misses synced edits, so "my change did nothing" is usually "the process is
   // still on old code". Compare this mtime against the file you just edited.

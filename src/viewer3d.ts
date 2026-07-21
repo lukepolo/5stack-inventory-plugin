@@ -605,7 +605,7 @@ export function snapshotModel(
   /** Opportunistic cache fill rather than something the user is waiting on —
    *  hold it until no viewer is onscreen. */
   background = false,
-): Promise<Blob | null> {
+): Promise<Blob | null | typeof INCOMPLETE> {
   // Only the backfill rides the background lane. The craft modal's live 2D
   // preview is also a snapshot, but the user IS waiting on it, so it stays
   // interactive and is never preempted.
@@ -616,7 +616,7 @@ export function snapshotModel(
   // would block the craft preview behind it for as long as the modal's own
   // viewer stayed open — the very thing the wait-before-the-lane ordering
   // below exists to prevent.
-  const attempt = (n: number): Promise<Blob | null> =>
+  const attempt = (n: number): Promise<Blob | null | typeof INCOMPLETE> =>
     (background ? viewersIdle() : Promise.resolve())
       .then(() => {
         // The idle wait happens BEFORE taking the lane, never inside it.
@@ -652,12 +652,16 @@ export const bakesInFlight = () => snapshotsInFlight;
 const BAKE_PREEMPT_RETRIES = 3;
 /** Distinct from null: "yielded the GPU, ask again" rather than "this failed". */
 const PREEMPTED = Symbol("preempted");
+/** "The assets aren't on the mount yet" — the render would be a white gun.
+ *  Distinct from null (a real failure) so callers can keep the item queued and
+ *  show a pending state instead of caching a wrong picture forever. */
+export const INCOMPLETE = Symbol("incomplete");
 
 async function snapshotModelNow(
   model: string,
   opts: Omit<ViewerOpts, "interactive" | "still">,
   priority: BuildPriority = "interactive",
-): Promise<Blob | null | typeof PREEMPTED> {
+): Promise<Blob | null | typeof PREEMPTED | typeof INCOMPLETE> {
   snapshotsInFlight++;
   const holder = document.createElement("div");
   holder.style.cssText = "position:fixed;left:-10000px;top:0;width:640px;height:480px;pointer-events:none;";
@@ -667,6 +671,12 @@ async function snapshotModelNow(
     handle = await mountViewer(holder, model, { ...opts, interactive: false, still: true, frame: "fit", priority });
     // Decal texture loads + a few physics frames for the charm to hang.
     await new Promise((r) => setTimeout(r, 750));
+    // Refuse to bake a skin whose textures aren't on the mount yet. The render
+    // key is id+wear+seed and nothing ever re-bakes a card, so a white snapshot
+    // taken during an extraction would be served forever — the extraction
+    // finishing would not fix it. INCOMPLETE (not null) so the caller can leave
+    // the item queued and try again later.
+    if (handle.paintIncomplete()) return INCOMPLETE;
     const raw = await handle.snapshot();
     return raw ? await cropToContent(raw) : raw;
   } catch (e) {
@@ -691,6 +701,10 @@ export interface ViewerHandle {
   flashSticker: (slot: number) => void;
   setCharm: (charm: CharmPlacement | null) => void;
   snapshot: () => Promise<Blob | null>;
+  /** True when the paint composited on fallbacks because a texture it names is
+   *  not on the mount yet (an extraction is still running). What's on screen is
+   *  not the real skin, so it must not be baked into a card. */
+  paintIncomplete: () => boolean;
   /** Measured placement frame, for tools/shadertest. See the impl for why. */
   probePlacement: () => PlacementProbe;
 }
@@ -811,6 +825,9 @@ async function buildViewer(
 ): Promise<ViewerHandle> {
   const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton } = await loadThree();
   throwIfAborted(signal);
+  // Set by the paint build below when a texture the skin names wasn't on the
+  // mount. Read by callers before they bake a card — see ViewerHandle.
+  let paintWasIncomplete = false;
   // Which body survived the hd/legacy prune below — slot markup is per-variant.
   let bodyVariant = "body_hd";
   // Per-viewer geometry clones produced by flattenToBindPose (the cached glTF ones are
@@ -1028,6 +1045,9 @@ async function buildViewer(
           weapon: weaponInputs,
           model, // so a fallback can be reported against the weapon it broke
         });
+        // Sticky: a rebuild that composites cleanly clears it, but within one
+        // build any missing texture means what's on screen isn't the real skin.
+        paintWasIncomplete = !!comp?.incomplete;
         // Custom paint jobs ship their own normal map (paint-UV space).
         // Gated on paint.useNormalMap, NOT on the texture existing: these
         // materials ship a real g_tNormal even with the switch off, so keying
@@ -3072,6 +3092,7 @@ async function buildViewer(
         },
       };
     },
+    paintIncomplete: () => paintWasIncomplete,
     // Render one fresh frame and hand back a PNG of exactly what's on screen.
     async snapshot() {
       if (disposed) return null;

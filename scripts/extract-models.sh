@@ -32,7 +32,16 @@ set -euo pipefail
 # dropped `position` on all 89 weapons, because the copy loop only accepted
 # ".png" and g_tPosition is RGBA16161616F, which the CLI writes as .exr. The
 # loop now probes real extensions and reports anything it fails to recover.
-EXTRACT_VERSION=3
+# v4 (2026-07-21): extracts econ item icons to <mount>/images (step 4). Item
+# artwork used to come from a third-party CDN; it is now ours, so a mount
+# without this step renders every tile blank rather than merely un-baked.
+# v5 (2026-07-21): writes models/sticker-markup.json (step 3d) — the per-weapon
+# sticker slot anchors, also previously read from that CDN. Without it sticker
+# placement falls back to a silhouette guess in the wrong UV space.
+# v6 (2026-07-21): extracts the paint chain to <mount>/paints (step 5) — the
+# vcompmat/vmat JSON and their textures, the last thing that came from the CDN.
+# Without it the compositor falls back to defaults and skins render white.
+EXTRACT_VERSION=6
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -54,6 +63,82 @@ if [[ ! -f "$VPK" ]]; then
   echo "   Set CS2_DIR to your CS2 install dir (the folder containing game/csgo)."
   exit 1
 fi
+
+# ---- Step timing -------------------------------------------------------------
+# A full run is ~15 minutes and most of it is one opaque decompile, so without
+# per-step numbers there is no way to tell where to spend effort. Each step
+# reports its own elapsed time, and the total lands in extract-version.json so
+# the admin panel can say how long the last run took.
+RUN_START=$(date +%s)
+STEP_START=$RUN_START
+declare -a STEP_TIMES=()
+fmt_dur() { # seconds -> "1m 23s" / "45s"
+  local s=$1
+  if (( s >= 60 )); then printf '%dm %02ds' $(( s / 60 )) $(( s % 60 )); else printf '%ds' "$s"; fi
+}
+# Progress goes to a FILE, not just stdout. The backend reads it to drive the
+# panel, and a file survives what a pipe does not: a backend restart mid-run, or
+# a run started outside it.
+#
+# The file carries the WHOLE step list up front, each with its own state and (for
+# the steps that know it) a unit count. A single "step 6 of 7" bar could not say
+# how big a step was or how far into it you were — 6/7 sat next to a 26,878-item
+# pass that had barely started.
+PROGRESS_FILE="${OUT_DIR:-$WORK}/extract-progress.json"
+export PROGRESS_FILE
+# Declared here so the panel can show what is coming, not just what has been.
+STEPS=(decompile-models rename-models composite-inputs charm-anchors sticker-markup econ-icons paint-chain stamp)
+
+# Read-modify-write via python: the file is shared with the embedded python
+# steps, and hand-rolling JSON in shell got the quoting wrong the first time.
+prog() { # prog <step> <state> [done] [total] [seconds]
+  P_NAME="$1" P_STATE="$2" P_DONE="${3:-}" P_TOTAL="${4:-}" P_SECS="${5:-}" \
+  python3 -c '
+import json, os, datetime
+f = os.environ["PROGRESS_FILE"]
+try:
+    d = json.load(open(f))
+except Exception:
+    d = {"steps": []}
+name = os.environ["P_NAME"]
+for s in d.get("steps", []):
+    if s["name"] == name:
+        s["state"] = os.environ["P_STATE"]
+        for key, env in (("done", "P_DONE"), ("total", "P_TOTAL"), ("seconds", "P_SECS")):
+            v = os.environ.get(env, "")
+            if v:
+                s[key] = int(v)
+        break
+d["at"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+json.dump(d, open(f, "w"))
+' 2>/dev/null || true
+}
+
+prog_init() {
+  local json="{\"steps\":["
+  local first=1
+  for s in "${STEPS[@]}"; do
+    [[ $first == 1 ]] || json+=","
+    first=0
+    json+="{\"name\":\"$s\",\"state\":\"pending\"}"
+  done
+  json+="]}"
+  printf '%s\n' "$json" >"$PROGRESS_FILE" 2>/dev/null || true
+}
+prog_init
+
+step() { # step "Name" — closes the previous step and opens this one
+  local now; now=$(date +%s)
+  if [[ -n "${STEP_NAME:-}" ]]; then
+    local d=$(( now - STEP_START ))
+    STEP_TIMES+=("$STEP_NAME=$d")
+    echo "--- [${STEP_NAME}] took $(fmt_dur "$d")"
+    prog "$STEP_NAME" done "" "" "$d"
+  fi
+  STEP_NAME="$1"
+  STEP_START=$now
+  prog "$1" running
+}
 
 # ---- Read the CS2 game build from steam.inf ----------------------------------
 # steam.inf sits right next to the VPK and is a plain Key=Value file. We stamp
@@ -87,7 +172,15 @@ if [[ ! -x "$CLI" ]]; then
 fi
 echo "--- CLI: $CLI"
 
+# One listing of the archive, reused by every step below (model sharding,
+# sticker markup, icons, paints). Cheap, and it keeps the matching rules in one
+# place instead of each step re-deriving what exists.
+VPK_LIST="$WORK/vpk-list.txt"
+"$CLI" -i "$VPK" --vpk_dir 2>/dev/null | awk '{print $1}' | grep '/' >"$VPK_LIST" || true
+echo "--- Archive: $(wc -l <"$VPK_LIST") entries"
+
 # ---- 2. Decompile every weapon model to GLB with materials + textures --------
+step "decompile-models"
 echo "--- Decompiling weapon models (this takes a few minutes)…"
 # --gltf_export_animations is NOT about playing animations: it is the only way
 # to make VRF emit the SKELETON (skins + bone nodes). Without it the export
@@ -110,12 +203,70 @@ echo "--- Decompiling weapon models (this takes a few minutes)…"
 # metallicRoughness/normal bound on both materials. The composite inputs in
 # step 3b are unaffected too — they parse with `-b DATA` and never touch a
 # shader. Chasing this costs a from-source VRF build and buys nothing.
-"$CLI" -i "$VPK" -o "$RAW" -d \
-  -f "weapons/models/" -e "vmdl_c" \
-  --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
-  --gltf_export_animations
+# Sharded by weapon directory across all cores. As ONE invocation this is a
+# single-threaded walk of every model and by far the longest step; the shards are
+# independent (one weapon each) so they scale nearly linearly.
+#
+# Each shard gets its OWN output dir. Pointing them all at $RAW would have them
+# racing to write the same shared material/texture files, and a torn texture is
+# not something the later flat-copy would notice. They are merged with `cp -rn`
+# afterwards, first writer wins — the files are identical either way.
+mapfile -t WEAPON_DIRS < <(grep '^weapons/models/.*\.vmdl_c$' "$VPK_LIST" |
+  awk -F/ 'NF>3 {print $1"/"$2"/"$3"/"}' | sort -u)
+SHARDS="$WORK/raw_shards"
+rm -rf "$SHARDS"
+mkdir -p "$SHARDS"
+if (( ${#WEAPON_DIRS[@]} == 0 )); then
+  echo "!! No weapon directories found in the archive listing — falling back to one pass."
+  "$CLI" -i "$VPK" -o "$RAW" -d \
+    -f "weapons/models/" -e "vmdl_c" \
+    --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
+    --gltf_export_animations
+else
+  echo "--- Sharding ${#WEAPON_DIRS[@]} weapon dirs across $(nproc) cores…"
+  export CLI VPK SHARDS
+  # Each shard touches a marker on completion; a watcher turns that into a
+  # per-weapon count so the panel shows real movement instead of sitting on
+  # "step 1 of 7" for the whole decompile.
+  SHARD_DONE="$SHARDS/.done"
+  mkdir -p "$SHARD_DONE"
+  export SHARD_DONE
+  (
+    total=${#WEAPON_DIRS[@]}
+    while [[ -d "$SHARD_DONE" ]]; do
+      n=$(find "$SHARD_DONE" -type f 2>/dev/null | wc -l | tr -d "[:space:]")
+      prog "decompile-models" running "$n" "$total"
+      (( n >= total )) && break
+      sleep 3
+    done
+  ) &
+  SHARD_WATCH=$!
+  printf '%s\n' "${WEAPON_DIRS[@]}" | xargs -P "$(nproc)" -I{} bash -c '
+    dir="$1"
+    out="$SHARDS/$(echo "$dir" | tr "/" "_")"
+    # FILTER, do not silence. As one pass this step emitted ~26k lines, almost
+    # all of it the documented VCS-71 shader noise plus a four-line vpk preamble
+    # per shard. Dumping it all buried everything; dumping none of it also threw
+    # away real decompile failures, which is the only thing here worth reading.
+    # Keep the rest, tagged with the weapon so 12 parallel shards stay legible.
+    "$CLI" -i "$VPK" -o "$out" -d -f "$dir" -e "vmdl_c" \
+      --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
+      --gltf_export_animations 2>&1 |
+      grep -vE 'Only VCS file versions|^Preloading vpk|^Added folder|^Found "Counter-Strike 2"|^--- Dumping decompiled|^--- Creating mesh|^--- Loading material|^--- Dump written to|^$' |
+      sed "s|^|    [$(basename "$dir")] |" || true
+    : >"$SHARD_DONE/$(echo "$dir" | tr "/" "_")"
+  ' _ {}
+  kill "$SHARD_WATCH" 2>/dev/null || true
+  wait "$SHARD_WATCH" 2>/dev/null || true
+  for shard in "$SHARDS"/*/; do
+    [[ -d "$shard" ]] && cp -rn "$shard". "$RAW/" 2>/dev/null || true
+  done
+  rm -rf "$SHARDS"
+  echo "--- Merged $(find "$RAW" -name '*.glb' | wc -l) glb files from shards"
+fi
 
 # ---- 3. Rename to cs2-lib model keys -----------------------------------------
+step "rename-models"
 # The plugin looks up /models/<cs2-lib model key>.glb. Quirks: M4A4's key is
 # "m4a1", Glock-18 is "glock", USP-S is "usp_silencer", etc.
 declare -A MAP=(
@@ -209,6 +360,7 @@ find "$RAW" -name '*.png' -exec cp -n {} "$DEST" \; 2>/dev/null || true
 echo "--- Mapped $count weapons ($(du -sh "$DEST" | cut -f1) total)"
 
 # ---- 3b. Per-weapon composite inputs ------------------------------------------
+step "composite-inputs"
 # CS2 composites skins from per-weapon input textures (cavity/AO/noPaint,
 # paint-by-number masks, base color, base rough/metal — all in paint-UV
 # space). The 3D viewer's compositor consumes them from
@@ -380,7 +532,72 @@ if not vmats:
 made = 0
 unmapped, unscannable, missing_tex = [], [], []
 
-for vmat_path in sorted(vmats):
+# Each scan() is its own CLI process that re-opens the 132k-entry VPK index, and
+# there are ~148 of them — serially that is minutes of pure startup cost with the
+# CPU mostly idle. They are independent and read-only, so run them up front on a
+# pool and let the loop below consume the results.
+
+# Unit-level progress for the panel. Written to the same file the shell uses —
+# see the `progress` helper there for why it is a file and not stdout.
+def progress(step, done, total):
+    """Update this step's unit count in the shared progress file. Read-modify-
+    write because the file holds every step, not just the current one."""
+    pf = os.environ.get("PROGRESS_FILE")
+    if not pf:
+        return
+    try:
+        try:
+            with open(pf) as fh:
+                doc = json.load(fh)
+        except Exception:
+            doc = {"steps": []}
+        for s in doc.get("steps", []):
+            if s["name"] == step:
+                s["state"] = "running"
+                s["done"], s["total"] = done, total
+                break
+        else:
+            # The step id must exist in the shell's STEPS list or the update
+            # lands nowhere and the row sits indeterminate forever — which is
+            # exactly how "paint-textures" vs "paint-chain" hid for a whole run.
+            print(f"!! progress: no step named {step!r} — check STEPS in the shell",
+                  file=__import__("sys").stderr)
+        doc["at"] = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(pf, "w") as fh:
+            json.dump(doc, fh)
+    except Exception:
+        pass
+
+from concurrent.futures import ThreadPoolExecutor
+_ordered = sorted(vmats)
+with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as _pool:
+    SCANNED = dict(zip(_ordered, _pool.map(scan, _ordered)))
+
+# Pre-extract every texture these bundles reference, in ONE pass. `-f` takes a
+# comma-separated list of exact paths (and only honours exact paths when `-e` is
+# omitted), so ~540 individual CLI calls — each re-opening the 132k-entry archive
+# index — collapse into a handful. This step was 7m09s almost entirely on that
+# startup cost.
+_all_vtex = sorted({
+    (v[:-2] if v.endswith("_c") else v) + "_c"
+    for _tex, _ in SCANNED.values() for v in _tex.values()
+})
+print(f"--- Pre-extracting {len(_all_vtex)} composite-input textures…", flush=True)
+_BATCH = 150
+_workers = max(2, min(8, (os.cpu_count() or 4)))
+for _i in range(0, len(_all_vtex), _BATCH):
+    _batch = _all_vtex[_i:_i + _BATCH]
+    _stride = max(1, (len(_batch) + _workers - 1) // _workers)
+    _slices = [_batch[j:j + _stride] for j in range(0, len(_batch), _stride)]
+    with ThreadPoolExecutor(max_workers=len(_slices)) as _pool:
+        list(_pool.map(
+            lambda paths: subprocess.run(
+                [cli, "-i", vpk, "-o", raw, "-d", "-f", ",".join(paths)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False),
+            _slices))
+    progress("composite-inputs", min(_i + _BATCH, len(_all_vtex)), len(_all_vtex))
+
+for vmat_path in _ordered:
     base = os.path.basename(vmat_path)
     folder = os.path.basename(os.path.dirname(vmat_path))
     if folder == "customization":  # default_composite_inputs.vmat_c, no weapon
@@ -412,7 +629,7 @@ for vmat_path in sorted(vmats):
         out_dir = os.path.join(dest, f"{key}.inputs")
 
     label = os.path.basename(out_dir)
-    textures, floats = scan(vmat_path)
+    textures, floats = SCANNED[vmat_path]
     if not textures:
         # Block dump failed or the param names moved — say so per-weapon rather
         # than emit a half-empty bundle.
@@ -428,14 +645,11 @@ for vmat_path in sorted(vmats):
     os.makedirs(out_dir, exist_ok=True)
     for param, vtex in textures.items():
         vtex = vtex[:-2] if vtex.endswith("_c") else vtex
-        subprocess.run(
-            [cli, "-i", vpk, "-o", raw, "-d", "-f", vtex + "_c"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-        )
+        # Already on disk from the batched pre-extract above.
         # The CLI picks the output container from the texture's FORMAT, so an
         # 8-bit map lands as .png but a float one does not. g_tPosition is
         # RGBA16161616F (verified: 1024x1024, decodes to RgbaF32) and comes out
-        # as .exr — which is also how cdn.cstrike.app serves it.
+        # as .exr.
         #
         # This loop used to hardcode ".png" and skip anything else in silence.
         # That is exactly how the v2 run produced 89 bundles with `surface` and
@@ -583,6 +797,7 @@ if missing_tex:
 PYEOF
 
 # ---- 3c. Keychain (charm) anchor points --------------------------------------
+step "charm-anchors"
 # Where a charm hangs is baked into the weapon model as an attachment named
 # "keychain" (parented to bone weapon_hand_r), and it is hand-placed per weapon
 # — the AK's sits forward of the ejection port while the M4A4's sits behind it,
@@ -780,25 +995,883 @@ if rotated:
     print("!!! The chain is translation-only — these anchors may be off.")
 PYEOF
 
-# ---- 4. Stamp the pipeline version -------------------------------------------
+# ---- 3d. Sticker slot markup -------------------------------------------------
+step "sticker-markup"
+# Per-weapon sticker slot anchors, in the weapon's TEXCOORD_1 UV space.
+#
+# CS2 does not project stickers as 3D decals — it composites them in UV space
+# through a mask, so every slot has a hand-authored anchor. Without these the
+# viewer falls back to guessing a position from the silhouette, which is a
+# different space entirely and never lines up.
+#
+# These live in the vmdl_c's DATA block under m_modelInfo.m_keyValueText.
+# Decompiling the model (step 2) does NOT recover them: VRF's ModelExtract
+# re-emits only a whitelist of keys and StickerMarkup isn't on it — which is why
+# the keychain attachment came through and this didn't. `-b DATA` prints the
+# block verbatim as KV3 text instead, sidestepping the whitelist. Same trick as
+# §3b, and likewise it never resolves a shader, so the VCS-71 noise is absent.
+#
+# One invocation for every model: the dump delimits files with `[n/m] <path>`.
+echo ""
+echo "--- Extracting sticker slot markup…"
+CLI="$CLI" VPK="$VPK" DEST="$DEST" python3 - <<'PYEOF'
+import json, os, re, subprocess
+
+cli, vpk, dest = os.environ["CLI"], os.environ["VPK"], os.environ["DEST"]
+MODEL_KEY = json.loads(os.environ.get("MODEL_KEY_JSON") or "{}")
+
+proc = subprocess.run(
+    [cli, "-i", vpk, "-f", "weapons/models/", "-e", "vmdl_c", "-b", "DATA"],
+    capture_output=True, text=True, errors="replace",
+)
+
+HEADER = re.compile(r"^\[\d+/\d+\]\s+(\S+)\s*$")
+sections, cur, buf = {}, None, []
+for line in proc.stdout.splitlines():
+    m = HEADER.match(line)
+    if m:
+        if cur:
+            sections[cur] = buf
+        cur, buf = m.group(1), []
+    elif cur is not None:
+        buf.append(line)
+if cur:
+    sections[cur] = buf
+
+SCALAR = re.compile(r"^(\w+)\s*=\s*(\S.*)$")
+
+def value(raw):
+    raw = raw.strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1]
+    if raw.startswith("["):
+        return [float(x) for x in raw.strip("[] ").split(",") if x.strip()]
+    if raw in ("true", "false"):
+        return raw == "true"
+    try:
+        return float(raw)
+    except ValueError:
+        return raw
+
+def parse_markup(lines):
+    """The array of slot records under `StickerMarkup`. Indentation-driven: each
+    record also carries a Polygons/Vertices tree we want nothing from, and
+    keying on depth skips it without having to parse KV3 in general."""
+    try:
+        i = next(n for n, l in enumerate(lines) if l.strip() == "StickerMarkup =")
+    except StopIteration:
+        return []
+    j = i + 1
+    while j < len(lines) and lines[j].strip() != "[":
+        j += 1
+    if j >= len(lines):
+        return []
+    base = len(lines[j]) - len(lines[j].lstrip("\t"))
+    out, entry = [], None
+    for line in lines[j + 1:]:
+        # VRF separates array elements with a trailing comma ("\t\t},"), so the
+        # record terminators are `},` and not `}`. Dropping it here rather than
+        # comparing against both spellings also covers `],` and any scalar that
+        # picks one up. Without this every record opens and none ever closes,
+        # and the whole pass silently yields zero slots.
+        stripped = line.strip().rstrip(",")
+        indent = len(line) - len(line.lstrip("\t"))
+        if indent <= base and stripped == "]":
+            break
+        if indent == base + 1:
+            if stripped == "{":
+                entry = {}
+            elif stripped == "}" and entry is not None:
+                out.append(entry)
+                entry = None
+            continue
+        # Anything deeper than a record's own keys is the polygon mesh.
+        if entry is None or indent != base + 2:
+            continue
+        m = SCALAR.match(stripped)
+        if m:
+            entry[m.group(1)] = value(m.group(2))
+    return out
+
+def slot(rec):
+    off = rec.get("Offset")
+    if not isinstance(off, list) or len(off) != 2:
+        return None
+    try:
+        out = {
+            "index": int(rec["Index"]),
+            "mesh": str(rec.get("Mesh") or "body_hd"),
+            "offset": [round(float(off[0]), 6), round(float(off[1]), 6)],
+            "scale": float(rec["Scale"]),
+            # Radians — values top out around 0.19, which is meaningless as degrees.
+            "rotation": float(rec.get("Rotation") or 0.0),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    special = rec.get("SpecialIdentifier")
+    if special:
+        out["special"] = str(special)
+    return out
+
+markup, empty = {}, []
+for path, lines in sections.items():
+    base = os.path.basename(path).replace(".vmdl_c", "")
+    key = MODEL_KEY.get(base)
+    if not key:
+        continue  # a mag/prop vmdl, or a model we don't ship
+    slots = [s for s in (slot(r) for r in parse_markup(lines)) if s]
+    if slots:
+        markup[key] = sorted(slots, key=lambda s: s["index"])
+    else:
+        empty.append(key)
+
+with open(os.path.join(dest, "sticker-markup.json"), "w") as fh:
+    json.dump(markup, fh, indent=1, sort_keys=True)
+
+total = sum(len(v) for v in markup.values())
+print(f"--- Sticker markup: {total} slots across {len(markup)} weapons")
+if empty:
+    # Knives and gloves genuinely have no sticker slots, so this list is only a
+    # problem if a RIFLE shows up in it.
+    print(f"---   no slots (expected for melee): {len(empty)} — {', '.join(sorted(empty)[:8])}")
+if not markup:
+    print("!!! No sticker markup recovered at all — sticker placement will fall "
+          "back to the silhouette guess. Check the `-b DATA` output format.")
+PYEOF
+
+# ---- 4. Econ item icons ------------------------------------------------------
+step "econ-icons"
+# Flat item artwork for everything the UI lists. We serve this ourselves — there
+# is no third-party CDN in the serving path — so if it isn't written here, the
+# tile is blank.
+#
+# Only `weapon` and `melee` get a 3D render (supports3d in src/itemVisuals.ts),
+# and for those the flat icon is just the placeholder shown while the real bake
+# runs. Everything else — stickers, agents, gloves, patches, charms, cases,
+# graffiti — has NO other source, which is why a missing icon there is a
+# permanently empty card rather than a slow one.
+#
+# The filenames are cs2-lib's (`item.image`), because that is what the catalog
+# hands the frontend. cs2-lib names assets `<game-stem>_<hash8>.webp` using its
+# own content hash, which we can't recompute — but stripping the suffix leaves
+# the game asset's name, and that we can resolve. Measured on build 14116:
+# 26872/26878 resolve; the 6 misses are items newer than the installed game.
+echo ""
+echo "--- Extracting econ item icons…"
+
+if [[ -n "$OUT_DIR" ]]; then IMG_DEST="$OUT_DIR/images"; else IMG_DEST="$WORK/images"; fi
+if [[ -n "$OUT_DIR" ]]; then PAINT_DEST="$OUT_DIR/paints"; else PAINT_DEST="$WORK/paints"; fi
+mkdir -p "$IMG_DEST" "$PAINT_DEST/materials" "$PAINT_DEST/textures"
+
+# The manifest generator needs cs2-lib, so it runs from whichever backend tree
+# has node_modules: /app in the container image, ../backend from a repo checkout.
+# Shared by steps 4 and 5 — icons and paints are both keyed off cs2-lib names.
+ASSET_MANIFEST="$WORK/asset-manifest.json"
+manifest_built=0
+for backend_dir in "/app" "$(dirname "$0")/../backend"; do
+  gen="$backend_dir/scripts/build-asset-manifest.mjs"
+  if [[ -f "$gen" && -d "$backend_dir/node_modules/@ianlucas/cs2-lib" ]]; then
+    if (cd "$backend_dir" && node "scripts/build-asset-manifest.mjs") >"$ASSET_MANIFEST" 2>/dev/null; then
+      manifest_built=1
+      break
+    fi
+  fi
+done
+if [[ "$manifest_built" != 1 ]]; then
+  echo "!! Could not build the asset manifest (no backend tree with cs2-lib installed)."
+  echo "   Skipping icons AND paints — item art will be blank and skins render white."
+else
+  RAW_ICONS="$WORK/raw_icons"
+  rm -rf "$RAW_ICONS"
+
+  CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_ICONS="$RAW_ICONS" \
+  ASSET_MANIFEST="$ASSET_MANIFEST" IMG_DEST="$IMG_DEST" python3 - <<'PYEOF'
+import glob, json, os, re, shutil, subprocess, sys
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+cli, vpk = os.environ["CLI"], os.environ["VPK"]
+raw, dest = os.environ["RAW_ICONS"], os.environ["IMG_DEST"]
+manifest = json.load(open(os.environ["ASSET_MANIFEST"]))["icons"]
+
+ECON = "panorama/images/econ/"
+
+# ---- index the archive's icons -------------------------------------------
+# Key on the lowercased basename with the trailing `_png` dropped: the archive
+# spells some assets in mixed case (cu_bizon_Curse) while cs2-lib lowercases,
+# so an exact byte match silently loses items.
+by_name = {}
+for line in open(os.environ["VPK_LIST"]):
+    p = line.strip()
+    if not p.startswith(ECON):
+        continue
+    base = re.sub(r"\.(vtex_c|vsvg_c)$", "", p.split("/")[-1])
+    base = re.sub(r"_png$", "", base).lower()
+    by_name.setdefault(base, p)
+
+# Names that merely START with a wanted stem — sticker art carries a
+# `_<schema>_<id>` tail that cs2-lib drops.
+by_prefix = defaultdict(list)
+for name in by_name:
+    for i, ch in enumerate(name):
+        if ch == "_":
+            by_prefix[name[:i]].append(name)
+
+TINT = re.compile(r"_([0-9a-f]{6})$")
+
+def resolve(stem):
+    """-> (archive path or None, tint hex or None, reason). Order matters: the
+    wear/tint rules must not fire before an exact hit, or e.g. a skin literally
+    named ..._light would resolve to the wrong asset."""
+    s = stem.lower()
+    if s in by_name:
+        return by_name[s], None, "exact"
+    # Weapon skin icons ship one per wear tier; they differ only in the amount
+    # of battle-scarring drawn on. `light` is the cleanest and reads best small.
+    for tier in ("light", "medium", "heavy"):
+        if f"{s}_{tier}" in by_name:
+            return by_name[f"{s}_{tier}"], None, "wear"
+    # Graffiti: cs2-lib mints one item per TINT, appending the rgb hex to the
+    # base name. The archive only ships the untinted white stencil.
+    m = TINT.search(s)
+    if m and s[: m.start()] in by_name:
+        return by_name[s[: m.start()]], m.group(1), "tint"
+    # Sticker art appends a `_<schema>_<id>` tail cs2-lib drops, so a UNIQUE
+    # prefix match is that same asset. Several matches is not a near-miss to be
+    # broken by "shortest wins": the vanilla gloves land here, and the archive
+    # only ships their SKINNED variants (sporty_gloves -> 57 of them). Guessing
+    # publishes a random skin as the vanilla item, which reads as correct and is
+    # wrong — strictly worse than the blank tile. Report it instead.
+    cands = by_prefix.get(s)
+    if cands and len(cands) == 1:
+        return by_name[cands[0]], None, "prefix"
+    return None, None, ("ambiguous" if cands else "absent")
+
+wanted = defaultdict(list)   # archive path -> [(out name, tint)]
+missing = []
+for entry in manifest:
+    path, tint, reason = resolve(entry["stem"])
+    if path is None:
+        missing.append(dict(entry, reason=reason))
+        continue
+    wanted[path].append((entry["out"], tint))
+
+print(f"---   {len(manifest)} icons wanted, {len(wanted)} distinct archive assets")
+
+# ---- extract + convert ---------------------------------------------------
+# `-f` takes a COMMA-SEPARATED LIST and accepts exact file paths, so a single
+# process extracts exactly the icons we want. It only honours exact paths when
+# `-e` is OMITTED — with an extension filter it silently matches nothing.
+#
+# The previous approach unpacked whole econ subtrees, which decompiled ~19k
+# assets we never use (and made `stickers` a single 8.5k-asset serial stall).
+
+def convert(src, out, tint):
+    dst = os.path.join(dest, out)
+    if tint:
+        # Multiply, not -colorize: the stencils carry internal shading (measured
+        # weighted luminance 0.49, not a flat 1.0), and colorize would flatten
+        # it to a solid slab. Alpha is re-attached because the composite drops
+        # it, which showed up as NaN coverage.
+        cmd = ["convert", src, "-colorspace", "sRGB",
+               "(", "+clone", "-alpha", "off", "-fill", f"#{tint}", "-colorize", "100", ")",
+               "-compose", "Multiply", "-composite",
+               "(", src, "-alpha", "extract", ")", "-compose", "CopyOpacity", "-composite",
+               "-quality", "85", dst]
+    else:
+        cmd = ["convert", src, "-quality", "85", dst]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
+have_convert = shutil.which("convert") is not None
+if not have_convert:
+    print("!!  ImageMagick `convert` not found — writing PNG instead of webp "
+          "(~8x larger). Install imagemagick for the real output.")
+
+
+# Unit-level progress for the panel. Written to the same file the shell uses —
+# see the `progress` helper there for why it is a file and not stdout.
+def progress(step, done, total):
+    """Update this step's unit count in the shared progress file. Read-modify-
+    write because the file holds every step, not just the current one."""
+    pf = os.environ.get("PROGRESS_FILE")
+    if not pf:
+        return
+    try:
+        try:
+            with open(pf) as fh:
+                doc = json.load(fh)
+        except Exception:
+            doc = {"steps": []}
+        for s in doc.get("steps", []):
+            if s["name"] == step:
+                s["state"] = "running"
+                s["done"], s["total"] = done, total
+                break
+        else:
+            # The step id must exist in the shell's STEPS list or the update
+            # lands nowhere and the row sits indeterminate forever — which is
+            # exactly how "paint-textures" vs "paint-chain" hid for a whole run.
+            print(f"!! progress: no step named {step!r} — check STEPS in the shell",
+                  file=__import__("sys").stderr)
+        doc["at"] = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(pf, "w") as fh:
+            json.dump(doc, fh)
+    except Exception:
+        pass
+
+written, failed = 0, []
+todo_paths = sorted(wanted)
+BATCH = 150
+for bi in range(0, len(todo_paths), BATCH):
+    batch = todo_paths[bi:bi + BATCH]
+    shutil.rmtree(raw, ignore_errors=True)
+    os.makedirs(raw, exist_ok=True)
+    workers = max(2, min(8, (os.cpu_count() or 4)))
+    stride = max(1, (len(batch) + workers - 1) // workers)
+    slices = [batch[i:i + stride] for i in range(0, len(batch), stride)]
+
+    def grab(paths):
+        subprocess.run([cli, "-i", vpk, "-o", raw, "-d", "-f", ",".join(paths)],
+                       capture_output=True)
+
+    with ThreadPoolExecutor(max_workers=len(slices)) as pool:
+        list(pool.map(grab, slices))
+
+    jobs = []
+    for path in batch:
+        # The CLI picks the container from the texture format, and a handful of
+        # econ assets are .vsvg_c rather than .vtex_c — probe by glob so a
+        # silent skip can't pass for "no such icon".
+        stem = os.path.join(raw, re.sub(r"\.vtex_c$|\.vsvg_c$", "", path))
+        src = next(iter(sorted(glob.glob(glob.escape(stem) + ".*"))), None)
+        if src is None:
+            failed.extend(o for o, _ in wanted[path])
+            continue
+        for out, tint in wanted[path]:
+            if not have_convert:
+                shutil.copyfile(src, os.path.join(dest, out.replace(".webp", ".png")))
+                written += 1
+            else:
+                jobs.append((src, out, tint))
+
+    if jobs:
+        with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as pool:
+            for ok, (_, out, _) in zip(pool.map(lambda j: convert(*j), jobs), jobs):
+                if ok:
+                    written += 1
+                else:
+                    failed.append(out)
+    print(f"---   icons {written}/{len(manifest)}", flush=True)
+    progress("econ-icons", written, len(manifest))
+
+shutil.rmtree(raw, ignore_errors=True)
+print(f"--- Wrote {written} icons to {dest}")
+
+# Two very different failures. A 3D-rendered type degrades to "slow" (the bake
+# still draws it); anything else degrades to a permanently blank tile — so the
+# counts are reported apart rather than as one reassuring total.
+blocking = [m for m in missing if not m["placeholderOnly"]]
+placeholder = [m for m in missing if m["placeholderOnly"]]
+if placeholder:
+    print(f"--- {len(placeholder)} unresolved icons are 3D-rendered types "
+          f"(placeholder only — cards still bake)")
+if blocking:
+    by_type = defaultdict(int)
+    for m in blocking:
+        by_type[m["type"]] += 1
+    print(f"!!! {len(blocking)} icons have NO other source and will render blank: "
+          + ", ".join(f"{t}x{n}" for t, n in sorted(by_type.items())))
+    # Two different causes, two different fixes — don't report them as one.
+    absent = [m for m in blocking if m["reason"] == "absent"]
+    ambiguous = [m for m in blocking if m["reason"] == "ambiguous"]
+    if absent:
+        print(f"!!!   {len(absent)} absent from the archive, e.g. "
+              + ", ".join(m["out"] for m in absent[:4]))
+        print("!!!   Usually means the installed CS2 build predates these items.")
+    if ambiguous:
+        print(f"!!!   {len(ambiguous)} matched several assets and were NOT guessed, e.g. "
+              + ", ".join(m["out"] for m in ambiguous[:4]))
+        print("!!!   Mostly vanilla gloves: the archive ships only skinned variants, "
+              "so any pick would be a wrong image dressed up as the right one.")
+if failed:
+    print(f"!!! {len(failed)} icons failed to convert, e.g. {failed[:5]}")
+PYEOF
+
+  # ---- 5. Paint chain --------------------------------------------------------
+  # The skin finishes themselves: a vcompmat per paint (loose per-skin values)
+  # pointing at a shared template vmat, which in turn names the pattern/normal/
+  # mask textures. Without these the compositor falls back to defaults and every
+  # skin renders untextured white.
+  #
+  # cs2-lib publishes these as JSON — a KV3 dump with scalars stringified and
+  # resource references rewritten to asset paths. We reproduce that from the
+  # archive: `-b DATA` gives the KV3 text, we parse it, rewrite the references to
+  # our own filenames, and emit the same shape. Only the ENTRY filenames have to
+  # match cs2-lib (the catalog's `paintMaterial`); includes and textures are
+  # referenced from inside the JSON we write, so those names are ours to choose.
+  #
+  # Verified against the pre-cut mirror: our output is semantically identical.
+  # Floats differ in TEXT only — VRF prints 0.24 where cs2-lib had
+  # 0.23999999463558197, the same float32 — so compare numerically, not bytewise.
+  step "paint-chain"
+  echo ""
+  echo "--- Extracting paint chain…"
+  RAW_PAINTS="$WORK/raw_paints"
+  rm -rf "$RAW_PAINTS"
+  CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_PAINTS="$RAW_PAINTS" \
+  ASSET_MANIFEST="$ASSET_MANIFEST" PAINT_DEST="$PAINT_DEST" python3 - <<'PYEOF'
+import glob, hashlib, json, os, re, shutil, subprocess
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+
+cli, vpk = os.environ["CLI"], os.environ["VPK"]
+raw, dest = os.environ["RAW_PAINTS"], os.environ["PAINT_DEST"]
+manifest = json.load(open(os.environ["ASSET_MANIFEST"])).get("paints", [])
+
+
+# Unit-level progress for the panel. Written to the same file the shell uses —
+# see the `progress` helper there for why it is a file and not stdout.
+def progress(step, done, total):
+    """Update this step's unit count in the shared progress file. Read-modify-
+    write because the file holds every step, not just the current one."""
+    pf = os.environ.get("PROGRESS_FILE")
+    if not pf:
+        return
+    try:
+        try:
+            with open(pf) as fh:
+                doc = json.load(fh)
+        except Exception:
+            doc = {"steps": []}
+        for s in doc.get("steps", []):
+            if s["name"] == step:
+                s["state"] = "running"
+                s["done"], s["total"] = done, total
+                break
+        else:
+            # The step id must exist in the shell's STEPS list or the update
+            # lands nowhere and the row sits indeterminate forever — which is
+            # exactly how "paint-textures" vs "paint-chain" hid for a whole run.
+            print(f"!! progress: no step named {step!r} — check STEPS in the shell",
+                  file=__import__("sys").stderr)
+        doc["at"] = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(pf, "w") as fh:
+            json.dump(doc, fh)
+    except Exception:
+        pass
+
+# ---- KV3 text parser -------------------------------------------------------
+# Small on purpose: paint KV3 only uses objects, arrays, strings, numbers,
+# booleans and `resource:"..."` refs. No binary blobs, no heredocs.
+_TOKEN = re.compile(
+    r"""
+      (?P<ws>\s+)
+    | (?P<comment><!--.*?-->)
+    | (?P<punct>[\{\}\[\],=])
+    | (?P<prefixed>[A-Za-z_][A-Za-z0-9_]*:"(?:[^"\\]|\\.)*")
+    | (?P<string>"(?:[^"\\]|\\.)*")
+    | (?P<number>[-+]?(?:\d+\.\d+(?:[eE][-+]?\d+)?|\.\d+|\d+))
+    | (?P<ident>[A-Za-z_][A-Za-z0-9_.]*)
+    """,
+    re.X | re.S,
+)
+
+
+class Ref(str):
+    """A `resource:"..."` value. Subclasses str so it still reads as the game
+    path, but stays distinguishable so the rewrite finds every reference
+    instead of sniffing for path-shaped strings."""
+    __slots__ = ()
+
+
+def kv3_parse(text):
+    pos, end, buf = 0, len(text), []
+
+    def pump():
+        nonlocal pos
+        while pos < end:
+            m = _TOKEN.match(text, pos)
+            if not m:
+                raise ValueError(f"cannot tokenize at {text[pos:pos + 40]!r}")
+            pos = m.end()
+            if m.lastgroup not in ("ws", "comment"):
+                return (m.lastgroup, m.group())
+        return None
+
+    def peek():
+        if not buf:
+            t = pump()
+            if t is None:
+                return None
+            buf.append(t)
+        return buf[0]
+
+    def take():
+        peek()
+        return buf.pop(0) if buf else None
+
+    def value():
+        tok = take()
+        if tok is None:
+            raise ValueError("unexpected end of input")
+        kind, text_ = tok
+        if kind == "punct" and text_ == "{":
+            obj = {}
+            while True:
+                nxt = peek()
+                if nxt is None:
+                    raise ValueError("unterminated object")
+                if nxt[1] == "}":
+                    take()
+                    return obj
+                if nxt[1] == ",":
+                    take()
+                    continue
+                kkind, key = take()
+                if kkind == "string":
+                    key = key[1:-1]
+                elif kkind != "ident":
+                    raise ValueError(f"bad key {key!r}")
+                eq = take()
+                if eq is None or eq[1] != "=":
+                    raise ValueError(f"expected = after {key!r}")
+                obj[key] = value()
+        if kind == "punct" and text_ == "[":
+            arr = []
+            while True:
+                nxt = peek()
+                if nxt is None:
+                    raise ValueError("unterminated array")
+                if nxt[1] == "]":
+                    take()
+                    return arr
+                if nxt[1] == ",":
+                    take()
+                    continue
+                arr.append(value())
+        if kind == "string":
+            return text_[1:-1]
+        if kind == "prefixed":
+            return Ref(text_[text_.index(":") + 1:][1:-1])
+        if kind == "number":
+            return float(text_) if re.search(r"[.eE]", text_) else int(text_)
+        if kind == "ident":
+            return {"true": True, "false": False, "null": None}.get(text_, text_)
+        raise ValueError(f"unexpected token {text_!r}")
+
+    return value()
+
+
+# ---- archive index ---------------------------------------------------------
+# Every compiled material, keyed "<basename>.<kind>" lowercased (the archive
+# mixes case; cs2-lib lowercases). Also keyed by full path so a reference from
+# inside a KV3 resolves directly.
+by_key, by_path = {}, {}
+for line in open(os.environ["VPK_LIST"]):
+    p = line.strip()
+    m = re.search(r"\.(vcompmat_c|vmat_c|vtex_c)$", p)
+    if not m:
+        continue
+    by_path[p.lower()] = p
+    kind = m.group(1)[:-2]
+    base = os.path.basename(p)[: -(len(m.group(1)) + 1)]
+    by_key.setdefault(f"{base}.{kind}".lower(), p)
+
+
+def resolve_ref(ref):
+    """A reference names the SOURCE asset ("....vmat"); the archive holds the
+    COMPILED one ("....vmat_c")."""
+    cand = f"{ref}_c".lower()
+    if cand in by_path:
+        return by_path[cand]
+    m = re.search(r"\.(vcompmat|vmat|vtex)$", ref)
+    return by_key.get(f"{os.path.basename(ref)[: -(len(m.group(1)) + 1)]}.{m.group(1)}".lower()) if m else None
+
+
+# ---- output naming ---------------------------------------------------------
+# cs2-lib's exact filename where it has one (the catalog's paintMaterial points
+# at it and must resolve); otherwise our own stable name. The short hash keeps
+# same-named assets in different trees apart.
+wanted_name = {}
+unresolved = []
+for entry in manifest:
+    path = by_key.get(f"{entry['stem']}.{entry['kind']}".lower())
+    if path:
+        wanted_name[path] = entry["out"]
+    else:
+        unresolved.append(entry["out"])
+
+
+def out_name(path, kind):
+    if path in wanted_name:
+        return wanted_name[path]
+    stem = os.path.basename(path)
+    stem = stem[: stem.index(".")]
+    h = hashlib.sha1(path.encode()).hexdigest()[:8]
+    return f"{stem}_{h}.{'webp' if kind == 'vtex' else kind + '.json'}"
+
+
+def asset_url(path, kind):
+    return f"/{'textures' if kind == 'vtex' else 'materials'}/{out_name(path, kind)}"
+
+
+# ---- bulk DATA dump --------------------------------------------------------
+# One CLI process per tree instead of ~12k: each start re-opens the 132k-entry
+# archive index, which dwarfs the parsing. The trees are DERIVED from where the
+# entry points actually live (paints sit under weapons/, gloves/, stickers/,
+# workshop/paintkits/ and the customization tree) — hardcoding them silently
+# lost every sticker vmat and the case-hardening templates.
+HEADER = re.compile(r"^\[\d+/\d+\]\s+(\S+)\s*$")
+
+
+def split_blocks(stdout, out):
+    cur, buf = None, []
+    for line in stdout.splitlines():
+        m = HEADER.match(line)
+        if m:
+            if cur:
+                out[cur] = "\n".join(buf)
+            cur, buf = m.group(1), []
+        elif cur is not None:
+            buf.append(line)
+    if cur:
+        out[cur] = "\n".join(buf)
+    return out
+
+
+def dump(spec):
+    prefix, ext = spec
+    proc = subprocess.run([cli, "-i", vpk, "-f", prefix, "-e", ext, "-b", "DATA"],
+                          capture_output=True, text=True, errors="replace")
+    return split_blocks(proc.stdout, {})
+
+
+TREES = sorted({"/".join(p.split("/")[:2]) + "/" for p in wanted_name})
+specs = [(t, e) for t in TREES for e in ("vcompmat_c", "vmat_c")]
+blocks = {}
+with ThreadPoolExecutor(max_workers=min(8, max(2, len(specs)))) as pool:
+    for part in pool.map(dump, specs):
+        blocks.update(part)
+print(f"---   dumped {len(blocks)} material blocks from {len(TREES)} trees")
+
+
+def kv3_body(text):
+    i = text.find('--- Data for block "DATA" ---')
+    return text[text.index("\n", i) + 1:] if i >= 0 else text
+
+
+# ---- walk the graph from every entry point ---------------------------------
+docs, textures, failed = {}, set(), []
+queue = [p for p in wanted_name if p.endswith(("vcompmat_c", "vmat_c"))]
+seen = set(queue)
+while queue:
+    path = queue.pop()
+    body = blocks.get(path)
+    if body is None:
+        # Reached by reference from outside the entry-point trees — the shared
+        # workshop/paintkits templates do this. Rare enough to fetch one at a
+        # time rather than widen the bulk dump.
+        proc = subprocess.run([cli, "-i", vpk, "-f", path, "-b", "DATA"],
+                              capture_output=True, text=True, errors="replace")
+        split_blocks(proc.stdout, blocks)
+        body = blocks.get(path)
+    if body is None:
+        failed.append(f"{path} (no DATA block)")
+        continue
+    try:
+        doc = kv3_parse(kv3_body(body))
+    except Exception as e:
+        failed.append(f"{path} ({e})")
+        continue
+    docs[path] = doc
+
+    def visit(node):
+        if isinstance(node, Ref):
+            target = resolve_ref(str(node))
+            if not target:
+                return
+            if target.endswith("vtex_c"):
+                textures.add(target)
+            elif target not in seen:
+                seen.add(target)
+                queue.append(target)
+        elif isinstance(node, dict):
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+
+    visit(doc)
+
+print(f"---   {len(docs)} materials reachable, {len(textures)} textures referenced")
+
+# ---- serialise -------------------------------------------------------------
+# cs2-lib stringifies every scalar (1 -> "1", -50.0 -> "-50", true -> "1").
+# Everything downstream runs Number() over these, so the exact spelling only
+# matters for matching the reference format.
+RESOURCE_SUFFIX = re.compile(r"\.(vcompmat|vmat|vtex)$")
+
+
+def scalar(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        f = float(v)
+        return str(int(f)) if f.is_integer() and abs(f) < 1e15 else repr(f)
+    return v
+
+
+def rewrite(ref):
+    target = resolve_ref(ref)
+    if not target:
+        return ref  # dangling in the archive too — leave it legible
+    return asset_url(target, "vtex" if target.endswith("vtex_c") else
+                     ("vcompmat" if target.endswith("vcompmat_c") else "vmat"))
+
+
+def convert(node):
+    if isinstance(node, Ref):
+        return rewrite(str(node))
+    if isinstance(node, dict):
+        return {k: convert(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [convert(v) for v in node]
+    if node is None:
+        return None
+    # Plain strings that name a resource get rewritten too — m_materialName and
+    # m_stringAttributes carry paths without the resource: prefix, and cs2-lib
+    # rewrote those as well.
+    if isinstance(node, str) and RESOURCE_SUFFIX.search(node):
+        return rewrite(node)
+    return scalar(node)
+
+
+written = 0
+for path, doc in docs.items():
+    kind = "vcompmat" if path.endswith("vcompmat_c") else "vmat"
+    with open(os.path.join(dest, "materials", out_name(path, kind)), "w") as fh:
+        json.dump(convert(doc), fh, separators=(",", ":"))
+    written += 1
+    # Thousands of files; without this the step looks hung until textures start.
+    if written % 250 == 0:
+        progress("paint-chain", written, len(docs))
+print(f"---   wrote {written} material JSON files")
+
+# ---- textures --------------------------------------------------------------
+have_convert = shutil.which("convert") is not None
+tex_dir = os.path.join(dest, "textures")
+todo = [t for t in sorted(textures) if not os.path.exists(os.path.join(tex_dir, out_name(t, "vtex")))]
+print(f"---   {len(todo)} textures to extract ({len(textures) - len(todo)} already present)")
+
+# `-f` takes a COMMA-SEPARATED LIST and accepts exact file paths, so one process
+# can extract exactly the textures we want. The catch: it only honours exact
+# paths when `-e` is OMITTED — combined with an extension filter it silently
+# matches nothing and writes zero files.
+#
+# This matters enormously. One call per texture ran at ~1.6/s (each start
+# re-opens the 132k-entry index) — about 85 minutes. Unpacking whole folders
+# instead was worse: some hold thousands of textures we don't need, and it was
+# tracking to ~3 hours. Exact batches do neither.
+BATCH = 150
+converted = 0
+for bi in range(0, len(todo), BATCH):
+    batch = todo[bi:bi + BATCH]
+    shutil.rmtree(raw, ignore_errors=True)
+    os.makedirs(raw, exist_ok=True)
+    # Split across cores; each sub-batch is still one process for many files.
+    workers = max(2, min(8, (os.cpu_count() or 4)))
+    stride = max(1, (len(batch) + workers - 1) // workers)
+    slices = [batch[i:i + stride] for i in range(0, len(batch), stride)]
+
+    def grab(paths):
+        subprocess.run([cli, "-i", vpk, "-o", raw, "-d", "-f", ",".join(paths)],
+                       capture_output=True)
+
+    with ThreadPoolExecutor(max_workers=len(slices)) as pool:
+        list(pool.map(grab, slices))
+    jobs = []
+    for t in batch:
+        # The CLI picks the container from the texture FORMAT, so 8-bit maps
+        # land as .png but float ones (position/PFM) come out .exr. Probe by
+        # glob rather than guessing the list — a silent skip here is a texture
+        # the compositor then substitutes a default for.
+        stem = os.path.join(raw, re.sub(r"\.vtex_c$", "", t))
+        src = next(iter(sorted(glob.glob(glob.escape(stem) + ".*"))), None)
+        if src is None:
+            failed.append(f"{t} (no image written)")
+            continue
+        jobs.append((src, os.path.join(tex_dir, out_name(t, "vtex"))))
+
+    def to_webp(job):
+        src, dst = job
+        if not have_convert:
+            shutil.copyfile(src, dst)
+            return True
+        try:
+            subprocess.run(["convert", src, "-quality", "90", dst], check=True, capture_output=True)
+            return True
+        except Exception:
+            return False
+
+    with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as pool:
+        for ok, (_, dst) in zip(pool.map(to_webp, jobs), jobs):
+            if ok:
+                converted += 1
+            else:
+                failed.append(f"{os.path.basename(dst)} (convert failed)")
+    print(f"---   textures {converted}/{len(todo)}", flush=True)
+    progress("paint-chain", converted, len(todo))
+
+shutil.rmtree(raw, ignore_errors=True)
+print(f"--- Paint chain: {written} materials, {len(textures)} textures -> {dest}")
+if unresolved:
+    print(f"!!! {len(unresolved)} paint materials are not in this CS2 build "
+          f"(those skins render white), e.g. {', '.join(unresolved[:4])}")
+if failed:
+    print(f"!!! {len(failed)} paint assets failed: {failed[:5]}")
+PYEOF
+fi
+
+# ---- 6. Stamp the pipeline version -------------------------------------------
 # Written last, and only here: `set -e` means reaching this line is what makes
 # the run a success, so the stamp can never claim output that wasn't produced.
 # JSON helpers: a number when we have one, `null` otherwise (unquoted); a quoted
 # string or `null`. Keeps the stamp valid even on a CS2 install with no steam.inf.
 json_num() { [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf 'null'; }
 json_str() { [[ -n "$1" ]] && printf '"%s"' "$1" || printf 'null'; }
+step "stamp"          # closes the last real step so its time is reported
+RUN_SECONDS=$(( $(date +%s) - RUN_START ))
+# Per-step seconds as a JSON object, so the panel can show where the time went
+# rather than just a total that nobody can act on.
+steps_json() {
+  local out="{" first=1
+  for entry in "${STEP_TIMES[@]}"; do
+    [[ $first == 1 ]] || out+=","
+    first=0
+    out+="\"${entry%%=*}\":${entry##*=}"
+  done
+  printf '%s}' "$out"
+}
 cat >"$DEST/extract-version.json" <<JSON
 {
  "version": $EXTRACT_VERSION,
  "gameBuild": $(json_num "$GAME_BUILD"),
  "gamePatch": $(json_str "$GAME_PATCH"),
  "gameDate": $(json_str "$GAME_DATE"),
- "extractedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+ "extractedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+ "durationSeconds": $RUN_SECONDS,
+ "steps": $(steps_json)
 }
 JSON
+echo "--- Total run time: $(fmt_dur "$RUN_SECONDS")"
 echo "--- Stamped extract-version.json (pipeline v$EXTRACT_VERSION, CS2 build ${GAME_BUILD:-unknown})"
 
-# ---- 5. Bundle ---------------------------------------------------------------
+# ---- 7. Bundle ---------------------------------------------------------------
 if [[ -n "$OUT_DIR" ]]; then
   echo ""
   echo "=== Done: models written to $DEST ($(du -sh "$DEST" | cut -f1))"

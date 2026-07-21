@@ -24,58 +24,33 @@ import { API_ORIGIN } from "./api";
 
 type THREE = typeof import("three");
 
-// ---- CDN plumbing --------------------------------------------------------------
-// All paint-chain data lives on cdn.cstrike.app (mirrored under /paints).
-const PAINT_CDN = "https://cdn.cstrike.app";
+// ---- Asset plumbing ------------------------------------------------------------
+// Paint-chain data is served ONLY from our own mirror under /paints, populated
+// by the model extractor from the instance's own CS2 install. There is
+// deliberately no third-party fallback: a miss is a real error (the mount is
+// unpopulated or the extraction is behind), and it must surface as one rather
+// than being papered over by someone else's CDN.
 const PAINT_SELF = `${API_ORIGIN}/paints`;
 
-// The mirror is optional: when /paints is unpopulated EVERY asset would probe
-// it, 404, and only then fetch the CDN — two round-trips each, a slower first
-// paint, and a console so full of red that real errors hide in it. Give up on
-// the mirror after a few consecutive misses and go straight to the CDN for the
-// rest of the session. A few misses rather than one so a single absent file
-// can't disable a mirror that is otherwise fine.
-const MIRROR_GIVE_UP_AFTER = 3;
-let mirrorMisses = 0;
-const mirrorWorthTrying = () => mirrorMisses < MIRROR_GIVE_UP_AFTER;
-function noteMirror(hit: boolean) {
-  if (hit) {
-    mirrorMisses = 0;
-    return;
-  }
-  mirrorMisses++;
-  if (mirrorMisses === MIRROR_GIVE_UP_AFTER) {
-    console.info(`[paint] /paints mirror looks empty — serving from ${PAINT_CDN} for this session`);
+export class PaintAssetMissing extends Error {
+  constructor(readonly path: string) {
+    super(`paint asset not mirrored: ${path} — run the model extraction (Settings -> Extract models)`);
+    this.name = "PaintAssetMissing";
   }
 }
-/** True once the mirror has been written off, so callers can report it. */
-export const paintMirrorDisabled = () => !mirrorWorthTrying();
 
 export async function paintFetch(path: string): Promise<Response> {
-  if (mirrorWorthTrying()) {
-    try {
-      const res = await fetch(PAINT_SELF + path);
-      noteMirror(res.ok);
-      if (res.ok) return res;
-    } catch {
-      noteMirror(false); // self-host unreachable
-    }
-  }
-  return fetch(PAINT_CDN + path);
+  // Callers immediately .json() the result, so a 404 has to throw here or it
+  // surfaces as an unrelated JSON parse error.
+  const res = await fetch(PAINT_SELF + path).catch(() => {
+    throw new PaintAssetMissing(path);
+  });
+  if (!res.ok) throw new PaintAssetMissing(path);
+  return res;
 }
 
-export async function paintTextureUrl(path: string): Promise<string> {
-  if (mirrorWorthTrying()) {
-    try {
-      const head = await fetch(PAINT_SELF + path, { method: "HEAD" });
-      const ok = head.ok && !(head.headers.get("content-type") ?? "").includes("text/html");
-      noteMirror(ok);
-      if (ok) return PAINT_SELF + path;
-    } catch {
-      noteMirror(false);
-    }
-  }
-  return PAINT_CDN + path;
+export function paintTextureUrl(path: string): string {
+  return PAINT_SELF + path;
 }
 
 // ---- Paint definition ----------------------------------------------------------
@@ -1662,6 +1637,14 @@ export interface CompositeResult {
   rm: import("three").Texture; // G = roughness, B = metalness (three's packing)
   /** Only present when opts.debug was set — see compositePaint. Test rig only. */
   debug?: import("three").Texture;
+  /** A texture the paint chain NAMES failed to load, so this composite is built
+   *  on fallbacks and does not show the real skin (typically white). True while
+   *  an extraction is still populating the mount.
+   *
+   *  Callers must not cache or upload a render when this is set: card bakes are
+   *  keyed on id+wear+seed and nothing re-bakes them, so one white snapshot
+   *  taken mid-extraction outlives the extraction permanently. */
+  incomplete: boolean;
   release: () => void;
 }
 
@@ -2136,8 +2119,24 @@ export async function compositePaint(
     debugRT?.dispose();
     for (const t of [white, black, aoDefault, rmDefault, grayDefault]) t.dispose();
   };
+  // A texture this paint NAMES failed to fetch, so the composite above ran on
+  // fallbacks and is not the real skin. Only textures the def actually declares
+  // count — plenty of finishes legitimately have no overlay or mask, and
+  // treating those absences as failure would condemn every skin.
+  //
+  // Computed per-composite rather than read from the global `failedUrls`, which
+  // accumulates across the whole session and would condemn every later skin
+  // once any one of them had failed.
+  const incomplete = ([
+    [def.pattern, pattern],
+    [def.masks, masks],
+    [def.overlay, overlayTex],
+    [def.paintRoughnessTex, roughTex],
+    [def.paintMetalnessTex, metalTex],
+  ] as const).some(([named, loaded]) => !!named && !loaded);
+
   const entry: CacheEntry = {
-    result: { albedo: albedoRT.texture, rm: rmRT.texture, debug: debugRT?.texture },
+    result: { albedo: albedoRT.texture, rm: rmRT.texture, debug: debugRT?.texture, incomplete },
     refs: 1,
     dispose,
   };

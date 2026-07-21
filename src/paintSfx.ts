@@ -38,8 +38,8 @@ const glitterTexCache = new Map<string, Promise<import("three").Texture | null>>
 function loadGlitterNormal(THREE: THREE, url: string): Promise<import("three").Texture | null> {
   let cached = glitterTexCache.get(url);
   if (!cached) {
-    cached = paintTextureUrl(url)
-      .then((u) => new THREE.TextureLoader().loadAsync(u))
+    cached = new THREE.TextureLoader()
+      .loadAsync(paintTextureUrl(url))
       .then((t) => {
         t.colorSpace = THREE.NoColorSpace; // packed normal + mask, never colour
         t.wrapS = t.wrapT = THREE.RepeatWrapping;

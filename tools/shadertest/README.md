@@ -44,9 +44,11 @@ Then open one of:
 | `http://localhost:5199/batch.html` | runs every fixture + a wear sweep, prints a PASS/FAIL table |
 | `http://localhost:5199/?model=famas&pm=/materials/<file>.vcompmat.json&wear=0.4&seed=821` | one skin, full resolved detail as JSON |
 
-Vite proxies `/materials`, `/textures` (→ `cdn.cstrike.app`) and `/models`,
-`/paints`, `/api` (→ `inventory.5stack.gg`), so there is **no auth, no deploy and
-no cache** in the loop. Edit `src/paintComposite.ts`, reload the page, see the
+Vite proxies `/materials`, `/textures`, `/images`, `/models`, `/paints` and
+`/api` at `inventory.5stack.gg` (override with `ASSET_HOST`), so there is **no
+auth, no deploy and no cache** in the loop. Every asset route points at one of
+our own hosts — there is no third-party mirror to borrow from, so the rig
+exercises exactly what production serves. Edit `src/paintComposite.ts`, reload the page, see the
 new GPU output.
 
 Both pages set `window.__done` when finished and expose results on

@@ -2,15 +2,21 @@ import { CS2Economy, CS2_ITEMS } from "@ianlucas/cs2-lib";
 import { english } from "@ianlucas/cs2-lib/translations/english";
 
 // Load the CS2 economy catalog once at startup (~27k items). This is the same
-// data source the reference cs2-inventory-simulator uses; images are hosted on
-// cdn.cstrike.app so we don't store any assets ourselves.
+// data source the reference cs2-inventory-simulator uses — but only for item
+// METADATA. Artwork is served from our own mount, never a third party.
 CS2Economy.load({ items: CS2_ITEMS, language: english });
 
-const CDN = "https://cdn.cstrike.app";
 const items = CS2Economy.itemsAsArray;
 
+// cs2-lib's `image` is a ROOT-RELATIVE path ("/images/<stem>_<hash8>.webp")
+// that we serve ourselves out of the extracted econ-icon mirror. It stays
+// relative here: the backend can't know the public origin (the plugin is
+// federated into the panel, so a bare path would resolve against the PANEL's
+// host), so the frontend prefixes it at the API boundary — see assetUrl in
+// src/api.ts. That indirection is also the seam for pointing artwork at a
+// shared CDN (skins.5stack.gg) later without touching the catalog.
 function img(path: string | undefined): string | null {
-  return path ? `${CDN}${path}` : null;
+  return path ?? null;
 }
 
 // CS2 teams: 2 = Terrorist, 3 = Counter-Terrorist.
@@ -36,6 +42,15 @@ export interface CatalogSkin {
   // Doppler ("Ruby", "Phase 2", "Emerald"), Marble Fade, etc. Each is its own
   // paint index; without this the picker shows N identical rows.
   altName?: string | null;
+  // What the 3D viewer needs to draw the finish before it is an owned item.
+  // The weapon sheet can infer the model from the slot, but a KNIFE sheet
+  // can't — every knife finish carries its own model — so listings that feed
+  // the craft editor have to say. Without these the editor had no model to
+  // probe and fell back to the flat icon; the same knife opened 3D fine once
+  // it was in the inventory, because that path reads getItem().
+  model?: string | null;
+  paintMaterial?: string | null;
+  legacyPaint?: boolean;
 }
 
 // The 36 base (vanilla) weapons. Excludes the C4. `id` is the base economy
@@ -83,6 +98,7 @@ export function getWeaponSkins(model: string): {
       altName: i.altName ?? null,
       rarity: i.rarity as string,
       image: img(i.image),
+      model: (i.model as string) ?? null,
       paintMaterial: i.paintMaterial ?? null,
       legacyPaint: !!i.legacy,
     }));
@@ -114,6 +130,12 @@ export function getKnives(): CatalogSkin[] {
       altName: k.altName ?? null,
       rarity: k.rarity as string,
       image: img(k.image),
+      // Per FINISH, not per slot: "★ Karambit | Doppler" and "★ Bayonet |
+      // Doppler" are different models, so the craft editor can only mount 3D
+      // if the listing carries it.
+      model: (k.model as string) ?? null,
+      paintMaterial: k.paintMaterial ?? null,
+      legacyPaint: !!k.legacy,
     }));
 }
 
@@ -322,16 +344,6 @@ export function getStickerBounds(model: string): { x: [number, number]; y: [numb
     x: [base.stickerOffsetXMin, base.stickerOffsetXMax],
     y: [base.stickerOffsetYMin, base.stickerOffsetYMax],
   };
-}
-
-// cs2-lib ships a versioned model path per weapon ("/models/weapon_rif_ak47_
-// 025c0af3.glb"); the same stem with .json is the parsed model KV on its CDN,
-// which is where the sticker slot markup lives. See stickerMarkup.ts.
-export function getWeaponPlayerModel(model: string): string | null {
-  const base = items.find((i) => i.type === "weapon" && i.model === model && !i.index) as
-    | (Record<string, unknown> & { playerModel?: string })
-    | undefined;
-  return base?.playerModel ?? null;
 }
 
 export function getItem(id: number) {

@@ -20,7 +20,7 @@ import {
   ThumbsUp, ThumbsDown, Box, X, ChevronLeft, ChevronRight,
   Search, FilterX,
 } from "lucide-vue-next";
-import { hasModel, mountViewer, snapshotModel, type ViewerHandle } from "./viewer3d";
+import { hasModel, mountViewer, snapshotModel, INCOMPLETE, type ViewerHandle } from "./viewer3d";
 import {
   fetchTestCatalog,
   fetchTestList,
@@ -188,7 +188,7 @@ async function renderOne(item: RenderTestItem): Promise<TestResult> {
   if (!(await hasModel(item.model))) {
     return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: "model not extracted" };
   }
-  let blob: Blob | null;
+  let blob: Blob | null | typeof INCOMPLETE;
   try {
     blob = await snapshotModel(item.model, {
       paintMaterial: item.paintMaterial,
@@ -198,6 +198,12 @@ async function renderOne(item: RenderTestItem): Promise<TestResult> {
     });
   } catch (e) {
     return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: e instanceof Error ? e.message : String(e) };
+  }
+  // Paint assets missing from the mount would render (and then STORE) a white
+  // gun, which is exactly the failure this suite exists to catch — report it as
+  // a failure rather than filing a wrong picture as a pass.
+  if (blob === INCOMPLETE) {
+    return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: "paint assets not extracted yet" };
   }
   if (!blob) return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: "snapshot returned no image" };
 

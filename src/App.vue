@@ -70,7 +70,7 @@ import TileActions from "./TileActions.vue";
 import FilterDropdown from "./FilterDropdown.vue";
 import { attachmentsOf, CARD_ART, CARD_CHROME_PX, glowStyle, isReadOnly, itemName, STEAM_BLUE, wearTier } from "./itemVisuals";
 import { isCompact, isCoarse } from "./responsive";
-import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import "./style.css";
 
 // `user` plus the host's routing contract (base/path/query/navigate) — see
@@ -1006,7 +1006,11 @@ function openCraft(skin: Skin) {
   duplicating.value = false;
   viewOnly.value = false;
   craftInstId.value = null;
-  craftModel.value = isWeaponPos(selected.value) ? occupantModel(selected.value) : null;
+  // The finish's OWN model wins: a knife/zeus/c4 sheet isn't a weapon position,
+  // so the slot can't name a model, and every knife finish is a different one.
+  // Falling back to the slot keeps working for weapon skins whose listing
+  // predates the model field. No model = no 3D — see the `craft` watcher.
+  craftModel.value = skin.model ?? (isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
   craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: [null, null, null, null, null], patches: [null, null, null, null, null], charm: null };
   craftBaseline = ""; // new craft — no stored render to reuse
   // A brand-new craft gets a URL too: /craft/<skinId>, with the draft itself in
@@ -1325,6 +1329,11 @@ async function confirmCraft() {
 // Fire-and-forget: snapshot the painted 3D model and cache it as this
 // instance's card image (served from /renders/ on the mount).
 const renderedIds = new Set<number>();
+// A bake found paint assets missing from the mount, which means an extraction
+// is still populating it. Latched for the session: it flips off on reload, and
+// the honest message while it's set is "these are still being prepared" rather
+// than showing white guns as if they were the real skins.
+const assetsPending = ref(false);
 // Snapshots each need a WebGL context — run them one at a time so a page of
 // missing renders backfills calmly instead of exhausting context limits.
 let renderQueue: Promise<unknown> = Promise.resolve();
@@ -1392,6 +1401,15 @@ async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
       // while a 3D viewer is onscreen instead of fighting it for the GPU.
       true,
     );
+    if (blob === INCOMPLETE) {
+      // Paint assets aren't extracted yet — this would bake a white gun, and
+      // render keys never change, so it would be served forever. Leave the id
+      // unmarked so the backfill retries once the extraction has populated the
+      // mount, and let the card show its pending state meanwhile.
+      renderedIds.delete(inst.id);
+      assetsPending.value = true;
+      return false;
+    }
     if (!blob) {
       renderedIds.delete(inst.id); // snapshot failed — retry later
       return false;
@@ -1454,7 +1472,7 @@ function onRenderError(e: Event, i: InventoryItem) {
 // so every view shares ONE render/fallback/bake chain and ONE bake-status
 // source. (Must be provided AFTER the consts exist — script-setup runs
 // top-to-bottom.)
-provide("itemArt", { renderSrc, onRenderError, renderingIds, queuedIds });
+provide("itemArt", { renderSrc, onRenderError, renderingIds, queuedIds, assetsPending });
 
 // 3D preview inside the craft/edit modal.
 const modal3d = ref(false);
@@ -1892,7 +1910,9 @@ async function refreshCraftPreview() {
       // whose result the token check below would only throw away.
       () => token === craftPreviewToken,
     );
-    if (!blob || token !== craftPreviewToken) return;
+    // INCOMPLETE = the skin's textures aren't extracted yet; showing the white
+    // fallback as a 'preview' would be a lie. Leave the catalog art in place.
+    if (!blob || blob === INCOMPLETE || token !== craftPreviewToken) return;
     if (craftPreview.value) URL.revokeObjectURL(craftPreview.value);
     craftPreview.value = URL.createObjectURL(blob);
   } finally {
@@ -2054,8 +2074,7 @@ const gearWarnings = computed(() => {
   else if (extractWarn.value === "stale") out.push("Model extraction is out of date — re-run it");
   return out;
 });
-function onCacheCleared(scope: "renders" | "paints" | "all") {
-  if (scope === "paints") return;
+function onCacheCleared(_scope: "renders") {
   // Reset session bookkeeping so cards re-bake fresh right away.
   renderedIds.clear();
   Object.values(localRenders.value).forEach((u) => URL.revokeObjectURL(u));

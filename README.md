@@ -147,8 +147,11 @@ if you're looking for it in git history, this section is what it became.
 
 - **Item/skin data** comes from [`@ianlucas/cs2-lib`](https://github.com/ianlucas/cs2-lib)
   (the same catalog the reference simulator uses). ~27k items — weapons, skins,
-  knives, gloves, agents — with names, rarities, and images on
-  `cdn.cstrike.app`, so we store **no assets**.
+  knives, gloves, agents — with names and rarities. cs2-lib supplies **metadata
+  only**: all artwork is extracted from the instance's own CS2 install onto the
+  models mount and served from `/images` and `/paints`. No third-party CDN is in
+  the serving path, and a missing asset is an error rather than a silent
+  fallback — see `scripts/extract-models.sh`.
 - **Loadout model**: one row per `(steam_id, team, slot)` in `inventory.loadout`,
   where `slot` is a weapon model (`ak47`) or a special slot (`knife`, `gloves`,
   `agent`) and `item_id` is a cs2-lib item id.

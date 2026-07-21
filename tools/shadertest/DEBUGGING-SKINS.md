@@ -61,7 +61,7 @@ You need: **model key** (which GLB), **paintMaterial** (the vcompmat path),
 **legacy** (which body — legacy vs HD unwrap), and the **official image** name
 so you can pull the reference render:
 
-    https://cdn.cstrike.app/images/<image>.webp
+    https://inventory.5stack.gg/images/<image>.webp
 
 The craft URL id is the cs2-lib item id: `/apps/inventory/craft/<id>`.
 
@@ -71,7 +71,7 @@ The craft URL id is the cs2-lib item id: `/apps/inventory/craft/<id>`.
 vcompmat  (per-skin, loose variables)  ->  template vmat  (compiled, shared)
 ```
 
-Fetch both from `https://cdn.cstrike.app/materials/<file>.json` and dump every
+Fetch both from `https://inventory.5stack.gg/paints/materials/<file>.json` and dump every
 named parameter. A large share of "shader bugs" are actually **the loader
 resolving the wrong value**, and you can see that here in seconds without
 rendering anything.
