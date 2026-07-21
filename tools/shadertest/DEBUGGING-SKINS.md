@@ -219,6 +219,33 @@ style 0/7/8 so they can never both be live). See `glsl-sampler-unit-limit`.
 GLSL contains the descending form and drivers evaluate it as
 `clamp((x-e0)/(e1-e0))`, so it is equivalent in practice — but don't rely on it.
 
+**`g_flColorBrightness` is applied TWICE, with a clamp between and after.**
+CONFIRMED (combo 293, style5.glsl:444-445): `b = mix(brightness, 1, chip);
+col = clamp(clamp(base*b, 0,1) * b, 0,1)`. We were doing one unclamped multiply,
+which left Deagle | Blaze's flames a muddy dark red — the gold flame bodies sit
+near 0.12 linear and one ×3 only reaches ~0.36 (dim), where the double-with-clamp
+reaches 1.0 (bright orange = actual fire). It lives in the SHARED albedo path so
+it touches every style, but for the ~all skins where brightness is 1 it is just
+clamp(cPaint), a no-op (cPaint is already a convex mix of in-gamut colours). All
+14 fixtures still pass.
+
+**Projected styles (2, 5) must composite at 4096, not 2048.** The flame/spray
+graphic is high-frequency and the triplanar projection undersamples it at 2048 —
+Deagle | Blaze's crisp fire tongues averaged into a muddy dark-red blur (mean
+flame measured 240/78/5 vs a per-pixel target ~255/140/36; the bright yellow
+highlights that read as "fire" simply weren't sampled — maxG 130 at 2048 vs 229
+at 4096). GROUND TRUTH: skinport serves the GAME's own baked albedo at 4096
+(cdn.skinport.com/3d-viewer/textures/<id>/material0_color_...png — the exact
+paint in the deagle's UV, invaluable for a per-pixel compare), and the game's
+native g_tPosition is only 1024 (extraction verified), so the resolution that
+matters is the ATLAS, not the input map. Fix: MAX_COMPOSITE_SIZE_PROJECTED=4096.
+Cost is ~3.3s build for the deagle (one-off, cached); scoped to styles 2/5 so it
+does not tax the other seven. To reverse-engineer any skin against the real
+game render, pull skinport's baked color+metal textures (they apply pre-baked
+maps to a mesh, they do NOT composite at runtime) and the base weapon
+color/ORM from the cluster (/cs2-models/models/<key>_*_orm_*.png — the deagle's
+chrome base is grey 83/82/81, metalness 0.94).
+
 **Not everything is baked.** Glitter, pearlescence and iridescence are RUNTIME
 weapon-material effects (`src/paintSfx.ts`), not compositor ones. The compositor
 owes them only the SFX mask, written into the rough/metal map. If an effect is
@@ -227,6 +254,26 @@ view-dependent it cannot live in the composite.
 **Styles 2 and 5 are PROJECTED.** They do not sample the pattern in paint-UV
 space at all — they build the coordinate from `g_tPosition` via a triplanar
 projection. Any reasoning that assumes paint-UV sampling is wrong for them.
+
+**The extracted `g_tSurface` (object-space normal) is BROKEN, and it collapses
+the triplanar into vertical stripes.** The projection blends three planes by the
+surface normal (`mix(mix(A,B,blend.y·|n.y|⁷), C, blend.z·|n.z|⁷)`). Our extracted
+surface map is 94% empty/black and the ~6% with data decodes to length-√3
+vectors, not unit normals — so `sprayNormal()` returns a near-constant, the blend
+always picks plane A, and A has constant-v on many surfaces, so the flame graphic
+smears into VERTICAL STRIPES ("stretched" look) instead of curling. FIX (shader
+workaround): derive the normal from the position map's own screen-space gradient,
+`normalize(cross(dFdx(sprPos), dFdy(sprPos)))` — the object-space position's
+gradient IS the surface normal in paint-UV space, and it's a clean per-weapon
+normal we already trust. This made Deagle | Blaze's flames curl and match the
+game's baked albedo. PROPER fix is upstream: re-extract g_tSurface correctly (the
+extractor is producing a near-empty map — same class of silent-drop bug as
+g_tPosition in extraction v2). How it was pinned: the flat map matched the game
+on color/distribution but the flame SHAPES differed (ours striped, game curly);
+comparing our flat composite crop to skinport's baked albedo crop side by side
+(sRGB!) showed the stripe-vs-curl clearly, and `|surface·2-1|` measuring √3 proved
+the normal map was garbage. Judge projected skins on the FLAT MAP first — a wrong
+projection is obvious there and pointless to chase on the 3D model.
 
 **`g_vSprayBlend` is a float2, and the compiled reflection's `.y`/`.z` are NOT
 its `.y`/`.z`.** This one nearly cost a regression. The decompiled GLSL mixes on
@@ -248,6 +295,27 @@ material param name (here Blend vs BiasBlend), find the `Expression(...)` in the
 successfully, exited 0, and silently dropped `g_tPosition` from all 89 weapons
 because the copy loop only accepted `.png` and that map is `.exr`. Check the
 per-weapon `meta.json`, not the exit code.
+
+**The `.exr` position map loads UPSIDE-DOWN, and `flipY` cannot fix it.**
+EXRLoader returns a `DataTexture`, and WebGL's `UNPACK_FLIP_Y_WEBGL` does not
+apply to typed-array uploads, so `t.flipY = false` (or true) is a no-op — the
+rows have to be swapped in the data by hand. Every `.png` composite input comes
+in the OTHER orientation (TextureLoader honours flipY), so the position map was
+sampled vertically mirrored while all the masks/AO/surface were upright: each
+texel got some unrelated UV island's object-space position and the projected
+styles (2, 5) painted their artwork nowhere near where it belonged. Deagle |
+Blaze put its gold band across the middle of the slide instead of the muzzle;
+the fix moved it to a solid-orange muzzle with flames licking back, matching the
+in-game render. How it was PINNED (the method that finally worked after a lot of
+flailing on lit renders): load the weapon GLB, and for a sample of vertices look
+the position map up at that vertex's paint UV and correlate the three channels
+against the vertex's real object-space position. Best |correlation| over all
+channel/axis pairs was 0.09 as-loaded (i.e. no relationship at all) and 0.995
+with V flipped; the control (surface.png, ordinary TextureLoader) was 0.75 vs
+0.24, i.e. already upright. Correlate against ground-truth geometry — do NOT try
+to read a projection off a shaded 3D render, the lighting and sRGB-on-write
+corrupt every value (an emissiveMap hack to force it unlit still left it
+unreadable).
 
 ---
 

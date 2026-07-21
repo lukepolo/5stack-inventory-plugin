@@ -170,6 +170,15 @@ export const FIXTURES: Fixture[] = [
           "address mode finally matters in this space — horizontal=2 (clamp) pins " +
           "u<0 to the flame sheet's gold band and u>1 to its green band, which the " +
           "palette maps to black. Wrapping tiles flames onto the grip.\n" +
+          "LOAD-BEARING: the triplanar normal comes from the POSITION GRADIENT " +
+          "(cross(dFdx,dFdy) of sprayPos), NOT g_tSurface — the extracted surface " +
+          "normal is broken (94% empty) and collapses the flames into vertical " +
+          "stripes. Judge the FLAT MAP: the flames must CURL, not streak.\n" +
+          "LOAD-BEARING: g_tPosition (.exr) must have its rows flipped in loadExr " +
+          "— EXRLoader hands back a DataTexture that is upside-down vs the .png " +
+          "inputs and three ignores flipY on it. Without the flip the flames land " +
+          "mid-slide instead of a solid-orange muzzle (measured: pos-map vs GLB " +
+          "vertex position correlates 0.09 unflipped, 0.995 flipped).\n" +
           "CAUTION: the rig's checks are statistical and will NOT catch a wrong " +
           "projection here — this fixture guards against a total collapse only. " +
           "Judge Blaze visually against the reference.",

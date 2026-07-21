@@ -1032,8 +1032,25 @@ void main() {
   // sample through it.
   vec2 patUv = xf(vUv, uPatX0, uPatX1);
   bool projected = (uStyle == 2 || uStyle == 5) && uHasPosition;
+  vec3 sprP = sprayPos();
+  // Object-space normal for the triplanar plane blend, derived from the position
+  // map's own screen-space gradient (dFdx/dFdy of the blurred object-space
+  // position IS the surface normal, in paint-UV space).
+  //
+  // We do NOT use g_tSurface here even though Valve's shader does: our EXTRACTED
+  // g_tSurface is broken — 94% of it is empty/black and the ~6% with data decodes
+  // to length-√3 vectors, not unit normals (measured on the deagle). Feeding that
+  // to the plane blend returns a near-constant normal, so the triplanar collapses
+  // to a single plane (A) and the flame graphic smears into VERTICAL STRIPES
+  // instead of curling — the "stretched" look. The position gradient is a clean,
+  // per-weapon-correct normal we already trust, and it makes Deagle | Blaze's
+  // flames match the game's baked albedo. (Proper fix is upstream: re-extract
+  // g_tSurface correctly — see the extractor. This is the robust shader-side
+  // workaround until then. Seams between UV islands get a bad gradient, but the
+  // artwork lands inside islands so it does not show.)
+  vec3 sprN = normalize(cross(dFdx(sprP), dFdy(sprP)));
   vec4 pattern = projected
-    ? sprayTriplanar(sprayPos(), sprayNormal(), uPatX0, uPatX1)
+    ? sprayTriplanar(sprP, sprN, uPatX0, uPatX1)
     : texture(tPattern, patUv);
 
   // ---- Overlay sample + mask gate ----------------------------------------------
@@ -1491,7 +1508,18 @@ void main() {
     grunge.rgb = mix(grunge.rgb, vec3(1.0), anoEdges);
   }
 
-  vec3 cRaw = cPaint * uColorBrightness;
+  // g_flColorBrightness is applied TWICE with a clamp between and after, NOT
+  // once. CONFIRMED (combo 293, style5.glsl:444-445):
+  //   b   = mix(g_flColorBrightness, 1.0, chip);   // chip -> 1 on anodized edges
+  //   col = clamp(clamp(base * b, 0,1) * b, 0,1);
+  // Applying it once left Deagle | Blaze's flames a muddy dark red: the gold
+  // flame bodies sit near cPaint 0.12 linear, and one x3 only reaches ~0.36
+  // (dim orange) where the double-with-clamp reaches 1.0 (bright orange), which
+  // is the difference between "smudge" and "fire". For the ~everything-else
+  // skins where g_flColorBrightness is 1 this is clamp(cPaint) — a no-op, since
+  // cPaint is already a convex mix of in-gamut palette colours.
+  float bright = mix(uColorBrightness, 1.0, anoEdges);
+  vec3 cRaw = clamp(clamp(cPaint * bright, 0.0, 1.0) * bright, 0.0, 1.0);
   vec3 colG = cRaw * grunge.rgb;
 
   // CS2 "albedo levels": worn paint drifts toward a normalized, luminance-
@@ -1519,7 +1547,27 @@ const texCache = new Map<string, Promise<import("three").Texture | null>>();
 /** g_tPosition ships as RGBA16161616F, which the extractor hands us as .exr —
  *  TextureLoader cannot read it. Loaded through three's EXRLoader and sampled
  *  linear/clamped, matching Valve's g_sTrilinearClamp. Kept in the same cache so
- *  one weapon's position map is fetched once per session. */
+ *  one weapon's position map is fetched once per session.
+ *
+ *  ROW ORDER: EXRLoader hands back a DataTexture whose rows run the OPPOSITE way
+ *  to what TextureLoader produces for the .png inputs, and three IGNORES `flipY`
+ *  on a DataTexture (UNPACK_FLIP_Y_WEBGL does not apply to typed-array uploads),
+ *  so the flag alone cannot fix it — the rows have to be swapped by hand.
+ *
+ *  MEASURED, against the deagle GLB (sample every vertex's paint UV, look the
+ *  position map up there, correlate with that vertex's real object-space
+ *  position). Best |correlation| over all channel/axis pairs:
+ *      position.exr as-is    0.09   (i.e. NO relationship — pure garbage)
+ *      position.exr V-flipped 0.995
+ *  and the control, surface.png down the ordinary TextureLoader path, is the
+ *  other way round: 0.746 as-is, 0.244 flipped. So the .png inputs are already
+ *  oriented correctly and only the EXR is inverted.
+ *
+ *  This silently wrecked BOTH projected styles (2 spraypaint, 5 anodized
+ *  airbrushed) on every weapon: they build the pattern coordinate from this map,
+ *  so a vertical flip hands each texel some other island's position and the
+ *  artwork lands nowhere near where it belongs. Deagle | Blaze put its gold band
+ *  across the middle of the slide instead of the muzzle. */
 function loadExr(THREE: THREE, url: string): Promise<import("three").Texture | null> {
   const key = `${url}|exr`;
   let cached = texCache.get(key);
@@ -1527,11 +1575,27 @@ function loadExr(THREE: THREE, url: string): Promise<import("three").Texture | n
     cached = import("three/examples/jsm/loaders/EXRLoader.js")
       .then((m) => new m.EXRLoader().loadAsync(url))
       .then((t) => {
+        // Swap rows in place: EXRLoader's DataTexture is upside-down relative to
+        // the .png inputs and three ignores flipY on a DataTexture. See the
+        // block comment above for the measurement that pins this.
+        const img = t.image as { width: number; height: number; data: { [i: number]: number; length: number; subarray?: unknown } };
+        const data = img.data;
+        const rowLen = (data.length / (img.width * img.height)) * img.width;
+        for (let y = 0; y < (img.height >> 1); y++) {
+          const top = y * rowLen;
+          const bot = (img.height - 1 - y) * rowLen;
+          for (let i = 0; i < rowLen; i++) {
+            const s = data[top + i];
+            data[top + i] = data[bot + i];
+            data[bot + i] = s;
+          }
+        }
         t.colorSpace = THREE.NoColorSpace; // position data, never colour
         t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
         t.minFilter = t.magFilter = THREE.LinearFilter;
         t.generateMipmaps = false;
         t.flipY = false;
+        t.needsUpdate = true;
         return t;
       })
       .catch(() => {
@@ -1607,8 +1671,16 @@ export interface CompositeResult {
 // alongside the GLB and env map runs into the per-tab ceiling and gets the tab
 // killed. Halving to 1k quarters the cost, and at phone screen sizes the
 // detail difference isn't visible anyway.
-const MAX_COMPOSITE_SIZE =
-  typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches ? 1024 : 2048;
+const COARSE_POINTER = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
+const MAX_COMPOSITE_SIZE = COARSE_POINTER ? 1024 : 2048;
+// Projected styles (2 spraypaint, 5 anodized airbrushed) build the pattern from a
+// triplanar projection of the 1024 position map. The flame/spray graphic is
+// high-frequency, and at 2048 the projection undersamples it — Deagle | Blaze's
+// crisp fire tongues smear into a muddy red blur. The GAME composites these at
+// 4096 (matching its 4096 color/metalness inputs; the position map is natively
+// 1024 for the game too, so resolution here is the atlas, not the input). Match
+// it on desktop; coarse-pointer devices stay at 1024 for memory.
+const MAX_COMPOSITE_SIZE_PROJECTED = COARSE_POINTER ? 1024 : 4096;
 
 type CacheEntry = { result: Omit<CompositeResult, "release">; refs: number; dispose: () => void };
 type RendererCache = Map<string, CacheEntry>;
@@ -1811,7 +1883,8 @@ export async function compositePaint(
   const grgX = texXform(sv.grungeRot, sv.grungeScale * sizeScale, sv.grungeOffsetX, sv.grungeOffsetY);
 
   const imgW = (t: import("three").Texture | null) => (t?.image as { width?: number } | undefined)?.width ?? 0;
-  const size = Math.min(Math.max(imgW(pattern), imgW(baseColor), 1024), MAX_COMPOSITE_SIZE);
+  const sizeCap = wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE;
+  const size = Math.min(Math.max(imgW(pattern), imgW(baseColor), 1024), sizeCap);
 
   quadGeom ??= (() => {
     const g = new THREE.BufferGeometry();

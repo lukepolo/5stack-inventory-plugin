@@ -675,11 +675,14 @@ BONE_ORIGIN = re.compile(r'origin = \[([^\]]+)\]')
 BONE_ANGLES = re.compile(r'angles = \[([^\]]+)\]')
 
 def bone_chain(text, target="weapon_offset"):
-    """Model-space position of `target`, plus the largest rotation seen on the
-    way there. Translation-only: every shipped weapon has ~0 rotation in this
-    chain (verified across all 34), so applying an unverified Euler order would
-    be guesswork. max_angle is returned so a future model that DOES rotate
-    shows up loudly instead of silently misplacing the charm."""
+    """Model-space position of `target`, plus the largest rotation on the chain
+    that ACTUALLY moves it — `target` and its ancestors only. Translation-only:
+    every shipped weapon has ~0 rotation in this chain (verified across all 34),
+    so applying an unverified Euler order would be guesswork. max_angle is
+    returned so a future model that DOES rotate the anchor shows up loudly
+    instead of silently misplacing the charm. Rotations on sibling/cousin bones
+    (e.g. g3sg1's charging_handle at 90°) never touch the anchor, so they are
+    NOT counted — measuring them just cries wolf on every game update."""
     stack, cur, found, max_angle = [], None, None, 0.0
     for line in text.split("\n"):
         if '_class = "Bone"' in line:
@@ -710,10 +713,13 @@ def bone_chain(text, target="weapon_offset"):
             parent = stack[-1] if stack else None
             cur["abs"] = ([p + c for p, c in zip(parent["abs"], cur["origin"])]
                           if parent else list(cur["origin"]))
-            max_angle = max([max_angle] + [abs(a) for a in angles])
+            cur["angles"] = angles
             stack.append(cur)
             if cur["name"] == target:
                 found = cur["abs"]
+                # stack is now target + its ancestors: the only bones whose
+                # rotation can move the anchor.
+                max_angle = max([0.0] + [abs(a) for b in stack for a in b["angles"]])
             cur = None
     return found, max_angle
 
@@ -722,6 +728,7 @@ def bone_chain(text, target="weapon_offset"):
 S = 0.0254
 world = {}
 rotated = []
+skipped = []
 for key, found in sorted(anchors.items()):
     kc = found.get("keychain") or found.get("keychain_legacy")
     if not kc:
@@ -730,8 +737,13 @@ for key, found in sorted(anchors.items()):
     try:
         base, max_angle = bone_chain(open(path, encoding="utf-8", errors="replace").read())
     except OSError:
+        skipped.append((key, "no attachments/.vmdl dumped"))
         continue
     if base is None:
+        # No `weapon_offset` bone. Dual-wield rigs (elite) parent their
+        # attachments to weapon_r/weapon_l instead, so the single-weapon base
+        # correction does not apply — they need their own placement handling.
+        skipped.append((key, "no weapon_offset bone (dual-wield rig?)"))
         continue
     if max_angle > 0.01:
         rotated.append((key, round(max_angle, 3)))
@@ -757,6 +769,9 @@ for key, found in sorted(anchors.items()):
 with open(os.path.join(dest, "charm-anchors.json"), "w") as fh:
     json.dump(world, fh, indent=1, sort_keys=True)
 print(f"--- Charm anchors (viewer space) for {len(world)} weapons")
+if skipped:
+    print(f"!!! No charm anchor written for {len(skipped)} weapon(s) with a "
+          f"keychain attachment: {skipped}")
 if rotated:
     print(f"!!! Bone rotation in the weapon_offset chain: {rotated}")
     print("!!! The chain is translation-only — these anchors may be off.")

@@ -211,6 +211,10 @@ const TESTS_DIR = process.env.TESTS_DIR ?? "/cs2-models/tests";
 // reaches the filesystem.
 const TEST_KEY = /^test-\d+\.png$/;
 const REPORT_FILE = "report.json";
+// Human good/bad triage. Its own file because it outlives the renders: Clear
+// throws away every PNG and the machine report, but somebody's judgement on
+// ~2k skins is not something to make them redo for a re-run.
+const VERDICT_FILE = "verdicts.json";
 
 // The work-list. Public reference data like the rest of /api/catalog.
 app.get("/api/tests/catalog", async () => getRenderTestCatalog());
@@ -248,6 +252,28 @@ app.put("/api/tests/report", async (request, reply) => {
   }
 });
 
+// Human verdicts (good / bad / note per finish). Readable by anyone who can see
+// the gallery; only an admin can write.
+app.get("/api/tests/verdicts", async (_request, reply) => {
+  try {
+    const buf = await fs.readFile(path.join(TESTS_DIR, VERDICT_FILE));
+    return reply.type("application/json").send(buf);
+  } catch {
+    return {};
+  }
+});
+app.put("/api/tests/verdicts", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  try {
+    await fs.mkdir(TESTS_DIR, { recursive: true });
+    await fs.writeFile(path.join(TESTS_DIR, VERDICT_FILE), JSON.stringify(request.body ?? {}));
+    return { ok: true };
+  } catch {
+    return reply.status(500).send({ error: "test store unavailable" });
+  }
+});
+
 // Store one rendered finish. Raw PNG body (octet-stream, same parser as the
 // card render route); the key is validated against TEST_KEY before it touches
 // disk.
@@ -269,14 +295,23 @@ app.post<{ Params: { key: string } }>("/api/tests/snap/:key", async (request, re
   }
 });
 
-// Wipe the suite (admin) — everything repopulates on the next run.
+// Wipe the suite (admin) — everything repopulates on the next run. Deliberately
+// file-by-file rather than rm -rf: the verdict file is human triage and must
+// survive, so only renders and the machine report are removed.
 app.delete("/api/tests", async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
-  const before = await dirStats(TESTS_DIR);
-  await fs.rm(TESTS_DIR, { recursive: true, force: true }).catch(() => {});
-  await fs.mkdir(TESTS_DIR, { recursive: true }).catch(() => {});
-  return { cleared: before.files };
+  let cleared = 0;
+  try {
+    for (const file of await fs.readdir(TESTS_DIR)) {
+      if (!TEST_KEY.test(file) && file !== REPORT_FILE) continue;
+      await fs.rm(path.join(TESTS_DIR, file), { force: true }).catch(() => {});
+      cleared++;
+    }
+  } catch {
+    /* nothing rendered yet */
+  }
+  return { cleared };
 });
 
 // Serve the rendered PNGs. Registered under BOTH paths for the same reason as
