@@ -66,6 +66,10 @@ export interface Catalog {
   defaults?: DefaultsMap;
   /** Changes whenever the extracted assets might have. See assetVersion below. */
   assetVersion?: string;
+  /** Where to fetch item art and paint assets from. Empty (the default) means
+   *  the same host that served this API. Non-empty when the operator has opted
+   *  into the shared 5stack CDN. */
+  assetOrigin?: string;
 }
 
 export interface CatalogItem {
@@ -134,8 +138,12 @@ export interface InventoryItem {
 // "/images/..." would resolve against the wrong host). Resolving here, at the
 // single door every API response comes through, means no view has to remember
 // to do it — and swapping artwork onto a shared CDN later is a one-line change.
+// Defaults to the API host — what every deployment does unless it opts into the
+// shared CDN. Set from /catalog, so it is in place before any asset is fetched.
+let assetOrigin = API_ORIGIN;
 export const ASSET_ORIGIN = API_ORIGIN;
-export const assetUrl = (path: string) => `${ASSET_ORIGIN}${path}`;
+export const getAssetOrigin = () => assetOrigin;
+export const assetUrl = (path: string) => `${assetOrigin}${path}`;
 
 /** Rewrite every "/images/..." string in a decoded response body in place.
  *  Item art appears under a dozen different keys (item, skin, stickers[],
@@ -196,6 +204,9 @@ export const withAssetVersion = (url: string) =>
 export const fetchCatalog = async () => {
   const c = await request<Catalog>("/catalog");
   if (c.assetVersion) assetVersion = c.assetVersion;
+  // Empty string is meaningful — "serve from this host" — so only a non-empty
+  // value overrides the default.
+  if (c.assetOrigin) assetOrigin = c.assetOrigin;
   return c;
 };
 
@@ -446,6 +457,27 @@ export type CacheStats = {
   models?: DirStat;
 };
 export const fetchCacheStats = () => request<CacheStats>("/admin/cache");
+
+// Shared 5stack asset CDN. Off by default: extraction output is deterministic
+// for a given pipeline+CS2 build, so a first-party CDN can serve exactly what
+// this box would have produced — but which host your assets come from is the
+// operator's call to make, not a default to inherit.
+export type AssetCdnStatus = {
+  enabled: boolean;
+  base: string;
+  /** CDN origin, or null if nothing is extracted here yet. */
+  origin: string | null;
+  /** Does the CDN's pipeline+build match ours? null when unknown. */
+  available: boolean | null;
+  extractVersion: number | null;
+  gameBuild: number | null;
+  /** What the CDN reports, for showing the mismatch rather than just denying. */
+  cdnVersion?: number | null;
+  cdnGameBuild?: number | null;
+};
+export const fetchAssetCdn = () => request<AssetCdnStatus>("/admin/asset-cdn");
+export const setAssetCdn = (enabled: boolean) =>
+  request<{ enabled: boolean }>("/admin/asset-cdn", { method: "PUT", body: JSON.stringify({ enabled }) });
 // Renders only. Paints and icons are extracted from the server's own CS2
 // install with no upstream to re-fetch from, so deleting them breaks rendering
 // until someone re-extracts — the backend rejects any other scope.

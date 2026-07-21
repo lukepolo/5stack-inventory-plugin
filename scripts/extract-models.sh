@@ -41,7 +41,19 @@ set -euo pipefail
 # v6 (2026-07-21): extracts the paint chain to <mount>/paints (step 5) — the
 # vcompmat/vmat JSON and their textures, the last thing that came from the CDN.
 # Without it the compositor falls back to defaults and skins render white.
-EXTRACT_VERSION=6
+# v7 (2026-07-21): paint entry points restricted to the types that are actually
+# composited (weapon/melee/glove). Stickers and patches are drawn as decals from
+# their flat icon and never fetch a paint material, so following their 10,565
+# vmats pulled in 6,245 textures nothing requests — 76% of the texture work.
+# Paints also build in paints.next and swap in atomically, so a run no longer
+# disturbs what is being served.
+# v8 (2026-07-21): the graph walk now follows PLAIN-STRING resource references,
+# not just typed `resource:` ones. Every skin names its template vmat as a bare
+# string (m_strSpecificContainerMaterial), so no template was ever walked or
+# written — the rewrite emitted a correct reference to a file that did not
+# exist, and those skins rendered broken (Deagle | Blaze). Any mount built
+# before this is missing every template vmat, which is why this bumps.
+EXTRACT_VERSION=8
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -241,18 +253,25 @@ else
     done
   ) &
   SHARD_WATCH=$!
+  # FILTER, do not silence. As one pass this step emitted ~26k lines, almost all
+  # of it the documented VCS-71 shader noise plus a four-line vpk preamble per
+  # shard. Dumping it all buried everything; dumping none of it also threw away
+  # real decompile failures, which is the only thing here worth reading. Keep
+  # the rest, tagged with the weapon so 12 parallel shards stay legible.
+  #
+  # The pattern lives in an exported VARIABLE on purpose. Inlining it put single
+  # quotes inside the single-quoted `bash -c '...'` body below, which closed that
+  # string early — the shell then tried to run `^Preloading` as a command and no
+  # shard ever executed.
+  SHARD_NOISE='Only VCS file versions|^Preloading vpk|^Added folder|^Found "Counter-Strike 2"|^--- Dumping decompiled|^--- Creating mesh|^--- Loading material|^--- Dump written to|^$'
+  export SHARD_NOISE
   printf '%s\n' "${WEAPON_DIRS[@]}" | xargs -P "$(nproc)" -I{} bash -c '
     dir="$1"
     out="$SHARDS/$(echo "$dir" | tr "/" "_")"
-    # FILTER, do not silence. As one pass this step emitted ~26k lines, almost
-    # all of it the documented VCS-71 shader noise plus a four-line vpk preamble
-    # per shard. Dumping it all buried everything; dumping none of it also threw
-    # away real decompile failures, which is the only thing here worth reading.
-    # Keep the rest, tagged with the weapon so 12 parallel shards stay legible.
     "$CLI" -i "$VPK" -o "$out" -d -f "$dir" -e "vmdl_c" \
       --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
       --gltf_export_animations 2>&1 |
-      grep -vE 'Only VCS file versions|^Preloading vpk|^Added folder|^Found "Counter-Strike 2"|^--- Dumping decompiled|^--- Creating mesh|^--- Loading material|^--- Dump written to|^$' |
+      grep -vE "$SHARD_NOISE" |
       sed "s|^|    [$(basename "$dir")] |" || true
     : >"$SHARD_DONE/$(echo "$dir" | tr "/" "_")"
   ' _ {}
@@ -1160,8 +1179,43 @@ echo ""
 echo "--- Extracting econ item icons…"
 
 if [[ -n "$OUT_DIR" ]]; then IMG_DEST="$OUT_DIR/images"; else IMG_DEST="$WORK/images"; fi
-if [[ -n "$OUT_DIR" ]]; then PAINT_DEST="$OUT_DIR/paints"; else PAINT_DEST="$WORK/paints"; fi
-mkdir -p "$IMG_DEST" "$PAINT_DEST/materials" "$PAINT_DEST/textures"
+# Paints are built in a STAGING dir and swapped in atomically at the end, so a
+# run never disturbs what is being served. Materials reference textures by name,
+# so a half-populated paints dir renders skins white — and an extraction takes
+# long enough that somebody will hit it. The live copy stays untouched until the
+# whole step succeeds.
+#
+# Only paints get this. Icons degrade gracefully (a blank tile that fills in on
+# the next load) and models are written early and HEAD-probed before use, so
+# neither earns the extra moving parts.
+if [[ -n "$OUT_DIR" ]]; then PAINT_LIVE="$OUT_DIR/paints"; else PAINT_LIVE="$WORK/paints"; fi
+PAINT_DEST="$PAINT_LIVE.next"
+mkdir -p "$IMG_DEST" "$PAINT_LIVE/materials" "$PAINT_LIVE/textures"
+rm -rf "$PAINT_DEST"
+
+# Seed staging from the live copy with HARDLINKS: near-instant, no extra disk
+# for the (many) files a run does not change, and it preserves the
+# skip-what-exists resume in the texture pass.
+#
+# Only safe within the SAME CS2 build. Our texture filenames hash the archive
+# PATH, not the contents — so if Valve changes a texture's bytes without moving
+# it, the name is identical, the resume check sees the file and we would serve
+# the old one forever. A build change therefore forces a clean rebuild.
+PREV_BUILD=$(STAMP="$DEST/extract-version.json" python3 - <<'PYV' 2>/dev/null || true
+import json, os
+try:
+    print(json.load(open(os.environ["STAMP"])).get("gameBuild") or "")
+except Exception:
+    print("")
+PYV
+)
+if [[ -n "$GAME_BUILD" && "$PREV_BUILD" == "$GAME_BUILD" ]]; then
+  echo "--- Seeding paint staging from the live copy (same CS2 build $GAME_BUILD)"
+  cp -al "$PAINT_LIVE" "$PAINT_DEST"
+else
+  echo "--- CS2 build changed (${PREV_BUILD:-none} -> ${GAME_BUILD:-unknown}) — rebuilding paints from scratch"
+fi
+mkdir -p "$PAINT_DEST/materials" "$PAINT_DEST/textures"
 
 # The manifest generator needs cs2-lib, so it runs from whichever backend tree
 # has node_modules: /app in the container image, ../backend from a repo checkout.
@@ -1325,6 +1379,12 @@ def progress(step, done, total):
 
 written, failed = 0, []
 todo_paths = sorted(wanted)
+# Publish the denominator BEFORE the first batch. Progress is otherwise only
+# reported once a 150-item batch finishes, and until the first one lands the
+# panel sees a running step with no total — which it renders as an
+# indeterminate bar, indistinguishable from stuck. Matters most when there is
+# nothing to do: the loop never runs, so nothing was ever reported at all.
+progress("econ-icons", 0, len(manifest))
 BATCH = 150
 for bi in range(0, len(todo_paths), BATCH):
     batch = todo_paths[bi:bi + BATCH]
@@ -1650,7 +1710,20 @@ def dump(spec):
     return split_blocks(proc.stdout, {})
 
 
-TREES = sorted({"/".join(p.split("/")[:2]) + "/" for p in wanted_name})
+# Entry points only live in weapons/paints/ and gloves/paints/, but every one of
+# them REFERENCES a template vmat that lives somewhere else entirely:
+#
+#   materials/models/weapons/customization/  -> the per-skin template vmats and
+#                                               default_composite_inputs
+#   workshop/paintkits/                      -> shared gunsmith/case-hardening
+#
+# Those are structural, not incidental, so dump them as trees rather than
+# leaning on the per-file fallback below — it works, but it is one CLI process
+# per template, and a template that fails to resolve takes its skin down with
+# it. Deagle | Blaze rendered broken for exactly this reason: its vcompmat
+# pointed at aa_flames.vmat.json and nothing had written it.
+TEMPLATE_TREES = {"materials/models/weapons/customization/", "workshop/paintkits/"}
+TREES = sorted({"/".join(p.split("/")[:2]) + "/" for p in wanted_name} | TEMPLATE_TREES)
 specs = [(t, e) for t in TREES for e in ("vcompmat_c", "vmat_c")]
 blocks = {}
 with ThreadPoolExecutor(max_workers=min(8, max(2, len(specs)))) as pool:
@@ -1663,6 +1736,10 @@ def kv3_body(text):
     i = text.find('--- Data for block "DATA" ---')
     return text[text.index("\n", i) + 1:] if i >= 0 else text
 
+
+# Strings that NAME a resource. Used by both the graph walk and the rewrite —
+# they have to agree on what counts as a reference.
+RESOURCE_SUFFIX = re.compile(r"\.(vcompmat|vmat|vtex)$")
 
 # ---- walk the graph from every entry point ---------------------------------
 docs, textures, failed = {}, set(), []
@@ -1690,8 +1767,20 @@ while queue:
     docs[path] = doc
 
     def visit(node):
-        if isinstance(node, Ref):
-            target = resolve_ref(str(node))
+        # Follow typed `resource:` refs AND plain strings that name a resource.
+        # These MUST match what convert() rewrites, or the two disagree and you
+        # get a correct-looking reference to a file nothing ever wrote.
+        #
+        # That is not hypothetical: every skin's template vmat is referenced as
+        # `m_strSpecificContainerMaterial = "materials/.../aa_flames.vmat"` — a
+        # bare string, not a Ref. Walking only Refs meant no template was ever
+        # queued, so Deagle | Blaze shipped a vcompmat pointing at a vmat that
+        # did not exist, and rendered broken.
+        if isinstance(node, (Ref, str)):
+            raw = str(node)
+            if not isinstance(node, Ref) and not RESOURCE_SUFFIX.search(raw):
+                return
+            target = resolve_ref(raw)
             if not target:
                 return
             if target.endswith("vtex_c"):
@@ -1714,7 +1803,6 @@ print(f"---   {len(docs)} materials reachable, {len(textures)} textures referenc
 # cs2-lib stringifies every scalar (1 -> "1", -50.0 -> "-50", true -> "1").
 # Everything downstream runs Number() over these, so the exact spelling only
 # matters for matching the reference format.
-RESOURCE_SUFFIX = re.compile(r"\.(vcompmat|vmat|vtex)$")
 
 
 def scalar(v):
@@ -1751,18 +1839,18 @@ def convert(node):
     return scalar(node)
 
 
-written = 0
-for path, doc in docs.items():
-    kind = "vcompmat" if path.endswith("vcompmat_c") else "vmat"
-    with open(os.path.join(dest, "materials", out_name(path, kind)), "w") as fh:
-        json.dump(convert(doc), fh, separators=(",", ":"))
-    written += 1
-    # Thousands of files; without this the step looks hung until textures start.
-    if written % 250 == 0:
-        progress("paint-chain", written, len(docs))
-print(f"---   wrote {written} material JSON files")
-
-# ---- textures --------------------------------------------------------------
+# ---- textures FIRST ---------------------------------------------------------
+# Order matters, and it is the whole reason this step used to break the site
+# mid-run. A material NAMES its textures, so writing materials first left the
+# mount holding materials that pointed at files not yet extracted — for the
+# several minutes the texture pass takes. Anything viewed in that window
+# composited on fallbacks and rendered as a white gun.
+#
+# Textures first inverts that. Old textures are never deleted, so at every
+# instant every material on disk resolves: either the previous material with its
+# textures still present, or the new one with textures already written. The
+# worst a reader sees is a material that hasn't been refreshed yet, which is a
+# correct older skin rather than a broken new one.
 have_convert = shutil.which("convert") is not None
 tex_dir = os.path.join(dest, "textures")
 todo = [t for t in sorted(textures) if not os.path.exists(os.path.join(tex_dir, out_name(t, "vtex")))]
@@ -1779,6 +1867,9 @@ print(f"---   {len(todo)} textures to extract ({len(textures) - len(todo)} alrea
 # tracking to ~3 hours. Exact batches do neither.
 BATCH = 150
 converted = 0
+# See the econ-icons pass: publish the denominator before the first batch so
+# the panel has a determinate bar from the start.
+progress("paint-chain", 0, len(todo))
 for bi in range(0, len(todo), BATCH):
     batch = todo[bi:bi + BATCH]
     shutil.rmtree(raw, ignore_errors=True)
@@ -1809,13 +1900,25 @@ for bi in range(0, len(todo), BATCH):
 
     def to_webp(job):
         src, dst = job
-        if not have_convert:
-            shutil.copyfile(src, dst)
-            return True
+        # Write to a temp and rename. Staging is seeded with HARDLINKS to the
+        # live copy, so writing a texture in place would mutate the file being
+        # served right now. Today the skip-existing filter above means we never
+        # touch an existing texture — but that is an accident of ordering, and
+        # this makes it safe by construction. It also means a reader can never
+        # catch a half-written image.
+        tmp = dst + ".tmp"
         try:
-            subprocess.run(["convert", src, "-quality", "90", dst], check=True, capture_output=True)
+            if not have_convert:
+                shutil.copyfile(src, tmp)
+            else:
+                subprocess.run(["convert", src, "-quality", "90", tmp], check=True, capture_output=True)
+            os.replace(tmp, dst)
             return True
         except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
             return False
 
     with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as pool:
@@ -1828,6 +1931,58 @@ for bi in range(0, len(todo), BATCH):
     progress("paint-chain", converted, len(todo))
 
 shutil.rmtree(raw, ignore_errors=True)
+
+# ---- materials LAST ---------------------------------------------------------
+# Every texture these reference is on disk by now — see the note above the
+# texture pass for why that ordering is load-bearing.
+written = 0
+# The textures pass left the bar at its own denominator; hand over to this
+# one immediately rather than after the first 250.
+progress("paint-chain", 0, len(docs))
+for path, doc in docs.items():
+    kind = "vcompmat" if path.endswith("vcompmat_c") else "vmat"
+    out_path = os.path.join(dest, "materials", out_name(path, kind))
+    # Write-then-rename: a reader must never catch a half-written material, and
+    # os.replace is atomic within a filesystem.
+    tmp = out_path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(convert(doc), fh, separators=(",", ":"))
+    os.replace(tmp, out_path)
+    written += 1
+    if written % 250 == 0:
+        progress("paint-chain", written, len(docs))
+# Final exact count: the throttle above leaves the bar short of 100% whenever
+# the total is not a multiple of 250 (or is under it, where it never fired).
+progress("paint-chain", written, len(docs))
+print(f"---   wrote {written} material JSON files")
+
+# ---- prune, one generation behind -------------------------------------------
+# Delete textures nothing references any more — but keep whatever the PREVIOUS
+# run referenced too. A browser that cached a material before this run holds
+# immutable URLs for the texture names that material used; dropping them the
+# moment they go unreferenced would 404 those and render that tab's guns white,
+# which is exactly the interruption staging exists to avoid. One run of grace is
+# enough — a tab that old has reloaded.
+keep = {out_name(t, "vtex") for t in textures}
+prev_file = os.path.join(dest, "referenced.json")
+try:
+    with open(prev_file) as fh:
+        keep |= set(json.load(fh))
+except Exception:
+    pass  # first run, or unreadable — prune nothing this time
+removed = 0
+for f in os.listdir(tex_dir):
+    if f not in keep:
+        try:
+            os.remove(os.path.join(tex_dir, f))
+            removed += 1
+        except OSError:
+            pass
+with open(prev_file, "w") as fh:
+    json.dump(sorted(out_name(t, "vtex") for t in textures), fh)
+if removed:
+    print(f"---   pruned {removed} textures no longer referenced by this or the previous run")
+
 print(f"--- Paint chain: {written} materials, {len(textures)} textures -> {dest}")
 if unresolved:
     print(f"!!! {len(unresolved)} paint materials are not in this CS2 build "
@@ -1835,6 +1990,21 @@ if unresolved:
 if failed:
     print(f"!!! {len(failed)} paint assets failed: {failed[:5]}")
 PYEOF
+
+  # ---- swap staging into place ------------------------------------------------
+  # `set -e` means we only reach here if the step above succeeded, so the live
+  # copy is only ever replaced by a COMPLETE one. Two renames within the same
+  # filesystem, so each is atomic: a request either resolves against the old
+  # directory or the new one, never a half-built mix. Readers already holding an
+  # open fd finish against the inode they opened.
+  echo "--- Swapping paints into place…"
+  rm -rf "$PAINT_LIVE.old"
+  mv "$PAINT_LIVE" "$PAINT_LIVE.old"
+  mv "$PAINT_DEST" "$PAINT_LIVE"
+  # Hardlinked from the new copy where nothing changed, so this frees only the
+  # files this run actually replaced.
+  rm -rf "$PAINT_LIVE.old"
+  echo "--- Paints live: $(find "$PAINT_LIVE/materials" -type f | wc -l | tr -d "[:space:]") materials, $(find "$PAINT_LIVE/textures" -type f | wc -l | tr -d "[:space:]") textures"
 fi
 
 # ---- 6. Stamp the pipeline version -------------------------------------------

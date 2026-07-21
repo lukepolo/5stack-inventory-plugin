@@ -14,9 +14,12 @@ import {
   generateServerApiKey,
   fetchCacheStats,
   clearCache,
+  fetchAssetCdn,
+  setAssetCdn,
   fetchExtractStatus,
   startExtractJob,
   extractLogUrl,
+  type AssetCdnStatus,
   type CacheStats,
   type CfgSyncResult,
   type ExtractStatus,
@@ -156,6 +159,36 @@ const extractedRows = computed(() => {
     { key: "images", label: "Item icons", hint: "Flat catalog art for every item", ...(s.images ?? { files: 0, bytes: 0 }) },
   ];
 });
+// ---- shared asset CDN (opt-in) ----------------------------------------------
+const assetCdn = ref<AssetCdnStatus | null>(null);
+const assetCdnBusy = ref(false);
+async function refreshAssetCdn() {
+  try {
+    assetCdn.value = await fetchAssetCdn();
+  } catch {
+    assetCdn.value = null; // older backend — the row just doesn't render
+  }
+}
+async function toggleAssetCdn(enabled: boolean) {
+  if (assetCdnBusy.value) return;
+  assetCdnBusy.value = true;
+  try {
+    await setAssetCdn(enabled);
+    await refreshAssetCdn();
+    emit(
+      "notify",
+      enabled
+        ? "Asset CDN enabled — reload for clients to start fetching from it."
+        : "Asset CDN disabled — assets come from this server again.",
+      "success",
+    );
+  } catch (e) {
+    fail(e);
+  } finally {
+    assetCdnBusy.value = false;
+  }
+}
+
 async function refreshCacheStats() {
   try {
     cacheStats.value = await fetchCacheStats();
@@ -323,6 +356,7 @@ watch(
     if (key === "") loadKey();
     else if (key === "assets") {
       refreshCacheStats();
+      refreshAssetCdn();
       // Also needed here to learn whether a run is live: the asset counts climb
       // during an extraction, and this tab is where you watch them.
       refreshExtractStatus();
@@ -593,6 +627,62 @@ const BTN_DANGER =
             <p v-else class="text-sm text-muted-foreground">
               Asset stats unavailable — older backend, or the mount is missing.
             </p>
+
+            <!-- Shared CDN opt-in. Off by default and deliberately explicit:
+                 the whole reason the third-party CDN was removed is that assets
+                 were arriving from a host nobody had chosen. A 5stack-run CDN is
+                 fine; inheriting it silently is not. -->
+            <div v-if="assetCdn" class="space-y-2">
+              <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Asset source</p>
+              <div class="rounded-md border border-border">
+                <div class="flex items-start justify-between gap-4 px-4 py-3">
+                  <span class="min-w-0">
+                    <span class="block text-sm text-foreground">Use the 5stack asset CDN</span>
+                    <span class="block text-xs text-muted-foreground">
+                      Serve item art, paints and models from
+                      <span class="font-mono">{{ assetCdn.base }}</span> instead of this server. Extraction output is
+                      identical for a given pipeline and CS2 build, so this is the same data — it just saves running the
+                      extraction at all.
+                    </span>
+                  </span>
+                  <button
+                    :class="BTN"
+                    :disabled="assetCdnBusy || (!assetCdn.enabled && assetCdn.available === false)"
+                    :title="
+                      !assetCdn.enabled && assetCdn.available === false
+                        ? 'The CDN has no assets published for this pipeline + CS2 build yet'
+                        : undefined
+                    "
+                    @click="toggleAssetCdn(!assetCdn.enabled)"
+                  >
+                    <Loader2 v-if="assetCdnBusy" class="h-3.5 w-3.5 animate-spin" />
+                    {{ assetCdn.enabled ? "Disable" : "Enable" }}
+                  </button>
+                </div>
+                <!-- Say whether it can actually serve THIS build before someone
+                     flips it on and finds every skin missing. -->
+                <div class="border-t border-border px-4 py-2.5 text-xs">
+                  <span v-if="!assetCdn.origin" class="text-muted-foreground">
+                    Nothing extracted yet, so there is no pipeline + build to match against.
+                  </span>
+                  <span v-else-if="assetCdn.available === true" class="text-[hsl(var(--tac-cyan))]">
+                    ✓ Serving <span class="font-mono">v{{ assetCdn.extractVersion }}-{{ assetCdn.gameBuild }}</span> —
+                    same pipeline and CS2 build as this server.
+                  </span>
+                  <span v-else-if="assetCdn.available === false" class="text-[hsl(var(--tac-amber))]">
+                    Build mismatch — this server is
+                    <span class="font-mono">v{{ assetCdn.extractVersion }}-{{ assetCdn.gameBuild }}</span>, the CDN has
+                    <span class="font-mono">{{
+                      assetCdn.cdnVersion != null ? "v" + assetCdn.cdnVersion + "-" + assetCdn.cdnGameBuild : "nothing"
+                    }}</span>. Assets would be for a different build, so this stays on the local extraction.
+                  </span>
+                  <span v-else class="text-muted-foreground">Could not reach the CDN to check.</span>
+                </div>
+              </div>
+              <p v-if="assetCdn.enabled" class="text-xs text-muted-foreground">
+                This server's own extracted files stay on disk and are used again the moment this is turned off.
+              </p>
+            </div>
           </div>
         </section>
 

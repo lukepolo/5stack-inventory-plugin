@@ -20,7 +20,7 @@
 // - transforms quantized to 2 decimals (%.2f / floor((x+.005)*100)/100)
 // - pattern & wear & grunge scale all multiply weaponLength/36 for
 //   spray/anodized-air styles, uvScale for everything else
-import { API_ORIGIN, withAssetVersion } from "./api";
+import { getAssetOrigin, withAssetVersion } from "./api";
 
 type THREE = typeof import("three");
 
@@ -30,7 +30,9 @@ type THREE = typeof import("three");
 // deliberately no third-party fallback: a miss is a real error (the mount is
 // unpopulated or the extraction is behind), and it must surface as one rather
 // than being papered over by someone else's CDN.
-const PAINT_SELF = `${API_ORIGIN}/paints`;
+// Resolved per call, not captured at module load: the origin is only known once
+// /catalog has landed, and an operator can point it at the shared CDN.
+const paintBase = () => `${getAssetOrigin()}/paints`;
 
 export class PaintAssetMissing extends Error {
   constructor(readonly path: string) {
@@ -44,18 +46,29 @@ export async function paintFetch(path: string): Promise<Response> {
   // and so cannot self-version. See withAssetVersion.
   // Callers immediately .json() the result, so a 404 has to throw here or it
   // surfaces as an unrelated JSON parse error.
-  const res = await fetch(withAssetVersion(PAINT_SELF + path)).catch(() => {
+  const res = await fetch(withAssetVersion(paintBase() + path)).catch(() => {
     throw new PaintAssetMissing(path);
   });
   if (!res.ok) throw new PaintAssetMissing(path);
   return res;
 }
 
-// Deliberately NOT versioned: texture filenames already carry a content hash we
-// generate, so the URL changes whenever the bytes do. Adding a version would
-// re-download all ~8k of them after every extraction for nothing.
+// Versioned, despite the hash in the filename. That hash is over the ARCHIVE
+// PATH, not the contents — so when a CS2 update rewrites a texture's bytes
+// without moving it, the name is byte-identical and a client caching it
+// `immutable` for a year would keep the stale one forever.
+//
+// Item ICONS are genuinely different and stay unversioned: their hash is
+// cs2-lib's, taken over the image contents, so the filename already changes
+// whenever the art does.
+//
+// The cost is re-fetching the paint textures once per completed extraction,
+// which is rare and lazy. The alternative — hashing each texture's bytes at
+// write time so names are truly content-addressed — is better and would also
+// fix the skip-existing resume being able to keep a stale file, but it is a
+// real refactor rather than a correctness patch.
 export function paintTextureUrl(path: string): string {
-  return PAINT_SELF + path;
+  return withAssetVersion(paintBase() + path);
 }
 
 // ---- Paint definition ----------------------------------------------------------
@@ -610,10 +623,10 @@ export function loadWeaponInputs(model: string, legacy = false): Promise<WeaponI
   if (!cached) {
     cached = (async () => {
       const load = async (d: string): Promise<WeaponInputs | null> => {
-        const res = await fetch(`${API_ORIGIN}/models/${encodeURIComponent(d)}/meta.json`);
+        const res = await fetch(`${getAssetOrigin()}/models/${encodeURIComponent(d)}/meta.json`);
         if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) return null;
         const meta = (await res.json()) as WeaponInputs & { textures?: Record<string, string> };
-        const base = `${API_ORIGIN}/models/${encodeURIComponent(d)}/`;
+        const base = `${getAssetOrigin()}/models/${encodeURIComponent(d)}/`;
         const rel = (p?: string) => (p ? base + p : undefined);
         return {
           ao: rel(meta.textures?.ao),

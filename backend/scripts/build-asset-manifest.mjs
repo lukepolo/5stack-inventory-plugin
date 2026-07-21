@@ -47,6 +47,18 @@ for (const item of CS2Economy.itemsAsArray) {
   });
 }
 
+// Types whose paint chain is actually COMPOSITED. Only these fetch a
+// paintMaterial: viewer3d passes one for the weapon being rendered, and the
+// skin-test suite covers weapon/knife/glove. Stickers and patches are drawn as
+// decals from their flat `image`, never from a paint material — see
+// StickerPlacement in viewer3d.ts, which carries an image and nothing else.
+//
+// This filter is worth a lot. cs2-lib lists 12,044 paint materials but only
+// 1,479 belong to these types; following the other 10,565 dragged in 6,245
+// textures nothing ever requests — 76% of the texture work, and the paint step
+// was 71% of the whole extraction.
+const COMPOSITED_TYPES = new Set(["weapon", "melee", "glove"]);
+
 // Paint materials. `paintMaterial` is "/materials/<stem>_<hash8>.vcompmat.json"
 // (a few are .vmat.json) — same hash-suffix rule as the icons, so the stem is
 // again the game asset's own name. These are only the ENTRY POINTS: each one
@@ -57,6 +69,7 @@ const seenPaint = new Set();
 for (const item of CS2Economy.itemsAsArray) {
   const pm = item.paintMaterial;
   if (typeof pm !== "string" || !pm.startsWith("/materials/")) continue;
+  if (!COMPOSITED_TYPES.has(item.type)) continue;
   if (seenPaint.has(pm)) continue;
   seenPaint.add(pm);
   const file = pm.slice("/materials/".length);

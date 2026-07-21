@@ -1855,6 +1855,20 @@ watch(
     }, 450);
   },
 );
+// StatTrak toggle → attach/detach the module on the live viewer. Deliberately
+// NOT folded into the wear/seed remount above: the module is independent of the
+// paint composite, and remounting would reset the camera on every flip.
+watch(
+  () => craft.value?.stattrak,
+  (on) => {
+    if (!modalViewerHandle || !craft.value) return;
+    modalViewerHandle.setStatTrak(
+      on
+        ? { count: inventory.value.find((i) => i.id === craftInstId.value)?.stattrak_count ?? 0 }
+        : null,
+    );
+  },
+);
 // Numeric edits / picker changes → live decal + charm updates. The viewer
 // no-ops on identical placements, so drag echoes don't rebuild anything.
 watch(
@@ -1878,7 +1892,7 @@ let craftPreviewToken = 0;
 let craftBaseline = "";
 const craftStateJson = () =>
   craft.value
-    ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm])
+    ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm, craft.value.stattrak])
     : "";
 async function refreshCraftPreview() {
   const c = craft.value;
@@ -1887,7 +1901,7 @@ async function refreshCraftPreview() {
   // A brand-new craft with no customization has nothing worth baking — the
   // base catalog art is the truth until stickers/charm/wear get touched
   // (the template already falls back to craft.skin.image while null).
-  if (editingId.value == null && craftBaseline === "" && !c.stickers.some(Boolean) && !c.charm) return;
+  if (editingId.value == null && craftBaseline === "" && !c.stickers.some(Boolean) && !c.charm && !c.stattrak) return;
   if (!(await hasModel(model))) return;
   const token = ++craftPreviewToken;
   craftPreviewBusy.value = true;
@@ -1920,9 +1934,9 @@ async function refreshCraftPreview() {
   }
 }
 watch(
-  () =>
-    craft.value &&
-    JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm]),
+  // must match craftStateJson exactly — the baseline compare below is what
+  // decides whether the already-baked render still stands
+  () => craft.value && craftStateJson(),
   (v) => {
     clearTimeout(craftPreviewTimer);
     if (!v) {

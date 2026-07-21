@@ -60,7 +60,13 @@ const TEAMS = new Set(["CT", "T"]);
 app.get("/api/catalog", async () => {
   // assetVersion rides along here because the client needs it before it can
   // request a single paint file, and this is the one call it always makes first.
-  return { weapons: getWeapons(), agents: getAgents(), defaults: getDefaults(), assetVersion: await assetVersion() };
+  return {
+    weapons: getWeapons(),
+    agents: getAgents(),
+    defaults: getDefaults(),
+    assetVersion: await assetVersion(),
+    assetOrigin: await assetOrigin(),
+  };
 });
 
 // Paint-chain files and econ icons are extracted from the instance's own CS2
@@ -1401,6 +1407,64 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
   return { imported, updated, removed, skipped, partial: !complete };
 });
 
+// ---- Shared asset CDN (opt-in) ---------------------------------------------
+// Extraction is DETERMINISTIC: texture names hash the archive path, material
+// names come from cs2-lib, so the same pipeline version against the same CS2
+// build produces byte-identical output on every deployment. That makes a shared,
+// 5stack-operated CDN safe — an instance can serve exactly what it would have
+// extracted itself, without spending ~13 minutes extracting it.
+//
+// OPT-IN, and off by default, on purpose. The failure that motivated removing
+// cdn.cstrike.app was assets quietly arriving from somewhere the operator did
+// not choose; a first-party CDN is fine, silently switching to it is not.
+const ASSET_CDN_BASE = process.env.INVENTORY_ASSET_CDN ?? "https://skins.5stack.gg";
+
+async function assetCdnEnabled(): Promise<boolean> {
+  const { rows } = await pool.query<{ value: string }>(
+    `SELECT value FROM inventory.settings WHERE key = 'asset_cdn'`,
+  );
+  return rows[0]?.value === "1";
+}
+
+/** The CDN's own pipeline+build, read from the stamp it serves. The CDN host is
+ *  the same frontend on a second domain (see the panel's ingress.yaml), so it
+ *  serves assets at the ROOT and its extract stamp is reachable at the same
+ *  path ours is. No /api is exposed there, which is why this reads the stamp
+ *  file rather than asking the API. */
+async function assetCdnStamp(): Promise<{ version: number | null; gameBuild: number | null }> {
+  try {
+    const res = await fetch(`${ASSET_CDN_BASE}/models/extract-version.json`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return { version: null, gameBuild: null };
+    const p = (await res.json()) as { version?: number; gameBuild?: number };
+    return {
+      version: typeof p.version === "number" ? p.version : null,
+      gameBuild: typeof p.gameBuild === "number" ? p.gameBuild : null,
+    };
+  } catch {
+    return { version: null, gameBuild: null };
+  }
+}
+
+/** Where clients should fetch item art and paint assets from. Empty means "the
+ *  same host that served the API" — the default, and what every deployment did
+ *  before this existed.
+ *
+ *  Refuses to hand out the CDN unless its pipeline AND CS2 build match ours.
+ *  The assets sit at the host root with no version in the URL, so a mismatch
+ *  would quietly serve another build's skins rather than 404 — wrong pixels are
+ *  far harder to notice than missing ones. Extraction is deterministic for a
+ *  given pipeline+build, so equal keys really do mean identical bytes. */
+async function assetOrigin(): Promise<string> {
+  if (!(await assetCdnEnabled())) return "";
+  const mine = await readExtractStamp();
+  if (mine.version == null || mine.gameBuild == null) return "";
+  const theirs = await assetCdnStamp();
+  const match = theirs.version === mine.version && theirs.gameBuild === mine.gameBuild;
+  return match ? ASSET_CDN_BASE : "";
+}
+
 // ---- Server API key (panel-generated; used as invsim_apikey by game servers) --
 
 async function getServerApiKey(): Promise<string | null> {
@@ -1560,6 +1624,44 @@ async function requireAdmin(request: Parameters<typeof getIdentity>[0]) {
   if (identity.role !== "administrator") return { code: 403 as const, error: "Only administrators can manage caches." };
   return null;
 }
+// Read/write the shared-CDN opt-in. Reports whether the CDN actually has this
+// build so the panel can say so BEFORE someone flips it on and finds every skin
+// missing — the CDN is keyed on pipeline+build, and a deployment on a CS2
+// version it has never published is a real possibility.
+app.get("/api/admin/asset-cdn", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const { version, gameBuild } = await readExtractStamp();
+  const enabled = await assetCdnEnabled();
+  const origin = version != null && gameBuild != null ? ASSET_CDN_BASE : null;
+  // Report exactly what the client gate decides on, so the panel can never say
+  // "available" while assetOrigin quietly refuses it.
+  const theirs = origin ? await assetCdnStamp() : { version: null, gameBuild: null };
+  const available = origin ? theirs.version === version && theirs.gameBuild === gameBuild : null;
+  return {
+    enabled,
+    base: ASSET_CDN_BASE,
+    origin,
+    available,
+    extractVersion: version,
+    gameBuild,
+    cdnVersion: theirs.version,
+    cdnGameBuild: theirs.gameBuild,
+  };
+});
+
+app.put<{ Body: { enabled?: boolean } }>("/api/admin/asset-cdn", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const enabled = request.body?.enabled === true;
+  await pool.query(
+    `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('asset_cdn', $1, now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [enabled ? "1" : "0"],
+  );
+  return { enabled };
+});
+
 app.get("/api/admin/cache", async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
