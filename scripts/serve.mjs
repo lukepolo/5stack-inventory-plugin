@@ -13,6 +13,7 @@ const root = fileURLToPath(new URL("../dist", import.meta.url));
 const modelsDir = process.env.MODELS_DIR ?? "/cs2-models/models";
 const paintsDir = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const rendersDir = process.env.RENDERS_DIR ?? "/cs2-models/renders";
+const testsDir = process.env.TESTS_DIR ?? "/cs2-models/tests";
 // Production nginx falls back to the backend when /paints|/renders miss the
 // mount (`try_files $uri @paints`), and that miss is exactly what drives the
 // backend's lazy CDN mirror. Without the same fallback here, dev hot-swap 404s
@@ -53,6 +54,9 @@ createServer(async (req, res) => {
     } else if (pathname.startsWith("/renders/")) {
       base = rendersDir;
       pathname = pathname.slice("/renders".length);
+    } else if (pathname.startsWith("/tests/")) {
+      base = testsDir;
+      pathname = pathname.slice("/tests".length);
     }
     const file = normalize(join(base, pathname));
     if (!file.startsWith(base + sep) && file !== join(root, "index.html")) {
@@ -66,7 +70,7 @@ createServer(async (req, res) => {
     } catch {
       // Mount miss on a backend-backed path — hand it to the backend, which
       // serves it and mirrors it so the next request comes off the mount.
-      if (base === paintsDir || base === rendersDir) {
+      if (base === paintsDir || base === rendersDir || base === testsDir) {
         try {
           const upstream = await fetch(backendOrigin + req.url);
           if (upstream.ok) {

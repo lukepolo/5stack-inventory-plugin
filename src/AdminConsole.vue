@@ -6,7 +6,8 @@
 // Each side tab is a route (/admin, /admin/assets, /admin/models) — same as
 // settings, where the nav is links rather than in-page anchors.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download, AlertTriangle, ChevronRight } from "lucide-vue-next";
+import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download, AlertTriangle, Info, ChevronRight } from "lucide-vue-next";
+import SkinTests from "./SkinTests.vue";
 import {
   API_ORIGIN,
   fetchServerApiKey,
@@ -47,6 +48,7 @@ const TABS = [
   { key: "", label: "Game Server" },
   { key: "assets", label: "Asset Cache" },
   { key: "models", label: "3D Models" },
+  { key: "tests", label: "Skin Tests" },
 ] as const;
 const activeKey = computed(() => {
   const s = props.section ?? "";
@@ -481,6 +483,15 @@ const BTN_DANGER =
           </div>
         </section>
 
+        <!-- Skin Tests — renders every finish for a visual sweep. Its own
+             component: the render loop + gallery is a lot of state that has no
+             business entangled with the cache/extract logic here. -->
+        <SkinTests
+          v-else-if="activeKey === 'tests'"
+          :is-admin="isAdmin"
+          @notify="(m: string, k: 'error' | 'success') => emit('notify', m, k)"
+        />
+
         <!-- 3D Models -->
         <section v-else :class="CARD">
           <div class="space-y-6 p-6">
@@ -532,6 +543,32 @@ const BTN_DANGER =
                     {{ extractStatus.finishedAt ? new Date(extractStatus.finishedAt).toLocaleString() : "never" }}
                   </dd>
                 </div>
+                <!-- Which CS2 build the assets were extracted against, and what
+                     the mounted install reports now. Only shown once we know at
+                     least one of them. -->
+                <div
+                  v-if="extractStatus.gameBuild != null || extractStatus.currentGameBuild != null"
+                  class="flex items-center justify-between gap-4 px-4 py-3"
+                >
+                  <dt class="text-sm text-muted-foreground">CS2 build</dt>
+                  <dd class="font-mono text-sm" :class="extractStatus.gameBuild != null ? '' : 'text-muted-foreground'">
+                    <!-- Stamped build (what the assets were extracted against). -->
+                    <template v-if="extractStatus.gameBuild != null">
+                      {{ extractStatus.gameBuild }}
+                      <span v-if="extractStatus.gamePatch" class="text-muted-foreground">· {{ extractStatus.gamePatch }}</span>
+                      <span v-if="extractStatus.gameUpdated" class="text-muted-foreground">
+                        → now {{ extractStatus.currentGameBuild }}
+                      </span>
+                    </template>
+                    <!-- No stamped build (assets predate version stamping): still
+                         show what the live install reports, so the field is useful. -->
+                    <template v-else-if="extractStatus.currentGameBuild != null">
+                      <span class="text-muted-foreground">install reports</span> {{ extractStatus.currentGameBuild }}
+                      <span v-if="extractStatus.currentGamePatch" class="text-muted-foreground">· {{ extractStatus.currentGamePatch }}</span>
+                    </template>
+                    <template v-else>unknown</template>
+                  </dd>
+                </div>
               </dl>
 
               <p v-if="extractStatus.error" class="text-xs text-destructive">{{ extractStatus.error }}</p>
@@ -564,6 +601,39 @@ const BTN_DANGER =
                     — this build's script produces
                     <span class="font-mono">v{{ extractStatus.requiredVersion }}</span>. Re-run the
                     extraction below to pick up the changes.
+                  </p>
+                </div>
+              </div>
+
+              <!-- Game version drift. Deliberately a softer, blue/muted notice —
+                   not the amber re-extract alert above. The game moving on is
+                   informational: most CS2 patches don't touch weapon models, so
+                   this is a "re-run if skins look wrong" hint, not a demand. -->
+              <div
+                v-if="extractStatus.gameUpdated"
+                class="flex items-start gap-3 rounded-md border border-[hsl(var(--tac-cyan)/0.4)] bg-[hsl(var(--tac-cyan)/0.08)] px-3 py-2.5"
+              >
+                <Info class="mt-0.5 h-3.5 w-3.5 flex-none text-[hsl(var(--tac-cyan))]" />
+                <div class="min-w-0 space-y-1">
+                  <p class="text-sm font-medium text-foreground">
+                    {{ extractStatus.gameBuild != null ? "Game updated since last extract" : "Game version not recorded" }}
+                  </p>
+                  <!-- Known baseline that has since moved on. -->
+                  <p v-if="extractStatus.gameBuild != null" class="text-xs text-muted-foreground">
+                    The models were extracted against CS2 build
+                    <span class="font-mono">{{ extractStatus.gameBuild }}</span
+                    ><span v-if="extractStatus.gamePatch" class="font-mono"> ({{ extractStatus.gamePatch }})</span>, but the
+                    install is now build <span class="font-mono">{{ extractStatus.currentGameBuild }}</span
+                    ><span v-if="extractStatus.currentGamePatch" class="font-mono"> ({{ extractStatus.currentGamePatch }})</span>.
+                    Most patches don't change weapon models — re-run the extraction below only if skins look wrong.
+                  </p>
+                  <!-- No baseline: assets predate build tracking, so we can't say
+                       which build they match — don't assume they're current. -->
+                  <p v-else class="text-xs text-muted-foreground">
+                    The models on the mount were extracted before build tracking existed, so we can't tell which CS2 build
+                    they match. The install is build <span class="font-mono">{{ extractStatus.currentGameBuild }}</span
+                    ><span v-if="extractStatus.currentGamePatch" class="font-mono"> ({{ extractStatus.currentGamePatch }})</span>.
+                    Re-run the extraction below to record the baseline and pick up any model changes.
                   </p>
                 </div>
               </div>

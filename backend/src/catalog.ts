@@ -189,6 +189,47 @@ export function getGloves(): CatalogSkin[] {
     }));
 }
 
+export interface RenderTestItem {
+  id: number;
+  name: string;
+  kind: "weapon" | "knife" | "glove";
+  model: string;
+  paintMaterial: string;
+  legacy: boolean;
+  rarity: string;
+  image: string | null;
+}
+
+// Every 3D-renderable painted finish — weapon skins, knife finishes and glove
+// finishes — flattened into the minimum a client needs to drive the viewer
+// (model + paintMaterial + legacy). This is the work-list the skin test suite
+// walks; only `index`-bearing items are finishes (the vanilla base carries no
+// paint and nothing to test). Each item's own economy id is the stable render
+// key, so a run is resumable and a re-run overwrites in place.
+export function getRenderTestCatalog(): RenderTestItem[] {
+  const KIND: Record<string, RenderTestItem["kind"]> = {
+    weapon: "weapon",
+    melee: "knife",
+    glove: "glove",
+  };
+  const out: RenderTestItem[] = [];
+  for (const i of items) {
+    const kind = KIND[i.type as string];
+    if (!kind || !i.index || !i.model || !i.paintMaterial) continue;
+    out.push({
+      id: i.id,
+      name: i.name,
+      kind,
+      model: i.model as string,
+      paintMaterial: i.paintMaterial,
+      legacy: !!i.legacy,
+      rarity: i.rarity as string,
+      image: img(i.image),
+    });
+  }
+  return out;
+}
+
 // Default (stock) items for the special slots — cs2-lib marks them `free`.
 // Knives/gloves/agents differ per team; Zeus/C4/music kit are global.
 export function getDefaults() {

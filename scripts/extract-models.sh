@@ -52,6 +52,23 @@ if [[ ! -f "$VPK" ]]; then
   exit 1
 fi
 
+# ---- Read the CS2 game build from steam.inf ----------------------------------
+# steam.inf sits right next to the VPK and is a plain Key=Value file. We stamp
+# the build alongside our pipeline version so the backend can tell when the game
+# has moved on under the current assets (Valve shipped a patch since the last
+# extract) — a softer signal than the pipeline stamp, since most patches don't
+# touch weapon models. A missing/odd file just leaves these empty.
+STEAM_INF="$CS2_DIR/game/csgo/steam.inf"
+GAME_BUILD=""; GAME_PATCH=""; GAME_DATE=""
+if [[ -f "$STEAM_INF" ]]; then
+  GAME_BUILD=$(grep -m1 '^ClientVersion=' "$STEAM_INF" | cut -d= -f2- | tr -d '\r')
+  GAME_PATCH=$(grep -m1 '^PatchVersion=' "$STEAM_INF" | cut -d= -f2- | tr -d '\r')
+  GAME_DATE=$(grep -m1 '^VersionDate=' "$STEAM_INF" | cut -d= -f2- | tr -d '\r')
+  echo "--- CS2 build: ${GAME_BUILD:-unknown} (${GAME_PATCH:-?}, ${GAME_DATE:-?})"
+else
+  echo "!! steam.inf not found at $STEAM_INF — game version will not be stamped."
+fi
+
 mkdir -p "$RAW" "$DEST/knives" "$DEST/extra" "$CLI_DIR"
 
 # ---- 1. Fetch Source 2 Viewer CLI (linux-x64) --------------------------------
@@ -748,13 +765,20 @@ PYEOF
 # ---- 4. Stamp the pipeline version -------------------------------------------
 # Written last, and only here: `set -e` means reaching this line is what makes
 # the run a success, so the stamp can never claim output that wasn't produced.
+# JSON helpers: a number when we have one, `null` otherwise (unquoted); a quoted
+# string or `null`. Keeps the stamp valid even on a CS2 install with no steam.inf.
+json_num() { [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf 'null'; }
+json_str() { [[ -n "$1" ]] && printf '"%s"' "$1" || printf 'null'; }
 cat >"$DEST/extract-version.json" <<JSON
 {
  "version": $EXTRACT_VERSION,
+ "gameBuild": $(json_num "$GAME_BUILD"),
+ "gamePatch": $(json_str "$GAME_PATCH"),
+ "gameDate": $(json_str "$GAME_DATE"),
  "extractedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSON
-echo "--- Stamped extract-version.json (pipeline v$EXTRACT_VERSION)"
+echo "--- Stamped extract-version.json (pipeline v$EXTRACT_VERSION, CS2 build ${GAME_BUILD:-unknown})"
 
 # ---- 5. Bundle ---------------------------------------------------------------
 if [[ -n "$OUT_DIR" ]]; then

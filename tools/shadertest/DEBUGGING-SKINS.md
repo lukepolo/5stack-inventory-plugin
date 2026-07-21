@@ -228,6 +228,22 @@ view-dependent it cannot live in the composite.
 space at all — they build the coordinate from `g_tPosition` via a triplanar
 projection. Any reasoning that assumes paint-UV sampling is wrong for them.
 
+**`g_vSprayBlend` is a float2, and the compiled reflection's `.y`/`.z` are NOT
+its `.y`/`.z`.** This one nearly cost a regression. The decompiled GLSL mixes on
+`g_vSprayBiasBlend.y` and `.z`, which reads like "use material components 1 and
+2". It is not. The compiled `g_vSprayBiasBlend` is a CPU-side Expression
+(csgo_customweapon.slang:645):
+`float3(g_bBiasSpray||0, g_vSprayBlend.x, g_vSprayBlend.y)`, and `g_vSprayBlend`
+is declared `float2` (slang:689). So shader `.y`/`.z` = material `.x`/`.y`, i.e.
+the parse `[v[0], v[1]]` is CORRECT. Reading `[v[1], v[2]]` "to match the GLSL"
+is wrong — the material stores a padded vec4 but only `.x`/`.y` are real, and the
+`.z` padding merely happens to be 0 on Blaze so the mistake renders plausibly.
+GENERAL TRAP: SPIRV-Cross shows you the *compiled* uniform, not the
+material→uniform binding. When a `g_v*` name in the GLSL differs from the
+material param name (here Blend vs BiasBlend), find the `Expression(...)` in the
+.slang before assuming component order — the compiled `.slang` (find via
+[[cs2-shader-decompile]]) is the ground truth, the reflection alone is not.
+
 **A green extraction run proves nothing about completeness.** v2 stamped
 successfully, exited 0, and silently dropped `g_tPosition` from all 89 weapons
 because the copy loop only accepted `.png` and that map is `.exr`. Check the

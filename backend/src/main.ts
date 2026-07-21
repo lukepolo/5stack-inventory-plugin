@@ -27,6 +27,7 @@ import {
   slotForItem,
   isBaseWeapon,
   getStickerBounds,
+  getRenderTestCatalog,
 } from "./catalog.ts";
 
 // Per-request in/out logging drowns out everything the app actually says
@@ -191,6 +192,107 @@ for (const route of ["/api/renders/:key", "/renders/:key"]) {
   } catch {
     return reply.status(404).send({ error: "not found" });
   }
+  });
+}
+
+// ---- Skin test suite --------------------------------------------------------
+// A dev/QA harness that renders EVERY painted finish (weapon/knife/glove) so a
+// human can eyeball the whole catalog for compositor regressions at once. The
+// PNGs are browser-produced (the real production render path) and streamed here
+// to the same hostPath mount as the card renders — never committed, wiped and
+// regenerated on demand. Serving + storage + the report live in the container;
+// only the WebGL render itself needs a browser (see src/SkinTests.vue).
+//
+// Admin-gated: a full run writes ~2k files and pins a GPU for the better part
+// of an hour, so it is not something a normal signed-in user should kick off.
+const TESTS_DIR = process.env.TESTS_DIR ?? "/cs2-models/tests";
+// Render key = the finish's own economy id. Stable (resumable, overwrite in
+// place) and un-spoofable into a path — the regex is the only thing that ever
+// reaches the filesystem.
+const TEST_KEY = /^test-\d+\.png$/;
+const REPORT_FILE = "report.json";
+
+// The work-list. Public reference data like the rest of /api/catalog.
+app.get("/api/tests/catalog", async () => getRenderTestCatalog());
+
+// Which finishes are already rendered — lets a run resume instead of redoing
+// the whole catalog, and backs the gallery.
+app.get("/api/tests/list", async () => {
+  try {
+    const files = await fs.readdir(TESTS_DIR);
+    return { keys: files.filter((f) => TEST_KEY.test(f)) };
+  } catch {
+    return { keys: [] };
+  }
+});
+
+// Persisted flags from the last run (failures + suspected-grey renders), so the
+// gallery can surface problems after a reload without re-analysing pixels.
+app.get("/api/tests/report", async (_request, reply) => {
+  try {
+    const buf = await fs.readFile(path.join(TESTS_DIR, REPORT_FILE));
+    return reply.type("application/json").send(buf);
+  } catch {
+    return {};
+  }
+});
+app.put("/api/tests/report", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  try {
+    await fs.mkdir(TESTS_DIR, { recursive: true });
+    await fs.writeFile(path.join(TESTS_DIR, REPORT_FILE), JSON.stringify(request.body ?? {}));
+    return { ok: true };
+  } catch {
+    return reply.status(500).send({ error: "test store unavailable" });
+  }
+});
+
+// Store one rendered finish. Raw PNG body (octet-stream, same parser as the
+// card render route); the key is validated against TEST_KEY before it touches
+// disk.
+app.post<{ Params: { key: string } }>("/api/tests/snap/:key", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const key = request.params.key;
+  if (!TEST_KEY.test(key)) return reply.status(400).send({ error: "bad key" });
+  const body = request.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > 5_000_000 || !/^\x89PNG/.test(body.subarray(0, 4).toString("latin1"))) {
+    return reply.status(400).send({ error: "bad render" });
+  }
+  try {
+    await fs.mkdir(TESTS_DIR, { recursive: true });
+    await fs.writeFile(path.join(TESTS_DIR, key), body);
+    return { ok: true };
+  } catch {
+    return reply.status(500).send({ error: "test store unavailable" });
+  }
+});
+
+// Wipe the suite (admin) — everything repopulates on the next run.
+app.delete("/api/tests", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const before = await dirStats(TESTS_DIR);
+  await fs.rm(TESTS_DIR, { recursive: true, force: true }).catch(() => {});
+  await fs.mkdir(TESTS_DIR, { recursive: true }).catch(() => {});
+  return { cleared: before.files };
+});
+
+// Serve the rendered PNGs. Registered under BOTH paths for the same reason as
+// /renders (see above): /api/tests/img/* is the canonical client path, bare
+// /tests/* backs nginx's static-miss fallback.
+for (const route of ["/api/tests/img/:key", "/tests/:key"]) {
+  app.get<{ Params: { key: string } }>(route, async (request, reply) => {
+    const key = request.params.key;
+    if (!TEST_KEY.test(key)) return reply.status(404).send({ error: "not found" });
+    try {
+      const buf = await fs.readFile(path.join(TESTS_DIR, key));
+      reply.header("Cache-Control", "public, max-age=3600");
+      return reply.type("image/png").send(buf);
+    } catch {
+      return reply.status(404).send({ error: "not found" });
+    }
   });
 }
 
@@ -1515,13 +1617,64 @@ async function readExtractState(): Promise<ExtractState> {
 // the two can never drift apart in a release.
 const EXTRACT_VERSION_FILE = path.join(MODELS_ROOT, "models", "extract-version.json");
 
+// The CS2 build the game reports, from its steam.inf. `gameBuild` (ClientVersion)
+// is the monotonic integer we compare on; the patch/date strings are for display.
+interface GameVersion {
+  gameBuild: number | null;
+  gamePatch: string | null;
+  gameDate: string | null;
+}
+
+// steam.inf is a plain Key=Value text file. Tolerant of missing keys / CRLF.
+function parseSteamInf(text: string): GameVersion {
+  const get = (key: string) => {
+    const m = text.match(new RegExp(`^${key}=(.*)$`, "m"));
+    return m ? m[1].trim() : null;
+  };
+  const build = get("ClientVersion");
+  return {
+    gameBuild: build != null && /^\d+$/.test(build) ? Number(build) : null,
+    gamePatch: get("PatchVersion"),
+    gameDate: get("VersionDate"),
+  };
+}
+
 async function readExtractVersion(): Promise<number | null> {
+  return (await readExtractStamp()).version;
+}
+
+// The full stamp written by the last successful run: the pipeline version plus
+// the CS2 build the assets were extracted against. Tolerant of old stamps that
+// predate the game fields (they read back as null).
+async function readExtractStamp(): Promise<{ version: number | null } & GameVersion> {
   try {
     const raw = await fs.readFile(EXTRACT_VERSION_FILE, "utf8");
-    const { version } = JSON.parse(raw) as { version?: unknown };
-    return typeof version === "number" ? version : null;
+    const p = JSON.parse(raw) as Partial<{ version: number } & GameVersion>;
+    return {
+      version: typeof p.version === "number" ? p.version : null,
+      gameBuild: typeof p.gameBuild === "number" ? p.gameBuild : null,
+      gamePatch: typeof p.gamePatch === "string" ? p.gamePatch : null,
+      gameDate: typeof p.gameDate === "string" ? p.gameDate : null,
+    };
   } catch {
-    return null; // never run, or extracted before versioning existed
+    return { version: null, gameBuild: null, gamePatch: null, gameDate: null };
+  }
+}
+
+// The build the mounted CS2 install reports right now — read live, so it reflects
+// a Valve patch that landed after the last extract. Null fields when unmounted.
+async function readCurrentGameVersion(): Promise<GameVersion> {
+  const steamInf = path.join(CS2_DIR, "game", "csgo", "steam.inf");
+  try {
+    const raw = await fs.readFile(steamInf, "utf8");
+    const parsed = parseSteamInf(raw);
+    app.log.debug(
+      `[game-version] read ${steamInf}: build=${parsed.gameBuild ?? "null"} patch=${parsed.gamePatch ?? "null"} date=${parsed.gameDate ?? "null"}`,
+    );
+    return parsed;
+  } catch (e) {
+    app.log.warn(`[game-version] could not read ${steamInf}: ${(e as Error).message}`);
+    return { gameBuild: null, gamePatch: null, gameDate: null };
   }
 }
 
@@ -1549,15 +1702,31 @@ async function hasExtractedModels(): Promise<boolean> {
 }
 
 async function extractVersionInfo() {
-  const [extractVersion, requiredVersion, extracted] = await Promise.all([
-    readExtractVersion(),
+  const [stamp, requiredVersion, extracted, current] = await Promise.all([
+    readExtractStamp(),
     readRequiredExtractVersion(),
     hasExtractedModels(),
+    readCurrentGameVersion(),
   ]);
+  const { version: extractVersion, gameBuild, gamePatch, gameDate } = stamp;
   return {
     extractVersion,
     requiredVersion,
     extracted,
+    // CS2 build the assets were extracted against vs. what the install reports
+    // now. `gameUpdated` is a soft, informational signal — it deliberately does
+    // NOT feed `stale`/the re-extract badge, since most CS2 patches don't touch
+    // weapon models. It's true whenever we have extracted assets and the live
+    // build differs from the stamped one; a MISSING stamp (assets predate build
+    // tracking) counts as "differs" too — we can't claim they're current, so we
+    // surface it rather than silently assume they match.
+    gameBuild,
+    gamePatch,
+    gameDate,
+    currentGameBuild: current.gameBuild,
+    currentGamePatch: current.gamePatch,
+    currentGameDate: current.gameDate,
+    gameUpdated: extracted && current.gameBuild != null && gameBuild !== current.gameBuild,
     // Three things all mean "an admin needs to press the button": nothing
     // extracted at all, output with no version stamp (pre-versioning), and
     // output behind this build's pipeline. `extracted` tells them apart for

@@ -249,7 +249,7 @@ const viewEnterFrom = computed(() =>
 const viewLeaveTo = computed(() =>
   view.value === "inventory" ? "opacity-0 -translate-x-4" : "opacity-0 translate-x-4",
 );
-const DEFAULT_WEAR = 0.06;
+const DEFAULT_WEAR = 0;
 
 // ---- CS2 positional loadout slots -------------------------------------------
 // Like CS2: 1 starting pistol + 4 other pistols, 5 mid-tier, 5 rifles per team.

@@ -186,6 +186,74 @@ export async function uploadRender(instanceId: number, blob: Blob): Promise<{ ok
   }
 }
 
+// ---- Skin test suite --------------------------------------------------------
+// Drives src/SkinTests.vue: the render work-list, the resume/gallery listing,
+// and the persisted problem report. PNGs upload as raw octet-stream (same as
+// uploadRender); the key is the finish's economy id, validated server-side.
+export interface RenderTestItem {
+  id: number;
+  name: string;
+  kind: "weapon" | "knife" | "glove";
+  model: string;
+  paintMaterial: string;
+  legacy: boolean;
+  rarity: string;
+  image: string | null;
+}
+// One entry per rendered finish, keyed by economy id. `status` flags the hard
+// failures (no model, empty frame); `sat`/`luma`/`coverage` are measured off
+// the rendered pixels so the gallery can SORT by chroma — the reliable way to
+// surface a "renders flat grey" compositor bug without false-flagging skins
+// that are legitimately dark or achromatic. Small enough (~2k rows of numbers)
+// to live as a plain JSON blob on the mount and survive reloads.
+export interface TestResult {
+  status: "ok" | "failed" | "empty";
+  /** Mean per-pixel chroma (max−min channel) over gun pixels, 0–255. */
+  sat: number;
+  /** Mean luma over gun pixels, 0–255. */
+  luma: number;
+  /** Share of the frame the weapon covers, 0–1. */
+  coverage: number;
+  reason?: string;
+}
+export type TestReport = Record<string, TestResult>;
+
+export const testKeyFor = (id: number) => `test-${id}.png`;
+export const testImgUrl = (key: string) => `${API_ORIGIN}/api/tests/img/${key}`;
+
+export const fetchTestCatalog = () => request<RenderTestItem[]>("/tests/catalog");
+export const fetchTestList = () =>
+  request<{ keys: string[] }>("/tests/list").then((r) => r.keys);
+export const fetchTestReport = () => request<TestReport>("/tests/report");
+export const saveTestReport = (report: TestReport) =>
+  request<{ ok: boolean }>("/tests/report", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(report),
+  });
+export const clearTests = () =>
+  request<{ cleared: number }>("/tests", { method: "DELETE" });
+
+export async function uploadTestSnap(key: string, blob: Blob): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/tests/snap/${key}`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: blob,
+    });
+    if (res.ok) return { ok: true };
+    let error = `HTTP ${res.status}`;
+    try {
+      const data = (await res.json()) as { error?: string };
+      if (data?.error) error = `${error} — ${data.error}`;
+    } catch { /* non-JSON */ }
+    return { ok: false, error };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
 // Per-weapon sticker geometry (cached — schema data only moves on a CS2 model
 // change). `slots` carries the game's own per-slot UV anchors; `bounds` is the
 // looser envelope cs2-lib derives from them.
@@ -329,6 +397,17 @@ export interface ExtractStatus {
   requiredVersion?: number | null;
   extracted?: boolean;
   stale?: boolean;
+  // CS2 game build. The first three are the build the assets were extracted
+  // against (from the stamp); the `current*` ones are read live from the
+  // mounted install's steam.inf. `gameUpdated` is a soft "the game moved on"
+  // hint — a separate, non-alarming notice, NOT the `stale` re-extract badge.
+  gameBuild?: number | null;
+  gamePatch?: string | null;
+  gameDate?: string | null;
+  currentGameBuild?: number | null;
+  currentGamePatch?: string | null;
+  currentGameDate?: string | null;
+  gameUpdated?: boolean;
 }
 // Plain <a download> hits this: same cookie-auth path the render <img> tags
 // use, so no token juggling.

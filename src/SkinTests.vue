@@ -1,0 +1,410 @@
+<script setup lang="ts">
+// Skin test suite: render EVERY painted finish (weapon / knife / glove) through
+// the real production path (snapshotModel — the same code that bakes card art),
+// stream each PNG to the mount, and lay them all out in one gallery so a human
+// can sweep the whole catalog for compositor regressions at a glance.
+//
+// Why this lives here and not in a standalone tool: the point is to catch what
+// SHIPS, so it must render through the deployed viewer, not a rig that imports
+// src/ directly. This is a route inside the app (an admin tab), so it runs
+// against the same models mount + paint CDN the app itself uses.
+//
+// "Can it all run in the container?" — storage, serving and the report do
+// (backend + nginx, same mount as /renders). The render itself needs WebGL, so
+// it runs in WHATEVER browser opens this page. Open it, hit Run, leave the tab
+// in the foreground; ~2k finishes take the better part of an hour. It is
+// resumable (keyed on each finish's economy id) and safe to stop and restart.
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { Loader2, Play, Square, Trash2, RefreshCw, AlertTriangle } from "lucide-vue-next";
+import { hasModel, snapshotModel } from "./viewer3d";
+import {
+  fetchTestCatalog,
+  fetchTestList,
+  fetchTestReport,
+  saveTestReport,
+  uploadTestSnap,
+  clearTests,
+  testKeyFor,
+  testImgUrl,
+  type RenderTestItem,
+  type TestReport,
+  type TestResult,
+} from "./api";
+
+const props = defineProps<{ isAdmin?: boolean }>();
+const emit = defineEmits<{ (e: "notify", message: string, kind: "error" | "success"): void }>();
+
+// ---- data -------------------------------------------------------------------
+const catalog = ref<RenderTestItem[]>([]);
+const rendered = ref<Set<number>>(new Set()); // ids with a PNG on disk
+const report = ref<TestReport>({});
+const loading = ref(true);
+const loadError = ref<string | null>(null);
+
+// A fresh bake wins over the cached <img> — bump an id here after re-rendering
+// so its thumbnail cache-busts and reloads instead of showing the old pixels.
+const bakeStamp = ref<Record<number, number>>({});
+
+// The render finishes we render at. Wear/seed are the finish's LOOK, not part
+// of the key: the suite holds one current render per finish, and re-running at a
+// different wear overwrites it. Factory New + the app's default seed show the
+// cleanest pattern for spotting problems.
+const wear = ref(0);
+const seed = ref(1);
+
+async function load() {
+  loading.value = true;
+  loadError.value = null;
+  try {
+    const [cat, keys, rep] = await Promise.all([
+      fetchTestCatalog(),
+      fetchTestList(),
+      fetchTestReport().catch(() => ({}) as TestReport),
+    ]);
+    catalog.value = cat;
+    rendered.value = new Set(
+      keys.map((k) => Number(k.replace(/^test-(\d+)\.png$/, "$1"))).filter(Number.isFinite),
+    );
+    report.value = rep ?? {};
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    loading.value = false;
+  }
+}
+onMounted(load);
+
+// ---- the run ----------------------------------------------------------------
+const running = ref(false);
+let stopRequested = false;
+const progress = ref({ done: 0, total: 0 });
+const current = ref<string>("");
+
+const pending = computed(() => catalog.value.filter((i) => !rendered.value.has(i.id)));
+
+// Pixel stats off the rendered frame. The reliable grey-bug signal is low
+// chroma over the weapon's own pixels — but plenty of skins are legitimately
+// achromatic (bare knives, black finishes), so this is a SORT key for triage,
+// never an automatic condemnation. Only the hard failures (no model, empty
+// frame) get a red status.
+const scratch = document.createElement("canvas");
+async function analyze(blob: Blob): Promise<{ sat: number; luma: number; coverage: number }> {
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise<HTMLImageElement>((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = () => rej(new Error("decode failed"));
+      im.src = url;
+    });
+    const S = 96;
+    scratch.width = S;
+    scratch.height = S;
+    const ctx = scratch.getContext("2d", { willReadFrequently: true })!;
+    ctx.clearRect(0, 0, S, S);
+    ctx.drawImage(img, 0, 0, S, S);
+    const { data } = ctx.getImageData(0, 0, S, S);
+    let n = 0, sat = 0, luma = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i + 3] < 24) continue; // transparent backdrop — not the gun
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      n++;
+      sat += Math.max(r, g, b) - Math.min(r, g, b);
+      luma += 0.299 * r + 0.587 * g + 0.114 * b;
+    }
+    return {
+      sat: n ? +(sat / n).toFixed(1) : 0,
+      luma: n ? +(luma / n).toFixed(1) : 0,
+      coverage: +(n / (S * S)).toFixed(3),
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function renderOne(item: RenderTestItem): Promise<TestResult> {
+  if (!(await hasModel(item.model))) {
+    return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: "model not extracted" };
+  }
+  let blob: Blob | null;
+  try {
+    blob = await snapshotModel(item.model, {
+      paintMaterial: item.paintMaterial,
+      legacyPaint: item.legacy,
+      wear: wear.value,
+      seed: seed.value,
+    });
+  } catch (e) {
+    return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: e instanceof Error ? e.message : String(e) };
+  }
+  if (!blob) return { status: "failed", sat: 0, luma: 0, coverage: 0, reason: "snapshot returned no image" };
+
+  const stats = await analyze(blob).catch(() => ({ sat: 0, luma: 0, coverage: 0 }));
+  const up = await uploadTestSnap(testKeyFor(item.id), blob);
+  if (!up.ok) return { status: "failed", ...stats, reason: `upload failed: ${up.error}` };
+
+  rendered.value = new Set(rendered.value).add(item.id);
+  bakeStamp.value = { ...bakeStamp.value, [item.id]: Date.now() };
+  // A frame that's nearly all backdrop means the model didn't draw.
+  if (stats.coverage < 0.01) return { status: "empty", ...stats, reason: "near-empty frame" };
+  return { status: "ok", ...stats };
+}
+
+async function run(items: RenderTestItem[]) {
+  if (running.value) return;
+  running.value = true;
+  stopRequested = false;
+  progress.value = { done: 0, total: items.length };
+  let sinceSave = 0;
+  try {
+    for (const item of items) {
+      if (stopRequested) break;
+      current.value = item.name;
+      const result = await renderOne(item);
+      report.value = { ...report.value, [item.id]: result };
+      progress.value = { ...progress.value, done: progress.value.done + 1 };
+      // Persist the report periodically so a crash or a closed tab mid-run
+      // doesn't lose the problem flags for everything already done.
+      if (++sinceSave >= 40) {
+        sinceSave = 0;
+        saveTestReport(report.value).catch(() => {});
+      }
+      // Yield so the gallery repaints and the WebGL context from the disposed
+      // viewer is reclaimed before the next mount.
+      await new Promise((r) => setTimeout(r, 16));
+    }
+  } finally {
+    await saveTestReport(report.value).catch(() => {});
+    running.value = false;
+    current.value = "";
+    const failed = Object.values(report.value).filter((r) => r.status !== "ok").length;
+    emit(
+      "notify",
+      stopRequested
+        ? `Stopped — ${progress.value.done} rendered this run.`
+        : `Done — ${progress.value.done} rendered, ${failed} flagged.`,
+      "success",
+    );
+  }
+}
+
+const runPending = () => run(pending.value);
+const runAll = () => run(catalog.value);
+function stop() {
+  stopRequested = true;
+}
+onBeforeUnmount(() => {
+  stopRequested = true;
+});
+
+async function reRender(item: RenderTestItem) {
+  if (running.value) return;
+  const result = await renderOne(item);
+  report.value = { ...report.value, [item.id]: result };
+  saveTestReport(report.value).catch(() => {});
+}
+
+async function wipe() {
+  if (running.value) return;
+  if (!confirm("Delete every rendered skin PNG and the report? They regenerate on the next run.")) return;
+  try {
+    const { cleared } = await clearTests();
+    rendered.value = new Set();
+    report.value = {};
+    bakeStamp.value = {};
+    emit("notify", `Cleared ${cleared} files.`, "success");
+  } catch (e) {
+    emit("notify", e instanceof Error ? e.message : String(e), "error");
+  }
+}
+
+// ---- gallery ----------------------------------------------------------------
+const search = ref("");
+const kinds = ref<Record<RenderTestItem["kind"], boolean>>({ weapon: true, knife: true, glove: true });
+const problemsOnly = ref(false);
+const sortByChroma = ref(false);
+
+type Row = RenderTestItem & { result?: TestResult; done: boolean };
+const rows = computed<Row[]>(() => {
+  const q = search.value.trim().toLowerCase();
+  let list: Row[] = catalog.value
+    .filter((i) => kinds.value[i.kind])
+    .filter((i) => !q || i.name.toLowerCase().includes(q))
+    .map((i) => ({ ...i, result: report.value[i.id], done: rendered.value.has(i.id) }));
+  if (problemsOnly.value) list = list.filter((r) => r.result && r.result.status !== "ok");
+  list.sort((a, b) => {
+    if (sortByChroma.value) {
+      // Rendered-but-low-chroma first (the grey-bug suspects), then un-rendered,
+      // then the rest by name.
+      const sa = a.result ? a.result.sat : Infinity;
+      const sb = b.result ? b.result.sat : Infinity;
+      if (sa !== sb) return sa - sb;
+    }
+    return a.name.localeCompare(b.name);
+  });
+  return list;
+});
+
+const stats = computed(() => {
+  const vals = Object.values(report.value);
+  return {
+    total: catalog.value.length,
+    done: rendered.value.size,
+    failed: vals.filter((r) => r.status === "failed").length,
+    empty: vals.filter((r) => r.status === "empty").length,
+  };
+});
+
+function thumbUrl(item: Row): string {
+  const bust = bakeStamp.value[item.id];
+  return testImgUrl(testKeyFor(item.id)) + (bust ? `?v=${bust}` : "");
+}
+function ring(r?: TestResult): string {
+  if (!r) return "ring-border/50";
+  if (r.status === "failed") return "ring-2 ring-red-500/70";
+  if (r.status === "empty") return "ring-2 ring-amber-500/70";
+  return "ring-border/50";
+}
+</script>
+
+<template>
+  <section class="rounded-xl border border-border bg-card text-card-foreground shadow">
+    <div class="space-y-6 p-6">
+      <!-- Header + counts -->
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div class="min-w-0 space-y-1">
+          <h3 class="text-sm font-semibold uppercase tracking-wider text-foreground">Skin test suite</h3>
+          <p class="max-w-xl text-sm text-muted-foreground">
+            Renders every weapon, knife and glove finish through the real viewer so the whole
+            catalog can be eyeballed for compositor issues. Runs in this browser — keep the tab
+            in the foreground. Resumable; the PNGs live on the mount and are never committed.
+          </p>
+        </div>
+        <div class="flex shrink-0 gap-4 text-sm">
+          <div><span class="font-semibold text-foreground">{{ stats.done }}</span
+            ><span class="text-muted-foreground">/{{ stats.total }}</span>
+            <div class="text-xs text-muted-foreground">rendered</div></div>
+          <div><span class="font-semibold" :class="stats.failed ? 'text-red-500' : 'text-foreground'">{{ stats.failed }}</span>
+            <div class="text-xs text-muted-foreground">failed</div></div>
+          <div><span class="font-semibold" :class="stats.empty ? 'text-amber-500' : 'text-foreground'">{{ stats.empty }}</span>
+            <div class="text-xs text-muted-foreground">empty</div></div>
+        </div>
+      </div>
+
+      <p v-if="!isAdmin" class="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-600">
+        <AlertTriangle class="h-4 w-4 shrink-0" />
+        Running the suite writes to the shared mount and needs an administrator session.
+      </p>
+
+      <!-- Controls -->
+      <div class="flex flex-wrap items-center gap-2">
+        <button
+          v-if="!running"
+          :disabled="!isAdmin || loading || !pending.length"
+          class="inline-flex h-9 items-center gap-2 rounded-md bg-[hsl(var(--tac-amber))] px-3 text-sm font-medium text-black transition-colors hover:brightness-110 disabled:opacity-40"
+          @click="runPending"
+        >
+          <Play class="h-3.5 w-3.5" /> Render pending ({{ pending.length }})
+        </button>
+        <button
+          v-else
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-muted"
+          @click="stop"
+        >
+          <Square class="h-3.5 w-3.5" /> Stop
+        </button>
+        <button
+          :disabled="!isAdmin || running || loading"
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm transition-colors hover:bg-muted disabled:opacity-40"
+          @click="runAll"
+          title="Re-render every finish, including ones already done"
+        >
+          <RefreshCw class="h-3.5 w-3.5" /> Re-render all
+        </button>
+        <button
+          :disabled="!isAdmin || running || loading || !stats.done"
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-border px-3 text-sm text-red-500 transition-colors hover:bg-red-500/10 disabled:opacity-40"
+          @click="wipe"
+        >
+          <Trash2 class="h-3.5 w-3.5" /> Clear
+        </button>
+
+        <div class="ml-auto flex items-center gap-3 text-sm text-muted-foreground">
+          <label class="flex items-center gap-1">wear
+            <input v-model.number="wear" type="number" min="0" max="1" step="0.05"
+              :disabled="running" class="h-8 w-16 rounded-md border border-border bg-transparent px-2" /></label>
+          <label class="flex items-center gap-1">seed
+            <input v-model.number="seed" type="number" min="0" max="1000" step="1"
+              :disabled="running" class="h-8 w-16 rounded-md border border-border bg-transparent px-2" /></label>
+        </div>
+      </div>
+
+      <!-- Progress -->
+      <div v-if="running" class="space-y-1">
+        <div class="h-1.5 overflow-hidden rounded-full bg-muted">
+          <div class="h-full bg-[hsl(var(--tac-amber))] transition-[width] duration-200"
+            :style="{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }"></div>
+        </div>
+        <p class="flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 class="h-3 w-3 animate-spin" />
+          {{ progress.done }}/{{ progress.total }} — {{ current }}
+        </p>
+      </div>
+
+      <p v-if="loadError" class="text-sm text-red-500">Failed to load: {{ loadError }}</p>
+
+      <!-- Filters -->
+      <div class="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4 text-sm">
+        <input v-model="search" placeholder="filter by name…"
+          class="h-8 w-48 rounded-md border border-border bg-transparent px-2" />
+        <label v-for="k in (['weapon','knife','glove'] as const)" :key="k" class="flex items-center gap-1 text-muted-foreground">
+          <input v-model="kinds[k]" type="checkbox" /> {{ k }}
+        </label>
+        <label class="flex items-center gap-1 text-muted-foreground">
+          <input v-model="problemsOnly" type="checkbox" /> problems only
+        </label>
+        <label class="flex items-center gap-1 text-muted-foreground" title="Float low-chroma renders to the top — the grey-bug suspects">
+          <input v-model="sortByChroma" type="checkbox" /> sort by chroma
+        </label>
+        <span class="ml-auto text-xs text-muted-foreground">{{ rows.length }} shown</span>
+      </div>
+
+      <!-- Gallery -->
+      <div v-if="loading" class="py-12 text-center text-sm text-muted-foreground">
+        <Loader2 class="mx-auto h-5 w-5 animate-spin" />
+      </div>
+      <div v-else class="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
+        <div v-for="item in rows" :key="item.id"
+          class="group relative overflow-hidden rounded-lg border border-border bg-black/20 ring-1 ring-inset"
+          :class="ring(item.result)">
+          <div class="aspect-square">
+            <img v-if="item.done" :src="thumbUrl(item)" :alt="item.name" loading="lazy"
+              class="h-full w-full object-contain" />
+            <div v-else class="flex h-full w-full items-center justify-center text-[10px] text-muted-foreground">
+              not rendered
+            </div>
+          </div>
+          <div class="space-y-0.5 p-1.5">
+            <p class="truncate text-[11px] font-medium leading-tight text-foreground" :title="item.name">{{ item.name }}</p>
+            <div class="flex items-center justify-between text-[10px] text-muted-foreground">
+              <span>{{ item.kind }}<span v-if="item.legacy"> · legacy</span></span>
+              <span v-if="item.result">sat {{ item.result.sat }}</span>
+            </div>
+            <p v-if="item.result && item.result.status !== 'ok'" class="truncate text-[10px] text-red-500" :title="item.result.reason">
+              {{ item.result.reason }}
+            </p>
+          </div>
+          <!-- Re-render one, on hover -->
+          <button v-if="isAdmin && !running"
+            class="absolute right-1 top-1 hidden rounded bg-black/60 p-1 text-white group-hover:block hover:bg-black/80"
+            title="Re-render this finish" @click="reRender(item)">
+            <RefreshCw class="h-3 w-3" />
+          </button>
+        </div>
+      </div>
+      <p v-if="!loading && !rows.length" class="py-8 text-center text-sm text-muted-foreground">
+        Nothing matches the current filters.
+      </p>
+    </div>
+  </section>
+</template>

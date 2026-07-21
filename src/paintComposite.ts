@@ -147,11 +147,13 @@ export interface PaintDef {
   colorBrightness: number;
   pearlescent: number;
   patternScale: number;
-  /** g_vSprayBlend / g_bBiasSpray — the projected styles (2, 5) only. The blend
-   *  pair weights the Y and Z planes of the triplanar projection; the bias
-   *  re-applies an sRGB encode to the surface normal before unpacking, which
-   *  pushes every component positive so the spray reads as coming from one
-   *  direction (an airbrush) rather than symmetrically from both sides. */
+  /** g_vSprayBlend / g_bBiasSpray — the projected styles (2, 5) only. The pair
+   *  (material .x, .y — g_vSprayBlend is a float2) weights the triplanar mix via
+   *  the CPU-packed g_vSprayBiasBlend: [0] scales the A->B mix by |n.y|^7, [1]
+   *  scales the ->C mix by |n.z|^7. The bias re-applies an sRGB encode to the
+   *  surface normal before unpacking, which pushes every component positive so
+   *  the spray reads as coming from one direction (an airbrush) rather than
+   *  symmetrically from both sides. */
   sprayBlend: [number, number];
   biasSpray: boolean;
   /** g_nPatternTextureHorizontal/VerticalSampling — Source 2
@@ -514,7 +516,13 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       colorBrightness: flt("g_flColorBrightness", 1),
       pearlescent: flt("g_flPearlescentScale", 0),
       patternScale: flt("g_flPatternTexCoordScale", 1),
-      // Shader default is Default2(1, 1) — see csgo_customweapon.slang.
+      // g_vSprayBlend is a float2 (csgo_customweapon.slang:689, Default2(1,1)).
+      // The shader mixes on g_vSprayBiasBlend.y/.z, but those are NOT this vec's
+      // .y/.z — a CPU-side Expression packs them (slang:645):
+      //   g_vSprayBiasBlend = float3(g_bBiasSpray||0, g_vSprayBlend.x, g_vSprayBlend.y)
+      // so shader .y/.z = material .x/.y. Hence [.x, .y] here. (Reading [.y,.z]
+      // is wrong: the material stores a padded vec4 but only .x/.y are real, and
+      // .z is padding that merely happens to be 0 for Blaze.)
       sprayBlend: ((v) => [v?.[0] ?? 1, v?.[1] ?? 1])(vec("g_vSprayBlend")) as [number, number],
       biasSpray: int("g_bBiasSpray", 0) !== 0,
       patternAddrH: int("g_nPatternTextureHorizontalSampling", 0),
