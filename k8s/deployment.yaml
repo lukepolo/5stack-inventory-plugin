@@ -127,23 +127,23 @@ spec:
           hostPath:
             path: /opt/5stack/models/cs2-model-extract
             type: DirectoryOrCreate
-        # The node's CS2 install (game-streamer's steam library), read-only.
+        # The node's CS2 dedicated-server install, read-only. This is the same
+        # tree the game-server pods mount at /serverdata/serverfiles, and every
+        # 5stack game node already has it — no game-streamer (client) install
+        # required. Verified byte-identical to the client install for our
+        # purposes: same pak01_dir.vpk md5, same steam.inf build, same 480 pak
+        # chunks, and the VPK carries weapons/models/* plus the
+        # composite_inputs + paints materials the extractor reads.
         #
-        # Mount game-streamer's ROOT, not the CS2 dir four levels down, and
-        # reach the game via CS2_DIR. The deep path mounted empty even with the
-        # install plainly present on the node: that subtree is assembled by the
-        # game-streamer container (it holds SteamLinuxRuntime files and a
-        # Steam.dll symlink into /mnt/game-streamer, which only resolves inside
-        # that container) and Steam replaces directories under it on update, so
-        # a bind mount of the leaf goes stale. This is the exact path
-        # game-streamer itself hostPaths, so it is known to resolve.
+        # Its ROOT *is* the CS2 dir (game/csgo/pak01_dir.vpk sits two levels
+        # down), so CS2_DIR is just the mountPath — no steamapps/common detour.
         #
         # type: Directory on purpose — a missing path must fail the pod loudly
         # rather than be conjured as an empty dir, which is how this last broke
         # silently and cost hours.
         - name: cs2-game
           hostPath:
-            path: /opt/5stack/game-streamer
+            path: /opt/5stack/serverfiles
             type: Directory
       containers:
         - name: inventory-backend
@@ -170,7 +170,7 @@ spec:
                   name: inventory-secrets
                   key: DATABASE_URL
             - name: CS2_DIR
-              value: /cs2-game/steamapps/common/Counter-Strike Global Offensive
+              value: /cs2-game
             # Scratch (CLI download + raw decompile) goes on the models mount
             # we already have — real node disk with room, no extra volume.
             - name: EXTRACT_WORK_DIR

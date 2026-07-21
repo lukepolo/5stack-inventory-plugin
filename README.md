@@ -293,7 +293,10 @@ does the build-watch + serve in one command.
 5. **3D models (optional)** — the frontend deployment expects a hostPath mount
    at **`/opt/5stack/models/cs2-model-extract`** on the node (mounted read-only
    at `/cs2-models`; `/models/*` is served from its `models/` subfolder).
-   Populate it with `scripts/extract-models.sh` run against a CS2 install. The
+   Populate it with `scripts/extract-models.sh` run against a CS2 install —
+   or just hit "extract models" in the plugin's admin settings, which runs the
+   same script in the backend pod against the CS2 dedicated-server install
+   mounted at `/cs2-game` (hostPath `/opt/5stack/serverfiles`). The
    mount is `DirectoryOrCreate`, so pods run fine without it — the UI detects
    missing models via 404s and simply never offers 3D rendering. Refreshing
    models is a file copy on the node; no rebuild or redeploy.

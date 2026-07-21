@@ -34,7 +34,10 @@ set -euo pipefail
 # loop now probes real extensions and reports anything it fails to recover.
 EXTRACT_VERSION=3
 
-CS2_DIR="${CS2_DIR:-/opt/5stack/game-streamer/steamapps/common/Counter-Strike Global Offensive}"
+# Default is the node's CS2 dedicated-server install — the same tree the
+# game-server pods mount, present on every 5stack game node. Its root IS the
+# CS2 dir (game/csgo/pak01_dir.vpk lives two levels down).
+CS2_DIR="${CS2_DIR:-/opt/5stack/serverfiles}"
 VPK="$CS2_DIR/game/csgo/pak01_dir.vpk"
 OUT_DIR="${OUT_DIR:-}"
 WORK="${WORK_DIR:-$(pwd)}/cs2-model-extract"
