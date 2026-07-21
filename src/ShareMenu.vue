@@ -20,6 +20,12 @@ const props = defineProps<{
   /** Compact icon-only trigger, for tight toolbars. */
   icon?: boolean;
   label?: string;
+  /**
+   * Overrides the trigger's shape (not its colours) where the surrounding row
+   * sizes its controls differently — e.g. focus view, whose header pins
+   * everything to the height of the 2D/3D pill.
+   */
+  btnClass?: string;
 }>();
 
 const open = ref(false);
@@ -58,7 +64,9 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
         :class="[
           props.icon
             ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground'
-            : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground',
+            : props.btnClass
+              ? [props.btnClass, 'text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']
+              : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground',
           open ? 'border-[color:var(--acc)] text-foreground' : 'border-border',
         ]"
         @click.stop="open = !open"

@@ -1033,21 +1033,24 @@ void main() {
   vec2 patUv = xf(vUv, uPatX0, uPatX1);
   bool projected = (uStyle == 2 || uStyle == 5) && uHasPosition;
   vec3 sprP = sprayPos();
-  // Object-space normal for the triplanar plane blend, derived from the position
-  // map's own screen-space gradient (dFdx/dFdy of the blurred object-space
-  // position IS the surface normal, in paint-UV space).
+  // Object-space normal for the triplanar plane blend, taken as the GEOMETRIC
+  // normal: dFdx/dFdy of the blurred object-space position IS the surface normal
+  // in paint-UV space.
   //
-  // We do NOT use g_tSurface here even though Valve's shader does: our EXTRACTED
-  // g_tSurface is broken — 94% of it is empty/black and the ~6% with data decodes
-  // to length-√3 vectors, not unit normals (measured on the deagle). Feeding that
-  // to the plane blend returns a near-constant normal, so the triplanar collapses
-  // to a single plane (A) and the flame graphic smears into VERTICAL STRIPES
-  // instead of curling — the "stretched" look. The position gradient is a clean,
-  // per-weapon-correct normal we already trust, and it makes Deagle | Blaze's
-  // flames match the game's baked albedo. (Proper fix is upstream: re-extract
-  // g_tSurface correctly — see the extractor. This is the robust shader-side
-  // workaround until then. Seams between UV islands get a bad gradient, but the
-  // artwork lands inside islands so it does not show.)
+  // We deliberately do NOT use g_tSurface here even though Valve's shader does.
+  // g_tSurface is a valid unit normal map (verified: |s*2-1| p50 = 1.000, 99.9%
+  // coverage as the SHADER samples it) — but it carries the weapon's fine surface
+  // detail, and the plane blend weights it as pow(|n|, 7). That exponent turns
+  // small detail wobble into hard plane flips, so the pattern switches projection
+  // planes texel to texel and the artwork shreds into VERTICAL STRIPES — the
+  // "stretched" look on Deagle | Blaze. The position gradient is the SMOOTH
+  // geometric normal, so the plane choice is stable and the flames curl and match
+  // the game's baked albedo. All 14 fixtures pass on it.
+  //
+  // NOTE for anyone re-measuring g_tSurface: do NOT sample it through a 2D canvas.
+  // Its alpha is 0 everywhere, and canvas readback premultiplies, so getImageData
+  // returns black and it looks like a broken/empty map. It is not — read it back
+  // through WebGL (or PIL) instead. That artifact cost hours here.
   vec3 sprN = normalize(cross(dFdx(sprP), dFdy(sprP)));
   vec4 pattern = projected
     ? sprayTriplanar(sprP, sprN, uPatX0, uPatX1)

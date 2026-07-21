@@ -403,6 +403,12 @@ const INV_TOOLBAR_PL = computed(() => (invRailShown.value ? "pl-6 lg:pl-2.5" : "
 // and the pair looked mismatched rather than like one set of controls.
 const FOCUS_ACTION =
   "flex h-9 min-w-[104px] items-center justify-center gap-1.5 rounded-md border px-3.5 text-f11 font-medium uppercase tracking-wider transition-colors";
+// Focus view's STAGE controls (Edit / Inspect / Share), which sit in the header
+// beside the 2D/3D pill. They were px/py-sized while the pill is a padded tab
+// group, so they came out ~6px shorter and read as a different tier of control.
+// Everything in that row is pinned to h-8 instead.
+const FOCUS_STAGE =
+  "flex h-8 items-center gap-1.5 rounded-md border px-3 text-f10 uppercase tracking-wider transition-colors";
 function selRing(on: boolean) {
   return on ? { borderColor: "var(--acc)", boxShadow: "0 0 0 1px var(--acc)" } : {};
 }
@@ -4562,7 +4568,7 @@ if (MDEBUG) {
                    anchored to nothing. -->
               <div class="flex flex-none items-center gap-2.5">
                 <!-- Same sliding-pill animated tabs as every other tab group. -->
-                <div v-if="focus3dAvailable" :ref="(el) => focus3dPill.setListEl(el)" class="relative flex items-center rounded-lg bg-muted p-1">
+                <div v-if="focus3dAvailable" :ref="(el) => focus3dPill.setListEl(el)" class="relative flex h-8 items-center rounded-lg bg-muted p-1">
                   <div
                     v-show="focus3dPill.w.value > 0"
                     class="pointer-events-none absolute bottom-1 left-0 top-1 z-0 rounded-md"
@@ -4577,7 +4583,7 @@ if (MDEBUG) {
                   ></div>
                   <button
                     :ref="(el) => focus3dPill.setRef('2D', el)"
-                    class="relative z-[1] flex items-center gap-1.5 rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
+                    class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
                     :class="!focus3d ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
                     @click="setFocus3d(false)"
                   >
@@ -4585,18 +4591,29 @@ if (MDEBUG) {
                   </button>
                   <button
                     :ref="(el) => focus3dPill.setRef('3D', el)"
-                    class="relative z-[1] flex items-center gap-1.5 rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
+                    class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
                     :class="focus3d ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
                     @click="setFocus3d(true)"
                   >
                     <Box class="h-3.5 w-3.5" /> 3D
                   </button>
                 </div>
-                <!-- Inspect + Share live top right, same corner as every other
-                     surface (3D overlay, craft modal, item detail). -->
+                <!-- Edit + Inspect + Share live top right, same corner as every
+                     other surface (3D overlay, craft modal, item detail).
+                     Edit leads: focus is where you land on a slot, and until now
+                     the only way into the editor from here was the context menu
+                     or a trip back to the grid. -->
+                <button
+                  v-if="isSkinned(focusRow) && canEdit && focusInstance"
+                  :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
+                  title="Edit this item — wear, pattern, stickers, charm"
+                  @click="openEdit(focusInstance)"
+                >
+                  <Pencil class="h-3.5 w-3.5" /> Edit
+                </button>
                 <button
                   v-if="isSkinned(focusRow) && canEdit && focusInstance && !isCoarse"
-                  class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+                  :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
                   title="Launch CS2 and inspect this item in-game"
                   @click="openInspectLink(focusInstance.id)"
                 >
@@ -4606,6 +4623,7 @@ if (MDEBUG) {
                   v-if="isSkinned(focusRow) && canEdit"
                   :links="instanceShareLinks(focusInstance?.id)"
                   :note="ITEM_LINK_NOTE"
+                  :btn-class="FOCUS_STAGE"
                 />
               </div>
             </div>

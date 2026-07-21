@@ -171,9 +171,11 @@ export const FIXTURES: Fixture[] = [
           "u<0 to the flame sheet's gold band and u>1 to its green band, which the " +
           "palette maps to black. Wrapping tiles flames onto the grip.\n" +
           "LOAD-BEARING: the triplanar normal comes from the POSITION GRADIENT " +
-          "(cross(dFdx,dFdy) of sprayPos), NOT g_tSurface — the extracted surface " +
-          "normal is broken (94% empty) and collapses the flames into vertical " +
-          "stripes. Judge the FLAT MAP: the flames must CURL, not streak.\n" +
+          "(cross(dFdx,dFdy) of sprayPos), NOT g_tSurface. g_tSurface is a VALID " +
+          "normal map, but it carries fine surface detail and the blend weights it " +
+          "pow(|n|,7), which flips planes texel-to-texel and shreds the flames into " +
+          "vertical stripes. The gradient is the smooth geometric normal. Judge the " +
+          "FLAT MAP: the flames must CURL, not streak.\n" +
           "LOAD-BEARING: g_tPosition (.exr) must have its rows flipped in loadExr " +
           "— EXRLoader hands back a DataTexture that is upside-down vs the .png " +
           "inputs and three ignores flipY on it. Without the flip the flames land " +

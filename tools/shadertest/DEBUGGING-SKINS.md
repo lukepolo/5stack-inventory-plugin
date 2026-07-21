@@ -255,25 +255,33 @@ view-dependent it cannot live in the composite.
 space at all — they build the coordinate from `g_tPosition` via a triplanar
 projection. Any reasoning that assumes paint-UV sampling is wrong for them.
 
-**The extracted `g_tSurface` (object-space normal) is BROKEN, and it collapses
-the triplanar into vertical stripes.** The projection blends three planes by the
-surface normal (`mix(mix(A,B,blend.y·|n.y|⁷), C, blend.z·|n.z|⁷)`). Our extracted
-surface map is 94% empty/black and the ~6% with data decodes to length-√3
-vectors, not unit normals — so `sprayNormal()` returns a near-constant, the blend
-always picks plane A, and A has constant-v on many surfaces, so the flame graphic
-smears into VERTICAL STRIPES ("stretched" look) instead of curling. FIX (shader
-workaround): derive the normal from the position map's own screen-space gradient,
-`normalize(cross(dFdx(sprPos), dFdy(sprPos)))` — the object-space position's
-gradient IS the surface normal in paint-UV space, and it's a clean per-weapon
-normal we already trust. This made Deagle | Blaze's flames curl and match the
-game's baked albedo. PROPER fix is upstream: re-extract g_tSurface correctly (the
-extractor is producing a near-empty map — same class of silent-drop bug as
-g_tPosition in extraction v2). How it was pinned: the flat map matched the game
-on color/distribution but the flame SHAPES differed (ours striped, game curly);
-comparing our flat composite crop to skinport's baked albedo crop side by side
-(sRGB!) showed the stripe-vs-curl clearly, and `|surface·2-1|` measuring √3 proved
-the normal map was garbage. Judge projected skins on the FLAT MAP first — a wrong
-projection is obvious there and pointless to chase on the 3D model.
+**The triplanar plane blend needs the SMOOTH geometric normal, not `g_tSurface`.**
+The projection blends three planes by the surface normal
+(`mix(mix(A,B,blend.y·|n.y|⁷), C, blend.z·|n.z|⁷)`). Feeding it `g_tSurface` —
+which Valve's shader does — shreds the artwork into VERTICAL STRIPES (the
+"stretched" look on Deagle | Blaze): g_tSurface carries the weapon's fine surface
+detail, and `pow(|n|,7)` turns small detail wobble into hard plane flips, so the
+pattern switches projection planes texel to texel. FIX: use the geometric normal,
+`normalize(cross(dFdx(sprPos), dFdy(sprPos)))` — the blurred object-space
+position's gradient IS the surface normal in paint-UV space, and it is smooth, so
+the plane choice is stable. Blaze's flames then curl and match the game's baked
+albedo; 14/14 fixtures pass.
+
+**`g_tSurface` is NOT broken, and canvas readback will lie to you about it.** I
+"measured" it as 94% empty with length-√3 vectors and nearly changed the
+extractor over it. Both readings were false: its alpha is 0 everywhere and a 2D
+canvas PREMULTIPLIES on readback, so `getImageData` returns black for every
+texel. Read it back through WebGL (render it and `readRenderTargetPixels`) or
+with PIL — done that way it is 99.9% covered and `|s*2-1|` p50 = 1.000, a
+perfectly valid unit normal map. The extraction is fine; no re-extract or version
+bump was needed. GENERAL RULE: any input map whose alpha is 0 (surface, masks…)
+cannot be measured through a canvas — use WebGL or PIL.
+
+How the stripe bug was actually pinned: the flat map matched the game on colour
+and distribution, but the flame SHAPES differed (ours striped, game curly).
+Cropping our flat composite next to skinport's baked albedo (sRGB, V-flipped to
+align) made it obvious. Judge projected skins on the FLAT MAP first — a wrong
+projection is unmistakable there and pointless to chase on the 3D model.
 
 **`g_vSprayBlend` is a float2, and the compiled reflection's `.y`/`.z` are NOT
 its `.y`/`.z`.** This one nearly cost a regression. The decompiled GLSL mixes on
