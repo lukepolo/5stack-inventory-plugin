@@ -2,6 +2,7 @@ import { readFileSync, createWriteStream } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import Fastify, { LogController } from "fastify";
 import { pool } from "./db.ts";
@@ -1808,6 +1809,76 @@ async function resolveExtractScript(): Promise<string | null> {
 const CS2_DIR = process.env.CS2_DIR ?? "/cs2-game";
 const EXTRACT_LOG_LINES = 200;
 
+// ---- How many workers the extraction may use -------------------------------
+// One plain integer in a file on the mount, because the script re-reads it as
+// it runs: raising the number in the panel adds workers to the decompile
+// already in progress rather than needing a restart. The DB row is the durable
+// setting; this file is how a live run hears about it.
+const EXTRACT_JOBS_FILE = path.join(MODELS_ROOT, "extract-jobs");
+// Measured peak RSS of ONE decompile worker (see "Parallelism" in the script,
+// where the full measurements live). A range, not a number, because it depends
+// entirely on the weapon a worker draws: the knife directory peaked at 0.5 GB,
+// a single 4K-textured AK at 1.3 GB. Full-run aggregates landed between those
+// per worker (12 workers -> 13.5 GB, 3 -> 3.7 GB), so the band is honest rather
+// than padded. The panel multiplies it out to warn before someone OOMs their
+// box — which is exactly what `-P $(nproc)` used to do here.
+const EXTRACT_WORKER_MIN_MB = 500;
+const EXTRACT_WORKER_MAX_MB = 1400;
+// Headroom the panel tells operators to leave. This plugin runs INSIDE a 5stack
+// deployment, so the box is normally also serving the panel, its database and
+// possibly game servers; an extraction that fits only by consuming every free
+// page takes those down with it.
+const PANEL_RESERVE_MB = 3072;
+// One worker. The failure mode of guessing high is the operator's machine
+// going down, so the default is the one that cannot do that.
+const EXTRACT_JOBS_DEFAULT = 1;
+
+function extractCores(): number {
+  return Math.max(1, os.cpus().length || 1);
+}
+
+/** Node memory, for the panel's "N workers ≈ X GB of Y GB" warning. Reads
+ *  /proc/meminfo first: under a cgroup os.freemem() reports the HOST's free
+ *  pages, and MemAvailable is the number that actually predicts an OOM. */
+async function machineMemoryMb(): Promise<{ totalMb: number | null; availableMb: number | null }> {
+  try {
+    const meminfo = await fs.readFile("/proc/meminfo", "utf8");
+    const field = (name: string) => {
+      const m = new RegExp(`^${name}:\\s+(\\d+) kB`, "m").exec(meminfo);
+      return m ? Math.round(Number(m[1]) / 1024) : null;
+    };
+    const totalMb = field("MemTotal");
+    const availableMb = field("MemAvailable");
+    if (totalMb) return { totalMb, availableMb };
+  } catch {
+    // Not Linux — fall through to the os module.
+  }
+  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
+  const freeMb = Math.round(os.freemem() / 1024 / 1024);
+  return { totalMb: totalMb || null, availableMb: freeMb || null };
+}
+
+async function readExtractJobs(): Promise<number> {
+  const { rows } = await pool.query<{ value: string }>(
+    `SELECT value FROM inventory.settings WHERE key = 'extract_jobs'`,
+  );
+  const n = Number(rows[0]?.value);
+  if (!Number.isInteger(n) || n < 1) return EXTRACT_JOBS_DEFAULT;
+  return Math.min(n, extractCores());
+}
+
+/** Publish the count where the running script can see it. Best-effort: the
+ *  script falls back to its own default if the file is missing or junk, so a
+ *  failure here slows a run down, it doesn't break one. */
+async function writeExtractJobsFile(jobs: number): Promise<void> {
+  try {
+    await fs.mkdir(MODELS_ROOT, { recursive: true });
+    await fs.writeFile(EXTRACT_JOBS_FILE, `${jobs}\n`);
+  } catch (e) {
+    app.log.warn(`[extract-models] could not publish worker count: ${(e as Error).message}`);
+  }
+}
+
 type ExtractState = {
   state: "idle" | "running" | "succeeded" | "failed" | "interrupted";
   startedAt: string | null;
@@ -2159,11 +2230,22 @@ async function startExtraction(): Promise<{ started: true } | { code: number; er
   // Scratch defaults onto the models mount: it's already there, it's real node
   // disk with room, and the raw decompile pass is several GB.
   const workDir = process.env.EXTRACT_WORK_DIR ?? path.join(MODELS_ROOT, ".work");
+  // Publish the worker count before the script can read it, so a run always
+  // starts on the operator's setting rather than the script's own default.
+  const jobs = await readExtractJobs();
+  await writeExtractJobsFile(jobs);
   // Deliberately NOT detached: a run is tied to the process that started it, so
   // restarting the backend stops it. Simple and predictable — the alternative
   // leaves orphaned multi-GB jobs nobody is tracking.
   const child = spawn("bash", [script], {
-    env: { ...process.env, CS2_DIR, OUT_DIR: MODELS_ROOT, WORK_DIR: workDir },
+    env: {
+      ...process.env,
+      CS2_DIR,
+      OUT_DIR: MODELS_ROOT,
+      WORK_DIR: workDir,
+      EXTRACT_JOBS: String(jobs),
+      EXTRACT_JOBS_FILE,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   extractChild = child;
@@ -2271,7 +2353,51 @@ app.get("/api/admin/extract-models", async (request, reply) => {
   const status = live ? { ...stored, state: "running" as const, log: extractLog.join("\n") } : stored;
   const logBytes = await fs.stat(EXTRACT_LOG_FILE).then((s) => s.size, () => 0);
   const progress = live ? await readExtractProgress() : null;
-  return { available: true as const, ...status, logBytes, progress, ...(await extractVersionInfo()) };
+  return {
+    available: true as const,
+    ...status,
+    logBytes,
+    progress,
+    workers: await extractWorkerInfo(),
+    ...(await extractVersionInfo()),
+  };
+});
+
+/** Everything the panel needs to choose a worker count and be warned about it:
+ *  the setting, what the box has, and what a worker costs at each end of the
+ *  measured range. */
+async function extractWorkerInfo() {
+  const { totalMb, availableMb } = await machineMemoryMb();
+  return {
+    jobs: await readExtractJobs(),
+    cores: extractCores(),
+    perWorkerMinMb: EXTRACT_WORKER_MIN_MB,
+    perWorkerMaxMb: EXTRACT_WORKER_MAX_MB,
+    panelReserveMb: PANEL_RESERVE_MB,
+    memTotalMb: totalMb,
+    memAvailableMb: availableMb,
+  };
+}
+
+// Changing this DURING a run is the intended path, not an edge case: the script
+// re-reads the file every couple of seconds, so more workers start within one
+// tick. Fewer never kills a worker mid-model — the pool just stops refilling
+// until it has drained to the new number.
+app.put<{ Body: { jobs?: number } }>("/api/admin/extract-models/jobs", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const cores = extractCores();
+  const raw = Number(request.body?.jobs);
+  if (!Number.isInteger(raw) || raw < 1 || raw > cores) {
+    return reply.status(400).send({ error: `jobs must be a whole number between 1 and ${cores}.` });
+  }
+  await pool.query(
+    `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('extract_jobs', $1, now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [String(raw)],
+  );
+  await writeExtractJobsFile(raw);
+  return { workers: await extractWorkerInfo() };
 });
 
 // Full log as a download — the panel only ever shows the tail, and the

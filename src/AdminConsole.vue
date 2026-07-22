@@ -6,7 +6,20 @@
 // Each side tab is a route (/admin, /admin/assets, /admin/models) — same as
 // settings, where the nav is links rather than in-page anchors.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Loader2, Copy, KeyRound, Trash2, Box, Check, ShieldAlert, Download, Info, ChevronRight } from "lucide-vue-next";
+import {
+  Loader2,
+  Copy,
+  KeyRound,
+  Trash2,
+  Box,
+  Check,
+  ShieldAlert,
+  Download,
+  Info,
+  ChevronRight,
+  Minus,
+  Plus,
+} from "lucide-vue-next";
 import SkinTests from "./SkinTests.vue";
 import {
   API_ORIGIN,
@@ -18,6 +31,7 @@ import {
   setAssetCdn,
   fetchExtractStatus,
   startExtractJob,
+  setExtractJobs,
   extractLogUrl,
   type AssetCdnStatus,
   type CacheStats,
@@ -115,12 +129,12 @@ const invsimSnippet = computed(() =>
 
 // ---- extraction run time ----------------------------------------------------
 const fmtDuration = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`);
-// Prefer this mount's OWN measured time over a generic estimate — it varies a
-// lot with the node. "A few minutes" was badly wrong; it is tens of minutes.
-const extractDurationHint = computed(() => {
-  const secs = extractStatus.value?.lastRunSeconds;
-  return secs != null ? `Took ${fmtDuration(secs)} last time.` : "Can take up to ~30 minutes.";
-});
+// Shown only before this box has ever measured itself — once it has, "Last run"
+// carries the real duration and this would just restate it. Any figure we put
+// here would be a lie on somebody's hardware anyway: it swings with the worker
+// count, the CPU and the disk, and one panel took half an hour.
+const extractDurationHint =
+  "Takes a long time — how long depends on the worker count and this machine's CPU and disk.";
 // The two heaviest steps, which is the actionable part — a bare total tells you
 // the run is long but not which stage to blame.
 const slowestSteps = computed(() => {
@@ -223,7 +237,12 @@ function stopPoll() {
 async function refreshExtractStatus() {
   const wasLive = extractLive.value;
   try {
-    extractStatus.value = await fetchExtractStatus();
+    const next = await fetchExtractStatus();
+    // A poll every 5s racing a debounced edit would yank the worker count back
+    // to the server's older value while someone is still clicking. The pending
+    // number wins until its write lands.
+    if (pendingJobs.value != null && next.workers) next.workers = { ...next.workers, jobs: pendingJobs.value };
+    extractStatus.value = next;
     const s = extractStatus.value;
     emit("extract-stale", s.stale !== true ? null : s.extracted === false ? "missing" : "stale");
   } catch {
@@ -332,18 +351,142 @@ const extractElapsed = computed(() => {
 });
 
 const logLineCount = computed(() => (extractStatus.value?.log ? extractStatus.value.log.split("\n").length : 0));
+/** The download normally rides along in the log disclosure's header. This is
+ *  the case where there is no tail to disclose but a log file still exists —
+ *  after a backend restart the in-memory tail is empty while the file on the
+ *  mount is the whole previous run, which is exactly when someone needs it.
+ *  Also true on a backend too old to report status at all. */
+const showLogFallback = computed(
+  () => !extractStatus.value?.log && (!extractStatus.value || !!extractStatus.value.logBytes),
+);
 
 async function doStartExtract() {
   if (extractBusy.value) return;
   extractBusy.value = true;
   try {
     await startExtractJob();
-    emit("notify", "Extraction job started — this takes a few minutes.", "success");
+    emit("notify", "Extraction job started — expect it to run for a long while.", "success");
     await refreshExtractStatus();
   } catch (e) {
     fail(e);
   } finally {
     extractBusy.value = false;
+  }
+}
+
+// ---- workers ----------------------------------------------------------------
+// A memory dial. Each decompile worker peaks around 1.4 GB (measured — see the
+// script's "Parallelism" note), which is why this defaults to 1 and why the
+// projection below is stated in GB rather than as an abstract "parallelism"
+// number: running this at core count is what OOM-killed people's machines.
+const workersBusy = ref(false);
+const workers = computed(() => extractStatus.value?.workers ?? null);
+const fmtGb = (gb: number) => `${gb >= 10 ? Math.round(gb) : gb.toFixed(1)} GB`;
+
+/** The memory picture as one model, so the bar and the sentence under it can
+ *  never disagree.
+ *
+ *  Everything is measured against TOTAL, with what's already in use as the
+ *  first band — an operator needs to see that the extraction stacks on top of
+ *  a box that is already doing something, not into an empty machine. The
+ *  projection is a RANGE for the same reason the backend reports one: a worker
+ *  drawing the knife directory takes 0.5 GB and one drawing an AK takes 1.3, so
+ *  a single number would be a guess dressed as a measurement. */
+const memPlan = computed(() => {
+  const w = workers.value;
+  if (!w || !w.memTotalMb) return null;
+  const total = w.memTotalMb;
+  const available = w.memAvailableMb ?? null;
+  const inUse = available == null ? null : Math.max(0, total - available);
+  const min = (w.jobs * w.perWorkerMinMb) / 1024;
+  const max = (w.jobs * w.perWorkerMaxMb) / 1024;
+  const reserve = w.panelReserveMb / 1024;
+  const totalGb = total / 1024;
+  const inUseGb = inUse == null ? null : inUse / 1024;
+  const availableGb = available == null ? null : available / 1024;
+  // What the extraction may use before it is eating the panel's headroom.
+  const budgetGb = availableGb == null ? null : Math.max(0, availableGb - reserve);
+  const pct = (gb: number) => Math.max(0, Math.min(100, (gb / totalGb) * 100));
+  return {
+    totalGb,
+    inUseGb,
+    availableGb,
+    reserveGb: reserve,
+    minGb: min,
+    maxGb: max,
+    budgetGb,
+    // Bar geometry, all as percentages of total.
+    usedPct: inUseGb == null ? 0 : pct(inUseGb),
+    // The projection starts where current usage ends and spans min..max.
+    minPct: pct(min),
+    rangePct: pct(max - min),
+    // The reserve is the last slice of the track, so the projection visibly
+    // runs INTO it when a setting is too greedy.
+    reservePct: pct(reserve),
+  };
+});
+
+/** Three states, because they are three different sentences. `over` = even the
+ *  optimistic end doesn't fit; `tight` = the pessimistic end eats the panel's
+ *  headroom. Measured against what is FREE, not total — free is what decides
+ *  whether the kernel starts killing things. */
+const workerRisk = computed<"none" | "tight" | "over">(() => {
+  const p = memPlan.value;
+  if (!p || p.budgetGb == null) return "none";
+  if (p.minGb > p.budgetGb) return "over";
+  if (p.maxGb > p.budgetGb) return "tight";
+  return "none";
+});
+
+// The stepper moves LOCALLY on every click and the write is debounced behind
+// it. Awaiting the round-trip per click meant a request in flight swallowed the
+// next press — measured: five rapid clicks landed as three. A stepper that
+// silently drops input reads as broken, and the fix is not a faster request, it
+// is not making the pointer wait for one.
+let jobsTimer: ReturnType<typeof setTimeout> | null = null;
+/** Set while a debounced write is outstanding, so a status poll landing
+ *  mid-edit can't stomp the number under the user's cursor with the server's
+ *  older one. */
+const pendingJobs = ref<number | null>(null);
+
+function setWorkers(next: number) {
+  const w = workers.value;
+  if (!w) return;
+  const jobs = Math.min(Math.max(1, next), w.cores);
+  if (jobs === w.jobs) return;
+  const from = pendingJobs.value ?? w.jobs;
+  // Optimistic: the bar, the projection and the warnings all recompute off
+  // this, so the whole control answers the click immediately.
+  pendingJobs.value = jobs;
+  if (extractStatus.value) extractStatus.value = { ...extractStatus.value, workers: { ...w, jobs } };
+  if (jobsTimer) clearTimeout(jobsTimer);
+  jobsTimer = setTimeout(() => void commitWorkers(jobs, from), 350);
+}
+
+async function commitWorkers(jobs: number, from: number) {
+  workersBusy.value = true;
+  try {
+    const res = await setExtractJobs(jobs);
+    if (extractStatus.value) extractStatus.value = { ...extractStatus.value, workers: res.workers };
+    // Worth saying out loud when a run is live: the change is not queued for
+    // next time, it lands on the run you are watching.
+    if (extractLive.value) {
+      emit(
+        "notify",
+        jobs > from
+          ? `Now ${jobs} workers — the run in progress will spin up more within a few seconds.`
+          : `Now ${jobs} workers — the run in progress winds down to that as models finish.`,
+        "success",
+      );
+    }
+  } catch (e) {
+    fail(e);
+    // The optimistic number was never persisted — put the truth back rather
+    // than leaving the panel claiming a setting the backend rejected.
+    await refreshExtractStatus();
+  } finally {
+    pendingJobs.value = null;
+    workersBusy.value = false;
   }
 }
 
@@ -750,10 +893,21 @@ const BTN_DANGER =
                   </dd>
                   <dd v-else class="text-sm text-muted-foreground">nothing yet — 3D toggles stay hidden</dd>
                 </div>
-                <div class="flex items-center justify-between gap-4 px-4 py-3">
+                <!-- When it ran and how long it took are ONE fact about ONE
+                     event, so they share a row. As two rows they read as two
+                     separate things to check, and "13m 23s" appeared again next
+                     to the button — the same number in three places. -->
+                <div class="flex items-start justify-between gap-4 px-4 py-3">
                   <dt class="text-sm text-muted-foreground">Last run</dt>
-                  <dd class="font-mono text-sm" :class="extractStatus.finishedAt ? '' : 'text-muted-foreground'">
-                    {{ extractStatus.finishedAt ? new Date(extractStatus.finishedAt).toLocaleString() : "never" }}
+                  <dd class="text-right">
+                    <span class="font-mono text-sm" :class="extractStatus.finishedAt ? '' : 'text-muted-foreground'">
+                      {{ extractStatus.finishedAt ? new Date(extractStatus.finishedAt).toLocaleString() : "never" }}
+                      <template v-if="extractStatus.lastRunSeconds != null">
+                        <span class="text-muted-foreground">·</span>
+                        {{ fmtDuration(extractStatus.lastRunSeconds) }}
+                      </template>
+                    </span>
+                    <span v-if="slowestSteps" class="mt-0.5 block text-xs text-muted-foreground">{{ slowestSteps }}</span>
                   </dd>
                 </div>
                 <!-- Which CS2 build the assets were extracted against, and what
@@ -781,16 +935,6 @@ const BTN_DANGER =
                       <span v-if="extractStatus.currentGamePatch" class="text-muted-foreground">· {{ extractStatus.currentGamePatch }}</span>
                     </template>
                     <template v-else>unknown</template>
-                  </dd>
-                </div>
-                <!-- How long the last run took. Absent on pre-v5 stamps, and a
-                     re-extract is a ~15 minute commitment, so it is worth saying
-                     before someone presses the button rather than after. -->
-                <div v-if="extractStatus.lastRunSeconds != null" class="flex items-center justify-between gap-4 px-4 py-3">
-                  <dt class="text-sm text-muted-foreground">Last run took</dt>
-                  <dd class="text-right">
-                    <span class="font-mono text-sm">{{ fmtDuration(extractStatus.lastRunSeconds) }}</span>
-                    <span v-if="slowestSteps" class="mt-0.5 block text-xs text-muted-foreground">{{ slowestSteps }}</span>
                   </dd>
                 </div>
               </dl>
@@ -832,6 +976,177 @@ const BTN_DANGER =
                   </p>
                 </div>
               </div>
+              <!-- Worker count. Sits directly ABOVE the run button because it
+                   is part of the same decision: how hard this is about to hit
+                   the machine. Stated in GB, not as a "parallelism" number —
+                   the cost is memory, and the default of 1 exists because
+                   running one per core OOM-killed people's boxes. -->
+              <div v-if="workers" class="rounded-lg border border-border/70 bg-background/40 px-4 py-3">
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <p class="text-sm font-medium text-foreground">Parallel workers</p>
+                    <!-- What a worker IS, and what the box has, on one line —
+                         the capacity figure belongs with the explanation, not
+                         as a fourth entry in the colour key below. -->
+                    <p class="text-xs text-muted-foreground">
+                      Weapon models decompiled at once, while step 1 runs.<template v-if="memPlan">
+                        <span class="mx-1 text-muted-foreground/50">·</span>
+                        <span class="font-mono"
+                          >{{ memPlan.availableGb != null ? fmtGb(memPlan.availableGb) : "?" }} free of
+                          {{ fmtGb(memPlan.totalGb) }}</span
+                        ></template
+                      >
+                    </p>
+                  </div>
+                  <!-- Stepper, not a free-text field: the range is 1..cores and
+                       every value in it is one click from the current one. -->
+                  <div class="flex items-center gap-1">
+                    <button
+                      :class="[BTN, 'w-9 px-0']"
+                      :disabled="workers.jobs <= 1"
+                      title="Fewer workers"
+                      aria-label="Fewer workers"
+                      @click="setWorkers(workers.jobs - 1)"
+                    >
+                      <Minus class="h-3.5 w-3.5" />
+                    </button>
+                    <span
+                      class="min-w-[3.5rem] text-center font-mono text-lg tabular-nums"
+                      :class="workerRisk === 'over' ? 'text-destructive' : ''"
+                      aria-live="polite"
+                      >{{ workers.jobs }}</span
+                    >
+                    <button
+                      :class="[BTN, 'w-9 px-0']"
+                      :disabled="workers.jobs >= workers.cores"
+                      title="More workers"
+                      aria-label="More workers"
+                      @click="setWorkers(workers.jobs + 1)"
+                    >
+                      <Plus class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+                <!-- The projection is the whole point of the control: a worker
+                     count on its own tells an operator nothing about whether
+                     their box survives it. One track = all the memory on this
+                     machine, read left to right: what is in use now, what this
+                     setting adds (as a range, since it depends on the weapon a
+                     worker draws), and the headroom the rest of 5stack needs. -->
+                <template v-if="memPlan">
+                  <!-- Absolutely positioned bands, NOT flex children: flex items
+                       shrink to fit, so an over-budget projection would quietly
+                       compress itself back inside the track — understating the
+                       exact situation the bar exists to show. Positioned, it
+                       overruns the panel's reserve and gets clipped, which is
+                       what "this does not fit" should look like. -->
+                  <div
+                    class="relative mt-3 h-3 w-full overflow-hidden rounded-full bg-muted"
+                    role="img"
+                    :aria-label="`${fmtGb(memPlan.totalGb)} total memory. ${
+                      memPlan.inUseGb != null ? fmtGb(memPlan.inUseGb) + ' in use. ' : ''
+                    }Extraction needs about ${fmtGb(memPlan.minGb)} to ${fmtGb(memPlan.maxGb)} at ${workers.jobs} worker${
+                      workers.jobs === 1 ? '' : 's'
+                    }. ${fmtGb(memPlan.reserveGb)} reserved for the 5stack panel.`"
+                  >
+                    <!-- Panel headroom first, so the extraction draws OVER it
+                         when a setting is greedy enough to collide. -->
+                    <span
+                      class="absolute inset-y-0 right-0 bg-destructive/25"
+                      :style="{ width: memPlan.reservePct + '%' }"
+                    ></span>
+                    <!-- In use now. /35 rather than /25: against the track this
+                         sat at almost the same value, so the bar read as one
+                         undifferentiated grey blob and "how much headroom do I
+                         have" — the question it exists to answer — was lost. -->
+                    <span
+                      class="absolute inset-y-0 left-0 bg-foreground/35"
+                      :style="{ width: memPlan.usedPct + '%' }"
+                    ></span>
+                    <!-- Extraction: the part every run pays… The glow is the
+                         panel's existing vocabulary for "this is the live
+                         thing", and it earns it here — at one worker the band
+                         is a 2% sliver that otherwise disappears. It animates
+                         because it is the direct result of the stepper: seeing
+                         it grow is what connects the click to the cost. -->
+                    <span
+                      class="absolute inset-y-0 transition-[left,width] duration-300 ease-out motion-reduce:transition-none"
+                      :class="
+                        workerRisk === 'over'
+                          ? 'bg-destructive shadow-[0_0_6px_hsl(var(--destructive)/0.7)]'
+                          : 'bg-[hsl(var(--tac-amber))] shadow-[0_0_6px_hsl(var(--tac-amber)/0.6)]'
+                      "
+                      :style="{ left: memPlan.usedPct + '%', width: memPlan.minPct + '%' }"
+                    ></span>
+                    <!-- …and the part that depends on which weapons land where.
+                         Striped so it reads as "up to", not "will". -->
+                    <span
+                      class="absolute inset-y-0 opacity-60 transition-[left,width] duration-300 ease-out motion-reduce:transition-none [background-image:repeating-linear-gradient(45deg,currentColor_0_3px,transparent_3px_6px)]"
+                      :class="workerRisk === 'over' ? 'text-destructive' : 'text-[hsl(var(--tac-amber))]'"
+                      :style="{ left: memPlan.usedPct + memPlan.minPct + '%', width: memPlan.rangePct + '%' }"
+                    ></span>
+                  </div>
+                  <!-- A colour KEY, nothing else. It used to double as a stat
+                       readout, which put "In use 18 GB" next to "Free 14 GB of
+                       31 GB" — the same fact stated twice, since one is the
+                       other subtracted from the total. -->
+                  <dl class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.7rem] text-muted-foreground">
+                    <div v-if="memPlan.inUseGb != null" class="flex items-center gap-1.5">
+                      <span class="h-2 w-2 rounded-sm bg-foreground/25"></span>
+                      <dt>In use</dt>
+                      <dd class="font-mono">{{ fmtGb(memPlan.inUseGb) }}</dd>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                      <span
+                        class="h-2 w-2 rounded-sm"
+                        :class="workerRisk === 'over' ? 'bg-destructive' : 'bg-[hsl(var(--tac-amber))]'"
+                      ></span>
+                      <dt>Extraction</dt>
+                      <dd class="font-mono">{{ fmtGb(memPlan.minGb) }}–{{ fmtGb(memPlan.maxGb) }}</dd>
+                    </div>
+                    <div class="flex items-center gap-1.5">
+                      <span class="h-2 w-2 rounded-sm bg-destructive/25"></span>
+                      <dt>5stack panel</dt>
+                      <dd class="font-mono">{{ fmtGb(memPlan.reserveGb) }} min</dd>
+                    </div>
+                  </dl>
+                </template>
+                <p class="mt-2 text-xs" :class="workerRisk === 'none' ? 'text-muted-foreground' : ''">
+                  <template v-if="workerRisk === 'over'">
+                    <span class="font-medium text-destructive">
+                      {{ workers.jobs }} workers won't fit. Even the low end needs
+                      <span class="font-mono">{{ fmtGb(memPlan!.minGb) }}</span> and only
+                      <span class="font-mono">{{ fmtGb(memPlan!.budgetGb!) }}</span> is spare once the panel keeps its
+                      {{ fmtGb(memPlan!.reserveGb) }}.
+                    </span>
+                    The kernel will start killing processes — the extraction, the panel, or a live match. Lower it.
+                  </template>
+                  <template v-else-if="workerRisk === 'tight'">
+                    <span class="font-medium text-[hsl(var(--tac-amber))]">
+                      {{ workers.jobs }} workers may not fit.
+                    </span>
+                    If several land on 4K-textured weapons at once this reaches
+                    <span class="font-mono">{{ fmtGb(memPlan!.maxGb) }}</span> and starts eating the
+                    {{ fmtGb(memPlan!.reserveGb) }} the rest of 5stack needs. Safe below
+                    <span class="font-mono">{{ fmtGb(memPlan!.budgetGb!) }}</span
+                    >.
+                  </template>
+                  <template v-else-if="workers.jobs === 1">
+                    Raise it if this machine has memory to spare — more workers is the main thing that makes an
+                    extraction finish sooner.
+                  </template>
+                  <template v-else> Fits with room to spare. </template>
+                  <!-- Say it plainly: the knob is live. Without this, an
+                       operator watching a slow run assumes they have to cancel
+                       and start over to change it — the one thing this design
+                       exists to avoid. -->
+                  <template v-if="extractLive">
+                    <br />Takes effect on the run in progress — within seconds while models are decompiling, at the next
+                    batch after that. Lowering it never kills work mid-model; the pool just drains to the new number.
+                  </template>
+                </p>
+              </div>
+
               <!-- Problem and its fix as one block. The button used to sit
                    below the log, several hundred pixels from the sentence
                    telling you to press it. -->
@@ -880,9 +1195,12 @@ const BTN_DANGER =
                         : `Out of date — the mount has ${extractStatus.extractVersion == null ? "an unversioned pipeline" : "v" + extractStatus.extractVersion}, this build produces v${extractStatus.requiredVersion}.`
                     }}
                   </span>
+                  <!-- The estimate appears ONLY when this box has never measured
+                       itself. Once "Last run" carries a real duration, repeating
+                       it here made one number look like two different claims. -->
                   <span class="block text-muted-foreground">
-                    {{ extractDurationHint }} Replaces what's on the mount in place — 3D stays served
-                    throughout.
+                    <template v-if="extractStatus.lastRunSeconds == null">{{ extractDurationHint }} </template>
+                    Replaces what's on the mount in place — 3D stays served throughout.
                   </span>
                 </p>
               </div>
@@ -960,12 +1278,28 @@ const BTN_DANGER =
                 :open="extractLive || extractStatus.state === 'failed' || extractStatus.state === 'interrupted'"
                 class="group rounded-md border border-border"
               >
+                <!-- The download lives IN this header rather than in a block of
+                     its own below. Two separate log affordances, in two
+                     different styles, split by the progress list read as two
+                     features; they are one thing — the tail, and all of it.
+                     `.stop` keeps the link from toggling the disclosure. -->
                 <summary
                   class="flex cursor-pointer list-none items-center gap-2 px-4 py-2.5 text-sm text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden"
                 >
-                  <ChevronRight class="h-3.5 w-3.5 transition-transform duration-200 group-open:rotate-90" />
+                  <ChevronRight class="h-3.5 w-3.5 flex-none transition-transform duration-200 group-open:rotate-90" />
                   Run log
                   <span class="font-mono text-xs">last {{ logLineCount.toLocaleString() }} lines</span>
+                  <a
+                    :class="[BTN, 'ml-auto h-7 gap-1.5 px-2 text-xs']"
+                    :href="extractLogUrl()"
+                    download="extract-models.log"
+                    title="Complete output of the most recent run — the box below only shows the tail"
+                    @click.stop
+                  >
+                    <Download class="h-3 w-3" />
+                    Full log
+                    <span v-if="extractStatus.logBytes" class="font-mono">({{ fmtBytes(extractStatus.logBytes) }})</span>
+                  </a>
                 </summary>
                 <pre
                   class="max-h-72 overflow-auto whitespace-pre border-t border-border bg-background px-4 py-3 font-mono text-xs leading-relaxed text-muted-foreground"
@@ -976,18 +1310,24 @@ const BTN_DANGER =
             <!-- Outside the v-else on purpose: the last run's log is worth
                  grabbing even when the status lookup itself came back empty.
                  Plain link, not fetch — the browser streams it straight to
-                 disk and carries the session cookie on its own. -->
-            <div class="flex flex-wrap items-center gap-3 border-t border-border pt-4">
-              <a :class="BTN" :href="extractLogUrl()" download="extract-models.log">
-                <Download class="h-3.5 w-3.5" />
-                Download full log
-                <span v-if="extractStatus?.logBytes" class="font-mono text-xs">
-                  ({{ fmtBytes(extractStatus.logBytes) }})
-                </span>
+                 disk and carries the session cookie on its own. Same bordered
+                 module as the disclosure it stands in for, so the card keeps
+                 one container language top to bottom. -->
+            <div
+              v-if="showLogFallback"
+              class="flex flex-wrap items-center gap-3 rounded-md border border-border px-4 py-2.5"
+            >
+              <span class="text-sm text-muted-foreground">Run log</span>
+              <span class="text-xs text-muted-foreground/70">no tail in memory — the file is the whole run</span>
+              <a
+                :class="[BTN, 'ml-auto h-7 gap-1.5 px-2 text-xs']"
+                :href="extractLogUrl()"
+                download="extract-models.log"
+              >
+                <Download class="h-3 w-3" />
+                Full log
+                <span v-if="extractStatus?.logBytes" class="font-mono">({{ fmtBytes(extractStatus.logBytes) }})</span>
               </a>
-              <p class="text-xs text-muted-foreground">
-                Complete output of the most recent run — the box above only shows the tail.
-              </p>
             </div>
           </div>
         </section>

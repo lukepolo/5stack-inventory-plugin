@@ -76,8 +76,56 @@ if [[ ! -f "$VPK" ]]; then
   exit 1
 fi
 
+# ---- Parallelism -------------------------------------------------------------
+# Sized in WORKERS, and the unit that matters is memory, not cores. Every
+# fan-out here is a Source2Viewer or ImageMagick process, and the CLI's peak RSS
+# is set by the textures it decodes WHOLE, not by how long it runs. Measured on
+# a 12-core node:
+#
+#   decompile one weapon dir  -> 1.3 GB anon RSS (a single 4K-textured AK is
+#                                0.8 GB on its own; the knife dir, 22 models
+#                                with smaller maps, is only 0.5 GB)
+#   extract a texture batch   -> ~0.12 GB per process
+#
+# .NET GC knobs do nothing about that (tried: gcServer=0, GCConserveMemory=9,
+# GCHeapHardLimit — all within noise), because the memory is live decoded
+# pixels, not GC slack. How many run at once is the only lever. Measured over
+# the full 41-dir decompile on that node:
+#
+#   -P 12 -> 13.5 GB peak, 79s        -P 3 -> 3.7 GB peak,  86s
+#   -P  6 ->  7.0 GB peak, 78s        -P 2 -> 2.4 GB peak, 106s
+#
+# THE DEFAULT IS ONE. This step used to run `-P $(nproc)`, which asked for up to
+# 13.5 GB and OOM-killed people's machines — not the extraction, the box. The
+# cost of guessing low is a slower run; the cost of guessing high is somebody's
+# server falling over, so low is the default and the panel offers the knob with
+# the per-worker cost printed next to it.
+#
+# The count is re-read from JOBS_FILE while the run is going (see the decompile
+# loop), so raising it in the panel spins up more workers in a run ALREADY IN
+# PROGRESS. That is the intended workflow: start at one, watch the memory, add
+# workers if the box has room.
+DECOMPILE_WORKER_MB=1400   # measured peak RSS of one decompile shard
+EXTRACT_WORKER_MB=120      # …and of one texture extract/convert worker
+JOBS_FILE="${EXTRACT_JOBS_FILE:-${OUT_DIR:-$WORK}/extract-jobs}"
+CORES=$(nproc 2>/dev/null || echo 4)
+read_jobs() { # the panel's number, else the env, else 1 — clamped to the cores
+  local n=""
+  if [[ -r "$JOBS_FILE" ]]; then read -r n < "$JOBS_FILE" || true; fi
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then n="${EXTRACT_JOBS:-1}"; fi
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then n=1; fi
+  if (( n > CORES )); then n=$CORES; fi
+  if (( n < 1 )); then n=1; fi
+  printf '%s' "$n"
+}
+# The python steps read the same file for their own pools.
+export JOBS_FILE CORES
+echo "--- Parallelism: starting at $(read_jobs) worker(s) — about $((DECOMPILE_WORKER_MB / 1024))GB each" \
+  "while decompiling, $CORES cores available. Adjustable from the panel mid-run."
+
 # ---- Step timing -------------------------------------------------------------
-# A full run is ~15 minutes and most of it is one opaque decompile, so without
+# A full run is long — tens of minutes, and how many depends on the worker count
+# and the box — with most of it in one opaque decompile, so without
 # per-step numbers there is no way to tell where to spend effort. Each step
 # reports its own elapsed time, and the total lands in extract-version.json so
 # the admin panel can say how long the last run took.
@@ -217,7 +265,9 @@ echo "--- Decompiling weapon models (this takes a few minutes)…"
 # shader. Chasing this costs a from-source VRF build and buys nothing.
 # Sharded by weapon directory across all cores. As ONE invocation this is a
 # single-threaded walk of every model and by far the longest step; the shards are
-# independent (one weapon each) so they scale nearly linearly.
+# independent (one weapon each) so they scale nearly linearly — but each one
+# peaks around 1.3 GB, so how many run at once is the operator's call (see
+# "Parallelism" at the top), not the core count's.
 #
 # Each shard gets its OWN output dir. Pointing them all at $RAW would have them
 # racing to write the same shared material/texture files, and a torn texture is
@@ -235,48 +285,54 @@ if (( ${#WEAPON_DIRS[@]} == 0 )); then
     --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
     --gltf_export_animations
 else
-  echo "--- Sharding ${#WEAPON_DIRS[@]} weapon dirs across $(nproc) cores…"
-  export CLI VPK SHARDS
-  # Each shard touches a marker on completion; a watcher turns that into a
-  # per-weapon count so the panel shows real movement instead of sitting on
-  # "step 1 of 7" for the whole decompile.
+  echo "--- Sharding ${#WEAPON_DIRS[@]} weapon dirs, starting at $(read_jobs) worker(s)…"
+  # Each shard touches a marker on completion, which is both the progress count
+  # the panel reads and how the scheduler below knows what is still in flight.
   SHARD_DONE="$SHARDS/.done"
   mkdir -p "$SHARD_DONE"
-  export SHARD_DONE
-  (
-    total=${#WEAPON_DIRS[@]}
-    while [[ -d "$SHARD_DONE" ]]; do
-      n=$(find "$SHARD_DONE" -type f 2>/dev/null | wc -l | tr -d "[:space:]")
-      prog "decompile-models" running "$n" "$total"
-      (( n >= total )) && break
-      sleep 3
-    done
-  ) &
-  SHARD_WATCH=$!
   # FILTER, do not silence. As one pass this step emitted ~26k lines, almost all
   # of it the documented VCS-71 shader noise plus a four-line vpk preamble per
   # shard. Dumping it all buried everything; dumping none of it also threw away
   # real decompile failures, which is the only thing here worth reading. Keep
-  # the rest, tagged with the weapon so 12 parallel shards stay legible.
-  #
-  # The pattern lives in an exported VARIABLE on purpose. Inlining it put single
-  # quotes inside the single-quoted `bash -c '...'` body below, which closed that
-  # string early — the shell then tried to run `^Preloading` as a command and no
-  # shard ever executed.
+  # the rest, tagged with the weapon so parallel shards stay legible.
   SHARD_NOISE='Only VCS file versions|^Preloading vpk|^Added folder|^Found "Counter-Strike 2"|^--- Dumping decompiled|^--- Creating mesh|^--- Loading material|^--- Dump written to|^$'
-  export SHARD_NOISE
-  printf '%s\n' "${WEAPON_DIRS[@]}" | xargs -P "$(nproc)" -I{} bash -c '
-    dir="$1"
-    out="$SHARDS/$(echo "$dir" | tr "/" "_")"
-    "$CLI" -i "$VPK" -o "$out" -d -f "$dir" -e "vmdl_c" \
+  shard_one() {
+    local dir="$1" tag
+    tag="${dir//\//_}"
+    "$CLI" -i "$VPK" -o "$SHARDS/$tag" -d -f "$dir" -e "vmdl_c" \
       --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
       --gltf_export_animations 2>&1 |
       grep -vE "$SHARD_NOISE" |
       sed "s|^|    [$(basename "$dir")] |" || true
-    : >"$SHARD_DONE/$(echo "$dir" | tr "/" "_")"
-  ' _ {}
-  kill "$SHARD_WATCH" 2>/dev/null || true
-  wait "$SHARD_WATCH" 2>/dev/null || true
+    : >"$SHARD_DONE/$tag"
+  }
+  # A dynamic pool rather than `xargs -P N`: xargs fixes its width at launch,
+  # and the whole point of the knob is that an operator who starts at one worker
+  # and sees the box coping can raise it WITHOUT restarting a run that is
+  # already twenty minutes in. Every tick re-reads the count and tops the pool
+  # up to it. Lowering never kills a shard mid-flight — it just stops new ones
+  # starting until enough have finished, so the memory comes down on its own.
+  shard_total=${#WEAPON_DIRS[@]}
+  launched=0
+  want=$(read_jobs)
+  while :; do
+    done_n=$(find "$SHARD_DONE" -type f 2>/dev/null | wc -l | tr -d "[:space:]")
+    prog "decompile-models" running "$done_n" "$shard_total"
+    if (( done_n >= shard_total )); then break; fi
+    prev=$want
+    want=$(read_jobs)
+    if (( want != prev )); then
+      echo "--- Workers: $prev -> $want (panel)"
+    fi
+    # `launched - done_n` over-counts if a shard finished since the find above,
+    # which only ever makes this wait a tick longer. Never the other way round.
+    while (( launched < shard_total )) && (( launched - done_n < want )); do
+      shard_one "${WEAPON_DIRS[launched]}" &
+      launched=$((launched + 1))
+    done
+    sleep 2
+  done
+  wait
   for shard in "$SHARDS"/*/; do
     [[ -d "$shard" ]] && cp -rn "$shard". "$RAW/" 2>/dev/null || true
   done
@@ -442,6 +498,27 @@ import json, os, re, shutil, subprocess, sys
 cli, vpk, raw, dest = (os.environ[k] for k in ("CLI", "VPK", "RAW_CI", "DEST"))
 raw_models = os.environ["RAW"]  # step-2 vmdl tree — holds the *_mag.glb exports
 
+# ---- pool sizing ------------------------------------------------------------
+# Same worker count the panel writes and the decompile loop watches, re-read
+# every time a pool is built (once per batch), so raising the knob mid-run
+# speeds these steps up too.
+#
+# Floored at 4, unlike the decompile: these extract and convert TEXTURES at
+# ~0.12 GB per process, so four of them still sit under the 1.3 GB a SINGLE
+# decompile worker needs — memory the run has already spent by the time it gets
+# here. Dropping them to one would add minutes to the icon and paint steps to
+# save headroom nothing else is using.
+CORES = int(os.environ.get("CORES") or 0) or (os.cpu_count() or 4)
+
+
+def pool_size(cap=8):
+    try:
+        with open(os.environ["JOBS_FILE"]) as fh:
+            n = int(fh.read().strip())
+    except Exception:
+        n = int(os.environ.get("EXTRACT_JOBS") or 1)
+    return max(1, min(cap, CORES, max(4, n)))
+
 # The customization tree names folders by weapon CLASS (pist_/rif_/smg_/snip_/
 # shot_/mach_), which is NOT the cs2-lib model key the plugin serves under.
 # Stripping the prefix covers most; these are the ones it doesn't.
@@ -589,7 +666,7 @@ def progress(step, done, total):
 
 from concurrent.futures import ThreadPoolExecutor
 _ordered = sorted(vmats)
-with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as _pool:
+with ThreadPoolExecutor(max_workers=pool_size(CORES)) as _pool:
     SCANNED = dict(zip(_ordered, _pool.map(scan, _ordered)))
 
 # Pre-extract every texture these bundles reference, in ONE pass. `-f` takes a
@@ -603,7 +680,7 @@ _all_vtex = sorted({
 })
 print(f"--- Pre-extracting {len(_all_vtex)} composite-input textures…", flush=True)
 _BATCH = 150
-_workers = max(2, min(8, (os.cpu_count() or 4)))
+_workers = pool_size()
 for _i in range(0, len(_all_vtex), _BATCH):
     _batch = _all_vtex[_i:_i + _BATCH]
     _stride = max(1, (len(_batch) + _workers - 1) // _workers)
@@ -1248,6 +1325,27 @@ cli, vpk = os.environ["CLI"], os.environ["VPK"]
 raw, dest = os.environ["RAW_ICONS"], os.environ["IMG_DEST"]
 manifest = json.load(open(os.environ["ASSET_MANIFEST"]))["icons"]
 
+# ---- pool sizing ------------------------------------------------------------
+# Same worker count the panel writes and the decompile loop watches, re-read
+# every time a pool is built (once per batch), so raising the knob mid-run
+# speeds these steps up too.
+#
+# Floored at 4, unlike the decompile: these extract and convert TEXTURES at
+# ~0.12 GB per process, so four of them still sit under the 1.3 GB a SINGLE
+# decompile worker needs — memory the run has already spent by the time it gets
+# here. Dropping them to one would add minutes to the icon and paint steps to
+# save headroom nothing else is using.
+CORES = int(os.environ.get("CORES") or 0) or (os.cpu_count() or 4)
+
+
+def pool_size(cap=8):
+    try:
+        with open(os.environ["JOBS_FILE"]) as fh:
+            n = int(fh.read().strip())
+    except Exception:
+        n = int(os.environ.get("EXTRACT_JOBS") or 1)
+    return max(1, min(cap, CORES, max(4, n)))
+
 ECON = "panorama/images/econ/"
 
 # ---- index the archive's icons -------------------------------------------
@@ -1390,7 +1488,7 @@ for bi in range(0, len(todo_paths), BATCH):
     batch = todo_paths[bi:bi + BATCH]
     shutil.rmtree(raw, ignore_errors=True)
     os.makedirs(raw, exist_ok=True)
-    workers = max(2, min(8, (os.cpu_count() or 4)))
+    workers = pool_size()
     stride = max(1, (len(batch) + workers - 1) // workers)
     slices = [batch[i:i + stride] for i in range(0, len(batch), stride)]
 
@@ -1419,7 +1517,7 @@ for bi in range(0, len(todo_paths), BATCH):
                 jobs.append((src, out, tint))
 
     if jobs:
-        with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as pool:
+        with ThreadPoolExecutor(max_workers=pool_size(CORES)) as pool:
             for ok, (_, out, _) in zip(pool.map(lambda j: convert(*j), jobs), jobs):
                 if ok:
                     written += 1
@@ -1491,6 +1589,27 @@ from concurrent.futures import ThreadPoolExecutor
 cli, vpk = os.environ["CLI"], os.environ["VPK"]
 raw, dest = os.environ["RAW_PAINTS"], os.environ["PAINT_DEST"]
 manifest = json.load(open(os.environ["ASSET_MANIFEST"])).get("paints", [])
+
+# ---- pool sizing ------------------------------------------------------------
+# Same worker count the panel writes and the decompile loop watches, re-read
+# every time a pool is built (once per batch), so raising the knob mid-run
+# speeds these steps up too.
+#
+# Floored at 4, unlike the decompile: these extract and convert TEXTURES at
+# ~0.12 GB per process, so four of them still sit under the 1.3 GB a SINGLE
+# decompile worker needs — memory the run has already spent by the time it gets
+# here. Dropping them to one would add minutes to the icon and paint steps to
+# save headroom nothing else is using.
+CORES = int(os.environ.get("CORES") or 0) or (os.cpu_count() or 4)
+
+
+def pool_size(cap=8):
+    try:
+        with open(os.environ["JOBS_FILE"]) as fh:
+            n = int(fh.read().strip())
+    except Exception:
+        n = int(os.environ.get("EXTRACT_JOBS") or 1)
+    return max(1, min(cap, CORES, max(4, n)))
 
 
 # Unit-level progress for the panel. Written to the same file the shell uses —
@@ -1726,7 +1845,7 @@ TEMPLATE_TREES = {"materials/models/weapons/customization/", "workshop/paintkits
 TREES = sorted({"/".join(p.split("/")[:2]) + "/" for p in wanted_name} | TEMPLATE_TREES)
 specs = [(t, e) for t in TREES for e in ("vcompmat_c", "vmat_c")]
 blocks = {}
-with ThreadPoolExecutor(max_workers=min(8, max(2, len(specs)))) as pool:
+with ThreadPoolExecutor(max_workers=max(2, min(pool_size(), len(specs)))) as pool:
     for part in pool.map(dump, specs):
         blocks.update(part)
 print(f"---   dumped {len(blocks)} material blocks from {len(TREES)} trees")
@@ -1875,7 +1994,7 @@ for bi in range(0, len(todo), BATCH):
     shutil.rmtree(raw, ignore_errors=True)
     os.makedirs(raw, exist_ok=True)
     # Split across cores; each sub-batch is still one process for many files.
-    workers = max(2, min(8, (os.cpu_count() or 4)))
+    workers = pool_size()
     stride = max(1, (len(batch) + workers - 1) // workers)
     slices = [batch[i:i + stride] for i in range(0, len(batch), stride)]
 
@@ -1921,7 +2040,7 @@ for bi in range(0, len(todo), BATCH):
                 pass
             return False
 
-    with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4))) as pool:
+    with ThreadPoolExecutor(max_workers=pool_size(CORES)) as pool:
         for ok, (_, dst) in zip(pool.map(to_webp, jobs), jobs):
             if ok:
                 converted += 1

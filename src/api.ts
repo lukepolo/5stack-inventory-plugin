@@ -536,6 +536,25 @@ export interface ExtractStatus {
   currentGamePatch?: string | null;
   currentGameDate?: string | null;
   gameUpdated?: boolean;
+  /** How many models the extraction decompiles at once, and what that costs.
+   *  Absent on older backends, where the count wasn't adjustable.
+   *
+   *  This is a memory dial, not a speed dial: the per-worker figures are the
+   *  measured peak RSS of ONE worker (a range, because it depends which weapon
+   *  the worker draws), so the panel can say what a setting will cost before it
+   *  takes the machine out. It defaults to 1 for that reason.
+   *
+   *  `panelReserveMb` is the headroom to leave for the rest of the 5stack
+   *  deployment sharing the box — memory the extraction must not plan to use. */
+  workers?: {
+    jobs: number;
+    cores: number;
+    perWorkerMinMb: number;
+    perWorkerMaxMb: number;
+    panelReserveMb: number;
+    memTotalMb: number | null;
+    memAvailableMb: number | null;
+  };
 }
 // Plain <a download> hits this: same cookie-auth path the render <img> tags
 // use, so no token juggling.
@@ -544,6 +563,13 @@ export const extractLogUrl = () => `${API_ORIGIN}/api/admin/extract-models/log`;
 export const fetchExtractStatus = () => request<ExtractStatus>("/admin/extract-models");
 export const startExtractJob = () =>
   request<{ started: true }>("/admin/extract-models", { method: "POST", body: "{}" });
+// Takes effect immediately, including on a run already in progress — the script
+// re-reads the count as it works.
+export const setExtractJobs = (jobs: number) =>
+  request<{ workers: NonNullable<ExtractStatus["workers"]> }>("/admin/extract-models/jobs", {
+    method: "PUT",
+    body: JSON.stringify({ jobs }),
+  });
 
 // Admin: panel-generated server API key (game servers use it as invsim_apikey).
 export interface CfgSyncResult {
