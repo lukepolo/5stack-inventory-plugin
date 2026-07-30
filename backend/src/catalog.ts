@@ -141,6 +141,13 @@ export function getAgents() {
       rarity: a.rarity as string,
       teams: teamsOf(a),
       image: img(a.image),
+      // `model` and `type` are what let the craft editor mount 3D at all — the
+      // resolver reads the type to pick a viewer kind, and without either the
+      // agent sheet had no 2D/3D toggle and no 3D button. An agent's model is
+      // ALREADY the full archive path ("agents/models/tm_leet/tm_leet_variantg"),
+      // which is why nothing else has to translate it.
+      model: (a.model as string) ?? null,
+      type: a.type,
       def: a.def,
     }));
 }
@@ -593,6 +600,12 @@ export function getGloves(): CatalogSkin[] {
       name: g.name,
       rarity: g.rarity as string,
       image: img(g.image),
+      // Same reason as the agents above. `paintMaterial` rides along because a
+      // glove finish needs its own compositor — and because its presence is what
+      // the resolver checks to decide whether a glove can render yet.
+      model: (g.model as string) ?? null,
+      type: g.type,
+      paintMaterial: g.paintMaterial ?? null,
       def: g.def,
     }));
 }

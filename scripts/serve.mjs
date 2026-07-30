@@ -122,7 +122,13 @@ createServer(async (req, res) => {
     } catch {
       // Mount miss on a backend-backed path — hand it to the backend, which
       // serves it and mirrors it so the next request comes off the mount.
-      if (base === paintsDir || base === rendersDir || base === testsDir || base === imagesDir) {
+      if (
+        base === paintsDir ||
+        base === rendersDir ||
+        base === testsDir ||
+        base === imagesDir ||
+        base === modelsDir
+      ) {
         try {
           const upstream = await fetch(backendOrigin + req.url);
           if (upstream.ok) {

@@ -79,6 +79,7 @@ import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowSt
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
 
 // `user` plus the host's routing contract (base/path/query/navigate) — see
@@ -299,10 +300,17 @@ const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti"].includes(
 // "Special" is a LAYOUT concept (slot rail, catalog fetch, sheet keys) and was
 // doing double duty as the 3D gate, which is why knives could never show 3D
 // even once their GLBs existed. Split: this is the 3D one, and it's about
-// whether a slot resolves to something we have a model for. Knives do now.
-// zeus is a one-entry removal away (its GLB already ships); c4 needs a MAP
-// entry; gloves/agents need their own extraction and shader work.
-const isNo3d = (s: string) => ["gloves", "agent", "zeus", "c4", "musickit", "graffiti"].includes(s);
+// whether a slot resolves to something we have a model for.
+//
+// Gloves and agents came off this list when their trees joined the extraction
+// (v19). zeus came off too — its GLB has shipped all along, it was only ever
+// here because this list started life as the "special slot" one. c4 stays:
+// nothing extracts it, since it has no MAP entry.
+//
+// A slot-level answer is necessarily coarse — it is asked before an occupant is
+// known. The per-ITEM answer (a painted glove has no compositor yet) lives in
+// resolveViewerModel, and the focus/ctx paths below still HEAD-probe on top.
+const isNo3d = (s: string) => ["c4", "musickit", "graffiti"].includes(s);
 // Origin filter — the same control on the Inventory grid and on the loadout
 // sheet's Owned section, so "hide my Steam imports" works the same in both.
 type OriginFilter = "all" | "steam" | "crafted";
@@ -1471,16 +1479,78 @@ const craft = ref<{
  * preview takes the whole modal.
  */
 const craftHasOptions = computed(() => selected.value !== "graffiti");
-// What attachments the selected slot's item supports.
+/**
+ * What attachments the thing being edited supports.
+ *
+ * ASKS THE ITEM FIRST, and only falls back to the slot. It used to ask the slot
+ * alone, which is right when you craft from the loadout sheet (the slot IS the
+ * subject) and wrong every other way in: opening an owned agent from the
+ * inventory grid leaves `selected` on whatever weapon position was last picked,
+ * so the agent got a weapon's form — five sticker slots, a charm, a pattern and
+ * a float — and no patches at all.
+ *
+ * Note zeus and c4 take stickers despite not being weapon POSITIONS, and both
+ * are cs2-lib `weapon` type, so the item answer covers them without the special
+ * case the slot form needed.
+ */
 const attachKind = computed<"weapon" | "agent" | "none">(() => {
+  const type = craftType.value;
+  if (type) {
+    if (type === "agent") return "agent";
+    return type === "weapon" || type === "melee" ? "weapon" : "none";
+  }
   if (selected.value === "agent") return "agent";
   if (isWeaponPos(selected.value) || selected.value === "zeus" || selected.value === "c4") return "weapon";
   return "none";
 });
+/**
+ * The cs2-lib type of whatever the craft modal is editing, when it knows it.
+ *
+ * Every "which controls does this item get" question below asks THIS first and
+ * only falls back to the slot. They all used to ask the slot alone
+ * (`!['agent','musickit','graffiti'].includes(selected)`), which is right when
+ * you craft from the loadout sheet and wrong every other way in: opening an
+ * owned agent from the inventory grid leaves `selected` on whatever weapon
+ * position was last picked, so the agent was offered a pattern, a float and
+ * StatTrak — none of which an agent has.
+ */
+const craftType = computed(() => craft.value?.skin.type ?? craftInst.value?.item?.type ?? null);
+/** Fall back to the slot only when the item's type is genuinely unknown — a
+ *  catalog listing that predates the field. */
+const craftSlotSays = (nope: string[]) => !nope.includes(selected.value);
+const craftHasSeed = computed(() =>
+  craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti"]),
+);
+const craftHasWear = computed(() =>
+  craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti"]),
+);
+// StatTrak is weapons, knives and music kits — NOT gloves, which do have a float
+// and a pattern. That distinction is invisible to a slot-shaped gate.
+const craftHasStatTrak = computed(() =>
+  craftType.value
+    ? ["weapon", "melee", "musickit"].includes(craftType.value)
+    : craftSlotSays(["agent", "graffiti"]),
+);
 const editingId = ref<number | null>(null);
 // The weapon model this craft/edit is about. Crafting from the sheet = the
 // selected slot's weapon; editing from anywhere = the ITEM's own weapon.
 const craftModel = ref<string | null>(null);
+// What the 3D stage MOUNTS for this craft/edit — model key plus what kind of
+// thing it is. Distinct from craftModel, which stays "the weapon", because
+// plenty here is weapon-specific (sticker geometry, the weapon name, the
+// inspect link) and a charm has no weapon model at all. Resolved in the `craft`
+// watcher; null means this item has no 3D form.
+const craftTarget = ref<ViewerTarget | null>(null);
+/**
+ * Show a glove's forearms.
+ *
+ * CS2 models gloves as the player's viewmodel ARMS, so `bare_arm_*` geometry
+ * ships with every glove. Off by default — the ITEM is the glove, and the arms
+ * are twice its bulk, which dominates the frame and makes two finishes hard to
+ * compare side by side. Flipping it REMOUNTS: the arms are culled geometry, not
+ * a material flag.
+ */
+const gloveArms = ref(false);
 // Steam-imported items are READ-ONLY (they mirror a real inventory). Editing
 // one opens the same modal as a DUPLICATE: saving creates an editable copy.
 const duplicating = ref(false);
@@ -1579,7 +1649,11 @@ function openEdit(inst: InventoryItem) {
     if (pt && i < 5) patches[i] = { id: pt.id, name: pt.name, image: pt.image };
   });
   craft.value = {
-    skin: { id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint },
+    // `type` and `model` ride along because they are what decides WHAT the 3D
+    // stage mounts (see resolveViewerModel) — a charm carries no model at all,
+    // so without the type this projection resolves to "no 3D form" and the
+    // modal silently stays flat.
+    skin: { id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,
     stattrak: inst.stattrak,
@@ -1903,6 +1977,20 @@ const renderServes = (url: string) =>
 async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
   const model = inst.item?.model;
   if (!model || renderedIds.has(inst.id) || !(await hasModel(model))) return false;
+  // WEAPONS AND KNIVES ONLY.
+  //
+  // `hasModel` alone used to be the whole gate, which was fine while those were
+  // the only two types with a GLB. The moment gloves and agents landed on the
+  // mount they started baking too — and a glove baked through the weapon path
+  // has no compositor, so every painted glove card became a pair of blank white
+  // hands, cached under a key that says it is finished.
+  //
+  // Beyond the bug: 3D for the new types is ON DEMAND by design. Their grid card
+  // IS the flat icon, so there is nothing here to bake even once gloves
+  // composite correctly. Anything that changes must also change
+  // RENDERED_IN_3D in build-asset-manifest.mjs, which encodes the same decision
+  // for the extractor's missing-icon report.
+  if ((resolveViewerModelSync(inst.item)?.kind ?? null) !== "weapon") return false;
   // Already stored server-side? Nothing to bake. Carries the buster: after a
   // cache clear the browser still holds the deleted image, so an un-busted
   // probe loads it, concludes the server is fine and skips the re-bake — which
@@ -2066,13 +2154,30 @@ watch(craft, async (open) => {
   teardownModalViewer();
   modal3d.value = false;
   modal3dAvailable.value = false;
-  if (open && craftModel.value) {
+  craftTarget.value = null;
+  if (open) {
+    // What to MOUNT is not always the weapon model: a charm has no `model` at
+    // all (the econ schema names its mesh, and 23 of them share one blank), so
+    // resolveViewerModel is the only thing that can answer. The sync form comes
+    // first because everything except a charm can answer without a round trip —
+    // see the peek note below, which an unconditional await would defeat.
+    //
+    // The craftModel fallback is not belt-and-braces: /catalog/skins does not
+    // send `type`, so a plain AK finish resolves to null here, and without it
+    // every weapon in the craft sheet would lose 3D.
+    const sync = resolveViewerModelSync(craft.value?.skin);
+    craftTarget.value =
+      (sync === undefined ? await resolveViewerModel(craft.value?.skin) : sync) ??
+      (craftModel.value ? { model: craftModel.value, kind: "weapon" } : null);
+  }
+  const targetKey = craftTarget.value?.model;
+  if (open && targetKey) {
     // Peek before awaiting. On a cache hit this whole branch stays synchronous,
     // so `modal3d` is already true when the modal first paints and the 2D still
     // never appears — and `modal3dAvailable` goes false→true inside one flush,
     // so the 2D/3D pill doesn't blink out either.
-    const known = hasModelSync(craftModel.value);
-    modal3dAvailable.value = known ?? (await hasModel(craftModel.value));
+    const known = hasModelSync(targetKey);
+    modal3dAvailable.value = known ?? (await hasModel(targetKey));
     // 3D is the default editor: placement is the whole job here, and the 2D
     // form can't show you where anything actually lands. Falls back to the
     // form when the weapon has no extracted model, or when the link said ?d=2.
@@ -2325,22 +2430,39 @@ async function mountModalViewer() {
     return;
   }
   try {
-    const model = craftModel.value;
-    if (!model) return;
+    const target = craftTarget.value;
+    if (!target) return;
+    const model = target.model;
+    // Weapon-only machinery, skipped by kind rather than by "did the lookup
+    // happen to come back empty": sticker slots and the charm attachment are
+    // meaningless on a charm that IS the model, and stickerGeom would fetch
+    // markup for a key no weapon has.
+    const isWeapon = target.kind === "weapon";
     const handle = await mountViewer(modalViewerEl.value, model, {
       signal: ac.signal,
+      kind: target.kind,
+      charmSpec: target.charm ?? null,
+      gloveArms: gloveArms.value,
+      // A sticker or patch has no model to name, so it is addressed by its art.
+      decal:
+        target.kind === "sticker" || target.kind === "patch"
+          ? { image: craft.value?.skin.image ?? "", wear: 0 }
+          : null,
       paintMaterial: craft.value?.skin.paintMaterial ?? null,
       legacyPaint: !!craft.value?.skin.legacyPaint,
       wear: craft.value?.wear,
+      // A charm's `seed` is its own PATTERN, and the standalone viewer grades
+      // its material by it — so this is the charm's seed when the charm is the
+      // model, and the weapon's float pattern otherwise.
       seed: craft.value?.seed,
       // View mode isn't interactive in the viewer's sense: no attachment
       // dragging, and the model idles on a slow auto-rotate the way the old
       // standalone overlay did. Orbit/pan/zoom are gated on `still`, not this,
       // so they stay available either way.
       interactive: !viewOnly.value,
-      ...(await stickerGeom(model)),
-      stickers: craftStickerPlacements(),
-      charm: craftCharmPlacement(),
+      ...(isWeapon ? await stickerGeom(model) : {}),
+      stickers: isWeapon ? craftStickerPlacements() : [],
+      charm: isWeapon ? craftCharmPlacement() : null,
       // Live 3D, so a real readout — the owned item's count when the modal is
       // showing one (craftInstId covers editing AND duplicating, which
       // editingId does not), and 0 for a brand-new craft that has no kills.
@@ -2404,6 +2526,11 @@ async function mountModalViewer() {
 watch(modal3d, (on) => {
   if (on) void mountModalViewer();
   else teardownModalViewer();
+});
+// Culling the forearms changes GEOMETRY, so it cannot be flipped on a live
+// scene the way a material flag could — the viewer has to be rebuilt.
+watch(gloveArms, () => {
+  if (modal3d.value && craftTarget.value?.kind === "glove") void mountModalViewer();
 });
 // View ↔ edit is a flag flip, not a remount (see craftViewEdit for why), so the
 // already-mounted viewer has to be TOLD which mode it is in. Without this the
@@ -2860,6 +2987,139 @@ function openPicker(kind: "sticker" | "charm" | "patch", slot = 0) {
   pickerRarities.value = [];
   void pickerSearch();
 }
+// ---- Catalog art from the model, for items CS2 ships no picture of ----------
+/**
+ * Some catalog items have no artwork ANYWHERE in the game, so their card is
+ * blank however hard the extractor looks.
+ *
+ * The 8 paintable base gloves are the case: Bloodhound, Broken Fang, Sport,
+ * Slick, Specialist, Hydra, Moto and Handwraps. Verified against the archive —
+ * `default_generated/` holds only `<glove>_<paint>_<wear>` skinned variants,
+ * `base_weapons/` and `wearables/gloves/` hold only the two DEFAULT gloves, and
+ * items_game.txt gives the paintable ones no `image_inventory` key at all. You
+ * cannot own an unpainted Broken Fang Glove in game; cs2-lib synthesises the
+ * base item and invents an image path Valve never shipped.
+ *
+ * So the picture has to come from the MODEL, which we now extract. Baked on the
+ * card's own 404 rather than up front — this costs a GL context, and the only
+ * items that need it are the handful that ask.
+ *
+ * Session-scoped on purpose. The server-side render store is keyed per owned
+ * INSTANCE (`inst-<id>-…`) and these are catalog rows with no instance, so
+ * persisting them needs a second store — worth doing if this ever covers more
+ * than a few items, overkill for eight.
+ */
+const catalogArt = ref<Record<number, string>>({});
+const catalogArtTried = new Set<number>();
+async function bakeCatalogArt(skin: { id: number; name?: string; model?: string | null; type?: string | null; paintMaterial?: string | null }) {
+  if (!skin?.id || catalogArtTried.has(skin.id) || catalogArt.value[skin.id]) return;
+  catalogArtTried.add(skin.id);
+  const target = await resolveViewerModel(skin);
+  if (!target || !(await hasModel(target.model))) return;
+  try {
+    // Background lane and idle-gated, exactly like the card backfill: this is
+    // never what the user is waiting on.
+    await viewersIdle();
+    const blob = await snapshotModel(
+      target.model,
+      { kind: target.kind, charmSpec: target.charm ?? null, paintMaterial: null, wear: 0, seed: 0 },
+      undefined,
+      true,
+    );
+    if (blob && blob !== INCOMPLETE) catalogArt.value = { ...catalogArt.value, [skin.id]: URL.createObjectURL(blob) };
+  } catch {
+    /* a missing picture is not worth an error surface — the card stays blank */
+  }
+}
+function onCatalogArtError(e: Event, skin: { id: number; model?: string | null; type?: string | null }) {
+  (e.target as HTMLImageElement).style.visibility = "hidden";
+  void bakeCatalogArt(skin);
+}
+onBeforeUnmount(() => Object.values(catalogArt.value).forEach((u) => URL.revokeObjectURL(u)));
+
+// ---- Attachment 3D preview --------------------------------------------------
+/**
+ * One attachment, on its own, in 3D — over whatever is already open.
+ *
+ * The craft modal shows a sticker or a charm as its flat inventory icon, which
+ * for a sticker is not even the art the game draws (it is a 512x384 frame with
+ * the ink inset) and for a charm is a photograph of a 3D object. Picking one
+ * from a wall of those is guesswork, and the answer to "what does this actually
+ * look like" was: add it to the gun, then hunt for it on the model.
+ *
+ * So this is deliberately a SMALL overlay rather than a route or a replacement
+ * stage: it sits above the picker, the thing underneath keeps its state, and
+ * dismissing it puts you back exactly where you were mid-decision.
+ */
+const preview3d = ref<{ image: string; name: string; kind: string } | null>(null);
+const preview3dEl = ref<HTMLElement | null>(null);
+const preview3dBusy = ref(false);
+let preview3dHandle: ViewerHandle | null = null;
+let preview3dAbort: AbortController | null = null;
+let preview3dGen = 0;
+function closePreview3d() {
+  preview3dGen++;
+  preview3dAbort?.abort();
+  preview3dAbort = null;
+  preview3dHandle?.dispose();
+  preview3dHandle = null;
+  preview3dBusy.value = false;
+  preview3d.value = null;
+}
+/** Open the preview for any attachment-shaped thing (sticker, patch, charm). */
+/** Picker kind -> cs2-lib type. The picker says "charm"; the economy calls it a
+ *  "keychain", and the resolver switches on the economy's name. Without this the
+ *  charm preview resolved to null and the panel opened on nothing. */
+const ATTACH_TYPE: Record<string, string> = { sticker: "sticker", patch: "patch", charm: "keychain" };
+async function openPreview3d(item: { image?: string | null; name?: string | null; type?: string | null }, kind: string) {
+  if (!item?.image) return;
+  // The picker's rows are `Skin`s from an attachment catalog, which carry no
+  // `type` — the PICKER knows what it is asking for, so the kind comes from the
+  // caller and the resolver is fed a synthetic item.
+  const target = await resolveViewerModel({ type: item.type ?? ATTACH_TYPE[kind] ?? kind, image: item.image });
+  if (!target) return;
+  preview3d.value = { image: item.image, name: item.name ?? "", kind };
+  preview3dBusy.value = true;
+  const gen = ++preview3dGen;
+  await nextTick();
+  const host = preview3dEl.value;
+  if (!host || gen !== preview3dGen) {
+    preview3dBusy.value = false;
+    return;
+  }
+  try {
+    preview3dAbort?.abort();
+    const ac = new AbortController();
+    preview3dAbort = ac;
+    const handle = await mountViewer(host, target.model, {
+      signal: ac.signal,
+      kind: target.kind,
+      charmSpec: target.charm ?? null,
+      decal: target.kind === "sticker" || target.kind === "patch" ? { image: item.image, wear: 0 } : null,
+      frame: "fit",
+      // Orbitable but not draggable: there is no weapon to place anything on,
+      // and a slow turn is what shows a holo sticker or a charm's depth.
+      interactive: false,
+    });
+    // Dismissed (or another attachment picked) while the GLB loaded.
+    if (gen !== preview3dGen) {
+      handle.dispose();
+      return;
+    }
+    preview3dHandle = handle;
+  } catch (e) {
+    if ((e as Error)?.name !== "AbortError") mdebug("preview3d MOUNT failed", { e: String(e) });
+    if (gen === preview3dGen) preview3d.value = null;
+  } finally {
+    if (gen === preview3dGen) preview3dBusy.value = false;
+  }
+}
+// The craft modal closing (or the picker) must not leave a live context
+// rendering into a detached node.
+watch([craft, picker], () => {
+  if (preview3d.value) closePreview3d();
+});
+
 function pickAttachment(item: Skin) {
   if (!craft.value || !picker.value) return;
   const a: Attach = { id: item.id, name: item.name, image: item.image };
@@ -2954,7 +3214,13 @@ const gearWarnings = computed(() => {
   else if (extractWarn.value === "stale") out.push("Model extraction is out of date — re-run it");
   return out;
 });
-function onCacheCleared(_scope: "renders") {
+function onCacheCleared(scope: "renders" | "composites") {
+  // Composites are the shared paint textures, not the cards — binning them
+  // costs each skin one re-composite and leaves every baked card still valid.
+  // This ran for both scopes while the emit was typed as "renders" only, so
+  // reclaiming composite disk also threw away every card in the session and
+  // re-baked the lot. The type error hid it.
+  if (scope !== "renders") return;
   // Reset session bookkeeping so cards re-bake fresh right away.
   renderedIds.clear();
   Object.values(localRenders.value).forEach((u) => URL.revokeObjectURL(u));
@@ -4525,9 +4791,27 @@ watch(focus3d, () => nextTick(() => focus3dPill.sync(focus3d.value ? "3D" : "2D"
 watch([sheetOrigin, sheetMode, sheetFiltersOpen], () => nextTick(() => sheetOriginPill.sync(sheetOrigin.value)), { immediate: true });
 const viewer3dEl = ref<HTMLElement | null>(null);
 let viewerHandle: ViewerHandle | null = null;
-const focusModelKey = computed(() =>
-  view.value === "focus" && !isNo3d(selected.value) ? occupantModel(selected.value) : null,
-);
+/**
+ * What the focus stage mounts, as a TARGET rather than a bare key.
+ *
+ * The slot's occupant decides the kind, not the slot: the gloves slot holds a
+ * glove and the agent slot an agent, and both would otherwise mount as `kind:
+ * "weapon"` and run the weapon compositor over a mesh it was never written for.
+ *
+ * Resolved synchronously because this is a computed the template reads —
+ * `resolveViewerModelSync` answers without a round trip for every kind a
+ * loadout slot can hold (only charms need the async form, and no slot holds
+ * one). Falls back to the slot's own key so a DEFAULT with no catalog row still
+ * mounts, which is how an unowned weapon gets its 3D view.
+ */
+const focusTarget = computed<ViewerTarget | null>(() => {
+  if (view.value !== "focus" || isNo3d(selected.value)) return null;
+  const occupant = focusRow.value?.item ?? null;
+  if (occupant) return resolveViewerModelSync(occupant) ?? null;
+  const key = occupantModel(selected.value);
+  return key ? { model: key, kind: "weapon" } : null;
+});
+const focusModelKey = computed(() => focusTarget.value?.model ?? null);
 const focusPaint = computed(() =>
   isSkinned(focusRow.value) ? focusRow.value?.item?.paintMaterial ?? null : null,
 );
@@ -4700,14 +4984,19 @@ async function mount3d() {
     const ac = new AbortController();
     focusViewerAbort = ac;
     mdebug("focus viewer MOUNT start", { model: key });
+    // Weapon-only machinery, skipped by kind — sticker slots and the charm
+    // attachment mean nothing on an agent or a glove, and stickerGeom would
+    // fetch markup for a key no weapon has.
+    const isWeapon = (focusTarget.value?.kind ?? "weapon") === "weapon";
     const handle = await mountViewer(host, key, {
       signal: ac.signal,
+      kind: focusTarget.value?.kind,
       paintMaterial: focusPaint.value,
       legacyPaint: focusLegacyPaint.value,
       wear: focusRow.value?.wear ?? focusInstance.value?.wear,
       seed: focusRow.value?.seed ?? focusInstance.value?.seed,
-      ...(await stickerGeom(key)),
-      ...instPlacements(focusInstance.value),
+      ...(isWeapon ? await stickerGeom(key) : {}),
+      ...(isWeapon ? instPlacements(focusInstance.value) : {}),
       // Focus can be showing a loadout DEFAULT rather than an owned item, and
       // a default can be StatTrak too — instPlacements sees no instance there
       // and would drop the module, so fall back to the row.
@@ -4929,7 +5218,13 @@ async function load() {
 // the z-index stack, so what you see on top is what closes.
 function onGlobalKey(e: KeyboardEvent) {
   if (e.key === "Escape") {
-    if (confirmAsk.value) {
+    if (preview3d.value) {
+      // Topmost of the lot (z-1400) — it sits over the picker, which sits over
+      // the craft modal. Missing from this chain meant Escape fell straight
+      // through to `craft` and shut the whole editor from a look at a sticker.
+      closePreview3d();
+      e.stopPropagation();
+    } else if (confirmAsk.value) {
       confirmAsk.value = null;
       e.stopPropagation();
     } else if (ctx.value) {
@@ -7588,11 +7883,12 @@ if (MDEBUG) {
                   </span>
                   <div :class="CARD_ART">
                     <img
-                      :src="st.card.image ?? undefined"
+                      :src="catalogArt[st.card.id] ?? st.card.image ?? undefined"
                       alt=""
                       loading="lazy" decoding="async"
                       class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
                       :class="sheetKey === 'agent' && ART_FADE_B"
+                      @error="onCatalogArtError($event, st.card)"
                     />
                   </div>
                   <ItemName :item="st.card" strip class="relative z-[2]" />
@@ -7998,6 +8294,12 @@ if (MDEBUG) {
                     class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/pt:opacity-100"
                     @click.stop="craft!.patches[idx] = null"
                   ><X class="h-3 w-3" /></span>
+                  <span
+                    v-if="pt"
+                    class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/pt:opacity-100"
+                    :title="`View ${pt.name} in 3D`"
+                    @click.stop="openPreview3d(pt, 'patch')"
+                  ><Box class="h-3 w-3" /></span>
                 </button>
               </div>
             </div>
@@ -8027,6 +8329,15 @@ if (MDEBUG) {
                     class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/st:opacity-100"
                     @click.stop="craft!.stickers[idx] = null"
                   ><X class="h-3 w-3" /></span>
+                  <!-- Inspect what is ALREADY on the weapon. Without it the only
+                       way to see a sticker in 3D was to re-open the picker and
+                       find it again, which is backwards once it is applied. -->
+                  <span
+                    v-if="st"
+                    class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/st:opacity-100"
+                    :title="`View ${st.name} in 3D`"
+                    @click.stop="openPreview3d(st, 'sticker')"
+                  ><Box class="h-3 w-3" /></span>
                 </button>
               </div>
               <!-- Scratch wear per applied sticker ("sticker slot N wear", 0-1).
@@ -8101,6 +8412,12 @@ if (MDEBUG) {
                     class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/ch:opacity-100"
                     @click.stop="craft!.charm = null"
                   ><X class="h-3 w-3" /></span>
+                  <span
+                    v-if="craft.charm"
+                    class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/ch:opacity-100"
+                    :title="`View ${craft.charm.name} in 3D`"
+                    @click.stop="openPreview3d(craft!.charm, 'charm')"
+                  ><Box class="h-3 w-3" /></span>
                 </button>
                 <span v-if="craft.charm" class="truncate text-f10 text-muted-foreground">{{ craft.charm.name }}</span>
               </div>
@@ -8135,7 +8452,7 @@ if (MDEBUG) {
                 </label>
               </div>
             </div>
-            <div v-if="!['agent', 'musickit', 'graffiti'].includes(selected)" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+            <div v-if="craftHasSeed" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
               <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
               <!-- flex-1, not a fixed width: Pattern sat at w-24 and Wear at
                    w-28, so two stacked rows with the same label column ended in
@@ -8149,7 +8466,7 @@ if (MDEBUG) {
               />
               <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random pattern" @click="randomSeed">🎲</button>
             </div>
-            <div v-if="!['agent', 'musickit', 'graffiti'].includes(selected)" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
+            <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
               <div class="flex items-center gap-2">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
                 <input
@@ -8165,7 +8482,7 @@ if (MDEBUG) {
               <div class="mt-1 text-right font-mono text-f9 text-muted-foreground">{{ wearTier(craft.wear) }}</div>
             </div>
             <div
-              v-if="!['agent', 'graffiti'].includes(selected)"
+              v-if="craftHasStatTrak"
               class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5"
               :style="{ '--i': 5 }"
             >
@@ -8389,6 +8706,18 @@ if (MDEBUG) {
               @click="pickAttachment(it)"
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(it.rarity, 0.22)"></span>
+              <!-- Inspect before committing. A `button` inside the tile's button
+                   is invalid HTML, so this is a span with a click that stops
+                   propagation — otherwise picking is the only thing a tile can
+                   do, and choosing a holo sticker from a flat icon is a guess. -->
+              <span
+                role="button"
+                tabindex="0"
+                class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-[color:var(--acc)] group-hover:flex"
+                :title="`View ${it.name} in 3D`"
+                @click.stop="openPreview3d(it, picker?.kind ?? 'sticker')"
+                @keydown.enter.stop.prevent="openPreview3d(it, picker?.kind ?? 'sticker')"
+              ><Box class="h-3.5 w-3.5" /></span>
               <div :class="CARD_ART" class="relative z-[2]">
                 <!-- decoding="async" keeps the decode off the main thread. With
                      `lazy`, a fast scroll brings dozens of images into view at
@@ -8434,6 +8763,42 @@ if (MDEBUG) {
             <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
           </div>
         </div>
+        </Transition>
+
+        <!-- Attachment preview — a SIBLING of the picker's Transition, not a
+             child of it: <Transition> takes exactly one child, and nesting this
+             inside it silently stopped the picker from opening at all.
+             z-1400 puts it above the picker (z-1300) it is opened from.
+             Deliberately a small panel rather than a full stage — the picker
+             keeps its scroll position and its search, so this is a look, not a
+             detour. -->
+        <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
+          <div
+            v-if="preview3d"
+            class="fixed inset-0 z-[1400] grid place-items-center bg-background/80 p-4 backdrop-blur-sm"
+            @click.self="closePreview3d()"
+          >
+            <div class="flex w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
+              <div class="flex items-center gap-2 border-b border-border px-3 py-2">
+                <span class="min-w-0 flex-1 truncate text-f11 uppercase tracking-cs1">{{ preview3d.name }}</span>
+                <button
+                  class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                  title="Close"
+                  @click="closePreview3d()"
+                >
+                  <X class="h-4 w-4" />
+                </button>
+              </div>
+              <!-- Square: a sticker is square, a charm is portrait, and a fixed
+                   aspect keeps the panel from resizing as you flick between them. -->
+              <div class="relative aspect-square w-full bg-background">
+                <div ref="preview3dEl" class="absolute inset-0" />
+                <div v-if="preview3dBusy" class="pointer-events-none absolute inset-0 grid place-items-center">
+                  <Loader2 class="h-5 w-5 animate-spin text-muted-foreground" />
+                </div>
+              </div>
+            </div>
+          </div>
         </Transition>
 
         <!-- Same row, same positions in both modes: dismiss on the left, the

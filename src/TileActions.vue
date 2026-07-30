@@ -13,7 +13,8 @@
 import { computed } from "vue";
 import { Box, Copy, ExternalLink, Pencil, Trash2 } from "lucide-vue-next";
 import type { InventoryItem } from "./api";
-import { canInspect, isCustomizable, isReadOnly, supports3d } from "./itemVisuals";
+import { canInspect, isCustomizable, isReadOnly } from "./itemVisuals";
+import { resolveViewerModelSync } from "./viewerModel";
 import { isCoarse } from "./responsive";
 
 const props = withDefaults(
@@ -30,8 +31,15 @@ const emit = defineEmits<{ (e: "view3d" | "inspect" | "edit" | "duplicate" | "re
 // Steam-synced items are read-only server-side, so they get Duplicate where
 // crafted items get Edit — never both.
 const readOnly = computed(() => isReadOnly(props.inst));
-// Hidden, not disabled, for types we have no models for — see supports3d.
-const can3d = computed(() => supports3d(props.inst.item));
+// Hidden, not disabled, for types we have no models for.
+//
+// Asks the RESOLVER, not the type set: `supports3d` answers per TYPE, and the
+// per-ITEM answer is narrower — a painted glove is a glove we cannot composite
+// yet. Offering the button and landing on the flat image is exactly the "reads
+// as broken" the type gate was written to avoid, so it has to be the same
+// question the mount site will ask. `undefined` means "a charm, needs a lookup",
+// which is still a yes.
+const can3d = computed(() => resolveViewerModelSync(props.inst.item) !== null);
 // Same treatment for Edit: a graffiti has no float, pattern, StatTrak, name tag
 // or attachment slots, so the pencil opened an empty form. See isCustomizable.
 const canEditItem = computed(() => isCustomizable(props.inst.item));

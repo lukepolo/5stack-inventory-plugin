@@ -36,6 +36,7 @@ import {
   type AssetCdnStatus,
   type CacheStats,
   type CfgSyncResult,
+  type DirStat,
   type ExtractStatus,
 } from "./api";
 
@@ -48,7 +49,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "notify", message: string, kind: "error" | "success"): void;
   (e: "cfg-sync", cfg: CfgSyncResult | null): void;
-  (e: "cache-cleared", scope: "renders"): void;
+  // Both scopes clearClearCache accepts. It said "renders" only, which made the
+  // composites button a type error at its own call site.
+  (e: "cache-cleared", scope: "renders" | "composites"): void;
   // Extraction hasn't been run, or ran on an older pipeline. App owns the gear
   // badge, so every status refresh here reports the answer upward — that's
   // what clears the dot the moment a run finishes.
@@ -188,13 +191,60 @@ const cacheRows = computed(() => {
     },
   ];
 });
-const extractedRows = computed(() => {
+/**
+ * The extracted mounts, broken down by what each part actually is.
+ *
+ * Three rows was not enough to answer the question an operator actually has,
+ * which is "what is eating the disk". Both real answers were invisible: paint
+ * TEXTURES are ~12 GB behind a row labelled "Paint materials" (the materials
+ * themselves are 61 MB of JSON), and composite inputs are ~1.5 GB behind a row
+ * labelled "3D models" (the GLBs are ~170 MB).
+ *
+ * `required` marks the parts whose absence BREAKS rendering, so a 0 there reads
+ * as an error. The rest are legitimately empty on a mount extracted before they
+ * existed — flagging those red would cry wolf on every older install.
+ */
+const PART_META: Record<string, { label: string; hint: string; required?: boolean }> = {
+  meshes: { label: "Weapon, knife & glove models", hint: "The GLBs the viewer mounts", required: true },
+  agents: { label: "Agent models", hint: "Character meshes, kept at their archive path" },
+  charms: { label: "Charms", hint: "Keychain models and their textures" },
+  compositeInputs: {
+    label: "Composite inputs",
+    hint: "Per-weapon paint sources — the compositor reads these, the viewer never does",
+    required: true,
+  },
+  modelTextures: { label: "Model textures", hint: "The shared pool every GLB references", required: true },
+  modelMeta: { label: "Anchors & markup", hint: "Attachment points, sticker slots, the version stamp" },
+  paintMaterials: { label: "Finish definitions", hint: "One document per skin, naming its textures", required: true },
+  paintTextures: { label: "Finish textures", hint: "Patterns, masks, sticker and decal art", required: true },
+};
+const ZERO = { files: 0, bytes: 0 };
+const extractedGroups = computed(() => {
   const s = cacheStats.value;
   if (!s) return [];
+  const parts = s.parts;
+  const group = (key: string, label: string, hint: string, total: DirStat, partKeys: string[]) => {
+    const rows = partKeys
+      .map((k) => ({ key: k, ...PART_META[k], ...(parts?.[k as keyof typeof parts] ?? ZERO) }))
+      // A part with nothing in it is only worth a row when its absence MEANS
+      // something. Otherwise an older mount grows empty rows for every type it
+      // predates, which reads as breakage rather than as history.
+      .filter((r) => r.files > 0 || r.required);
+    return { key, label, hint, total, rows, share: (b: number) => (total.bytes ? b / total.bytes : 0) };
+  };
   return [
-    { key: "models", label: "3D models", hint: "Weapon GLBs + composite inputs", ...(s.models ?? { files: 0, bytes: 0 }) },
-    { key: "paints", label: "Paint materials", hint: "Skin finishes — without these, skins render white", ...s.paints },
-    { key: "images", label: "Item icons", hint: "Flat catalog art for every item", ...(s.images ?? { files: 0, bytes: 0 }) },
+    group(
+      "models",
+      "3D models mount",
+      "Meshes, their textures, and the compositor's inputs",
+      s.models ?? ZERO,
+      ["meshes", "agents", "charms", "compositeInputs", "modelTextures", "modelMeta"],
+    ),
+    group("paints", "Paint chain", "Every skin finish — without these, skins render white", s.paints, [
+      "paintMaterials",
+      "paintTextures",
+    ]),
+    group("images", "Item icons", "Flat catalog art for every item", s.images ?? ZERO, []),
   ];
 });
 // ---- shared asset CDN (opt-in) ----------------------------------------------
@@ -336,22 +386,46 @@ watch(extractLive, (live) => {
 // list wants to decode "composite-inputs" — say what is happening. Unknown ids
 // fall through to the raw name so a new step never renders as a blank row.
 const STEP_LABELS: Record<string, string> = {
-  "decompile-models": "Decompiling weapon models",
+  // "weapon models" was accurate until the same step started decompiling agents
+  // and gloves out of agents/models/ — which is most of its new runtime, so a
+  // label that only mentions weapons reads as a hang rather than as progress.
+  "decompile-models": "Decompiling weapons, agents & gloves",
   "rename-models": "Mapping models to catalog keys",
   "model-textures": "Compressing model textures",
   "composite-inputs": "Extracting composite inputs",
   "charm-anchors": "Reading charm anchors",
   "sticker-markup": "Reading sticker slots",
+  // Was missing entirely, so this row rendered as the raw kebab id.
+  "charm-models": "Reading charm & patch definitions",
   "econ-icons": "Extracting item icons",
   "paint-chain": "Extracting paint chain",
-  "sticker-art": "Extracting sticker art",
-  "sticker-art": "Extracting sticker art",
+  "sticker-art": "Extracting sticker & decal art",
   stamp: "Recording the build",
 };
 
 const extractProgress = computed(() => {
-  const steps = extractStatus.value?.progress?.steps;
-  if (!steps?.length || !extractLive.value) return null;
+  const rawSteps = extractStatus.value?.progress?.steps;
+  if (!rawSteps?.length || !extractLive.value) return null;
+  // ONE step reads as running at a time, whatever the file says.
+  //
+  // sticker-art is a sub-phase of paint-chain, not a step after it: the script
+  // pulls the paint textures, then the sticker textures, then writes the paint
+  // MATERIALS. So paint-chain is genuinely still in flight while sticker-art
+  // runs, and the file honestly reports both — which the panel then drew as two
+  // lit rows, reading as "the earlier one got stuck".
+  //
+  // The list is declared in execution order, so a later step running means every
+  // earlier one has finished the work it reports. Collapse on that rather than
+  // on any special knowledge of which pairs overlap, so a future sub-phase needs
+  // no change here.
+  const lastRunning = rawSteps.reduce((acc, s, i) => (s.state === "running" ? i : acc), -1);
+  const steps = rawSteps.map((s, i) =>
+    s.state === "running" && i < lastRunning
+      ? // Keep its counts; it really did complete them. Only the STATE was
+        // ambiguous, and `seconds` may be absent since the shell closes it later.
+        { ...s, state: "done" as const }
+      : s,
+  );
   return steps.map((s, i) => ({
     ...s,
     label: tr(`inventory.admin.extract.steps.${s.name}`, STEP_LABELS[s.name] ?? s.name),
@@ -808,20 +882,47 @@ const BTN_DANGER =
                   Extracted from this server's CS2 install
                 </p>
                 <div class="divide-y divide-border rounded-md border border-border">
-                  <div
-                    v-for="row in extractedRows"
-                    :key="row.key"
-                    class="flex items-center justify-between gap-4 px-4 py-3"
-                  >
-                    <span class="min-w-0">
-                      <span class="block text-sm text-foreground">{{ row.label }}</span>
-                      <span class="block text-xs text-muted-foreground">{{ row.hint }}</span>
-                    </span>
-                    <span class="whitespace-nowrap font-mono text-sm">
-                      <span :class="row.files ? '' : 'text-destructive'">{{ row.files.toLocaleString() }} files</span>
-                      <span class="text-muted-foreground">·</span>
-                      {{ fmtBytes(row.bytes) }}
-                    </span>
+                  <div v-for="g in extractedGroups" :key="g.key">
+                    <div class="flex items-center justify-between gap-4 px-4 py-3">
+                      <span class="min-w-0">
+                        <span class="block text-sm font-medium text-foreground">{{ g.label }}</span>
+                        <span class="block text-xs text-muted-foreground">{{ g.hint }}</span>
+                      </span>
+                      <span class="whitespace-nowrap font-mono text-sm">
+                        <span :class="g.total.files ? '' : 'text-destructive'">
+                          {{ g.total.files.toLocaleString() }} files
+                        </span>
+                        <span class="text-muted-foreground">·</span>
+                        {{ fmtBytes(g.total.bytes) }}
+                      </span>
+                    </div>
+                    <!-- Breakdown. The bar is proportion WITHIN the group, which is
+                         the comparison that answers "what is eating this mount" —
+                         against the grand total every model row would be a sliver
+                         next to the paint textures. -->
+                    <div v-if="g.rows.length" class="space-y-1.5 border-t border-border/50 bg-muted/20 px-4 py-2.5">
+                      <div v-for="row in g.rows" :key="row.key" class="space-y-1">
+                        <div class="flex items-baseline justify-between gap-4">
+                          <span class="min-w-0 text-xs text-muted-foreground">
+                            {{ row.label }}
+                            <span class="hidden sm:inline opacity-70">— {{ row.hint }}</span>
+                          </span>
+                          <span class="whitespace-nowrap font-mono text-xs">
+                            <span :class="row.files || !row.required ? 'text-muted-foreground' : 'text-destructive'">
+                              {{ row.files.toLocaleString() }}
+                            </span>
+                            <span class="text-muted-foreground/60">·</span>
+                            {{ fmtBytes(row.bytes) }}
+                          </span>
+                        </div>
+                        <div class="h-1 overflow-hidden rounded-full bg-border">
+                          <div
+                            class="h-full rounded-full bg-foreground/30"
+                            :style="{ width: `${Math.max(g.share(row.bytes) * 100, row.bytes ? 1 : 0)}%` }"
+                          />
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
                 <p class="text-xs text-muted-foreground">

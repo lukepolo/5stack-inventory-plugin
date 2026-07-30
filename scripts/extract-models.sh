@@ -92,6 +92,47 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v20 (2026-07-30): charm CLOTH SIMULATION (new step 3g -> <stem>.phys.json).
+# A CS2 charm is a cloth softbody, not a pendulum. Every kc_*.vmdl_c has always
+# carried a PHYS block whose m_pFeModel is a complete PhysFeModelDesc — Valve's
+# FEM/position-based cloth description, simulated by vphysics2's CFeModel — and
+# nothing ever read it. The viewer hung the charm off a hand-rolled one-particle
+# verlet pendulum on a 4mm cord instead, every constant of it a guess, which is
+# why charms read as a rigid blob on a string rather than a thing that swings and
+# flexes. There is no authored fallback to prefer: the charm GLB's one "inspect"
+# animation is a SINGLE static keyframe, so all charm motion in game comes out of
+# this solver. 62 models, ~8KB each, fetched lazily per charm.
+# Units need no conversion — see the step comment. Cheap to re-run on its own
+# (ONLY_STEPS=charm-physics), but it rides a version bump because it changes what
+# a charm looks like in a card bake.
+# v19 (2026-07-30): FOUR cosmetic types gain their assets in one run — batched
+# deliberately, because each bump re-bakes every card and rerunning this four
+# times over is hours of the operator's day.
+#
+#  1. STICKER TEXTURES (step 5, STICKER_TEXTURES). Sticker materials contribute a
+#     named set now, not just g_tSticker0. The material JSON already listed all
+#     ten params; nine of them 404'd, so the viewer had the flags for glitter /
+#     holographic / gold and none of the maps they need, and approximated the
+#     game's authored wear mask (g_tStickerScratches) with 2-octave value noise.
+#     ~6,960 files: g_tNormalRoughnessSticker0 (4,157) and g_tSfxMaskSticker0
+#     (2,650) are PER-STICKER, not the shared defaults they look like. Fixes
+#     stickers already applied to weapons, not just any standalone view.
+#  2. AGENTS (step 2 shard filter, step 3 placement). agents/models/ joins the
+#     decompile, and agents keep their ARCHIVE PATH on the mount because that is
+#     already what cs2-lib hands out as their model — no MAP entry, no client
+#     change. 63 in use out of 92.
+#  3. GLOVES (same two steps + GLOVE_KEY). The 12 meshes live under agents/ while
+#     their materials live under characters/, and the 10 cs2-lib keys are READ
+#     from items_game.txt rather than written down: t_gloves is glove_FINGERLESS
+#     and ct_gloves is glove_HARDKNUCKLE, neither of which is guessable, and two
+#     meshes belong to no item at all.
+#  4. PATCH MATERIALS (step 3f -> patch-materials.json, fed to step 5). cs2-lib
+#     gives a patch no paintMaterial — 0 of 112 — so nothing about a patch ever
+#     reached the paint chain and DECAL_TYPES's "patch" was dead code. The econ
+#     schema's patch_material is the only place the path exists.
+#
+# items_game.txt is now extracted ONCE above the step guards, since three steps
+# read it and a skipped step must not be able to empty it.
 # v18 (2026-07-29): decal art is resolved by STICKER KIT FOLDER, not by basename
 # (step 3f + steps 4/5). The archive files sticker art per event, cs2-lib keeps
 # only the basename, and the icon/material indexes were keyed on that — so all
@@ -132,7 +173,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=18
+EXTRACT_VERSION=20
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -231,7 +272,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models econ-icons paint-chain sticker-art stamp)
+STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -292,6 +333,42 @@ step() { # step "Name" — closes the previous step and opens this one
   prog "$1" running
 }
 
+# ---- Step selection (DEVELOPMENT ONLY) ---------------------------------------
+# A full run is hours, and most work on this script touches exactly one step —
+# so iterating on, say, the glove branch of rename-models meant re-decompiling
+# every weapon first. ONLY_STEPS/SKIP_STEPS are comma-separated step ids:
+#
+#   ONLY_STEPS=rename-models,model-textures ./scripts/extract-models.sh
+#   SKIP_STEPS=decompile-models             ./scripts/extract-models.sh
+#
+# Both default to empty, i.e. today's behaviour exactly — the backend never sets
+# them, so a production run cannot be affected by this.
+#
+# The seven model steps are individually selectable. econ-icons, paint-chain and
+# sticker-art are one interleaved flow with no seam between them, so naming any
+# of the three runs all three.
+#
+# A skipped step reuses whatever the last run left in $WORK and $DEST. That is
+# the point, and it is also the hazard: skip decompile-models after changing the
+# archive filter and you will be reading stale shards. Rerun clean before you
+# trust a result. Cross-step INPUTS (MAP, MODEL_KEY_JSON) are deliberately built
+# outside the guards so a skip can't silently empty them — put anything else of
+# that kind out there too, not inside the step that happens to use it first.
+want_step() { # want_step <id> — true when this run should execute it
+  local id="$1"
+  if [[ -n "${ONLY_STEPS:-}" ]] && [[ ",${ONLY_STEPS}," != *",${id},"* ]]; then return 1; fi
+  if [[ -n "${SKIP_STEPS:-}" ]] && [[ ",${SKIP_STEPS}," == *",${id},"* ]]; then return 1; fi
+  return 0
+}
+# Opens the step and reports whether to run its body. Skipped steps are marked
+# done with no duration so the panel doesn't sit on a step that never ran.
+step_if() { # step_if <id>
+  if want_step "$1"; then step "$1"; return 0; fi
+  echo "--- [$1] SKIPPED (ONLY_STEPS/SKIP_STEPS)"
+  prog "$1" done
+  return 1
+}
+
 # ---- Read the CS2 game build from steam.inf ----------------------------------
 # steam.inf sits right next to the VPK and is a plain Key=Value file. We stamp
 # the build alongside our pipeline version so the backend can tell when the game
@@ -332,7 +409,7 @@ VPK_LIST="$WORK/vpk-list.txt"
 echo "--- Archive: $(wc -l <"$VPK_LIST") entries"
 
 # ---- 2. Decompile every weapon model to GLB with materials + textures --------
-step "decompile-models"
+if step_if "decompile-models"; then
 echo "--- Decompiling weapon models (this takes a few minutes)…"
 # --gltf_export_animations is NOT about playing animations: it is the only way
 # to make VRF emit the SKELETON (skins + bone nodes). Without it the export
@@ -371,21 +448,39 @@ echo "--- Decompiling weapon models (this takes a few minutes)…"
 # adding the tree here is the whole cost — no second pass, and the shard
 # scheduler picks them up as a few more dirs.
 #
+# AGENTS AND GLOVES ride along the same way, out of `agents/models/`. One regex
+# covers both because the archive files them together, which is not obvious:
+#
+#   agents/models/<faction>/<name>.vmdl_c              63 agents in use
+#   agents/models/shared/arms/glove_<type>/...         12 glove meshes
+#
+# The 3-component grouping below turns that into one shard per faction plus one
+# for `agents/models/shared/`, which is the granularity the pool wants.
+#
+# Their MATERIALS live under `characters/`, a different top-level tree — but -f
+# scopes which vmdl_c files get DUMPED, not what VRF follows out of them, so
+# --gltf_export_materials pulls them regardless. (If a glove ever comes out
+# untextured, that assumption is where to look first.)
+#
 # Taking the first three path components covers both layouts the collections
 # use (with and without the extra vmdl/ level).
-mapfile -t WEAPON_DIRS < <(grep -E '^weapons/(models|keychains)/.*\.vmdl_c$' "$VPK_LIST" |
+mapfile -t WEAPON_DIRS < <(grep -E '^(weapons/(models|keychains)|agents/models)/.*\.vmdl_c$' "$VPK_LIST" |
   awk -F/ 'NF>3 {print $1"/"$2"/"$3"/"}' | sort -u)
 SHARDS="$WORK/raw_shards"
 rm -rf "$SHARDS"
 mkdir -p "$SHARDS"
 if (( ${#WEAPON_DIRS[@]} == 0 )); then
-  echo "!! No weapon directories found in the archive listing — falling back to one pass."
+  echo "!! No model directories found in the archive listing — falling back to one pass per tree."
+  # Both trees, or the fallback silently drops every agent and glove and the run
+  # still reports success. Two passes because -f takes one prefix.
+  for tree in "weapons/models/" "agents/models/"; do
   "$CLI" -i "$VPK" -o "$RAW" -d \
-    -f "weapons/models/" -e "vmdl_c" \
+    -f "$tree" -e "vmdl_c" \
     --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
     --gltf_export_animations
+  done
 else
-  echo "--- Sharding ${#WEAPON_DIRS[@]} weapon dirs, starting at $(read_jobs) worker(s)…"
+  echo "--- Sharding ${#WEAPON_DIRS[@]} model dirs (weapons, charms, agents, gloves), starting at $(read_jobs) worker(s)…"
   # Each shard touches a marker on completion, which is both the progress count
   # the panel reads and how the scheduler below knows what is still in flight.
   SHARD_DONE="$SHARDS/.done"
@@ -440,8 +535,11 @@ else
   echo "--- Merged $(find "$RAW" -name '*.glb' | wc -l) glb files from shards"
 fi
 
-# ---- 3. Rename to cs2-lib model keys -----------------------------------------
-step "rename-models"
+fi
+
+# The model key table is DATA, not work — every step that resolves an archive
+# name to a cs2-lib key needs it, so it lives outside the step guards below.
+#
 # The plugin looks up /models/<cs2-lib model key>.glb. Quirks: M4A4's key is
 # "m4a1", Glock-18 is "glock", USP-S is "usp_silencer", etc.
 declare -A MAP=(
@@ -510,14 +608,96 @@ declare -A MAP=(
   [weapon_knife_ursus]=knife_ursus
 )
 
+# Derived from MAP and consumed by two LATER python steps (composite-inputs,
+# sticker-markup), so it is built out here rather than inside a step: keeping it
+# in one meant a skipped rename-models handed the others an empty map, and an
+# empty MODEL_KEY resolves nothing without erroring.
+MODEL_KEY_JSON="{"
+for k in "${!MAP[@]}"; do MODEL_KEY_JSON+="\"$k\":\"${MAP[$k]}\","; done
+MODEL_KEY_JSON="${MODEL_KEY_JSON%,}}"
+export MODEL_KEY_JSON
+
+# ---- The econ schema, out here because THREE steps read it -------------------
+# rename-models needs the glove table below, charm-models needs
+# keychain_definitions, and step 3f needs sticker_kits. One small file and about
+# a second to pull, so it is extracted once up front rather than by whichever
+# step happens to run first — which is also what makes it survive a skip (see
+# the note on ONLY_STEPS).
+echo ""
+echo "--- Reading the econ schema…"
+rm -rf "$WORK/raw_items"
+"$CLI" -i "$VPK" -o "$WORK/raw_items" -d -f "scripts/items/items_game.txt" >/dev/null 2>&1 || true
+ITEMS_GAME="$(find "$WORK/raw_items" -name items_game.txt | head -1)"
+
+# ---- Glove model key -> mesh -------------------------------------------------
+# 10 cs2-lib keys against 12 meshes, and NOT guessable: `t_gloves` is
+# glove_FINGERLESS and `ct_gloves` is glove_HARDKNUCKLE, while `glove_fullfinger`
+# and `glove_cloth_collision` belong to no econ item at all. This is exactly the
+# case the knife MAP comment warns about — a wrong key just 404s in silence — so
+# it is READ, not written down:
+#
+#   "5030" { name sporty_gloves  model_player agents/models/shared/arms/glove_sporty/glove_sporty.vmdl }
+#
+# `name` IS cs2-lib's `model` for a glove, so the pair falls straight out.
+declare -A GLOVE_KEY=()
+if [[ -n "$ITEMS_GAME" ]]; then
+  while IFS=$'\t' read -r gname gmesh; do
+    [[ -n "$gname" && -n "$gmesh" ]] && GLOVE_KEY["$gmesh"]="$gname"
+  done < <(ITEMS_GAME="$ITEMS_GAME" python3 -c '
+import os, re, sys
+src = os.environ["ITEMS_GAME"]
+KV = re.compile(r"^\s*\"([^\"]+)\"\s+\"([^\"]*)\"\s*$")
+name = None
+out = {}
+for line in open(src, encoding="utf8", errors="replace"):
+    m = KV.match(line)
+    if not m:
+        continue
+    k, v = m.group(1), m.group(2)
+    if k == "name":
+        name = v
+    elif k == "model_player" and name and "/arms/glove_" in v:
+        # Mesh BASENAME is what the decompiler writes as <stem>.glb.
+        out.setdefault(v.rsplit("/", 1)[-1].removesuffix(".vmdl"), name)
+for mesh, n in sorted(out.items()):
+    sys.stdout.write(f"{n}\t{mesh}\n")
+' 2>/dev/null)
+fi
+echo "--- Glove keys: ${#GLOVE_KEY[@]} (${!GLOVE_KEY[*]})"
+
+# ---- 3. Rename to cs2-lib model keys -----------------------------------------
+if step_if "rename-models"; then
+
 count=0
 charms=0
+gloves=0
+agents=0
 while IFS= read -r -d '' f; do
   base="$(basename "$f" .glb)"
+  # Path RELATIVE to $RAW, which mirrors the archive — the agent branch below is
+  # the only thing that needs more than the basename, and it needs all of it.
+  rel="${f#"$RAW"/}"
   key="${MAP[$base]:-}"
+  gkey="${GLOVE_KEY[$base]:-}"
   if [[ -n "$key" ]]; then
     cp "$f" "$DEST/$key.glb"
     count=$((count + 1))
+  elif [[ -n "$gkey" ]]; then
+    # Gloves land TOP LEVEL under their cs2-lib key, exactly like weapons, so
+    # modelUrlFor("sporty_gloves") resolves with no client change. The two meshes
+    # with no econ item (fullfinger, cloth_collision) simply never match here.
+    cp "$f" "$DEST/$gkey.glb"
+    gloves=$((gloves + 1))
+  elif [[ "$rel" == agents/models/* && "$rel" != agents/models/shared/* && "$base" != *_physics ]]; then
+    # Agents keep their ARCHIVE PATH. cs2-lib already gives them
+    # `agents/models/tm_leet/tm_leet_variantg` as the model, and modelUrlFor
+    # encodes path segments individually — so mirroring the tree here is the
+    # whole integration, with no MAP entry and no client change. Their textures
+    # still go in the flat copy below: loadGltf parses with an explicit
+    # `/models/` base URL, so a subdirectory GLB resolves siblings from the root.
+    mkdir -p "$DEST/$(dirname "$rel")"
+    cp "$f" "$DEST/$rel"
+    agents=$((agents + 1))
   elif [[ "$base" == kc_*_physics ]]; then
     # Collision hulls ship alongside every charm and render as a grey blob if
     # anything ever loaded one. Nothing looks them up, so drop them rather than
@@ -546,11 +726,29 @@ done < <(find "$RAW" -name '*.glb' -print0)
 # viewer 404s and defaults render flat. Names are content-hashed, so a flat
 # copy dedupes shared ones (default_*, sticker_gaps, ...).
 find "$RAW" -name '*.png' -exec cp -n {} "$DEST" \; 2>/dev/null || true
+# `cp -n` is first-writer-wins and silent, and the namespace is now shared by
+# weapons, charms, gloves and 63 agents. That is SAFE by construction — the
+# decompiler names textures after the source vtex including its content hash
+# (`rif_famas_color_psd_442edc53.png`), so equal names mean equal content — but
+# a handful of names carry no hash (`physics_weaponrifle.png`), and those are
+# the ones that could quietly differ. Compare sizes and say so if they do:
+# cheap, and the alternative symptom is one wrong-textured agent with nothing in
+# any log.
+find "$RAW" -name '*.png' -printf '%f\t%s\t%p\n' 2>/dev/null | sort | awk -F'\t' '
+  { if ($1 == prev_name && $2 != prev_size) print "!! texture name collision with DIFFERENT sizes: " $1 " (" prev_size " vs " $2 ")\n!!   " prev_path "\n!!   " $3; prev_name=$1; prev_size=$2; prev_path=$3 }
+' || true
 
-echo "--- Mapped $count weapons, $charms charms ($(du -sh "$DEST" | cut -f1) total)"
+echo "--- Mapped $count weapons, $charms charms, $gloves gloves, $agents agents ($(du -sh "$DEST" | cut -f1) total)"
+# The glove keys come from the econ schema, so a zero here means the schema read
+# failed rather than that the archive changed — worth saying out loud, since the
+# only other symptom is every glove 404ing in the viewer.
+(( gloves == 0 )) && echo "!! No gloves mapped — check the GLOVE_KEY table above and that items_game.txt extracted."
+(( agents == 0 )) && echo "!! No agents mapped — check the shard filter includes agents/models/."
+
+fi
 
 # ---- 3a2. Model textures -> lossless webp -------------------------------------
-step "model-textures"
+if step_if "model-textures"; then
 # The glTF exporter writes PNG. Lossless WebP is byte-identical after decode and
 # MEASURED 18-36% smaller on these (avg ~25%: ak47_default_color 15->10MB,
 # _normal 15->11MB, _ao/orm 17->14MB) — so this is pure transfer and disk saved
@@ -770,8 +968,10 @@ print(f"---   {len(done)}/{len(todo)} textures -> lossless webp, "
       f"{rewritten} glb rewritten, {freed / 1e6:.0f}MB freed", flush=True)
 PYEOF
 
+fi
+
 # ---- 3b. Per-weapon composite inputs ------------------------------------------
-step "composite-inputs"
+if step_if "composite-inputs"; then
 # CS2 composites skins from per-weapon input textures (cavity/AO/noPaint,
 # paint-by-number masks, base color, base rough/metal — all in paint-UV
 # space). The 3D viewer's compositor consumes them from
@@ -817,14 +1017,6 @@ mkdir -p "$RAW_CI"
 # (148 entries, cheap) and let the walk below keep the composite_inputs ones.
 "$CLI" -i "$VPK" -o "$RAW_CI" \
   -f "weapons/models/" -e "vmat_c"
-
-# The models-tree vmats are named <glb basename>_composite_inputs.vmat_c, so the
-# same MAP that renames the GLBs in step 3 resolves their cs2-lib keys. Hand it
-# to the python below rather than maintaining a second copy that can drift.
-MODEL_KEY_JSON="{"
-for k in "${!MAP[@]}"; do MODEL_KEY_JSON+="\"$k\":\"${MAP[$k]}\","; done
-MODEL_KEY_JSON="${MODEL_KEY_JSON%,}}"
-export MODEL_KEY_JSON
 
 # Parse each composite_inputs vmat for its texture references, decompile
 # exactly those textures, and assemble <key>.inputs/ bundles.
@@ -1234,8 +1426,10 @@ if missing_tex:
               file=sys.stderr)
 PYEOF
 
+fi
+
 # ---- 3c. Keychain (charm) anchor points --------------------------------------
-step "charm-anchors"
+if step_if "charm-anchors"; then
 # Where a charm hangs is baked into the weapon model as an attachment named
 # "keychain" (parented to bone weapon_hand_r), and it is hand-placed per weapon
 # — the AK's sits forward of the ejection port while the M4A4's sits behind it,
@@ -1433,8 +1627,10 @@ if rotated:
     print("!!! The chain is translation-only — these anchors may be off.")
 PYEOF
 
+fi
+
 # ---- 3d. Sticker slot markup -------------------------------------------------
-step "sticker-markup"
+if step_if "sticker-markup"; then
 # Per-weapon sticker slot anchors, in the weapon's TEXCOORD_1 UV space.
 #
 # CS2 does not project stickers as 3D decals — it composites them in UV space
@@ -1608,8 +1804,10 @@ if not markup:
           "back to the silhouette guess. Check the `-b DATA` output format.")
 PYEOF
 
+fi
+
 # ---- 3e. Charm model + material map ------------------------------------------
-step "charm-models"
+if step_if "charm-models"; then
 # Which MODEL and which MATERIAL each charm is, straight from the econ schema.
 #
 # A charm is not "one model per charm". The community collections are a shared
@@ -1630,9 +1828,7 @@ step "charm-models"
 # release), so they are merged rather than read from the first.
 echo ""
 echo "--- Reading charm models…"
-rm -rf "$WORK/raw_items"
-"$CLI" -i "$VPK" -o "$WORK/raw_items" -d -f "scripts/items/items_game.txt" >/dev/null 2>&1 || true
-ITEMS_GAME="$(find "$WORK/raw_items" -name items_game.txt | head -1)"
+# items_game.txt is extracted once above the step guards — three steps read it.
 # Every keychain material's DATA block, for the shading params below. Written to
 # a FILE, not an environment variable: the dump is ~90 materials of KV3 and the
 # whole environment has to fit execve's limit, so inlining it failed the run
@@ -1878,14 +2074,17 @@ PYEOF
 # different stem (`ibuypower_1355_37`), so the file name has to stay the
 # manifest's. Like keychain_definitions these arrive in ~55 blocks, so merge.
 STICKER_KITS="$WORK/sticker-kits.json"
-ITEMS_GAME="$ITEMS_GAME" STICKER_KITS="$STICKER_KITS" python3 - <<'PYEOF'
-import json, os, re
+PATCH_MATS="$WORK/patch-materials.json"
+ITEMS_GAME="$ITEMS_GAME" STICKER_KITS="$STICKER_KITS" PATCH_MATS="$PATCH_MATS" DEST="$DEST" python3 - <<'PYEOF'
+import hashlib, json, os, re
 
 src, out_path = os.environ.get("ITEMS_GAME", ""), os.environ["STICKER_KITS"]
+patch_path, dest = os.environ["PATCH_MATS"], os.environ["DEST"]
 KV = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"\s*$')
 INDEX = re.compile(r'^"(\d+)"$')
 
 dirs = {}
+patches = {}
 if src and os.path.exists(src):
     lines = open(src, encoding="utf8", errors="replace").read().splitlines()
     i = 0
@@ -1913,6 +2112,18 @@ if src and os.path.exists(src):
                         mat, tree = entry.get("patch_material"), "patches"
                     if mat:
                         dirs[cur] = f"{tree}/{mat}".rsplit("/", 1)[0]
+                        # PATCHES need the FULL path, not just the folder.
+                        #
+                        # cs2-lib gives a patch no `paintMaterial` at all — 0 of
+                        # 112 — so unlike a sticker there is no manifest entry to
+                        # resolve, and the paint chain would never see one. This
+                        # is the only place the schema names it, so it is kept
+                        # whole and fed in as an extra entry point (same
+                        # mechanism the charm materials already use). That is
+                        # also what makes DECAL_TYPES's "patch" in the asset
+                        # manifest stop being dead code.
+                        if tree == "patches":
+                            patches[cur] = f"patches/{mat}.vmat"
                     cur, entry = None, None
             elif depth == 1:
                 m = INDEX.match(stripped)
@@ -1927,12 +2138,520 @@ if src and os.path.exists(src):
 
 with open(out_path, "w") as fh:
     json.dump(dirs, fh)
+# Two different files from the same table, exactly as the charm step does it:
+#
+#   $WORK  archive paths WITH the _c suffix, for the paint chain to queue as
+#          extra entry points (see CHARM_MATS, same mechanism)
+#   $DEST  the OUTPUT name each will be written under, so the backend can answer
+#          "which material is this patch" without re-deriving it — the same
+#          shape and the same hash rule charm-models.json uses
+def mat_out_name(path):
+    stem = os.path.basename(path)
+    stem = stem[: stem.index(".")]
+    return f"{stem}_{hashlib.sha1((path + '_c').encode()).hexdigest()[:8]}.vmat.json"
+
+
+with open(patch_path, "w") as fh:
+    json.dump(sorted({p + "_c" for p in patches.values()}), fh)
+os.makedirs(dest, exist_ok=True)
+with open(os.path.join(dest, "patch-materials.json"), "w") as fh:
+    json.dump({k: f"/materials/{mat_out_name(v)}" for k, v in patches.items()}, fh,
+              indent=1, sort_keys=True)
 print(f"--- Sticker kits: {len(dirs)} kit folders (disambiguates same-named decal art)")
+print(f"--- Patch materials: {len(patches)}")
 if not dirs:
     print("!!! No sticker kits recovered — decal art falls back to a basename match, "
           "which serves ONE event's art for every same-named sticker.")
+if not patches:
+    print("!!! No patch materials recovered — patches have no paintMaterial in cs2-lib, "
+          "so this file is the ONLY way their art reaches the paint chain.")
 PYEOF
 
+fi
+
+# ---- 3g. Charm cloth simulation ----------------------------------------------
+if step_if "charm-physics"; then
+# How a charm MOVES. A charm is a cloth softbody, not a pendulum.
+#
+# Every kc_*.vmdl_c carries a PHYS block whose m_pFeModel is a complete
+# PhysFeModelDesc — Valve's FEM/position-based cloth description, simulated by
+# vphysics2's CPhysicsSoftbody/CFeModel. Nodes, quads, rods, hinge limits, axial
+# bends, per-node masses and gravity, all authored per charm. The DATA block adds
+# `cloth_sleep_enabled`. There is no authored swing anywhere to fall back on: the
+# charm GLB's one "inspect" animation is a SINGLE static keyframe, a reference
+# pose. All charm motion in game comes out of this solver.
+#
+# The viewer had a hand-rolled one-particle verlet pendulum on a 4mm cord in its
+# place, every constant of it a guess. This is the real thing.
+#
+# Units need no conversion. The GLB's root node carries the 0.0254 scale and the
+# Source->glTF swizzle, so everything below it — bones, mesh — is Source inches in
+# Source axes, and so is this. Verified: m_InitPose entry 3 of kc_aus2025 is
+# joint1's GLB bind translation byte for byte. flGravity (360 in/s^2 here) is used
+# as-is; only the gravity DIRECTION has to be rotated in from world space.
+#
+# m_CtrlName maps sim nodes to bones. Only the `joint*` ctrls are real bones —
+# `$ha_*`, `$cc*` and `$cloth_node_*` are virtual — which is what makes 20 nodes
+# drive a 3-bone skin.
+#
+# Two invocations for the whole tree, as §3d does it: the dump delimits files with
+# `[n/m] <path>`. `-b PHYS` prints the block verbatim as KV3 rather than resolving
+# anything, so the VCS-71 noise is absent here too.
+echo ""
+echo "--- Extracting charm cloth models…"
+mkdir -p "$DEST"
+"$CLI" -i "$VPK" -f "weapons/keychains/" -e vmdl_c -b PHYS >"$WORK/charm-phys.txt" 2>/dev/null || true
+"$CLI" -i "$VPK" -f "weapons/keychains/" -e vmdl_c -b DATA >"$WORK/charm-phys-data.txt" 2>/dev/null || true
+# The raw dumps are archived next to the parsed JSON for the same reason §3c keeps
+# the .vmdl text: extraction runs on the game node and is slow, so a parser bug
+# should be fixable from the dump instead of costing another run. ~2.5MB, gzipped.
+gzip -c "$WORK/charm-phys.txt" >"$DEST/charm-phys.txt.gz" 2>/dev/null || true
+
+CHARM_PHYS="$WORK/charm-phys.txt" CHARM_PHYS_DATA="$WORK/charm-phys-data.txt" \
+DEST="$DEST" python3 - <<'PYEOF'
+import json, os, re
+
+phys_path, data_path = os.environ["CHARM_PHYS"], os.environ["CHARM_PHYS_DATA"]
+dest = os.environ["DEST"]
+
+# ---- KV3 text parser ---------------------------------------------------------
+# A trimmed copy of the paint parser further down this script. Trimmed and
+# duplicated rather than shared because the two live in different heredocs and
+# this one needs a strict subset — PHYS KV3 is objects, arrays, strings, numbers
+# and booleans, with no `resource:` refs and no binary blobs. If the tokenizer
+# below ever gains a case, check whether this one needs it too.
+_TOKEN = re.compile(
+    r"""
+      (?P<ws>\s+)
+    | (?P<comment><!--.*?-->)
+    | (?P<punct>[\{\}\[\],=])
+    | (?P<string>"(?:[^"\\]|\\.)*")
+    | (?P<number>[-+]?(?:\d+\.\d+(?:[eE][-+]?\d+)?|\.\d+|\d+))
+    | (?P<ident>[A-Za-z_][A-Za-z0-9_.]*)
+    """,
+    re.X | re.S,
+)
+
+
+def kv3_parse(text):
+    pos, end, buf = 0, len(text), []
+
+    def pump():
+        nonlocal pos
+        while pos < end:
+            m = _TOKEN.match(text, pos)
+            if not m:
+                raise ValueError(f"cannot tokenize at {text[pos:pos + 40]!r}")
+            pos = m.end()
+            if m.lastgroup not in ("ws", "comment"):
+                return (m.lastgroup, m.group())
+        return None
+
+    def peek():
+        if not buf:
+            t = pump()
+            if t is None:
+                return None
+            buf.append(t)
+        return buf[0]
+
+    def take():
+        peek()
+        return buf.pop(0) if buf else None
+
+    def value():
+        tok = take()
+        if tok is None:
+            raise ValueError("unexpected end of input")
+        kind, raw = tok
+        if kind == "punct" and raw == "{":
+            obj = {}
+            while True:
+                nxt = peek()
+                if nxt is None:
+                    raise ValueError("unterminated object")
+                if nxt[1] == "}":
+                    take()
+                    return obj
+                if nxt[1] == ",":
+                    take()
+                    continue
+                kkind, key = take()
+                if kkind == "string":
+                    key = key[1:-1]
+                elif kkind != "ident":
+                    raise ValueError(f"bad key {key!r}")
+                eq = take()
+                if eq is None or eq[1] != "=":
+                    raise ValueError(f"expected = after {key!r}")
+                obj[key] = value()
+        if kind == "punct" and raw == "[":
+            arr = []
+            while True:
+                nxt = peek()
+                if nxt is None:
+                    raise ValueError("unterminated array")
+                if nxt[1] == "]":
+                    take()
+                    return arr
+                if nxt[1] == ",":
+                    take()
+                    continue
+                arr.append(value())
+        if kind == "string":
+            return raw[1:-1]
+        if kind == "number":
+            return float(raw) if re.search(r"[.eE]", raw) else int(raw)
+        if kind == "ident":
+            return {"true": True, "false": False, "null": None}.get(raw, raw)
+        raise ValueError(f"unexpected token {raw!r}")
+
+    return value()
+
+
+HEADER = re.compile(r"^\[\d+/\d+\]\s+(\S+)\s*$")
+
+
+def sections(text):
+    """Split a `-b <BLOCK>` dump per file. The KV3 body starts at the first line
+    that is exactly `{` — everything above it is the resource header VRF always
+    prints (block table, external refs), which is not KV3 and must be dropped."""
+    out, cur, buf = {}, None, []
+    for line in text.splitlines():
+        m = HEADER.match(line)
+        if m:
+            if cur:
+                out[cur] = buf
+            cur, buf = m.group(1), []
+        elif cur is not None:
+            buf.append(line)
+    if cur:
+        out[cur] = buf
+
+    def body(lines):
+        for i, l in enumerate(lines):
+            if l.rstrip() == "{":
+                return "\n".join(lines[i:])
+        return ""
+
+    return {k: body(v) for k, v in out.items()}
+
+
+# VRF prints ~6 significant digits; rounding past that would invent precision.
+# At inch scale 1e-6in is far below anything visible, so never hand-tune these.
+R = 6
+
+
+def col(rows, key, cast=float):
+    return [cast(r[key]) for r in rows]
+
+
+def colr(rows, key):
+    return [round(float(r[key]), R) for r in rows]
+
+
+def colflat(rows, key, n, cast=float):
+    out = []
+    for r in rows:
+        v = r[key]
+        if len(v) != n:
+            raise ValueError(f"{key}: expected width {n}, got {len(v)}")
+        out.extend(cast(x) if cast is int else round(float(x), R) for x in v)
+    return out
+
+
+# Arrays empty on every charm in this build, kept as a TRIPWIRE rather than
+# assumed away: a future charm that populates one would need solver support it
+# silently would not get, and an unsimulated constraint means a charm that falls
+# through the gun instead of hanging off it.
+#
+# This list is much shorter than it first looked. Rods, twists, axial edges and
+# dyn/kin links are not rare — 15 of 62 charms carry rods (every weapon-shaped
+# charm, plus the display case), 13 carry axial edges, 2 carry twists. They were
+# merely absent from the first charm that got dumped.
+EXPECTED_EMPTY = [
+    "m_Ropes", "m_SpringIntegrator", "m_SimdSpringIntegrator",
+    "m_GoalDampedSpringIntegrators", "m_JiggleBones", "m_Tris", "m_SimdTris",
+    "m_SphereRigids", "m_BoxRigids", "m_SDFRigids", "m_TaperedCapsuleStretches",
+    "m_TaperedCapsuleRigids", "m_Effects", "m_MorphLayers", "m_MorphSetData",
+    "m_FitMatrices", "m_FitWeights", "m_KelagerBends", "m_AntiTunnelBytecode",
+    "m_CollisionPlanes", "m_WorldCollisionParams", "m_WorldCollisionNodes",
+    "m_LegacyStretchForce", "m_AnimStrayRadii", "m_SimdAnimStrayRadii",
+    "m_CtrlSoftOffsets", "m_CtrlOsOffsets", "m_FollowNodes", "m_LocalRotation",
+    "m_LocalForce", "m_LockToParent", "m_LockToGoal", "m_DynNodeVertexSet",
+    "m_RigidColliderPriorities",
+]
+
+
+def convert(fe, name, sleep):
+    n = int(fe["m_nNodeCount"])
+    # m_InitPose is [x, y, z, 1.0, qx, qy, qz, qw] per ctrl.
+    pos, rot = [], []
+    for e in fe["m_InitPose"]:
+        if len(e) != 8:
+            raise ValueError(f"m_InitPose width {len(e)}")
+        pos.extend(round(float(x), R) for x in e[0:3])
+        rot.extend(round(float(x), R) for x in e[4:8])
+
+    quads, bases = fe["m_Quads"], fe["m_NodeBases"]
+    hinges, integ = fe["m_HingeLimits"], fe["m_NodeIntegrator"]
+    rods, twists, axial = fe["m_Rods"], fe["m_Twists"], fe["m_AxialEdges"]
+
+    return {
+        "name": name,
+        "nodes": n,
+        "static": int(fe["m_nStaticNodes"]),
+        "rotLockStatic": int(fe["m_nRotLockStaticNodes"]),
+        "firstPosDriven": int(fe["m_nFirstPositionDrivenNode"]),
+        "treeDepth": int(fe["m_nTreeDepth"]),
+        # Every iteration count and every count1/count2 pair. Those pairs slice
+        # each constraint array into solver passes, and WHICH slice runs WHEN is a
+        # solver question the data cannot answer on its own — so keep them all
+        # rather than deciding here which ones matter.
+        "iters": int(fe["m_nExtraIterations"]),
+        "pressureIters": int(fe["m_nExtraPressureIterations"]),
+        "goalIters": int(fe["m_nExtraGoalIterations"]),
+        "quadCount1": int(fe["m_nQuadCount1"]),
+        "quadCount2": int(fe["m_nQuadCount2"]),
+        "simdQuadCount1": int(fe["m_nSimdQuadCount1"]),
+        "simdQuadCount2": int(fe["m_nSimdQuadCount2"]),
+        "triCount1": int(fe["m_nTriCount1"]),
+        "triCount2": int(fe["m_nTriCount2"]),
+        "baseJiggleDepends": int(fe["m_nNodeBaseJiggleboneDependsCount"]),
+        "staticNodeFlags": int(fe["m_nStaticNodeFlags"]),
+        "dynamicNodeFlags": int(fe["m_nDynamicNodeFlags"]),
+        "localForce": round(float(fe["m_flLocalForce"]), R),
+        "localRotation": round(float(fe["m_flLocalRotation"]), R),
+        "gravityScale": round(float(fe["m_flDefaultGravityScale"]), R),
+        "addWorldCollisionRadius": round(float(fe["m_flAddWorldCollisionRadius"]), R),
+        "motionSmoothCDT": round(float(fe["m_flMotionSmoothCDT"]), R),
+        "internalPressure": round(float(fe["m_flInternalPressure"]), R),
+        "timeDilation": round(float(fe["m_flDefaultTimeDilation"]), R),
+        "windage": round(float(fe["m_flWindage"]), R),
+        "windDrag": round(float(fe["m_flWindDrag"]), R),
+        "surfaceStretch": round(float(fe["m_flDefaultSurfaceStretch"]), R),
+        "threadStretch": round(float(fe["m_flDefaultThreadStretch"]), R),
+        "velAirDrag": round(float(fe["m_flDefaultVelAirDrag"]), R),
+        "expAirDrag": round(float(fe["m_flDefaultExpAirDrag"]), R),
+        "velQuadAirDrag": round(float(fe["m_flDefaultVelQuadAirDrag"]), R),
+        "expQuadAirDrag": round(float(fe["m_flDefaultExpQuadAirDrag"]), R),
+        "volumetricSolve": round(float(fe["m_flDefaultVolumetricSolveAmount"]), R),
+        "rodVelSmoothRate": round(float(fe["m_flRodVelocitySmoothRate"]), R),
+        "quadVelSmoothRate": round(float(fe["m_flQuadVelocitySmoothRate"]), R),
+        "rodVelSmoothIters": int(fe["m_nRodVelocitySmoothIterations"]),
+        "quadVelSmoothIters": int(fe["m_nQuadVelocitySmoothIterations"]),
+        "localDrag1": round(float(fe["m_flLocalDrag1"]), R),
+        "sleep": bool(sleep),
+        # The node -> bone map. `$`-prefixed ctrls are virtual and have no bone.
+        "ctrl": list(fe["m_CtrlName"]),
+        "invMass": [round(float(x), R) for x in fe["m_NodeInvMasses"]],
+        # radius/friction are per DYNAMIC node, NOT per node: their length is
+        # nodeCount - staticNodes on every charm here (20-4=16 on kc_aus2025,
+        # 21-4=17 on kc_wpn_ak_base), so index them as [node - staticNodes].
+        # friction is simply absent when it is uniformly zero.
+        "radius": [round(float(x), R) for x in fe["m_NodeCollisionRadii"]],
+        "friction": [round(float(x), R) for x in fe["m_DynNodeFriction"]],
+        "initPos": pos,
+        "initRot": rot,
+        "free": [int(x) for x in fe["m_FreeNodes"]],
+        "sourceElems": [int(x) for x in fe["m_SourceElems"]],
+        "skelParents": [int(x) for x in fe["m_SkelParents"]],
+        # The node BVH: parents and masks are one entry per TREE node (33 for a
+        # 21-node model), children are pairs. These index tree nodes, not sim
+        # nodes, which is why they sit outside the range check below.
+        "treeParents": [int(x) for x in fe["m_TreeParents"]],
+        "treeChildren": [int(x) for c in fe["m_TreeChildren"] for x in c["nChild"]],
+        "treeMasks": [int(x) for x in fe["m_TreeCollisionMasks"]],
+        "quads": {
+            "n": colflat(quads, "nNode", 4, int),
+            "slack": colr(quads, "flSlack"),
+            "shape": [round(float(x), R) for q in quads for v in q["vShape"] for x in v],
+        },
+        # Distance constraints. flMaxDist 16384 reads as "no upper bound" — a cord
+        # that may go slack but must not stretch past flMinDist.
+        "rods": {
+            "n": colflat(rods, "nNode", 2, int),
+            "min": colr(rods, "flMinDist"),
+            "max": colr(rods, "flMaxDist"),
+            "w0": colr(rods, "flWeight0"),
+            "relax": colr(rods, "flRelaxationFactor"),
+        },
+        "bases": {
+            "n": col(bases, "nNode", int),
+            "x0": col(bases, "nNodeX0", int),
+            "x1": col(bases, "nNodeX1", int),
+            "y0": col(bases, "nNodeY0", int),
+            "y1": col(bases, "nNodeY1", int),
+            "q": colflat(bases, "qAdjust", 4),
+        },
+        "hinges": {
+            "n": colflat(hinges, "nNode", 6, int),
+            "w4": colr(hinges, "flWeight4"),
+            "w5": colr(hinges, "flWeight5"),
+            "flags": col(hinges, "nFlags", int),
+            "center": colr(hinges, "flAngleCenter"),
+            "extent": colr(hinges, "flAngleExtents"),
+        },
+        # Bending constraints: six nodes, a barycentric-looking (te, tv) pair and
+        # four weights.
+        "axial": {
+            "n": colflat(axial, "nNode", 6, int),
+            "te": colr(axial, "te"),
+            "tv": colr(axial, "tv"),
+            "dist": colr(axial, "flDist"),
+            "w": colflat(axial, "flWeight", 4),
+        },
+        "twists": [
+            {"orient": int(t["nNodeOrient"]), "end": int(t["nNodeEnd"]),
+             "twist": round(float(t["flTwistRelax"]), R),
+             "swing": round(float(t["flSwingRelax"]), R)}
+            for t in twists
+        ],
+        "dynKinLinks": [
+            {"parent": int(l["m_nParent"]), "child": int(l["m_nChild"])}
+            for l in fe["m_DynKinLinks"]
+        ],
+        # Per NODE, one entry each — verified across all 62, not assumed.
+        "integrator": {
+            "damping": colr(integ, "flPointDamping"),
+            "animForce": colr(integ, "flAnimationForceAttraction"),
+            "animVertex": colr(integ, "flAnimationVertexAttraction"),
+            "gravity": colr(integ, "flGravity"),
+        },
+        "ctrlOffsets": [
+            {"o": [round(float(x), R) for x in c["vOffset"]],
+             "parent": int(c["nCtrlParent"]), "child": int(c["nCtrlChild"])}
+            for c in fe["m_CtrlOffsets"]
+        ],
+        "reverseOffsets": [
+            {"o": [round(float(x), R) for x in c["vOffset"]],
+             "ctrl": int(c["nBoneCtrl"]), "node": int(c["nTargetNode"])}
+            for c in fe["m_ReverseOffsets"]
+        ],
+        "antiTunnel": {
+            "probes": [
+                {"w": round(float(p["flWeight"]), R), "flags": int(p["nFlags"]),
+                 "node": int(p["nProbeNode"]), "count": int(p["nCount"]),
+                 "begin": int(p["nBegin"]),
+                 "activation": round(float(p["flActivationDistance"]), R),
+                 "curvature": round(float(p["flCurvatureRadius"]), R),
+                 "bias": round(float(p["flBias"]), R)}
+                for p in fe["m_AntiTunnelProbes"]
+            ],
+            "targets": [int(x) for x in fe["m_AntiTunnelTargetNodes"]],
+        },
+    }
+
+
+def check(out):
+    """Structural invariants. A charm failing one is DROPPED rather than shipped:
+    the solver is data-driven, and a bad index is either a crash or a charm that
+    flies off — neither is better than falling back to the flat sprite."""
+    n, errs = out["nodes"], []
+    if len(out["ctrl"]) != n:
+        errs.append(f"ctrl {len(out['ctrl'])} != nodes {n}")
+    if len(out["invMass"]) != n:
+        errs.append(f"invMass {len(out['invMass'])} != nodes {n}")
+    if len(out["integrator"]["gravity"]) != n:
+        errs.append(f"integrator {len(out['integrator']['gravity'])} != nodes {n}")
+    if len(out["initPos"]) != 3 * n:
+        errs.append(f"initPos {len(out['initPos'])} != 3*{n}")
+    dyn = n - out["static"]
+    for k in ("radius", "friction"):
+        if len(out[k]) not in (0, dyn):
+            errs.append(f"{k} {len(out[k])} != 0 or {dyn} (dynamic nodes)")
+    for i in range(out["static"]):
+        if out["invMass"][i] != 0.0:
+            errs.append(f"invMass[{i}] = {out['invMass'][i]}, expected 0 (static)")
+    idx = (out["quads"]["n"] + out["bases"]["n"] + out["bases"]["x0"]
+           + out["bases"]["x1"] + out["bases"]["y0"] + out["bases"]["y1"]
+           + out["hinges"]["n"] + out["free"] + out["antiTunnel"]["targets"]
+           + out["rods"]["n"] + out["axial"]["n"]
+           + [t["orient"] for t in out["twists"]] + [t["end"] for t in out["twists"]]
+           + [l["parent"] for l in out["dynKinLinks"]]
+           + [l["child"] for l in out["dynKinLinks"]])
+    bad = [i for i in idx if i < 0 or i >= n]
+    if bad:
+        errs.append(f"{len(bad)} node indices out of range 0..{n - 1}: {bad[:6]}")
+    return errs
+
+
+def read(path):
+    try:
+        return open(path, encoding="utf8", errors="replace").read()
+    except OSError:
+        return ""
+
+
+SLEEP = re.compile(r"cloth_sleep_enabled\s*=\s*(true|false)")
+sleep_by = {p: bool(SLEEP.search(t) and SLEEP.search(t).group(1) == "true")
+            for p, t in sections(read(data_path)).items()}
+
+index, failed, extra = {}, [], {}
+for path, text in sorted(sections(read(phys_path)).items()):
+    stem = os.path.basename(path).replace(".vmdl_c", "")
+    # Rigid collision hulls, dropped as GLBs in §3 for the same reason.
+    if stem.endswith("_physics"):
+        continue
+    try:
+        fe = kv3_parse(text).get("m_pFeModel")
+    except ValueError as e:
+        failed.append(f"{stem}: {e}")
+        continue
+    if not isinstance(fe, dict):
+        failed.append(f"{stem}: no m_pFeModel")
+        continue
+    for k in EXPECTED_EMPTY:
+        v = fe.get(k)
+        if isinstance(v, list) and v:
+            extra.setdefault(k, []).append(stem)
+    try:
+        out = convert(fe, stem, sleep_by.get(path, False))
+    except (KeyError, ValueError, TypeError) as e:
+        failed.append(f"{stem}: {type(e).__name__} {e}")
+        continue
+    errs = check(out)
+    if errs:
+        failed.append(f"{stem}: " + "; ".join(errs))
+        continue
+    with open(os.path.join(dest, f"{stem}.phys.json"), "w") as fh:
+        json.dump(out, fh, separators=(",", ":"), sort_keys=True)
+    index[stem] = {
+        "nodes": out["nodes"], "static": out["static"],
+        "quads": len(out["quads"]["slack"]), "bases": len(out["bases"]["n"]),
+        "hinges": len(out["hinges"]["center"]), "rods": len(out["rods"]["min"]),
+        "axial": len(out["axial"]["te"]), "twists": len(out["twists"]),
+    }
+
+with open(os.path.join(dest, "charm-physics.json"), "w") as fh:
+    json.dump(index, fh, indent=1, sort_keys=True)
+
+if index:
+    def rng(k):
+        return min(v[k] for v in index.values()), max(v[k] for v in index.values())
+    # The spans are the point of this line: the solver is data-driven, so an
+    # outlier model should read as a number here rather than as a viewer that
+    # drops to 5fps in production.
+    print(f"--- Charm physics: {len(index)} cloth models  " + "  ".join(
+        f"{k} {rng(k)[0]}-{rng(k)[1]}" for k in ("nodes", "quads", "rods", "hinges", "axial")))
+for k, v in sorted(extra.items()):
+    print(f"---   UNSUPPORTED {k} populated on {len(v)}: {', '.join(sorted(v)[:6])}")
+for f in failed:
+    print(f"---   skipped {f}")
+if not index:
+    print("!!! No charm physics recovered — charms fall back to the viewer's own "
+          "pendulum. Check the `-b PHYS` output format.")
+PYEOF
+
+fi
+
+# The icons/paints region is ALL OR NOTHING for ONLY_STEPS/SKIP_STEPS.
+# econ-icons, paint-chain and sticker-art are one interleaved python flow —
+# sticker-art is a sub-phase that paint-chain's own code opens and closes — so
+# there is no seam to cut between them. Naming any of the three runs all three.
+# It is guarded as a unit rather than left unguarded because it is the LONGEST
+# part of a run, and an ONLY_STEPS that still paid for it would be no use.
+if want_step "econ-icons" || want_step "paint-chain" || want_step "sticker-art"; then
 # ---- 4. Econ item icons ------------------------------------------------------
 step "econ-icons"
 # Flat item artwork for everything the UI lists. We serve this ourselves — there
@@ -2362,7 +3081,7 @@ PYEOF
   RAW_PAINTS="$WORK/raw_paints"
   rm -rf "$RAW_PAINTS"
   CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_PAINTS="$RAW_PAINTS" \
-  CHARM_MATS="$WORK/charm-materials.json" STICKER_KITS="$STICKER_KITS" \
+  CHARM_MATS="$WORK/charm-materials.json" PATCH_MATS="$WORK/patch-materials.json" STICKER_KITS="$STICKER_KITS" \
   ASSET_MANIFEST="$ASSET_MANIFEST" PAINT_DEST="$PAINT_DEST" python3 - <<'PYEOF'
 import glob, hashlib, json, os, re, shutil, subprocess, time
 from collections import defaultdict
@@ -2383,6 +3102,17 @@ CHARM_MATS = []
 try:
     with open(os.environ.get("CHARM_MATS") or "") as fh:
         CHARM_MATS = [p for p in json.load(fh) if isinstance(p, str)]
+except Exception:
+    pass
+# Patch materials, handed over by step 3f, and for the SAME reason the charms
+# are: cs2-lib gives a patch no paintMaterial (0 of 112), so nothing about a
+# patch reaches the manifest and the chain would never see one. 112 materials,
+# each pulling its own art plus the two shared embroidery maps under
+# patches/shared/.
+PATCH_MATS = []
+try:
+    with open(os.environ.get("PATCH_MATS") or "") as fh:
+        PATCH_MATS = [p for p in json.load(fh) if isinstance(p, str)]
 except Exception:
     pass
 
@@ -2671,7 +3401,13 @@ def dump(spec):
 # it. Deagle | Blaze rendered broken for exactly this reason: its vcompmat
 # pointed at aa_flames.vmat.json and nothing had written it.
 TEMPLATE_TREES = {"materials/models/weapons/customization/", "workshop/paintkits/"}
-TREES = sorted({"/".join(p.split("/")[:2]) + "/" for p in wanted_name} | TEMPLATE_TREES)
+# Patch entry points are raw archive paths, not manifest entries, so their tree
+# has to join the bulk dump — otherwise all 112 fall through to the
+# one-CLI-process-per-file path below. Charms are deliberately NOT added: there
+# are only 23 of them, that path already works, and widening a working bulk dump
+# is not what this change is for.
+EXTRA_TREES = {"/".join(p.split("/")[:2]) + "/" for p in PATCH_MATS}
+TREES = sorted({"/".join(p.split("/")[:2]) + "/" for p in wanted_name} | TEMPLATE_TREES | EXTRA_TREES)
 specs = [(t, e) for t in TREES for e in ("vcompmat_c", "vmat_c")]
 blocks = {}
 with ThreadPoolExecutor(max_workers=max(2, min(pool_size(), len(specs)))) as pool:
@@ -2689,6 +3425,31 @@ def kv3_body(text):
 # they have to agree on what counts as a reference.
 RESOURCE_SUFFIX = re.compile(r"\.(vcompmat|vmat|vtex)$")
 
+# The only textures a csgo_weapon_sticker.vfx material contributes — see the
+# cutoff in the walk below for why this is an allowlist and not the whole chain.
+# Named after the shader's own params so the two can be compared by eye against
+# a `-b DATA` dump.
+#
+#   g_tSticker0                 the square albedo (512x512, no padding)
+#   g_tStickerScratches         Valve's authored wear mask, shared
+#   g_tSfxMaskSticker0          which texels take the effect; per-sticker
+#   g_tHoloSpectrumSticker0     holo/gold rainbow ramp, shared
+#   g_tGlitterNormalSticker0    glitter sparkle normals (starmoon/magnolia/squares)
+#   g_tNormalRoughnessSticker0  2-channel normal + roughness in .z
+#   g_tColor                    the paper backing, shared
+#
+# Deliberately NOT here: g_tAmbientOcclusion / g_tMetalness / g_tNormal, which
+# on a sticker material are the flat engine defaults and carry nothing.
+STICKER_TEXTURES = {
+    "g_tSticker0",
+    "g_tStickerScratches",
+    "g_tSfxMaskSticker0",
+    "g_tHoloSpectrumSticker0",
+    "g_tGlitterNormalSticker0",
+    "g_tNormalRoughnessSticker0",
+    "g_tColor",
+}
+
 # ---- walk the graph from every entry point ---------------------------------
 # `sticker_textures` is a subset of `textures`, tracked so the two get their own
 # progress rows and their own times — a sticker run adds thousands of files and
@@ -2699,7 +3460,7 @@ queue = [p for p in wanted_name if p.endswith(("vcompmat_c", "vmat_c"))]
 # Charm materials resolve by exact archive path, so they skip the by_key lookup
 # the manifest entries need. out_name() falls through to its hash naming for
 # them, which is what charm-models.json was written against.
-for p in CHARM_MATS:
+for p in CHARM_MATS + PATCH_MATS:
     if p not in seen_charm:
         seen_charm.add(p)
         queue.append(p)
@@ -2725,22 +3486,35 @@ while queue:
         continue
     docs[path] = doc
 
-    # STICKERS STOP HERE. A sticker/patch material is an entry point like any
-    # other, but only one texture out of it is ever drawn: `g_tSticker0`, the
-    # square albedo the game puts on the weapon. Following the rest of its chain
-    # — holo spectrum, sfx masks, normals, the shared backing and scratches —
-    # would quadruple the texture count for assets the viewer never samples.
+    # STICKERS STOP HERE — but they take a NAMED SET with them, not one texture.
+    #
+    # A sticker/patch material is an entry point like any other, and following
+    # its whole chain would quadruple the texture count. So the walk still stops
+    # (the `continue` below is load-bearing); what changed in v19 is which
+    # textures come along.
+    #
+    # It was `g_tSticker0` alone, the square albedo the game puts on the weapon.
+    # That is enough to draw a sticker FLAT and nothing else: the game's own
+    # wear is `g_tStickerScratches` — a real authored scratch mask — and the
+    # holo/glitter/gold finishes are driven by `g_tSfxMaskSticker0` against a
+    # spectrum and a glitter normal. Without them the viewer approximated wear
+    # with value noise and could not draw an effect finish at all.
+    #
+    # The set is bounded and cheap. Everything except `g_tSfxMaskSticker0` is
+    # SHARED — `materials/default/stickers/*` and
+    # `materials/stickers/glitter_pattern/*`, ~13 files that dedupe by archive
+    # path through out_name() no matter how many stickers name them. Only the
+    # sfx mask is per-sticker, and only effect finishes have one (~1.1k).
     #
     # Recognised by shader name rather than by the manifest flag so a material
     # reached BY REFERENCE is treated the same way as one we asked for.
     if str(doc.get("m_shaderName") or "") == "csgo_weapon_sticker.vfx":
         for tp in doc.get("m_textureParams") or []:
-            if isinstance(tp, dict) and tp.get("m_name") == "g_tSticker0":
+            if isinstance(tp, dict) and tp.get("m_name") in STICKER_TEXTURES:
                 target = resolve_ref(str(tp.get("m_pValue") or ""))
                 if target and target.endswith("vtex_c"):
                     textures.add(target)
                     sticker_textures.add(target)
-                break
         continue
 
     def visit(node):
@@ -3051,6 +3825,8 @@ PYEOF
   # sticker-art is closed by the python above (it alone knows that phase's
   # duration); paint-chain stays with the shell so the run stamp still records a
   # time for it. Clearing STEP_NAME here instead dropped BOTH from the stamp.
+fi
+
 fi
 
 # ---- 6. Stamp the pipeline version -------------------------------------------

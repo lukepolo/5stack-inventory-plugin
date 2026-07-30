@@ -227,10 +227,12 @@ const COMPOSITE_MAX_BYTES = 48 * 1024 * 1024;
 
 const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
+const MODELS_DIR = process.env.MODELS_DIR ?? "/cs2-models/models";
 const ASSET_TYPES: Record<string, string> = {
   ".json": "application/json",
   ".webp": "image/webp",
   ".png": "image/png",
+  ".glb": "model/gltf-binary",
 };
 // Static asset mounts, populated ONLY by our own extractor from the instance's
 // own CS2 install (scripts/extract-models.sh). A miss is a 404 and stays a
@@ -272,6 +274,14 @@ function serveAssetDir(routePrefix: string, dir: string) {
 }
 serveAssetDir("/paints", PAINTS_DIR);
 serveAssetDir("/images", IMAGES_DIR);
+// Models were the one mount-backed tree with no static-miss fallback: nginx
+// ended its /models/ block in `=404`. That was survivable while the tree was 36
+// weapons written in one early step, but agents mirror their whole archive path
+// and are written in place over a long run — so "the frontend pod can't see a
+// GLB the backend pod can" becomes a visible, model-shaped hole rather than a
+// brief blank. Same contract as the others: our own extractor is the only
+// writer, and a genuine miss stays a 404.
+serveAssetDir("/models", MODELS_DIR);
 
 // Serve renders directly too — nginx falls back here when its mount copy
 // misses (e.g. frontend/backend pods on different nodes).
@@ -730,41 +740,145 @@ function imagePathParam(raw: string | undefined): string | null {
 // (superseded textures are pruned a generation behind), so it resolved 200 and
 // the weapon kept wearing the wrong sticker with nothing in any log. Costs one
 // stat per request; the map itself is what makes that acceptable.
-const stickerArtCache = new Map<string, string | null>();
+/**
+ * Everything csgo_weapon_sticker.vfx needs to draw one sticker.
+ *
+ * `art` is the original contract and keeps its meaning exactly, so a client
+ * that predates the effect work still works. `sfx` is the rest of the material:
+ * the flags that say WHICH finish this is, the scalars that tune it, and the
+ * maps the shader samples. Null when the mount has no material for this sticker.
+ *
+ * One route rather than two because it is one file read either way, and two
+ * routes reading the same document is how they end up disagreeing about which
+ * sticker they resolved.
+ */
+interface StickerSfx {
+  /** Texture paths under /textures, or null when not on this mount. */
+  scratches: string | null;
+  sfxMask: string | null;
+  holoSpectrum: string | null;
+  glitterNormal: string | null;
+  normalRoughness: string | null;
+  backing: string | null;
+  /** Which finish. Mutually exclusive in practice, but the shader tests each. */
+  glitter: boolean;
+  holo: boolean;
+  metallic: boolean;
+  paperBacking: boolean;
+  pbrFit: boolean;
+  legacyTint: boolean;
+  preserveRoughness: boolean;
+  clampSpectrumV: boolean;
+  selfIllum: boolean;
+  /** Scalars. Defaults are the shader's, for the params a material may omit. */
+  wear: number;
+  wearScratches: number;
+  colorBoost: number;
+  sfxColorBoost: number;
+  tintSaturate: number;
+  glitterScale: number;
+  colorTint: [number, number, number];
+  wearBias: [number, number];
+}
+
+// Scalars arrive STRINGIFIED — the extracted material JSON mirrors cs2-lib's
+// shape, where every scalar is a string ("0.858", not 0.858). Parsing with a
+// default rather than Number() so an absent param and an unparseable one behave
+// the same way, which is how the shader treats them.
+const numParam = (list: { m_name?: string; m_flValue?: unknown; m_nValue?: unknown }[] | undefined, name: string, dflt: number) => {
+  const raw = list?.find((p) => p.m_name === name);
+  const v = Number(raw?.m_flValue ?? raw?.m_nValue);
+  return Number.isFinite(v) ? v : dflt;
+};
+const boolParam = (list: { m_name?: string; m_nValue?: unknown }[] | undefined, name: string) =>
+  Number(list?.find((p) => p.m_name === name)?.m_nValue) === 1;
+const vecParam = (list: { m_name?: string; m_value?: unknown }[] | undefined, name: string, dflt: number[]) => {
+  const raw = list?.find((p) => p.m_name === name)?.m_value;
+  if (!Array.isArray(raw)) return dflt;
+  return raw.map((v) => (Number.isFinite(Number(v)) ? Number(v) : 0));
+};
+
+const stickerArtCache = new Map<string, { art: string | null; sfx: StickerSfx | null }>();
 let stickerArtStamp = -1;
 app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (request) => {
   const image = imagePathParam(request.query.image);
-  if (!image) return { art: null };
+  if (!image) return { art: null, sfx: null };
   const stamp = await fs.stat(EXTRACT_VERSION_FILE).then((s) => s.mtimeMs, () => -1);
   if (stamp !== stickerArtStamp) {
     stickerArtCache.clear();
     stickerArtStamp = stamp;
   }
   const hit = stickerArtCache.get(image);
-  if (hit !== undefined) return { art: hit };
+  if (hit !== undefined) return hit;
   let art: string | null = null;
+  let sfx: StickerSfx | null = null;
   try {
     const material = stickerMaterialFor(image);
     if (material) {
       const doc = JSON.parse(
         await fs.readFile(path.join(PAINTS_DIR, "materials", path.basename(material)), "utf8"),
-      ) as { m_textureParams?: { m_name?: string; m_pValue?: string }[] };
-      const tex = doc.m_textureParams?.find((t) => t.m_name === "g_tSticker0")?.m_pValue;
-      // Only claim it once the file is really there — the material names the
-      // texture whether or not the extraction pulled it.
-      if (tex?.startsWith("/textures/")) {
-        await fs.access(path.join(PAINTS_DIR, "textures", path.basename(tex)));
-        art = tex;
-      }
+      ) as {
+        m_textureParams?: { m_name?: string; m_pValue?: string }[];
+        m_intParams?: { m_name?: string; m_nValue?: unknown }[];
+        m_floatParams?: { m_name?: string; m_flValue?: unknown }[];
+        m_vectorParams?: { m_name?: string; m_value?: unknown }[];
+      };
+      // Only claim a texture once the file is really there — the material names
+      // every param whether or not the extraction pulled it, and before v19 it
+      // pulled exactly one of them. A client handed a path that 404s renders a
+      // black effect layer, which is worse than no effect at all.
+      const tex = async (name: string) => {
+        const p = doc.m_textureParams?.find((t) => t.m_name === name)?.m_pValue;
+        if (!p?.startsWith("/textures/")) return null;
+        try {
+          await fs.access(path.join(PAINTS_DIR, "textures", path.basename(p)));
+          return p;
+        } catch {
+          return null;
+        }
+      };
+      art = await tex("g_tSticker0");
+      const [scratches, sfxMask, holoSpectrum, glitterNormal, normalRoughness, backing] = await Promise.all([
+        tex("g_tStickerScratches"),
+        tex("g_tSfxMaskSticker0"),
+        tex("g_tHoloSpectrumSticker0"),
+        tex("g_tGlitterNormalSticker0"),
+        tex("g_tNormalRoughnessSticker0"),
+        tex("g_tColor"),
+      ]);
+      const tint = vecParam(doc.m_vectorParams, "g_vColorTintSticker0", [1, 1, 1]);
+      const bias = vecParam(doc.m_vectorParams, "g_vWearBiasSticker0", [1, 0]);
+      sfx = {
+        scratches, sfxMask, holoSpectrum, glitterNormal, normalRoughness, backing,
+        glitter: boolParam(doc.m_intParams, "g_bGlitterSticker0"),
+        holo: boolParam(doc.m_intParams, "g_bHolographicSticker0"),
+        metallic: boolParam(doc.m_intParams, "g_bMetallicSticker0"),
+        paperBacking: boolParam(doc.m_intParams, "g_bPaperBackingSticker0"),
+        pbrFit: boolParam(doc.m_intParams, "g_bAutomaticPBRColorFittingSticker0"),
+        legacyTint: boolParam(doc.m_intParams, "g_bLegacyTintMultiplySticker0"),
+        preserveRoughness: boolParam(doc.m_intParams, "g_bPreserveRoughnessSticker0"),
+        clampSpectrumV: boolParam(doc.m_intParams, "g_bClampSpectrumVSticker0"),
+        selfIllum: boolParam(doc.m_intParams, "g_bSelfIllumSticker0"),
+        wear: numParam(doc.m_floatParams, "g_flSticker0Wear", 0),
+        wearScratches: numParam(doc.m_floatParams, "g_fWearScratchesSticker0", 0),
+        colorBoost: numParam(doc.m_floatParams, "g_flColorBoostSticker0", 1),
+        sfxColorBoost: numParam(doc.m_floatParams, "g_flSfxColorBoostSticker0", 1),
+        tintSaturate: numParam(doc.m_floatParams, "g_flTintSaturateSticker0", 1),
+        glitterScale: numParam(doc.m_floatParams, "g_flGlitterScaleSticker0", 1),
+        colorTint: [tint[0] ?? 1, tint[1] ?? 1, tint[2] ?? 1],
+        wearBias: [bias[0] ?? 1, bias[1] ?? 0],
+      };
     }
   } catch {
     art = null;
+    sfx = null;
   }
   // Only successes are cached. A null means "not on this mount yet", and the
   // very next thing that changes it is an extraction — which would otherwise be
   // invisible until the pod restarted, leaving every sticker on the icon.
-  if (art) stickerArtCache.set(image, art);
-  return { art };
+  const answer = { art, sfx };
+  if (art) stickerArtCache.set(image, answer);
+  return answer;
 });
 
 // Which model and material a charm should render as.
@@ -2152,10 +2266,24 @@ async function syncGameConfigs(url: string, key: string): Promise<{ updated: str
 // without a full re-extraction, and every skin renders white in the meantime.
 // That is exactly what happened once. They are reported here but NOT clearable;
 // re-running the extraction is the way to rebuild them.
-async function dirStats(dir: string): Promise<{ files: number; bytes: number }> {
+type DirStat = { files: number; bytes: number };
+
+/**
+ * Walk a tree once, bucketing every file by what it IS.
+ *
+ * `classify` gets the path RELATIVE to `dir` and returns a bucket name, or null
+ * to count the file in the total but in no bucket. One walk either way — the
+ * expensive part is the ~45k stat calls, not the arithmetic — so a breakdown
+ * costs the same as the single number it replaces.
+ */
+async function dirStats(
+  dir: string,
+  classify?: (rel: string) => string | null,
+): Promise<DirStat & { buckets: Record<string, DirStat> }> {
   let files = 0;
   let bytes = 0;
-  async function walk(d: string) {
+  const buckets: Record<string, DirStat> = {};
+  async function walk(d: string, rel: string) {
     let entries;
     try {
       entries = await fs.readdir(d, { withFileTypes: true });
@@ -2164,15 +2292,57 @@ async function dirStats(dir: string): Promise<{ files: number; bytes: number }> 
     }
     for (const e of entries) {
       const full = path.join(d, e.name);
-      if (e.isDirectory()) await walk(full);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) await walk(full, childRel);
       else {
+        const size = (await fs.stat(full).catch(() => ({ size: 0 }))).size;
         files++;
-        bytes += (await fs.stat(full).catch(() => ({ size: 0 }))).size;
+        bytes += size;
+        const key = classify?.(childRel);
+        if (key) {
+          const b = (buckets[key] ??= { files: 0, bytes: 0 });
+          b.files++;
+          b.bytes += size;
+        }
       }
     }
   }
-  await walk(dir);
-  return { files, bytes };
+  await walk(dir, "");
+  return { files, bytes, buckets };
+}
+
+/**
+ * What lives on the models mount, by kind.
+ *
+ * Everything here is flat in one directory or one level down, so the shape of
+ * the path IS the answer — there is no manifest to consult and adding one would
+ * be a second thing to keep in sync with the extractor.
+ *
+ * The split exists because the two biggest things on this mount were invisible:
+ * composite inputs (1.2 GB of `.inputs.hd`, the per-weapon paint sources) and
+ * the flat model textures (1.4 GB) were both reported inside one "3D models"
+ * row that read as if it were a few hundred MB of GLBs.
+ */
+function classifyModelFile(rel: string): string | null {
+  // Agents keep their archive path (agents/models/<faction>/<name>.glb).
+  if (rel.startsWith("agents/")) return "agents";
+  // Per-weapon paint compositor sources — by far the largest bucket, and the
+  // one an operator low on disk most wants to see.
+  if (/(^|\/)[^/]+\.inputs(\.hd)?\//.test(rel)) return "compositeInputs";
+  const base = rel.split("/").pop() ?? "";
+  if (base.startsWith("kc_") && base.endsWith(".glb")) return "charms";
+  if (base.endsWith(".glb")) return "meshes"; // weapons, knives, gloves, modules
+  if (base.endsWith(".webp") || base.endsWith(".png")) return "modelTextures";
+  return "modelMeta"; // anchors, markup, the version stamp, raw .vmdl dumps
+}
+
+/** Paint chain: a little JSON naming a lot of texture. Split for the same
+ *  reason — "Paint materials, 12 GB" described 61 MB of JSON plus everything
+ *  the JSON points at. */
+function classifyPaintFile(rel: string): string | null {
+  if (rel.startsWith("materials/")) return "paintMaterials";
+  if (rel.startsWith("textures/")) return "paintTextures";
+  return null;
 }
 async function requireAdmin(request: Parameters<typeof getIdentity>[0]) {
   const identity = await getIdentity(request);
@@ -2255,16 +2425,27 @@ function cachedDirStats() {
   const value = (async () => {
     const [renders, paints, images, models, composites] = await Promise.all([
       dirStats(RENDERS_DIR),
-      dirStats(PAINTS_DIR),
+      dirStats(PAINTS_DIR, classifyPaintFile),
       dirStats(IMAGES_DIR),
-      dirStats(modelsDir),
+      dirStats(modelsDir, classifyModelFile),
       // Client-baked, self-invalidating and LRU-trimmed, so it needs no
       // attention — but it is the one directory here that grows from ordinary
       // use rather than from an extraction, so an operator watching disk should
       // be able to see it.
       dirStats(COMPOSITES_DIR),
     ]);
-    return { renders, paints, images, models, composites };
+    // Totals stay exactly where they were so an older panel keeps working; the
+    // breakdown rides alongside as `parts`. A panel that doesn't know about it
+    // renders the same three rows it always did.
+    const strip = (d: DirStat & { buckets?: Record<string, DirStat> }) => ({ files: d.files, bytes: d.bytes });
+    return {
+      renders: strip(renders),
+      paints: strip(paints),
+      images: strip(images),
+      models: strip(models),
+      composites: strip(composites),
+      parts: { ...models.buckets, ...paints.buckets },
+    };
   })();
   // Don't let a failed walk stick around as a poisoned memo.
   value.catch(() => {

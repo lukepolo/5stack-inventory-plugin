@@ -119,15 +119,20 @@ export function itemName(
 // (POST /api/inventory/:id). The UI offers "duplicate to edit" instead.
 export const isReadOnly = (i: InventoryItem) => i.origin === "steam";
 
-// Which cs2-lib types we can actually put on screen in 3D. Guns and knives have
-// extracted GLBs; gloves and agents don't (different VPK trees, and gloves need
-// their own shader path), and music kits / graffiti / stickers have no 3D form
-// at all. Offering a 3D button that silently falls back to the flat image reads
-// as broken, so the button is hidden rather than dead.
+// Which cs2-lib types we can actually put on screen in 3D. Music kits and
+// graffiti have no 3D form at all; offering a button that silently falls back
+// to the flat image reads as broken, so it is hidden rather than dead.
 //
-// This is a TYPE-level answer, not a per-file one — an individual model can
-// still be missing from the mount, which the viewer's own HEAD probe catches.
-const TYPES_3D = new Set(["weapon", "melee"]);
+// A charm is here even though it has no `model`: its mesh is named by the econ
+// schema rather than the item, and 23 of the 82 share one blank — which is why
+// resolveViewerModel exists and why nothing should derive a key from `model`
+// directly any more.
+//
+// This is a TYPE-level answer, not a per-file one. Two narrower gates sit below
+// it and both matter: an individual model can be missing from the mount (the
+// viewer's own HEAD probe catches that), and a PAINTED glove needs a compositor
+// that does not exist yet (see resolveViewerModelSync).
+const TYPES_3D = new Set(["weapon", "melee", "keychain", "agent", "glove", "sticker", "patch"]);
 export const supports3d = (item?: { type?: string | null } | null) => !!item?.type && TYPES_3D.has(item.type);
 
 // Which types actually HAVE a float and a pattern, mirroring cs2-lib's own

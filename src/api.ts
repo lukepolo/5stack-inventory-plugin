@@ -601,12 +601,30 @@ export const fetchSteamSync = () =>
 
 // Admin: cached-asset stats + clearing (renders / paints on the mount).
 export type DirStat = { files: number; bytes: number };
+/**
+ * Which slice of a mount a `parts` entry describes. Every one of these is a
+ * subdivision of `models` or `paints` above — the totals stay authoritative, so
+ * a backend that predates the breakdown just sends no `parts` and the panel
+ * falls back to the coarse rows.
+ */
+export type CachePart =
+  | "meshes" // weapon / knife / glove GLBs, plus the shared modules
+  | "agents" // agents/models/**, which keep their archive path
+  | "charms" // kc_*.glb
+  | "compositeInputs" // <weapon>.inputs[.hd] — the paint compositor's sources
+  | "modelTextures" // the flat texture pool the GLBs reference
+  | "modelMeta" // anchors, sticker markup, the version stamp
+  | "paintMaterials" // the finish JSON
+  | "paintTextures"; // everything the finish JSON points at
+
 export type CacheStats = {
   renders: DirStat;
   paints: DirStat;
   images?: DirStat; // absent on older backends
   models?: DirStat;
   composites?: DirStat; // shared paint composites; absent on older backends
+  /** Per-kind breakdown of `models` and `paints`. Absent on older backends. */
+  parts?: Partial<Record<CachePart, DirStat>>;
 };
 export const fetchCacheStats = () => request<CacheStats>("/admin/cache");
 

@@ -27,6 +27,12 @@ CS2Economy.load({ items: CS2_ITEMS, language: english });
 // missing one it is a cosmetic delay — not a blank card. Everything else has NO
 // second source, so a miss there is a permanently empty tile. The extractor
 // reports the two separately; don't collapse them.
+// NOT widened when gloves/agents/charms gained 3D views: this set means "the
+// icon is a placeholder while a card bakes", and those types render 3D ON DEMAND
+// only — their grid card IS the flat icon. Marking them here would downgrade a
+// permanently blank tile to a "cosmetic delay" in the extractor's report, which
+// is the opposite of true. Add a type here when it starts baking cards, not when
+// it starts rendering.
 const RENDERED_IN_3D = new Set(["weapon", "melee"]);
 
 // ---- sticker kit id, the ONLY thing that tells two same-named decals apart ---
