@@ -518,6 +518,39 @@ export function resetCharmSim(sim: CharmSim) {
   sim.asleep = false;
 }
 
+/**
+ * Re-hang the rig on the authored rest pose WITHOUT moving the anchor.
+ *
+ * resetCharmSim's sibling for a charm that is already somewhere: the anchor
+ * stays exactly where the drag put it and the rest of the rig is rebuilt around
+ * it, so the charm re-hangs in place instead of teleporting back to the model
+ * origin.
+ *
+ * The escape hatch for a rig that has ended up somewhere the constraints cannot
+ * walk it back from — chiefly the far side of a thin part, where the rods are
+ * satisfied, the contact push holds it there, and no amount of dragging brings
+ * it round. See the reseat in viewer3d's drag.
+ */
+export function reseatCharmSim(sim: CharmSim) {
+  const { initPos } = sim.model;
+  // Every pinned node moved by the same delta (see moveCharmAnchor), so node 0
+  // carries the whole of where the anchor has travelled since load.
+  const dx = sim.anchor[0] - initPos[0];
+  const dy = sim.anchor[1] - initPos[1];
+  const dz = sim.anchor[2] - initPos[2];
+  for (let n = 0; n < sim.model.nodes; n++) {
+    const i = n * 3;
+    sim.pos[i] = initPos[i] + dx;
+    sim.pos[i + 1] = initPos[i + 1] + dy;
+    sim.pos[i + 2] = initPos[i + 2] + dz;
+  }
+  sim.prev.set(sim.pos); // at rest: verlet carries velocity in the delta
+  sim.acc = 0;
+  sim.calm = 0;
+  sim.asleep = false;
+  sim.contactLoad = 0;
+}
+
 // ---- the solver ------------------------------------------------------------
 
 /**
@@ -1080,16 +1113,107 @@ function separate(sim: CharmSim, i: number, nx: number, ny: number, nz: number, 
 /** Fraction of the penetration depth to over-push, for contact hysteresis. */
 const CONTACT_SKIN = 0.02;
 
+/**
+ * How far a node may travel between contact samples, as a fraction of its own
+ * radius. Below 1 it cannot step over a wall: some sample always lands with the
+ * sphere overlapping it.
+ */
+const SWEEP_STRIDE = 0.75;
+/** Cap on samples for one node in one substep. A flick is the only thing that
+ *  ever needs more than two, and past this the node is moving so fast that the
+ *  velocity clamp upstream is the real answer. */
+const SWEEP_MAX_SAMPLES = 12;
+/**
+ * Where each colliding body proxy sat at the start of the current substep.
+ *
+ * Module-level and grown on demand rather than stored on the sim: stepping is
+ * synchronous and one sim at a time, and this is scratch for the duration of a
+ * single substep — it never has to survive one.
+ */
+let bodyFrom = new Float32Array(0);
+function snapshotBodies(sim: CharmSim) {
+  const m = sim.model;
+  const need = sim.drivenOffsets.length * 3;
+  if (bodyFrom.length < need) bodyFrom = new Float32Array(need);
+  for (let k = 0; k < sim.drivenOffsets.length; k++) {
+    const i = m.offChild[sim.drivenOffsets[k]] * 3;
+    bodyFrom[k * 3] = sim.pos[i];
+    bodyFrom[k * 3 + 1] = sim.pos[i + 1];
+    bodyFrom[k * 3 + 2] = sim.pos[i + 2];
+  }
+}
+/** Set by sweptContact when the hit was a genuine CROSSING — the node was clear
+ *  at the start of the substep and inside by the end — rather than a standing
+ *  penetration. See the give-up ramp in collideBody, which such a hit ignores. */
+let sweptCrossing = false;
+
+/**
+ * The FIRST contact along the segment a node travelled this substep, rather
+ * than whatever is true where it happened to land.
+ *
+ * This is the whole fix for tunnelling. The discrete test asks "is this sphere
+ * inside anything" at one point, so anything thinner than a node's own step is
+ * invisible to it: a flick's release kick moves the charm's body further in one
+ * substep than a magazine is thick, the test sees clear air on both sides, and
+ * the charm settles on the far side of the weapon with the rods perfectly happy.
+ *
+ * Sampling, not an analytic swept-sphere: the contact query is a closest-point
+ * query against a triangle grid, so walking the segment in steps shorter than
+ * the sphere reuses it exactly and cannot step over a wall. Steps are only spent
+ * when the node actually moved that far — at rest this is a single query, which
+ * is what it was before.
+ *
+ * `out` comes back as the correction FROM WHERE THE NODE ENDED UP: direction in
+ * 0..2, distance in 3, same shape the callers already apply.
+ */
+function sweptContact(
+  contact: ContactFn,
+  fx: number, fy: number, fz: number,
+  tx: number, ty: number, tz: number,
+  r: number,
+  out: Float32Array,
+): boolean {
+  sweptCrossing = false;
+  const dx = tx - fx, dy = ty - fy, dz = tz - fz;
+  const travel = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const stride = r * SWEEP_STRIDE;
+  // Short hop: where it landed is the only place it could have touched.
+  if (!(travel > stride)) return contact(tx, ty, tz, r, out);
+  const steps = Math.min(SWEEP_MAX_SAMPLES, Math.ceil(travel / stride));
+  for (let s = 1; s <= steps; s++) {
+    const t = s / steps;
+    const sx = fx + dx * t, sy = fy + dy * t, sz = fz + dz * t;
+    if (!contact(sx, sy, sz, r, out)) continue;
+    // Where it should have stopped: clear of the surface at the crossing.
+    const px = sx + out[0] * out[3] * (1 + CONTACT_SKIN);
+    const py = sy + out[1] * out[3] * (1 + CONTACT_SKIN);
+    const pz = sz + out[2] * out[3] * (1 + CONTACT_SKIN);
+    const cx = px - tx, cy = py - ty, cz = pz - tz;
+    const len = Math.sqrt(cx * cx + cy * cy + cz * cz);
+    // The last sample IS where it landed, so a hit there is the ordinary
+    // standing contact and `out` already describes it.
+    if (len < 1e-9) return true;
+    sweptCrossing = s < steps;
+    out[0] = cx / len;
+    out[1] = cy / len;
+    out[2] = cz / len;
+    out[3] = len;
+    return true;
+  }
+  return false;
+}
+
 function collide(sim: CharmSim, contact: ContactFn) {
   const m = sim.model;
   if (!m.radius.length) return;
   const p = sim.pos;
+  const prev = sim.prev;
   for (let k = 0; k < sim.dynamic.length; k++) {
     const n = sim.dynamic[k];
     const r = m.radius[n - m.static];
     if (!(r > 0)) continue;
     const i = n * 3;
-    if (!contact(p[i], p[i + 1], p[i + 2], r, tmpOut)) continue;
+    if (!sweptContact(contact, prev[i], prev[i + 1], prev[i + 2], p[i], p[i + 1], p[i + 2], r, tmpOut)) continue;
     separate(sim, i, tmpOut[0], tmpOut[1], tmpOut[2], tmpOut[3]);
   }
 }
@@ -1116,14 +1240,19 @@ function collideBody(sim: CharmSim, contact: ContactFn): boolean {
   const m = sim.model;
   if (!m.radius.length) return false;
   const p = sim.pos;
-  let bestX = 0, bestY = 0, bestZ = 0, best = 0;
+  let bestX = 0, bestY = 0, bestZ = 0, best = 0, crossed = false;
   for (let k = 0; k < sim.drivenOffsets.length; k++) {
     const n = m.offChild[sim.drivenOffsets[k]];
     const r = m.radius[n - m.static];
     if (!(r > 0)) continue;
     const i = n * 3;
-    if (!contact(p[i], p[i + 1], p[i + 2], r, tmpOut)) continue;
+    // Swept from where this proxy sat at the START of the substep. A driven node
+    // has no velocity of its own — solveFrames places it from the chain — so the
+    // segment has to come from the snapshot rather than from sim.prev.
+    const f = k * 3;
+    if (!sweptContact(contact, bodyFrom[f], bodyFrom[f + 1], bodyFrom[f + 2], p[i], p[i + 1], p[i + 2], r, tmpOut)) continue;
     const d = tmpOut[3];
+    if (sweptCrossing) crossed = true;
     if (d > best) {
       best = d;
       bestX = tmpOut[0];
@@ -1142,7 +1271,14 @@ function collideBody(sim: CharmSim, contact: ContactFn): boolean {
   // turns it into a still charm that is slightly embedded — wrong, but wrong
   // and STATIONARY, and it lets the sleep latch take over. Any real change —
   // the anchor moving, a drag, a flick — resets it through wakeCharmSim.
-  const fade = 1 - Math.min(1, Math.max(0, sim.contactLoad - CONTACT_GIVEUP) / (1 - CONTACT_GIVEUP));
+  //
+  // A CROSSING is exempt. The ramp exists for a standing penetration that
+  // cannot be satisfied; a node that was outside at the start of this substep
+  // and inside by the end is the opposite case — it is the one correction that
+  // must never be given up on, or the charm is through the weapon for good.
+  const fade = crossed
+    ? 1
+    : 1 - Math.min(1, Math.max(0, sim.contactLoad - CONTACT_GIVEUP) / (1 - CONTACT_GIVEUP));
   if (fade <= 0) return false;
   // RELAXED, not the full correction. The chain is about to be pulled back by
   // the constraint pass, so shoving it the whole way in one go overshoots and
@@ -1198,6 +1334,9 @@ const CONTACT_GIVEUP = 0.5;
 export function stepCharmSimOnce(sim: CharmSim, dt: number, g: Float32Array, contact?: ContactFn) {
   const m = sim.model;
   sim.contact = false;
+  // BEFORE anything moves: the body proxies still hold last substep's positions,
+  // and that is the far end of the segment the contact pass has to sweep.
+  if (contact) snapshotBodies(sim);
   predict(sim, dt, g);
   // Constraints FIRST, contacts LAST, and contacts inside the loop.
   //

@@ -20,8 +20,8 @@ import {
   ThumbsUp, ThumbsDown, Box, X, ChevronLeft, ChevronRight,
   Search, FilterX,
 } from "lucide-vue-next";
-import { hasModel, mountViewer, snapshotModel, INCOMPLETE, type ViewerHandle } from "./viewer3d";
-import { takeVerifyFailures } from "./compositeStore";
+import { hasModel, mountViewer, snapshotModel, INCOMPLETE, type ViewerHandle } from "../viewer3d";
+import { takeVerifyFailures } from "../compositeStore";
 import {
   fetchTestCatalog,
   fetchTestList,
@@ -38,7 +38,7 @@ import {
   type TestResult,
   type TestVerdict,
   type TestVerdicts,
-} from "./api";
+} from "../api";
 
 const props = defineProps<{ isAdmin?: boolean }>();
 const emit = defineEmits<{ (e: "notify", message: string, kind: "error" | "success"): void }>();

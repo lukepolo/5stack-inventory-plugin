@@ -8,7 +8,8 @@ import Fastify, { LogController } from "fastify";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
-import { getStickerMarkup, getCharmModels, getCharmShading } from "./stickerMarkup.ts";
+import { getStickerMarkup, getCharmModels, getCharmShading, getPatchMaterials } from "./stickerMarkup.ts";
+import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
 import {
   getWeapons,
   getDefaults,
@@ -63,9 +64,17 @@ const TEAMS = new Set(["CT", "T"]);
 app.get("/api/catalog", async () => {
   // assetVersion rides along here because the client needs it before it can
   // request a single paint file, and this is the one call it always makes first.
+  // `patchSlots` is how many patches the agent's MODEL can actually carry (3-5,
+  // read from its own materials). The craft form offers five because that is
+  // what the inventory schema stores; without this it let you fill all five and
+  // the viewer silently dropped the overflow. Null when the model is not on the
+  // mount — the client must read that as "unknown, do not restrict".
+  const agents = await Promise.all(
+    getAgents().map(async (a) => ({ ...a, patchSlots: a.model ? await patchSlotsFor(a.model) : null })),
+  );
   return {
     weapons: getWeapons(),
-    agents: getAgents(),
+    agents,
     defaults: getDefaults(),
     assetVersion: await assetVersion(),
     assetOrigin: await assetOrigin(),
@@ -798,7 +807,7 @@ const vecParam = (list: { m_name?: string; m_value?: unknown }[] | undefined, na
   return raw.map((v) => (Number.isFinite(Number(v)) ? Number(v) : 0));
 };
 
-const stickerArtCache = new Map<string, { art: string | null; sfx: StickerSfx | null }>();
+const stickerArtCache = new Map<string, { art: string | null; sfx: StickerSfx | null; patchBacking: string | null }>();
 let stickerArtStamp = -1;
 app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (request) => {
   const image = imagePathParam(request.query.image);
@@ -812,8 +821,9 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
   if (hit !== undefined) return hit;
   let art: string | null = null;
   let sfx: StickerSfx | null = null;
+  let patchBacking: string | null = null;
   try {
-    const material = stickerMaterialFor(image);
+    const material = stickerMaterialFor(image, await getPatchMaterials());
     if (material) {
       const doc = JSON.parse(
         await fs.readFile(path.join(PAINTS_DIR, "materials", path.basename(material)), "utf8"),
@@ -838,6 +848,16 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
         }
       };
       art = await tex("g_tSticker0");
+      // A PATCH IS NOT A STICKER MATERIAL. Its vmat is `csgo_character.vfx` —
+      // the same shader an agent's body uses — so it has no `g_tSticker0` and
+      // none of the sfx params below; its art is `g_tPatch0` and its stitched
+      // fabric border is `g_tPatch0Backing`, which the agent composite draws
+      // UNDER the art. Both are already extracted; nothing here needed a new
+      // extraction, only the lookup.
+      if (!art) {
+        art = await tex("g_tPatch0");
+        if (art) patchBacking = await tex("g_tPatch0Backing");
+      }
       const [scratches, sfxMask, holoSpectrum, glitterNormal, normalRoughness, backing] = await Promise.all([
         tex("g_tStickerScratches"),
         tex("g_tSfxMaskSticker0"),
@@ -876,7 +896,7 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
   // Only successes are cached. A null means "not on this mount yet", and the
   // very next thing that changes it is an extraction — which would otherwise be
   // invisible until the pod restarted, leaving every sticker on the icon.
-  const answer = { art, sfx };
+  const answer = { art, sfx, patchBacking };
   if (art) stickerArtCache.set(image, answer);
   return answer;
 });
@@ -1005,7 +1025,16 @@ app.get<{ Querystring: { ids?: string } }>("/api/catalog/items", async (request)
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isInteger(n) && n > 0)
     .slice(0, 24);
-  return ids.length ? getItemsByIds(ids) : [];
+  if (!ids.length) return [];
+  // Agents carry their patch-slot count here too, not only on /api/catalog.
+  // This is the route the CRAFT page resolves an owned item through, so without
+  // it the form fell back to five slots for every agent — which is wrong for 62
+  // of the 63 (they have three). See patchSlotsFor.
+  return Promise.all(
+    getItemsByIds(ids).map(async (i) =>
+      i.type === "agent" && i.model ? { ...i, patchSlots: await patchSlotsFor(i.model) } : i,
+    ),
+  );
 });
 
 // ---- Inventory (per-user owned item instances; the loadout is craft-gated) ----
@@ -1015,7 +1044,29 @@ app.get<{ Querystring: { ids?: string } }>("/api/catalog/items", async (request)
 // sticker's own scratch wear (0 pristine .. 1 scratched off) — distinct from
 // the weapon's float wear. Rows written before it existed normalize to null,
 // which reads as pristine everywhere downstream.
-type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null } | null;
+/**
+ * `inst` is the owned_items row this attachment IS, when it is a thing the user
+ * owns rather than a bare catalog id.
+ *
+ * That link is what makes a sticker on a gun the same object as the sticker in
+ * the inventory, and it is why `w` below is a FALLBACK rather than the truth:
+ * a linked attachment's scratch lives on its own row, so editing it from the
+ * sticker's page, the weapon's options column or the 3D preview all write to
+ * one place and every gun wearing it re-renders. Nothing has to be kept in
+ * sync because nothing is duplicated.
+ *
+ * Unlinked specs stay legal forever: Steam-imported guns have their stickers
+ * SCRAPED out of a description blob (see attachmentIds), so those are catalog
+ * ids with no instance behind them and `w` is all they will ever have.
+ */
+type AttachSpec = {
+  id: number;
+  x?: number | null;
+  y?: number | null;
+  r?: number | null;
+  w?: number | null;
+  inst?: number | null;
+} | null;
 // Clamp on READ as well as on write: the game applies this straight to the
 // "sticker slot N wear" econ attribute, so a bad float already sitting in the
 // JSONB column must never reach a server.
@@ -1023,17 +1074,44 @@ function normWear(w: unknown): number | null {
   if (typeof w !== "number" || !Number.isFinite(w)) return null;
   return Math.min(1, Math.max(0, w));
 }
+/**
+ * Accepts a string as well as a number, because that is how it comes BACK.
+ *
+ * owned_items.id is a bigint, and node-postgres hands those to JS as strings —
+ * so an id makes the round trip to the client as `"1014"` and returns as one.
+ * Stored as a NUMBER in the jsonb regardless, which is what the backfill in
+ * schema.sql writes and what jsonb_typeof(...) = 'number' tests for.
+ */
+const normInst = (v: unknown): number | null => {
+  const n = typeof v === "string" ? Number(v) : v;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : null;
+};
 function normSpecs(arr: unknown): AttachSpec[] {
   if (!Array.isArray(arr)) return [];
   return arr.map((entry) => {
     if (entry == null) return null;
     if (typeof entry === "number") return { id: entry };
     if (typeof entry === "object" && typeof (entry as { id?: unknown }).id === "number") {
-      const e = entry as { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null };
-      return { id: e.id, x: e.x ?? null, y: e.y ?? null, r: e.r ?? null, w: normWear(e.w) };
+      const e = entry as {
+        id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: number | null;
+      };
+      return { id: e.id, x: e.x ?? null, y: e.y ?? null, r: e.r ?? null, w: normWear(e.w), inst: normInst(e.inst) };
     }
     return null;
   });
+}
+/** Every owned_items id an item row's attachments point at. */
+function referencedInstances(row: {
+  stickers?: unknown[] | null;
+  patches?: unknown[] | null;
+  charm_offset?: { inst?: number | null } | null;
+}): number[] {
+  const out = [
+    ...normSpecs(row.stickers).map((s) => s?.inst ?? null),
+    ...normSpecs(row.patches).map((s) => s?.inst ?? null),
+    normInst(row.charm_offset?.inst),
+  ].filter((v): v is number => v != null);
+  return [...new Set(out)];
 }
 
 interface ItemRow {
@@ -1099,15 +1177,93 @@ function checkAttachments(
   }
   return null;
 }
+/** wear/seed of the owned rows an item's attachments are linked to. */
+type InstFacts = Map<number, { wear: number | null; seed: number | null }>;
+/**
+ * Load the attachment instances a set of item rows point at.
+ *
+ * Skipped entirely when nothing is linked, which is the common case for a
+ * Steam-heavy inventory and for every row written before the link existed.
+ */
+async function instFactsFor(steamId: string, rows: Parameters<typeof referencedInstances>[0][]): Promise<InstFacts> {
+  const ids = [...new Set(rows.flatMap(referencedInstances))];
+  if (!ids.length) return new Map();
+  // Scoped to the owner: an `inst` is user input, and without this a crafted
+  // spec could name someone else's row and read its wear back out.
+  const { rows: found } = await pool.query<{ id: string; wear: number | null; seed: number | null }>(
+    `SELECT id, wear, seed FROM inventory.owned_items WHERE steam_id = $1 AND id = ANY($2::bigint[])`,
+    [steamId, ids],
+  );
+  return new Map(found.map((r) => [Number(r.id), { wear: r.wear, seed: r.seed }]));
+}
+/**
+ * Fold each LINKED attachment's own wear/seed back into the spec that names it.
+ *
+ * The single place the link is dereferenced. Everything downstream — the
+ * inspect link, the equipped feed the game server reads, the enriched shape the
+ * UI gets — then works off a plain spec and never has to know whether the
+ * scratch came from the weapon's blob or the sticker's own row. That is the
+ * whole trick: one resolve at read time instead of four consumers each
+ * remembering to check.
+ *
+ * A spec with no `inst`, or one pointing at a row that has since been deleted,
+ * keeps its inline `w`. Steam-scraped attachments never have an instance and
+ * are the reason that fallback is permanent rather than a migration step.
+ */
+function resolveAttachments<T extends AttachBody>(row: T, insts: InstFacts): T {
+  const fix = (s: AttachSpec): AttachSpec => {
+    if (!s) return null;
+    const own = s.inst != null ? insts.get(s.inst) : undefined;
+    return own ? { ...s, w: own.wear ?? null } : s;
+  };
+  const charmInst = normInst(row.charm_offset?.inst);
+  const charmOwn = charmInst != null ? insts.get(charmInst) : undefined;
+  return {
+    ...row,
+    stickers: normSpecs(row.stickers).map(fix),
+    patches: normSpecs(row.patches).map(fix),
+    charm_offset: charmOwn ? { ...(row.charm_offset ?? {}), seed: charmOwn.seed ?? null } : row.charm_offset,
+  };
+}
+/** Load the links for these rows and dereference them in one step. */
+async function withAttachments<T extends AttachBody>(steamId: string, rows: T[]): Promise<T[]> {
+  const insts = await instFactsFor(steamId, rows);
+  return rows.map((r) => resolveAttachments(r, insts));
+}
 function enrichAttachments<T extends { stickers?: unknown[] | null; charm_id?: number | null; charm_offset?: ItemRow["charm_offset"]; patches?: unknown[] | null }>(row: T) {
   const enrich = (spec: AttachSpec) =>
-    spec ? { ...getItem(spec.id), x: spec.x ?? null, y: spec.y ?? null, r: spec.r ?? null, w: spec.w ?? null } : null;
+    spec
+      ? {
+          ...getItem(spec.id),
+          x: spec.x ?? null,
+          y: spec.y ?? null,
+          r: spec.r ?? null,
+          w: spec.w ?? null,
+          // Rides out to the UI so an edit can send it back. Without the round
+          // trip every save would look like a fresh catalog pick and mint the
+          // sticker again.
+          //
+          // Emitted as a STRING to match how owned_items.id is serialised —
+          // node-postgres renders bigints as strings, so the inventory's own
+          // ids are `"1014"`. Leaving this a number made every `inst === id`
+          // comparison in the UI quietly false, which is the worst shape a bug
+          // can take: the sticker is there, and nothing can find it.
+          inst: spec.inst != null ? String(spec.inst) : null,
+        }
+      : null;
   return {
     ...row,
     // Sparse arrays: index = the sticker/patch POSITION on the item.
     stickers: normSpecs(row.stickers).map(enrich),
     patches: normSpecs(row.patches).map(enrich),
-    charm: row.charm_id != null ? { ...getItem(row.charm_id), ...(row.charm_offset ?? {}) } : null,
+    charm:
+      row.charm_id != null
+        ? {
+            ...getItem(row.charm_id),
+            ...(row.charm_offset ?? {}),
+            inst: normInst(row.charm_offset?.inst) != null ? String(normInst(row.charm_offset?.inst)) : null,
+          }
+        : null,
   };
 }
 
@@ -1156,13 +1312,203 @@ app.get("/api/inventory", async (request, reply) => {
     list.push({ team: e.team, slot: e.slot });
     byInstance.set(e.item_instance_id, list);
   }
-  return items.map((row) => ({
+  // Every row the user owns is already in hand, so the attachment links resolve
+  // out of THIS result set — instFactsFor's query is for the endpoints that
+  // only have one row.
+  const insts: InstFacts = new Map(items.map((r) => [Number(r.id), { wear: r.wear, seed: r.seed }]));
+  const resolved = items.map((r) => resolveAttachments(r, insts));
+  // Which weapon each attachment instance is currently on. Derived rather than
+  // stored: the weapon's spec list is the single record of what is applied, and
+  // a second column saying the same thing is a second thing to get wrong.
+  // Keyed and valued as STRINGS, matching how owned_items.id serialises — this
+  // is compared against `id` in the UI, and a number would never match.
+  const attachedTo = new Map<number, string>();
+  for (const row of items) {
+    for (const inst of referencedInstances(row)) attachedTo.set(inst, String(row.id));
+  }
+  return resolved.map((row) => ({
     ...enrichAttachments(row),
     slot: slotForItem(row.item_id),
     item: getItem(row.item_id),
     equipped: byInstance.get(row.id) ?? [],
+    // "On your AK-47" — what makes an owned sticker feel owned rather than
+    // duplicated. Null when it is loose in the inventory.
+    attached_to: attachedTo.get(Number(row.id)) ?? null,
   }));
 });
+
+/**
+ * What a user is allowed to OWN, which is not the same as what they can equip.
+ *
+ * This gate used to be `slotForItem`, i.e. "can it go in a loadout slot" — and
+ * that answers null for stickers, patches and charms, so an attachment could
+ * never become an owned instance at all. The consequence was quiet and wrong:
+ * an attachment is stored on the weapon as a bare catalog id, so the sticker on
+ * your AK was not a thing you owned, could not be edited on its own, and could
+ * not carry its own scratch.
+ *
+ * EQUIPPING is still gated, independently and where it belongs — resolveEquip
+ * type-checks the item against the slot, so a slotless instance simply has
+ * nowhere to go. Nothing here can put a sticker in a rifle slot.
+ *
+ * Still a whitelist rather than "anything in the catalog": cases, keys, medals
+ * and coins resolve to real items and are not things this app models.
+ */
+const OWNABLE_TYPES = new Set(["sticker", "patch", "keychain"]);
+const craftable = (id: number) =>
+  !!slotForItem(id) || OWNABLE_TYPES.has(getItem(id)?.type as string);
+
+/** The attachment fields of a craft/update body, as they arrive and as they leave. */
+type AttachBody = {
+  stickers?: unknown[] | null;
+  patches?: unknown[] | null;
+  charm_id?: number | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: number | null } | null;
+};
+/**
+ * Turn attachment specs into OWNED attachments, and take them off whatever else
+ * was wearing them.
+ *
+ * Two things happen here, and both are what "it's in my inventory" means:
+ *
+ * MINTING. A spec with no `inst` came off the catalog — the user picked a
+ * sticker they don't own. Saving mints it, so the sticker on the gun and the
+ * sticker in the inventory are one row from that moment on. Deliberately at
+ * SAVE and not at attach: everything else in this editor commits on save, and
+ * minting on attach would litter the inventory with stickers from a craft that
+ * was abandoned.
+ *
+ * CONSUMING. An instance can only be on one weapon, so applying it here takes
+ * it off anything else. That is the CS2 rule and the one the user picked; the
+ * escape hatch for wanting a sticker on two rifles is to own two, which is what
+ * duplicate is for. The move is silent at this layer on purpose — the frontend
+ * knows `attached_to` from the inventory and asks before it gets here, and a
+ * server-side reject would just be a second way to say the same thing.
+ *
+ * NOT reachable from the Steam sync, and that matters: the sync writes scraped
+ * catalog ids straight to the column, so routing it through here would mint a
+ * fresh sticker instance on every re-sync.
+ */
+async function linkAttachments(steamId: string, body: AttachBody, selfId: number | null): Promise<AttachBody> {
+  const stickers = normSpecs(body.stickers);
+  const patches = normSpecs(body.patches);
+  const charmId = body.charm_id ?? null;
+  const charmOffset = body.charm_offset ?? null;
+
+  // Trust nothing: an `inst` is user input, so it only survives if the row is
+  // the caller's AND is actually the item the spec claims. A mismatch falls
+  // through to minting rather than erroring — the attachment is still valid,
+  // it just isn't the instance it said it was.
+  const claimed = [
+    ...stickers.map((s) => s?.inst ?? null),
+    ...patches.map((s) => s?.inst ?? null),
+    normInst(charmOffset?.inst),
+  ].filter((v): v is number => v != null);
+  const valid = new Map<number, number>(); // inst id -> item_id
+  if (claimed.length) {
+    const { rows } = await pool.query<{ id: string; item_id: number }>(
+      `SELECT id, item_id FROM inventory.owned_items WHERE steam_id = $1 AND id = ANY($2::bigint[])`,
+      [steamId, [...new Set(claimed)]],
+    );
+    for (const r of rows) valid.set(Number(r.id), r.item_id);
+  }
+
+  const minted: number[] = [];
+  // One instance cannot be in two slots of the SAME weapon either, and
+  // detachElsewhere can't catch that — it skips this row on purpose, so that a
+  // plain re-save doesn't strip the gun of its own stickers. Claiming an id
+  // that has already been taken by an earlier slot in this same request falls
+  // through to minting, which is what a second copy of a sticker is.
+  const taken = new Set<number>();
+  /** Resolve one spec to an owned instance, minting if it hasn't got one. */
+  const link = async (itemId: number, w: number | null, seedFor: number | null, inst: number | null) => {
+    if (inst != null && valid.get(inst) === itemId && !taken.has(inst)) {
+      taken.add(inst);
+      return inst;
+    }
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO inventory.owned_items (steam_id, item_id, wear, seed, origin)
+       VALUES ($1,$2,$3,$4,'crafted') RETURNING id`,
+      [steamId, itemId, w, seedFor],
+    );
+    const id = Number(rows[0].id);
+    minted.push(id);
+    taken.add(id);
+    return id;
+  };
+
+  const outStickers: AttachSpec[] = [];
+  for (const s of stickers) {
+    outStickers.push(s ? { ...s, inst: await link(s.id, s.w ?? null, null, s.inst ?? null) } : null);
+  }
+  const outPatches: AttachSpec[] = [];
+  for (const p of patches) {
+    outPatches.push(p ? { ...p, inst: await link(p.id, p.w ?? null, null, p.inst ?? null) } : null);
+  }
+  let outCharm = charmOffset;
+  if (charmId != null) {
+    const inst = await link(charmId, null, charmOffset?.seed ?? null, normInst(charmOffset?.inst));
+    outCharm = { ...(charmOffset ?? {}), inst };
+  }
+
+  const used = [
+    ...outStickers.map((s) => s?.inst ?? null),
+    ...outPatches.map((s) => s?.inst ?? null),
+    normInst(outCharm?.inst),
+  ].filter((v): v is number => v != null);
+  await detachElsewhere(steamId, used, selfId, minted);
+
+  return { stickers: outStickers, patches: outPatches, charm_id: charmId, charm_offset: outCharm };
+}
+/**
+ * Strip these instances off every OTHER item the user owns.
+ *
+ * A freshly minted id cannot be on anything yet, so the scan is skipped when
+ * nothing pre-existing is in play — which is the whole cost in the common case
+ * of building a gun out of catalog picks.
+ *
+ * Scans the user's rows in JS rather than asking Postgres to match inside the
+ * jsonb: a containment query needs a GIN index to beat a scan, and one player's
+ * inventory is a few hundred rows. Revisit if that stops being true.
+ */
+async function detachElsewhere(steamId: string, insts: number[], keepRowId: number | null, minted: number[]) {
+  const fresh = new Set(minted);
+  const hunt = new Set(insts.filter((i) => !fresh.has(i)));
+  if (!hunt.size) return;
+  const { rows } = await pool.query<ItemRow & { id: string }>(
+    `SELECT id, stickers, patches, charm_id, charm_offset FROM inventory.owned_items
+     WHERE steam_id = $1 AND (stickers IS NOT NULL OR patches IS NOT NULL OR charm_offset IS NOT NULL)`,
+    [steamId],
+  );
+  for (const row of rows) {
+    const rowId = Number(row.id);
+    if (keepRowId != null && rowId === keepRowId) continue;
+    const stickers = normSpecs(row.stickers);
+    const patches = normSpecs(row.patches);
+    const charmInst = normInst(row.charm_offset?.inst);
+    const nextStickers = stickers.map((s) => (s && s.inst != null && hunt.has(s.inst) ? null : s));
+    const nextPatches = patches.map((s) => (s && s.inst != null && hunt.has(s.inst) ? null : s));
+    const dropCharm = charmInst != null && hunt.has(charmInst);
+    const changed =
+      dropCharm ||
+      nextStickers.some((s, i) => s !== stickers[i]) ||
+      nextPatches.some((s, i) => s !== patches[i]);
+    if (!changed) continue;
+    await pool.query(
+      `UPDATE inventory.owned_items
+         SET stickers = $2::jsonb, patches = $3::jsonb,
+             charm_id = CASE WHEN $4 THEN NULL ELSE charm_id END,
+             charm_offset = CASE WHEN $4 THEN NULL ELSE charm_offset END
+       WHERE id = $1`,
+      [
+        rowId,
+        nextStickers.some(Boolean) ? JSON.stringify(nextStickers) : null,
+        nextPatches.some(Boolean) ? JSON.stringify(nextPatches) : null,
+        dropCharm,
+      ],
+    );
+  }
+}
 
 app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, reply) => {
   const identity = await getIdentity(request);
@@ -1173,25 +1519,33 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   if (typeof item_id !== "number" || !getItem(item_id)) {
     return reply.status(400).send({ error: "That item doesn't exist." });
   }
-  if (!slotForItem(item_id)) {
-    return reply.status(400).send({ error: "That item can't be equipped." });
+  if (!craftable(item_id)) {
+    return reply.status(400).send({ error: "That item can't be owned." });
   }
   const attachErr = checkAttachments(stickers, charm_id, patches);
   if (attachErr) {
     return reply.status(400).send({ error: attachErr });
   }
+  // Mint the attachments into the inventory and take them off anything else
+  // wearing them, BEFORE the weapon row is written — the specs it stores are
+  // the linked ones. selfId null: this row doesn't exist yet, so there is
+  // nothing of its own to preserve.
+  const linked = await linkAttachments(identity.steamId, { stickers, patches, charm_id, charm_offset }, null);
   const { rows } = await pool.query<ItemRow>(
     `INSERT INTO inventory.owned_items (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches)
      VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)
      RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
     [
       identity.steamId, item_id, wear ?? null, seed ?? null, stattrak ?? false, nametag ?? null,
-      normSpecs(stickers).some(Boolean) ? JSON.stringify(normSpecs(stickers)) : null, charm_id ?? null,
-      charm_offset ? JSON.stringify(charm_offset) : null,
-      normSpecs(patches).some(Boolean) ? JSON.stringify(normSpecs(patches)) : null,
+      normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null, charm_id ?? null,
+      linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
+      normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
     ],
   );
-  return { ...enrichInstance(rows[0], []), ...enrichAttachments(rows[0]) };
+  return {
+    ...enrichInstance(rows[0], []),
+    ...enrichAttachments((await withAttachments(identity.steamId, [rows[0]]))[0]),
+  };
 });
 
 // Update a crafted instance (StatTrak / wear / pattern / nametag). Reflects
@@ -1199,22 +1553,25 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
 app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
   "/api/inventory/:id",
   async (request, reply) => {
-    {
-      // Imported items mirror a real Steam inventory — read-only by design.
-      const identity0 = await getIdentity(request);
-      if (identity0) {
-        const chk = await pool.query(
-          `SELECT origin FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
-          [Number(request.params.id), identity0.steamId],
-        );
-        if (chk.rows[0]?.origin === "steam") {
-          return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
-        }
-      }
-    }
     const identity = await getIdentity(request);
     if (!identity) {
       return reply.status(401).send({ error: "unauthorized" });
+    }
+    {
+      // Imported items mirror a real Steam inventory — read-only by design.
+      const chk = await pool.query(
+        `SELECT origin FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+        [Number(request.params.id), identity.steamId],
+      );
+      // Existence is settled HERE, before anything is written. linkAttachments
+      // mints rows, and running it against an id that turns out not to be the
+      // caller's would leave those mints behind with no weapon to hang on.
+      if (!chk.rows.length) {
+        return reply.status(404).send({ error: "That item isn't in your inventory." });
+      }
+      if (chk.rows[0]?.origin === "steam") {
+        return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
+      }
     }
     const id = Number(request.params.id);
     const { wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches } = request.body;
@@ -1225,6 +1582,21 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
     const hasStickers = stickers !== undefined;
     const hasCharm = charm_id !== undefined;
     const hasPatches = patches !== undefined;
+    // Only what this request actually sends goes through the linker — an
+    // omitted field means "leave it alone", and minting for a key the caller
+    // never mentioned would grant stickers on a rename.
+    const linked = await linkAttachments(
+      identity.steamId,
+      {
+        stickers: hasStickers ? stickers : [],
+        patches: hasPatches ? patches : [],
+        charm_id: hasCharm ? charm_id : null,
+        charm_offset: hasCharm ? charm_offset : null,
+      },
+      // Keep THIS row's own links: an edit that only moves a sticker must not
+      // read as "applied elsewhere" and strip the gun it is already on.
+      id,
+    );
     const { rows } = await pool.query<ItemRow>(
       `UPDATE inventory.owned_items SET
          wear = COALESCE($3, wear), seed = COALESCE($4, seed),
@@ -1237,16 +1609,19 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
        RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
       [
         id, identity.steamId, wear ?? null, seed ?? null, stattrak ?? null, nametag ?? null,
-        hasStickers, hasStickers && normSpecs(stickers).some(Boolean) ? JSON.stringify(normSpecs(stickers)) : null,
+        hasStickers, hasStickers && normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null,
         hasCharm, hasCharm ? charm_id ?? null : null,
-        hasCharm && charm_offset ? JSON.stringify(charm_offset) : null,
-        hasPatches, hasPatches && normSpecs(patches).some(Boolean) ? JSON.stringify(normSpecs(patches)) : null,
+        hasCharm && linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
+        hasPatches, hasPatches && normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
       ],
     );
     if (!rows.length) {
       return reply.status(404).send({ error: "That item isn't in your inventory." });
     }
-    return { ...enrichInstance(rows[0], []), ...enrichAttachments(rows[0]) };
+    return {
+      ...enrichInstance(rows[0], []),
+      ...enrichAttachments((await withAttachments(identity.steamId, [rows[0]]))[0]),
+    };
   },
 );
 
@@ -1364,7 +1739,9 @@ app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request
   if (!rows.length) {
     return reply.status(404).send({ error: "That item isn't in your inventory." });
   }
-  const row = rows[0];
+  // Through the link first: an inspect link carries each sticker's scratch, and
+  // for a linked attachment that number lives on the sticker's own row.
+  const row = (await withAttachments(identity.steamId, rows))[0];
   const link = inspectLinkFor(row.item_id, row);
   if (!link) {
     return reply.status(400).send({ error: "That item can't be expressed as an inspect link." });
@@ -1377,8 +1754,15 @@ app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, rep
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
+  const id = Number(request.params.id);
+  // Scrapping an attachment takes it OFF whatever is wearing it first. The row
+  // is about to stop existing, and a spec still naming it would leave a weapon
+  // pointing at nothing: the sticker would keep rendering (the inline `w`
+  // fallback catches it) but nothing could ever edit or remove it again.
+  // Scoped to the owner, so this can only ever touch the caller's own weapons.
+  await detachElsewhere(identity.steamId, [id], null, []);
   await pool.query(`DELETE FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`, [
-    Number(request.params.id),
+    id,
     identity.steamId,
   ]);
   return { ok: true };
@@ -1946,9 +2330,19 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     const wearTier = wearMatch?.[1];
     if (wearTier) name = name.slice(0, -wearMatch![0].length);
     const itemId = getItemIdBySteamName(name);
-    if (itemId == null || !slotForItem(itemId)) {
+    // `craftable`, not `slotForItem`: the old gate was "can it go in a loadout
+    // slot", which answers no for a loose sticker or charm — so a player with a
+    // drawer full of Katowice Crowns imported none of them and the picker's
+    // "stickers you own" was always empty. Cases, keys, medals and coins still
+    // fall out here, since they aren't things this app models.
+    //
+    // Each CS2 item is its own asset with its own assetid — they do NOT arrive
+    // stacked with an `amount` — so owning fourteen Crowns imports as fourteen
+    // rows through the same per-asset upsert and prune below, with no quantity
+    // handling anywhere.
+    if (itemId == null || !craftable(itemId)) {
       skipped++;
-      // Resolved-but-slotless items (cases, keys, medals, coins) are expected
+      // Resolved-but-unownable items (cases, keys, medals, coins) are expected
       // and would drown the log — only unresolved names are anomalies.
       if (itemId == null) {
         unknown++;
@@ -1964,6 +2358,14 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     // renamed) onto the existing row: the id stays put, so anything equipped
     // in the loadout stays equipped. charm_offset is the user's own placement
     // and is deliberately left alone.
+    //
+    // Note `stickers = EXCLUDED.stickers` overwrites the column wholesale with
+    // freshly scraped catalog ids, which would DROP any `inst` links it held.
+    // Safe today because a Steam row can never acquire them — crafting always
+    // writes an origin of 'crafted', and the update endpoint refuses imported
+    // items outright — so there is nothing here to preserve. If either of those
+    // ever changes, this line has to merge instead of replace, or every re-sync
+    // will unlink a player's whole imported collection and mint it again.
     const { rows } = await pool.query<{ inserted: boolean }>(
       `INSERT INTO inventory.owned_items
          (steam_id, item_id, wear, seed, stattrak, origin, steam_asset_id,
@@ -2010,6 +2412,21 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
   // or the catalog lookup went wrong, not that the user sold everything.
   let removed = 0;
   if (complete && seen.length) {
+    // Which rows are about to go, BEFORE they go. An imported sticker can be
+    // applied to a crafted weapon, so trading it away on Steam has to take it
+    // off that gun too — deleting the row on its own would leave the weapon
+    // pointing at an instance that no longer exists, and the sticker would keep
+    // rendering off the inline fallback with nothing able to edit or remove it.
+    // Same reasoning as the DELETE endpoint, which detaches for the same reason.
+    const { rows: doomed } = await pool.query<{ id: string }>(
+      `SELECT id FROM inventory.owned_items
+       WHERE steam_id = $1 AND origin = 'steam' AND steam_asset_id IS NOT NULL
+         AND NOT (steam_asset_id = ANY($2::text[]))`,
+      [identity.steamId, seen],
+    );
+    if (doomed.length) {
+      await detachElsewhere(identity.steamId, doomed.map((r) => Number(r.id)), null, []);
+    }
     const { rowCount } = await pool.query(
       `DELETE FROM inventory.owned_items
        WHERE steam_id = $1 AND origin = 'steam' AND steam_asset_id IS NOT NULL
@@ -3248,6 +3665,10 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
      WHERE l.steam_id = $1`,
     [steamId],
   );
+  // THE feed the CS2 server applies, so the link has to be dereferenced here of
+  // all places — an unresolved spec would send the game the stale inline
+  // scratch while every screen in the panel showed the sticker's real one.
+  const equippedRows = await withAttachments(steamId, rows);
 
   const out = {
     agents: {} as Record<string, EquippedItem>,
@@ -3259,7 +3680,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     graffiti: undefined as EquippedItem | undefined,
   };
 
-  for (const row of rows) {
+  for (const row of equippedRows) {
     const item = getItem(row.item_id as number);
     if (!item) continue;
     const base: EquippedItem = {
@@ -3360,6 +3781,11 @@ async function start() {
   await app.register(cors, { origin: true, credentials: true });
   await applySchema();
   await app.listen({ port, host: "0.0.0.0" });
+  // Agent patch-slot counts, so the synchronous getItem() can answer. Fire and
+  // forget: a cold cache reads as "unknown", the form falls back to five slots
+  // for a moment, and the next request is right — far better than delaying
+  // listen() on 63 file reads.
+  void warmPatchSlots(getAgents().map((a) => a.model).filter((m): m is string => !!m));
   void autoExtractIfStale();
   // Freshness marker: node --watch in this container is event-based and quietly
   // misses synced edits, so "my change did nothing" is usually "the process is

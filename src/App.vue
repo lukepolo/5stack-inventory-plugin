@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch, provide, type ComputedRef } from "vue";
 import { cn } from "@5stack/ui";
-import en from "./locales/en.json";
+import { useI18n } from "./composables/useI18n";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -60,25 +60,57 @@ import {
   type ShareLink,
   type Draft,
 } from "./routes";
-import AdminConsole from "./AdminConsole.vue";
-import ShareMenu from "./ShareMenu.vue";
-import Tooltip from "./Tooltip.vue";
+import AdminConsole from "./components/AdminConsole.vue";
+import DevHud from "./components/DevHud.vue";
+import { devToolsEnabled, devToolsVersion, activeFlags, flagsVersion } from "./devFlags";
+import CatalogFilters, { type FacetAxis } from "./components/CatalogFilters.vue";
+import Armory from "./components/Armory.vue";
+import ShareMenu from "./components/ShareMenu.vue";
+import Tooltip from "./components/Tooltip.vue";
 import { MDEBUG, mdebug, setMdebugAmbient, traceLayer } from "./mdebug";
-import ItemArt from "./ItemArt.vue";
-import ItemName from "./ItemName.vue";
-import SlotStatus from "./SlotStatus.vue";
-import WearBar from "./WearBar.vue";
-import ItemTile from "./ItemTile.vue";
-import TileActions from "./TileActions.vue";
-import FilterDropdown from "./FilterDropdown.vue";
-import InfiniteSentinel from "./InfiniteSentinel.vue";
-import SortDirection from "./SortDirection.vue";
-import ViewerControls from "./ViewerControls.vue";
-import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
-import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, STEAM_BLUE, stripName, wearTier } from "./itemVisuals";
+import ItemArt from "./components/ItemArt.vue";
+import ItemName from "./components/ItemName.vue";
+import SlotStatus from "./components/SlotStatus.vue";
+import WearBar from "./components/WearBar.vue";
+import ItemTile from "./components/ItemTile.vue";
+import TileActions from "./components/TileActions.vue";
+import FilterDropdown from "./components/FilterDropdown.vue";
+import InfiniteSentinel from "./components/InfiniteSentinel.vue";
+import SortDirection from "./components/SortDirection.vue";
+import PatternRail from "./components/PatternRail.vue";
+import PatternScoreRail from "./components/PatternScoreRail.vue";
+import { SCAN_READ_SIZE } from "./patternScan";
+import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
+import ViewerControls from "./components/ViewerControls.vue";
+import PillTabs from "./components/PillTabs.vue";
+import DeckCard from "./components/DeckCard.vue";
+import DeckFan from "./components/DeckFan.vue";
+import ContextMenu, { MENU_ROW } from "./components/ContextMenu.vue";
+import FilterSheet from "./components/FilterSheet.vue";
+import { Z } from "./zLayers";
+import { SORT_DIR_ICON, type SortDir } from "./sortIcons";
+import {
+  SORTS, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, type SortMode,
+  ATTACH_SORTS, DEFAULT_ATTACH_SORT, ATTACH_SORT_NATURAL, ATTACH_DIR_HINT, ATTACH_SORT_KIND, type AttachSortMode,
+} from "./sortModes";
+import {
+  DEFAULT_WEAR, POSITION_GROUPS, START_PISTOLS, isWeaponPos, isSpecial, isShared, isNo3d,
+  type OriginFilter, ORIGIN_FILTERS, ORIGIN_VALUES, WEAPON_GROUPS, GEAR_TYPES, WEAPONISH,
+  categoryOf, prettyModel, matchesOrigin, catsForPos, DEFAULTS, RAIL, EXTRAS, ALL_SPECIALS,
+} from "./loadoutModel";
+import { useSortControl } from "./composables/useSortControl";
+import { SWIPE_ARM_PX } from "./composables/useSwipeDismiss";
+import { useSlotLongPress } from "./composables/useSlotLongPress";
+import { useAppHeight } from "./composables/useAppHeight";
+import { useBuildCheck } from "./composables/useBuildCheck";
+import { useViewerMount } from "./composables/useViewerMount";
+import { useDebouncedSearch, SEARCH_DEBOUNCE_MS } from "./composables/useDebouncedSearch";
+import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
+import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, STEAM_BLUE, stripName, wearTier } from "./itemVisuals";
+import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
-import { revealInScroller, scrollPanelToTop } from "./dom";
-import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
+import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type ViewerKind, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
 
@@ -217,6 +249,7 @@ const SCREEN_ROUTE: Record<ReturnType<typeof screenFor>, Route> = {
   grid: { name: "loadout" },
   focus: { name: "focus" },
   inventory: { name: "inventory" },
+  armory: { name: "armory" },
   admin: { name: "admin", section: "" },
 };
 const adminSection = computed(() => (route.value.name === "admin" ? route.value.section : ""));
@@ -276,119 +309,21 @@ const go = (to: string, options: { replace?: boolean; query?: Record<string, str
 // Loadout in the tab bar — so it slides in from the right and pushes Loadout
 // out to the left. Direction is read at transition time, when `view` already
 // holds the incoming screen, so enter/leave stay on the same axis.
+// Screens are ordered left-to-right: loadout, inventory, armory. Sliding by
+// that order is what makes the swap read as travel rather than a redraw — the
+// armory sits PAST the inventory (you get to it from there), so it arrives from
+// the right the way the inventory does from the loadout.
+const VIEW_ORDER: Record<string, number> = { grid: 0, focus: 0, inventory: 1, armory: 2, admin: 3 };
+const viewDeeper = computed(() => (VIEW_ORDER[view.value] ?? 0) > 0);
 const viewEnterFrom = computed(() =>
-  view.value === "inventory" ? "opacity-0 translate-x-4" : "opacity-0 -translate-x-4",
+  viewDeeper.value ? "opacity-0 translate-x-4" : "opacity-0 -translate-x-4",
 );
 const viewLeaveTo = computed(() =>
-  view.value === "inventory" ? "opacity-0 -translate-x-4" : "opacity-0 translate-x-4",
+  viewDeeper.value ? "opacity-0 -translate-x-4" : "opacity-0 translate-x-4",
 );
-const DEFAULT_WEAR = 0;
 
-// ---- CS2 positional loadout slots -------------------------------------------
-// Like CS2: 1 starting pistol + 4 other pistols, 5 mid-tier, 5 rifles per team.
-// Users pick WHICH weapon occupies each slot (right-click → replace), and each
-// slot's finish comes from their crafted inventory.
-const POSITION_GROUPS = [
-  { key: "pistols", label: "Pistols", positions: ["sp", "p1", "p2", "p3", "p4"] },
-  { key: "midtier", label: "Mid-Tier", positions: ["m1", "m2", "m3", "m4", "m5"] },
-  { key: "rifles", label: "Rifles", positions: ["r1", "r2", "r3", "r4", "r5"] },
-] as const;
-const START_PISTOLS = ["glock", "usp_silencer", "hkp2000"];
-const isWeaponPos = (s: string) => /^(sp|p[1-4]|m[1-5]|r[1-5])$/.test(s);
-const isSpecial = (s: string) => ["knife", "gloves", "agent", "zeus", "c4", "musickit", "graffiti"].includes(s);
-const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti"].includes(s);
-// "Special" is a LAYOUT concept (slot rail, catalog fetch, sheet keys) and was
-// doing double duty as the 3D gate, which is why knives could never show 3D
-// even once their GLBs existed. Split: this is the 3D one, and it's about
-// whether a slot resolves to something we have a model for.
-//
-// Gloves and agents came off this list when their trees joined the extraction
-// (v19). zeus came off too — its GLB has shipped all along, it was only ever
-// here because this list started life as the "special slot" one. c4 stays:
-// nothing extracts it, since it has no MAP entry.
-//
-// A slot-level answer is necessarily coarse — it is asked before an occupant is
-// known. The per-ITEM answer (a painted glove has no compositor yet) lives in
-// resolveViewerModel, and the focus/ctx paths below still HEAD-probe on top.
-const isNo3d = (s: string) => ["c4", "musickit", "graffiti"].includes(s);
-// Origin filter — the same control on the Inventory grid and on the loadout
-// sheet's Owned section, so "hide my Steam imports" works the same in both.
-type OriginFilter = "all" | "steam" | "crafted";
-const ORIGIN_FILTERS = [
-  ["all", "All"],
-  ["steam", "Synced"],
-  ["crafted", "Crafted"],
-] as const;
-// The inventory filter rail's taxonomy. An inventory mixes weapons, knives,
-// gloves, agents and the sticker/charm/patch catalogs, and a name search only
-// helps when you already know what you're looking for — "show me my charms"
-// needs a filter. Weapons split by their CS2 category so the rail speaks the
-// loadout's own Pistols / Mid-Tier / Rifles vocabulary instead of exposing raw
-// cs2-lib types.
-const WEAPON_GROUPS = [
-  ["rifle", "Rifles"],
-  ["smg", "SMGs"],
-  ["heavy", "Heavy"],
-  ["secondary", "Pistols"],
-  ["melee", "Knives"],
-  ["glove", "Gloves"],
-] as const;
-// Types with no per-model breakdown worth drawing — one toggle each.
-const GEAR_TYPES = [
-  ["agent", "Agents"],
-  ["sticker", "Stickers"],
-  ["keychain", "Charms"],
-  ["patch", "Patches"],
-  ["musickit", "Music Kits"],
-  ["graffiti", "Graffiti"],
-] as const;
-const WEAPONISH = new Set<string>(WEAPON_GROUPS.map(([k]) => k));
-// Weapons are addressed by their category ("rifle"), everything else by its
-// cs2-lib type ("keychain") — the two never collide, so one key space covers both.
-const categoryOf = (i: InventoryItem): string =>
-  i.item?.type === "weapon" ? i.item?.category ?? "weapon" : i.item?.type ?? "";
-// "usp_silencer" -> "USP Silencer", for models the weapon catalog doesn't name
-// (knives and gloves aren't in it).
-const prettyModel = (m: string) =>
-  m.split("_").map((w) => (w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1))).join(" ");
-const matchesOrigin = (i: InventoryItem, f: OriginFilter) =>
-  f === "all" || (f === "steam" ? isReadOnly(i) : !isReadOnly(i));
-function catsForPos(pos: string): string[] {
-  if (pos === "sp" || /^p/.test(pos)) return ["secondary"];
-  if (/^m/.test(pos)) return ["smg", "heavy"];
-  return ["rifle"];
-}
-// CS2 default loadouts (cs2-lib model names).
-const DEFAULTS: Record<Team, Record<string, string>> = {
-  CT: {
-    sp: "usp_silencer", p1: "elite", p2: "p250", p3: "fiveseven", p4: "deagle",
-    m1: "mp9", m2: "mp7", m3: "ump45", m4: "p90", m5: "nova",
-    r1: "famas", r2: "m4a1", r3: "ssg08", r4: "aug", r5: "awp",
-    knife: "knife",
-  },
-  T: {
-    sp: "glock", p1: "elite", p2: "p250", p3: "tec9", p4: "deagle",
-    m1: "mac10", m2: "mp7", m3: "ump45", m4: "p90", m5: "nova",
-    r1: "galilar", r2: "ak47", r3: "ssg08", r4: "sg556", r5: "awp",
-    // Without this the slot falls through to the literal pos ("knife"), which
-    // is a real cs2-lib key — but the CT default, so T showed a CT knife.
-    knife: "knife_t",
-  },
-};
-
-const RAIL = [
-  { slot: "agent", name: "Agent" },
-  { slot: "gloves", name: "Gloves" },
-  { slot: "knife", name: "Knife" },
-];
-// Extra equipment slots (CS2 inventory-simulator parity).
-const EXTRAS = [
-  { slot: "zeus", name: "Zeus x27" },
-  { slot: "c4", name: "C4" },
-  { slot: "musickit", name: "Music Kit" },
-  { slot: "graffiti", name: "Graffiti" },
-];
-const ALL_SPECIALS = [...RAIL, ...EXTRAS];
+// The slot taxonomy (POSITION_GROUPS, DEFAULTS, RAIL, EXTRAS, the slot
+// predicates) lives in loadoutModel.ts.
 
 // ---- team accent ------------------------------------------------------------
 // T uses the panel's brand amber (--tac-amber + its CTA gradient endpoints) so
@@ -577,11 +512,11 @@ const sheetLoading = ref(false);
  *  Shared by the inventory and the sheet. Declared up here because the sheet's
  *  watcher is thousands of lines above the inventory's — a `const` used before its
  *  declaration is a TDZ waiting for someone to make it eager. */
-const SEARCH_DEBOUNCE_MS = 220;
-const sheetSearch = ref("");
+const sheetSearchCtl = useDebouncedSearch();
+const sheetSearch = sheetSearchCtl.term;
 /** The sheet's debounced term — same reasoning as invSearchApplied, and the sheet
  *  animates its tiles too, so a live filter churned just as visibly here. */
-const sheetSearchApplied = ref("");
+const sheetSearchApplied = sheetSearchCtl.applied;
 const activeRarity = ref<string>("");
 // Graffiti-shaped facets. Nothing here is slot-aware: each control shows only
 // when the loaded catalog actually has more than one value behind it.
@@ -657,24 +592,13 @@ function selectPos(pos: string) {
 }
 
 // ---- rarity facets (rarity is a hex color from cs2-lib) ---------------------
-const RARITY_META: Record<string, { name: string; rank: number }> = {
-  "#b0c3d9": { name: "Consumer", rank: 1 },
-  "#5e98d9": { name: "Industrial", rank: 2 },
-  "#4b69ff": { name: "Mil-Spec", rank: 3 },
-  "#8847ff": { name: "Restricted", rank: 4 },
-  "#d32ce6": { name: "Classified", rank: 5 },
-  "#eb4b4b": { name: "Covert", rank: 6 },
-  "#e4ae39": { name: "★ Rare", rank: 7 },
-  "#ffd700": { name: "★ Rare", rank: 7 },
-  "#ffae39": { name: "★ Rare", rank: 7 },
-};
-function rarityName(hex?: string) {
-  return (hex && RARITY_META[hex.toLowerCase()]?.name) || "Special";
-}
+// RARITY_META / rarityName / rarityRank live in itemVisuals — the armory needs
+// the same table and two copies is two places for a colour to stop meaning what
+// it means.
 const rarityFacets = computed(() => {
   const seen = new Map<string, number>();
   for (const s of sheetSkins.value) {
-    if (s.rarity) seen.set(s.rarity, RARITY_META[s.rarity.toLowerCase()]?.rank ?? 8);
+    if (s.rarity) seen.set(s.rarity, rarityRank(s.rarity));
   }
   // Least → greatest (Consumer first, Covert/★ last), like the game.
   return [...seen.entries()]
@@ -801,16 +725,6 @@ function setSheetTint(v: string) {
 watch([sheetSearch, activeRarity], () => (sheetDesign.value = null));
 // Debounce, mirroring invSearchApplied: clearing is instant, typing waits for you
 // to stop. A settled term means a new list, so the panel goes back to the top.
-let sheetSearchTimer: ReturnType<typeof setTimeout> | undefined;
-watch(sheetSearch, (v) => {
-  clearTimeout(sheetSearchTimer);
-  if (!v.trim()) {
-    sheetSearchApplied.value = "";
-    return;
-  }
-  sheetSearchTimer = setTimeout(() => (sheetSearchApplied.value = v), SEARCH_DEBOUNCE_MS);
-});
-onBeforeUnmount(() => clearTimeout(sheetSearchTimer));
 
 // Rarity facets for the Inventory grid — over what's OWNED, not a catalog.
 const invRarity = ref<string>("");
@@ -818,88 +732,45 @@ const invRarityFacets = computed(() => {
   const seen = new Map<string, number>();
   for (const i of inventory.value) {
     const r = i.item?.rarity;
-    if (r) seen.set(r, RARITY_META[r.toLowerCase()]?.rank ?? 8);
+    if (r) seen.set(r, rarityRank(r));
   }
   return [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([hex]) => ({ hex, name: rarityName(hex) }));
 });
 
 // ---- sorting ----------------------------------------------------------------
-// One control on the Inventory grid, one on the sheet (Owned + Craft share
-// it). "Default" is whatever order the source already has: newest-first for
-// owned items, catalog order for finishes. Both persist.
-type SortMode = "default" | "rarity" | "name" | "wear";
-const SORTS: [SortMode, string][] = [
-  ["default", "Default"],
-  ["rarity", "Rarity"],
-  ["name", "Name"],
-  ["wear", "Wear"],
-];
-const rarityRank = (hex?: string | null) => (hex && RARITY_META[hex.toLowerCase()]?.rank) || 0;
-// Rarity, not insertion order: an inventory reads better with the covert reds
-// at the top than with whatever you happened to craft last.
-const DEFAULT_SORT: SortMode = "rarity";
+// One control on the Inventory grid, one on the sheet (Owned + Craft share it),
+// one in the attachment picker. All three are useSortControl over the tables in
+// sortModes.ts; "Default" is whatever order the source already has.
+//
+// Sort direction is shown, never implied — an unlabelled "Sort · Rarity" doesn't
+// say which end it starts from, and for wear the two ends mean opposite things
+// (a factory-new hunt vs a battle-scarred one).
 
-/**
- * Sort direction. Every sorted grid has one and SHOWS it — an unlabelled "Sort ·
- * Rarity" doesn't say which end it starts from, and for wear the two ends mean
- * opposite things (a factory-new hunt vs a battle-scarred one).
- *
- * Each mode has a NATURAL direction: the one you meant when you picked it. The
- * comparators below are written in that direction, and a flip negates the primary
- * key only — the name tiebreak stays A→Z either way, so reversing rarity doesn't
- * silently reverse the names inside each tier too.
- */
-const SORT_NATURAL: Record<SortMode, SortDir> = { default: "desc", rarity: "desc", name: "asc", wear: "asc" };
-// What each direction MEANS per mode, for the toggle's tooltip. "Ascending" is
-// useless here; "Lowest float first" is what someone is actually looking for.
-const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
-  default: { desc: "Source order", asc: "Reversed" },
-  rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
-  name: { asc: "A → Z", desc: "Z → A" },
-  wear: { asc: "Lowest float first", desc: "Highest float first" },
-};
-// Which icon pair reads the direction: names get A→Z, a float gets 0→1, a rank
-// gets the narrow/wide bars. See SortDirection.vue.
-const SORT_DIR_KIND: Record<SortMode, SortKind> = {
-  default: "amount",
-  rarity: "amount",
-  name: "alpha",
-  wear: "numeric",
-};
-/**
- * Direction is remembered PER MODE, not per control.
- *
- * A single stored direction per grid meant a preference set on one mode silently
- * became the default for every other: flip Name to Z→A, come back to Rarity, and
- * you get lowest-rarity-first for a choice you made about names. Rarity means
- * highest-first unless you have said otherwise ABOUT RARITY, and per-mode keys are
- * what makes that true no matter what you touched before.
- */
-const dirKey = (scope: string, mode: string) => `cs2inv.${scope}Dir.${mode}`;
-function loadDir(scope: string, mode: SortMode): SortDir {
-  const stored = localStorage.getItem(dirKey(scope, mode));
-  return stored === "asc" || stored === "desc" ? stored : SORT_NATURAL[mode];
-}
+// Its own fallback on purpose: an unrecognised colour sorts FIRST here (0),
+// where the facet lists put it last (8). Sorting a grid, "I don't know what
+// this is" belongs with the commons; listing the tiers, it belongs after them.
+const sortRarityRank = (hex?: string | null) => (hex && RARITY_META[hex.toLowerCase()]?.rank) || 0;
 
-const invSort = ref<SortMode>((localStorage.getItem("cs2inv.invSort") as SortMode | null) ?? DEFAULT_SORT);
-watch(invSort, (v) => localStorage.setItem("cs2inv.invSort", v));
-const invDir = ref<SortDir>(loadDir("inv", invSort.value));
-watch(invDir, (v) => localStorage.setItem(dirKey("inv", invSort.value), v));
-const sheetSort = ref<SortMode>((localStorage.getItem("cs2inv.sheetSort") as SortMode | null) ?? DEFAULT_SORT);
-watch(sheetSort, (v) => localStorage.setItem("cs2inv.sheetSort", v));
-const sheetDir = ref<SortDir>(loadDir("sheet", sheetSort.value));
-watch(sheetDir, (v) => localStorage.setItem(dirKey("sheet", sheetSort.value), v));
-// Switching mode restores THAT mode's remembered direction, or its natural one.
-// Two setters rather than one taking refs: templates auto-unwrap, so a shared
-// helper would receive the string values instead of the refs to write back to.
-function setInvSort(next: string) {
-  invSort.value = next as SortMode;
-  invDir.value = loadDir("inv", invSort.value);
-}
-function setSheetSort(next: string) {
-  sheetSort.value = next as SortMode;
-  sheetDir.value = loadDir("sheet", sheetSort.value);
-}
+const invSortCtl = useSortControl<SortMode>({
+  scope: "inv",
+  fallback: DEFAULT_SORT,
+  natural: SORT_NATURAL,
+  hints: SORT_DIR_HINT,
+  kinds: SORT_DIR_KIND,
+});
+// Destructured, including the computeds: a ref nested inside an object is not
+// auto-unwrapped in a template, only a top-level binding is.
+const { mode: invSort, dir: invDir, setMode: setInvSort, kind: invSortKind, hint: invSortHint } = invSortCtl;
+
+const sheetSortCtl = useSortControl<SortMode>({
+  scope: "sheet",
+  fallback: DEFAULT_SORT,
+  natural: SORT_NATURAL,
+  hints: SORT_DIR_HINT,
+  kinds: SORT_DIR_KIND,
+});
+const { mode: sheetSort, dir: sheetDir, setMode: setSheetSort, kind: sheetSortKind, hint: sheetSortHint } = sheetSortCtl;
+
 const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
 function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): InventoryItem[] {
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
@@ -907,7 +778,7 @@ function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): Inv
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(itemName(a.item), itemName(b.item)));
   if (mode === "wear") return arr.sort((a, b) => flip * ((a.wear ?? 1) - (b.wear ?? 1)) || byName(itemName(a.item), itemName(b.item)));
-  return arr.sort((a, b) => flip * (rarityRank(b.item?.rarity) - rarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
+  return arr.sort((a, b) => flip * (sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
 }
 function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
   if (mode === "wear") return list; // catalog skins have no wear
@@ -915,57 +786,10 @@ function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(a.name, b.name));
-  return arr.sort((a, b) => flip * (rarityRank(b.rarity) - rarityRank(a.rarity)) || byName(a.name, b.name));
+  return arr.sort((a, b) => flip * (sortRarityRank(b.rarity) - sortRarityRank(a.rarity)) || byName(a.name, b.name));
 }
 
-/**
- * Render window over a list that is already fully in memory — the client half of
- * infinite scrolling.
- *
- * The catalog lists behind these grids are big (2.2k graffiti, 578 knives, and an
- * inventory can be thousands of items) and every tile is a card with artwork, so
- * committing the whole list to the DOM at once is what actually made these
- * screens feel capped. The window grows a page at a time as the sentinel comes
- * into view; nothing is ever unreachable.
- *
- * `reset` is a getter over the FILTER inputs, not the list itself. Watching the
- * list would send you back to the top of the grid every time anything mutated it
- * — a render landing, an equip re-sorting — while changing a filter genuinely
- * should start over at page one.
- */
-/** How many more items each scroll-triggered growth adds. */
-const WINDOW_STEP = 60;
-/**
- * How many mount on the FIRST paint of a new list, and the cutoff for the
- * entrance cascade — see invCellDelay (grids) and sheetCellClass (sheet).
- *
- * Smaller than the growth step, which is the point. Every list change replaces the
- * cards rather than moving them (see invFilterSig), so the whole window is created
- * in one synchronous task — and at 60 image-bearing cards that task is long enough
- * to eat the frames the tab indicator and the cards' own entrance need, which read
- * as both of them stalling. Roughly a viewport's worth mounts up front and the
- * sentinel tops the rest up over later frames, where there is nothing to compete
- * with.
- */
-const WINDOW_FIRST = 24;
-function renderWindow<T>(
-  source: ComputedRef<T[]>,
-  reset: () => unknown,
-  step = WINDOW_STEP,
-  first = WINDOW_FIRST,
-) {
-  const shown = ref(first);
-  watch(reset, () => {
-    shown.value = first;
-  });
-  return {
-    items: computed(() => (shown.value >= source.value.length ? source.value : source.value.slice(0, shown.value))),
-    done: computed(() => shown.value >= source.value.length),
-    grow: () => {
-      shown.value += step;
-    },
-  };
-}
+// Render window + entrance-cascade cutoff live in composables/useRenderWindow.ts.
 
 const teamOk = (teams?: Team[] | null) => !teams || teams.length === 0 || teams.includes(team.value);
 const matchesFilters = (name?: string, rarity?: string) => {
@@ -979,10 +803,7 @@ const matchesFilters = (name?: string, rarity?: string) => {
 // Sheet: skins you OWN for the selected slot's weapon. The origin filter is
 // persisted — people who never want to equip their read-only Steam imports set
 // it to Crafted once and it stays that way.
-const sheetOrigin = ref<OriginFilter>(
-  (localStorage.getItem("cs2inv.sheetOrigin") as OriginFilter | null) ?? "all",
-);
-watch(sheetOrigin, (v) => localStorage.setItem("cs2inv.sheetOrigin", v));
+const sheetOrigin = usePersistedEnum<OriginFilter>("cs2inv.sheetOrigin", ORIGIN_VALUES, "all");
 const ownedForSheet = computed(() =>
   sortInstances(
     inventory.value.filter(
@@ -1023,6 +844,21 @@ interface Stack<T> {
   variants: T[];
 }
 const TINT_SUFFIX = / \([^()]+\)\s*$/;
+/**
+ * tintName -> colour, for the layers fanned out behind a colour deck.
+ *
+ * Comes from the SHEET's facets, which are fetched per loadout slot — so this
+ * only knows the tints of whichever weapon the sheet last loaded. It is passed
+ * to `stackByDesign` explicitly rather than read from inside it: the inventory
+ * grid stacks the same way, and having the palette reach out of an unrelated
+ * screen's state silently was the kind of coupling that is impossible to see at
+ * the call site.
+ *
+ * The inventory therefore gets whatever the sheet happens to hold, and mostly
+ * misses (tint names are per-finish, not a shared vocabulary) — which
+ * `.filter(Boolean)` turns into "no fan layers". Giving it a correct palette of
+ * its own needs an inventory-wide tint facet the API does not expose today.
+ */
 const tintColors = computed(() => new Map(sheetFacets.value.tints.map((t) => [t.value, t.color])));
 function stackByDesign<T>(
   list: T[],
@@ -1033,6 +869,8 @@ function stackByDesign<T>(
   // keyed v-for makes Vue's diff patch one node twice and orphan the other —
   // an already-filtered-out card left sitting in the grid.
   keyOf: (v: T) => string | number,
+  /** tintName -> colour for the fanned layers. See `tintColors`. */
+  palette: Map<string, string>,
 ): Stack<T>[] {
   const out: Stack<T>[] = [];
   const byDesign = new Map<number, Stack<T>>();
@@ -1068,14 +906,14 @@ function stackByDesign<T>(
     st.face = at(0);
     // Thirds apart, so the two behind never repeat the face or each other.
     st.behind = [at(Math.floor(n / 3)), at(Math.floor((2 * n) / 3))]
-      .map((v) => tintColors.value.get(of(v)?.tintName ?? "") ?? "")
+      .map((v) => palette.get(of(v)?.tintName ?? "") ?? "")
       .filter(Boolean);
   }
   return out;
 }
 
 const ownedStacks = computed(() =>
-  stackByDesign(ownedForSheet.value, sheetDesign.value, (i) => i.item, (i) => i.id),
+  stackByDesign(ownedForSheet.value, sheetDesign.value, (i) => i.item, (i) => i.id, tintColors.value),
 );
 
 // Sheet: ALL catalog skins for the weapon (craft mode). The catalog facets only
@@ -1100,7 +938,7 @@ const craftList = computed(() =>
 /** Craft grid stacks, plus the name a deck shows: the face's, minus the
  *  "(Colour)" that only distinguishes it from its own siblings. */
 const craftStacks = computed(() =>
-  stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id).map((st) => ({
+  stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id, tintColors.value).map((st) => ({
     ...st,
     card: st.variants.length > 1 ? { ...st.face, name: st.face.name.replace(TINT_SUFFIX, "") } : st.face,
   })),
@@ -1130,8 +968,8 @@ const sheetResetKey = () =>
     sheetOrigin.value,
   ].join("|");
 // Both windows count CARDS, not items — a stack is one thing to scroll past.
-const ownedWindow = renderWindow(ownedStacks, sheetResetKey);
-const craftWindow = renderWindow(craftStacks, sheetResetKey);
+const ownedWindow = useRenderWindow(ownedStacks, sheetResetKey);
+const craftWindow = useRenderWindow(craftStacks, sheetResetKey);
 // Sheet: replace mode — every weapon eligible for this position (defaults are
 // free) plus owned skins of those weapons.
 const replaceOptions = computed(() => {
@@ -1159,45 +997,11 @@ const replaceOptions = computed(() => {
 });
 
 // ---- mutations --------------------------------------------------------------
-/**
- * Translate `key`: our catalogue first, the panel second, `fallback` last.
- *
- * OURS wins deliberately. The panel ships its own messages and an operator
- * upgrading it must not be able to silently change this plugin's wording, so a
- * key we define is the one that renders. The panel is consulted only for keys
- * we do not own.
- *
- * Two distinct misses to survive, and vue-i18n conflates them: no host `t` at
- * all (standalone), and a host `t` that does not know the key — vue-i18n
- * returns the KEY itself for an unknown message, so without the comparison
- * below `inventory.foo.bar` would render on screen.
- *
- * Reads `props.locale` so anything computed from this re-evaluates on a
- * language switch — `props.t` is a stable reference and would not trigger it.
- */
-const CATALOGUES: Record<string, Record<string, unknown>> = { en };
-function lookup(catalogue: Record<string, unknown>, key: string): unknown {
-  return key.split(".").reduce<unknown>((o, k) => (o as Record<string, unknown>)?.[k], catalogue);
-}
-function tr(key: string, fallback: string, named?: Record<string, unknown>): string {
-  const lang = props.locale ?? "en";
-  const mine = lookup(CATALOGUES[lang] ?? {}, key) ?? lookup(CATALOGUES.en, key);
-  if (typeof mine === "string") {
-    return mine.replace(/\{(\w+)\}/g, (_, k) => String(named?.[k] ?? `{${k}}`));
-  }
-  const host = props.t?.(key, named);
-  return !host || host === key ? fallback : host;
-}
+// `tr`/`notify`/`fail` live in useI18n — see composables/useI18n.ts for why they
+// have to close over props rather than be a plain module. `props` is passed
+// whole, not destructured, so a language switch still invalidates.
+const { tr, notify, fail } = useI18n(props);
 
-/** Every notification in the plugin funnels through here — including the ones
- *  AdminConsole and SkinTests emit upward — so the host's toast is the single
- *  implementation. */
-function notify(message: string, kind: "error" | "success" = "error") {
-  props.notify(message, kind);
-}
-function fail(e: unknown) {
-  notify(e instanceof Error ? e.message : String(e), "error");
-}
 async function refreshAll() {
   [loadout.value, inventory.value] = await Promise.all([fetchLoadout(), fetchInventory()]);
   // Items staged for deletion are already gone from the UI but not yet from
@@ -1455,7 +1259,18 @@ function reorderStyle(pos: string): Record<string, string> {
 // `w` = the sticker's own scratch wear (0 pristine .. 1 scratched off), which
 // the game applies as "sticker slot N wear". Unrelated to `craft.wear`, the
 // weapon's float.
-type Attach = { id: number; name: string; image: string | null; x?: number | null; y?: number | null; r?: number | null; w?: number | null };
+/**
+ * `inst` is the owned_items row this attachment IS — see the backend's
+ * AttachSpec. It has to survive a round trip, because the server reads a spec
+ * with no `inst` as a fresh catalog pick and mints one: drop it on the way out
+ * and every save would grant the user another copy of every sticker on the gun.
+ *
+ * Deliberately NOT in the shareable draft URL (encodeDraft). An instance id
+ * belongs to one account, so a link opened by anyone else would name a row they
+ * don't own — the server falls through to minting there, which is exactly right
+ * for someone building their own copy of a craft.
+ */
+type Attach = { id: number; name: string; image: string | null; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null };
 const craft = ref<{
   skin: Skin;
   wear: number;
@@ -1467,7 +1282,7 @@ const craft = ref<{
   /** `seed` is the charm's own PATTERN, the same idea as the weapon's and a
    *  tradeable attribute in its own right. Purely an attribute: CS2 varies no
    *  charm geometry or art by it, so the 3D viewer never sees it. */
-  charm: (Attach & { z?: number | null; seed?: number | null }) | null;
+  charm: (Attach & { z?: number | null; seed?: number | null; inst?: string | null }) | null;
 } | null>(null);
 /**
  * Does the editor's right-hand column have anything IN it?
@@ -1478,7 +1293,6 @@ const craft = ref<{
  * left and a spray sat visibly off to the left of an empty panel. Hidden, the
  * preview takes the whole modal.
  */
-const craftHasOptions = computed(() => selected.value !== "graffiti");
 /**
  * What attachments the thing being edited supports.
  *
@@ -1493,16 +1307,23 @@ const craftHasOptions = computed(() => selected.value !== "graffiti");
  * are cs2-lib `weapon` type, so the item answer covers them without the special
  * case the slot form needed.
  */
-const attachKind = computed<"weapon" | "agent" | "none">(() => {
+const attachKind = computed<"weapon" | "melee" | "agent" | "none">(() => {
   const type = craftType.value;
   if (type) {
     if (type === "agent") return "agent";
-    return type === "weapon" || type === "melee" ? "weapon" : "none";
+    // Melee is its own answer, not a weapon: a knife takes a CHARM but has no
+    // sticker slots — CS2 offers stickers on guns only. Folded in with weapons
+    // it was handed five of them, which the game would simply drop.
+    if (type === "melee") return "melee";
+    return type === "weapon" ? "weapon" : "none";
   }
   if (selected.value === "agent") return "agent";
+  if (selected.value === "knife") return "melee";
   if (isWeaponPos(selected.value) || selected.value === "zeus" || selected.value === "c4") return "weapon";
   return "none";
 });
+/** Everything that can wear a charm — guns and knives, not gloves or agents. */
+const attachTakesCharm = computed(() => attachKind.value === "weapon" || attachKind.value === "melee");
 /**
  * The cs2-lib type of whatever the craft modal is editing, when it knows it.
  *
@@ -1518,11 +1339,56 @@ const craftType = computed(() => craft.value?.skin.type ?? craftInst.value?.item
 /** Fall back to the slot only when the item's type is genuinely unknown — a
  *  catalog listing that predates the field. */
 const craftSlotSays = (nope: string[]) => !nope.includes(selected.value);
+/**
+ * Is the pattern being edited a CHARM's?
+ *
+ * Charms and weapons both have one, and they are not the same control: a
+ * weapon's is a 1..1000 continuum you scrub, a charm's is a 1..100,000 space
+ * where each band is a colour you aim at. Same field, different instrument.
+ */
+const craftSeedIsCharm = computed(() => craftType.value === "keychain");
 const craftHasSeed = computed(() =>
   craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti"]),
 );
 const craftHasWear = computed(() =>
   craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti"]),
+);
+/**
+ * Can this finish's pattern move its artwork at all?
+ *
+ * Null while unknown — the paint def has to be fetched, and a control that
+ * flickers "fixed" for a frame before deciding otherwise is worse than one that
+ * waits. Every style 0 solid and style 3 anodized in the game answers false, so
+ * this is not an edge case: it is most of the finishes where someone would
+ * otherwise sit and press the die expecting something to happen.
+ */
+const patternMoves = ref<boolean | null>(null);
+/**
+ * A sticker's scratch wear, on the sticker's OWN page.
+ *
+ * The same number the weapon's options column exposes per slot — this is where
+ * you set it when the sticker is the subject rather than something stuck to a
+ * gun. It rides `craft.wear`, which already round-trips to owned_items.wear, so
+ * an owned sticker keeps its scuff with no new column.
+ *
+ * Type-only, never the slot: a sticker is always opened from the inventory or
+ * the catalog, where `selected` is still pointing at whatever weapon position
+ * was last touched.
+ */
+const craftHasScratch = computed(() => hasScratch({ type: craftType.value }));
+/**
+ * Name tag. Asks the type for the same reason every gate here does — the old
+ * slot-shaped test would offer one to a sticker opened from the inventory,
+ * because `selected` was still on a rifle.
+ */
+const craftHasNameTag = computed(() =>
+  craftType.value
+    // Guns and knives only. A name tag is applied with a Name Tag tool, and CS2
+    // will not let you put one on gloves, an agent, a music kit or a charm —
+    // the field was offered to gloves and charms purely because the old
+    // exclusion list was written before either could be opened on its own.
+    ? ["weapon", "melee"].includes(craftType.value)
+    : craftSlotSays(["agent", "musickit", "graffiti", "gloves"]),
 );
 // StatTrak is weapons, knives and music kits — NOT gloves, which do have a float
 // and a pattern. That distinction is invisible to a slot-shaped gate.
@@ -1530,6 +1396,27 @@ const craftHasStatTrak = computed(() =>
   craftType.value
     ? ["weapon", "melee", "musickit"].includes(craftType.value)
     : craftSlotSays(["agent", "graffiti"]),
+);
+/**
+ * Does the options column have anything to put in it?
+ *
+ * The UNION of the gates below rather than a rule of its own, so it can never
+ * disagree with them: add a control and this follows. It used to ask the slot
+ * ("not graffiti"), which was right while every craft started from a matching
+ * slot and wrong from the armory — a patch has no name tag, no float, no
+ * pattern, no StatTrak and no attachments, so it opened a 300px column with
+ * nothing in it.
+ *
+ * Declared after the gates it sums; see the note on craftHasNameTag.
+ */
+const craftHasOptions = computed(
+  () =>
+    craftHasNameTag.value ||
+    craftHasSeed.value ||
+    craftHasWear.value ||
+    craftHasScratch.value ||
+    craftHasStatTrak.value ||
+    attachKind.value !== "none",
 );
 const editingId = ref<number | null>(null);
 // The weapon model this craft/edit is about. Crafting from the sheet = the
@@ -1541,6 +1428,33 @@ const craftModel = ref<string | null>(null);
 // inspect link) and a charm has no weapon model at all. Resolved in the `craft`
 // watcher; null means this item has no 3D form.
 const craftTarget = ref<ViewerTarget | null>(null);
+
+// Declared AFTER craftTarget on purpose: `immediate` makes Vue run this
+// getter synchronously during setup, and reading a `const` that is declared
+// further down the file throws on the temporal dead zone — which blanked the
+// whole plugin, since a setup that throws mounts nothing at all.
+watch(
+  () => [craft.value?.skin.paintMaterial ?? null, craftTarget.value?.kind ?? null] as const,
+  async ([pm, kind]) => {
+    patternMoves.value = null;
+    // A GLOVE carries a pattern and is rendered by a different compositor —
+    // gloveComposite, which never reads the seed. Asking the weapon paint def
+    // about it would answer a question about a shader that is not the one
+    // drawing this. The pattern is still a real tradeable attribute, so the
+    // field stays; there is simply no look to browse.
+    if (kind === "glove") {
+      patternMoves.value = false;
+      return;
+    }
+    if (!pm) return;
+    const def = await loadPaintDef(pm);
+    // Still the same finish? The fetch is cached, but a fast click through two
+    // skins can still land these out of order.
+    if ((craft.value?.skin.paintMaterial ?? null) !== pm) return;
+    patternMoves.value = def ? seedMovesPattern(def) : null;
+  },
+  { immediate: true },
+);
 /**
  * Show a glove's forearms.
  *
@@ -1551,6 +1465,57 @@ const craftTarget = ref<ViewerTarget | null>(null);
  * a material flag.
  */
 const gloveArms = ref(false);
+// ---- developer HUD ---------------------------------------------------------
+// The cog is only offered where the tools are: always in a dev build, and in
+// production only once someone turns it on from the admin console. See
+// devFlags.ts for why that gate exists.
+const devHudOpen = ref(false);
+const showDevCog = computed(() => {
+  void devToolsVersion.value;
+  return devToolsEnabled();
+});
+/** Flags currently off their default — surfaced ON the cog so a switch left on
+ *  is visible without opening the panel. That is the failure this whole thing is
+ *  meant to prevent. */
+const devFlagCount = computed(() => {
+  void flagsVersion.value;
+  return activeFlags().length;
+});
+function onDevHudKey(e: KeyboardEvent) {
+  // Ctrl/Cmd+Shift+D. Shift keeps it clear of the browser's own Cmd+D
+  // (bookmark), and the shortcut is inert unless the tools are enabled at all.
+  if (!showDevCog.value) return;
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "D" || e.key === "d")) {
+    e.preventDefault();
+    devHudOpen.value = !devHudOpen.value;
+  }
+}
+onMounted(() => window.addEventListener("keydown", onDevHudKey));
+onBeforeUnmount(() => window.removeEventListener("keydown", onDevHudKey));
+/** The catalog's agent list, kept for its `patchSlots` — see patchSlotCount. */
+const catalogAgents = ref<Skin[]>([]);
+/**
+ * Poses offered for an agent in 3D.
+ *
+ * "Open" exists for PATCHES specifically: at any lifelike arm angle the upper
+ * arms cover the side and sleeve positions, so there is no one pose that both
+ * looks right and shows everything. Rather than compromise the default, the
+ * user picks. "Ready" is the model's own tools_preview clip — the only real
+ * animation an agent ships.
+ */
+const AGENT_POSES = [
+  { id: "ready" as const, label: "Ready", hint: "The model's own in-game pose" },
+  { id: "stand" as const, label: "Stand", hint: "Relaxed standing pose" },
+  { id: "open" as const, label: "Open", hint: "Arms out — shows every patch position" },
+];
+/** The model's own pose leads: it is how CS2 presents the agent, so it is what
+ *  someone expects to see first. "Open" is a tool, not a default. */
+const DEFAULT_AGENT_POSE = "ready" as const;
+const agentPose = ref<"stand" | "open" | "ready">(DEFAULT_AGENT_POSE);
+function setAgentPose(pose: "stand" | "open" | "ready") {
+  agentPose.value = pose;
+  modalViewer.current()?.setAgentPose(pose);
+}
 // Steam-imported items are READ-ONLY (they mirror a real inventory). Editing
 // one opens the same modal as a DUPLICATE: saving creates an editable copy.
 const duplicating = ref(false);
@@ -1567,6 +1532,7 @@ const viewOnly = ref(false);
 const craftInstId = ref<number | null>(null);
 const craftBusy = ref(false);
 function openCraft(skin: Skin) {
+  agentPose.value = DEFAULT_AGENT_POSE;
   editingId.value = null;
   duplicating.value = false;
   viewOnly.value = false;
@@ -1575,7 +1541,14 @@ function openCraft(skin: Skin) {
   // so the slot can't name a model, and every knife finish is a different one.
   // Falling back to the slot keeps working for weapon skins whose listing
   // predates the model field. No model = no 3D — see the `craft` watcher.
-  craftModel.value = skin.model ?? (isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
+  // The slot's model is a fallback for WEAPON finishes only. Crafting is
+  // reachable from the armory now (see Armory.vue), where `selected` is
+  // still pointing at whatever loadout position was last touched — so a sticker
+  // crafted on its own would inherit "ak47" and claim to be a rifle in the
+  // header and the report link.
+  const skinIsWeapon = !skin.type || skin.type === "weapon" || skin.type === "melee";
+  craftModel.value =
+    skin.model ?? (skinIsWeapon && isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
   craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: [null, null, null, null, null], patches: [null, null, null, null, null], charm: null };
   craftBaseline = ""; // new craft — no stored render to reuse
   // A brand-new craft gets a URL too: /craft/<skinId>, with the draft itself in
@@ -1633,6 +1606,7 @@ async function restoreDraftRoute(skinId: number) {
   }
 }
 function openEdit(inst: InventoryItem) {
+  agentPose.value = DEFAULT_AGENT_POSE;
   mdebug("openEdit()", { inst: inst.id, hasItem: !!inst.item });
   if (!inst.item) return;
   craftModel.value = inst.item.model ?? null;
@@ -1642,11 +1616,11 @@ function openEdit(inst: InventoryItem) {
   editingId.value = duplicating.value ? null : inst.id;
   const stickers: (Attach | null)[] = [null, null, null, null, null];
   (inst.stickers ?? []).forEach((st, i) => {
-    if (st && i < 5) stickers[i] = { id: st.id, name: st.name, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null };
+    if (st && i < 5) stickers[i] = { id: st.id, name: st.name, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null, inst: st.inst ?? null };
   });
   const patches: (Attach | null)[] = [null, null, null, null, null];
   (inst.patches ?? []).forEach((pt, i) => {
-    if (pt && i < 5) patches[i] = { id: pt.id, name: pt.name, image: pt.image };
+    if (pt && i < 5) patches[i] = { id: pt.id, name: pt.name, image: pt.image, inst: pt.inst ?? null };
   });
   craft.value = {
     // `type` and `model` ride along because they are what decides WHAT the 3D
@@ -1661,7 +1635,7 @@ function openEdit(inst: InventoryItem) {
     stickers,
     patches,
     charm: inst.charm
-      ? { id: inst.charm.id, name: inst.charm.name, image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null }
+      ? { id: inst.charm.id, name: inst.charm.name, image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null, inst: inst.charm.inst ?? null }
       : null,
   };
   // Until something changes, show the render we already have for this item.
@@ -1778,16 +1752,20 @@ function closeCraft() {
 }
 const rand = (min: number, max: number) => min + Math.random() * (max - min);
 function randomWear() {
-  if (craft.value) craft.value.wear = Number(rand(0, 1).toFixed(4));
+  // Two decimals for a scratch, six-figure precision for a float. Not fussiness:
+  // a sticker's scratch is the same 0..1 the per-slot sliders step at 0.01 and
+  // print at 2dp, so rolling 0.4837 here would have the sticker's own page and
+  // the weapon's options column disagree about the same number.
+  if (craft.value) craft.value.wear = Number(rand(0, 1).toFixed(craftHasScratch.value ? 2 : 4));
 }
 function randomSeed() {
   if (craft.value) craft.value.seed = Math.floor(rand(1, 1001));
 }
 // Charm patterns run to 100000, an order of magnitude past a weapon's 1000 —
 // they are their own attribute with their own range, not the weapon's reused.
-function randomCharmSeed() {
-  if (craft.value?.charm) craft.value.charm.seed = Math.floor(rand(1, 100001));
-}
+// The die for them lives inside PatternRail rather than here: it rolls within
+// whatever range the rail is showing, and a button that far from the range it
+// obeys is what made that relationship need a label nobody could read.
 function resetCraft() {
   if (craft.value)
     Object.assign(craft.value, {
@@ -1801,7 +1779,7 @@ function resetCraft() {
 // saved and reopened.
 // Sparse specs: index = slot; x/y/rotation/wear all flow to the game server.
 function toSpec(a: Attach | null): AttachSpec {
-  return a ? { id: a.id, x: a.x ?? null, y: a.y ?? null, r: a.r ?? null, w: a.w ?? null } : null;
+  return a ? { id: a.id, x: a.x ?? null, y: a.y ?? null, r: a.r ?? null, w: a.w ?? null, inst: a.inst ?? null } : null;
 }
 function craftBody() {
   const c = craft.value!;
@@ -1813,7 +1791,7 @@ function craftBody() {
     stickers: c.stickers.map(toSpec),
     patches: c.patches.map(toSpec),
     charm_id: c.charm?.id ?? null,
-    charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null } : null,
+    charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null, inst: c.charm.inst ?? null } : null,
   };
 }
 // Inspect the DRAFT — works before the craft has ever been saved.
@@ -1845,12 +1823,57 @@ async function duplicateCraft() {
   duplicating.value = true;
   await confirmCraft();
 }
+/**
+ * Attachments in this craft that are currently applied to something ELSE.
+ *
+ * A sticker can only be on one weapon at a time, so saving this would take each
+ * of these off the gun wearing it. The server does that move unconditionally —
+ * it has to, it's the rule — which is exactly why the asking happens here,
+ * where there is still something to cancel.
+ */
+function craftTakesFrom(): { name: string; from: string }[] {
+  const c = craft.value;
+  if (!c) return [];
+  const self = craftInstId.value != null ? String(craftInstId.value) : null;
+  const out: { name: string; from: string }[] = [];
+  const check = (a: Attach | null) => {
+    if (!a?.inst) return;
+    const row = inventory.value.find((i) => String(i.id) === String(a.inst));
+    // Loose, or already on THIS item — neither is a move.
+    if (row?.attached_to == null || String(row.attached_to) === self) return;
+    const host = inventory.value.find((i) => String(i.id) === String(row.attached_to));
+    out.push({ name: a.name, from: host ? itemName(host.item) : "another item" });
+  };
+  c.stickers.forEach(check);
+  c.patches.forEach(check);
+  check(c.charm);
+  return out;
+}
 async function confirmCraft() {
   if (!craft.value || craftBusy.value) return;
   // Belt-and-braces behind the disabled button: the editor is reachable signed
   // out (and via a shared /craft/<id> draft link), so the commit re-checks
   // rather than trusting that no path got here.
   if (!signedIn.value) return notify(tr("inventory.notify.sign_in_to_save", "Sign in to save this to your inventory."));
+  const moving = craftTakesFrom();
+  if (moving.length) {
+    confirmAsk.value = {
+      title: moving.length === 1 ? "Move it off the other item?" : "Move them off their other items?",
+      body:
+        moving.map((m) => `${m.name} is on your ${m.from}.`).join(" ") +
+        ` Saving moves ${moving.length === 1 ? "it" : "them"} here, so that item loses ${moving.length === 1 ? "it" : "them"}.` +
+        " To keep both, duplicate the attachment first.",
+      confirmLabel: "Move",
+      tone: "neutral",
+      // Cleared before re-entering, or this would ask again forever.
+      onConfirm: () => void saveCraft(),
+    };
+    return;
+  }
+  await saveCraft();
+}
+async function saveCraft() {
+  if (!craft.value || craftBusy.value) return;
   craftBusy.value = true;
   try {
     const body = craftBody();
@@ -2110,28 +2133,16 @@ provide("tr", tr);
 // 3D preview inside the craft/edit modal.
 const modal3d = ref(false);
 const modal3dAvailable = ref(false);
-const modal3dBusy = ref(false);
 const modalViewerEl = ref<HTMLElement | null>(null);
-let modalViewerHandle: ViewerHandle | null = null;
-// Bumped on every teardown so an in-flight mountModalViewer can tell that the
-// modal it was mounting for has since closed or been remounted.
-let modalViewerGen = 0;
-// The generation counter alone could only DISCARD a finished build — the mount
-// still ran to completion, allocating a GL context and compositing a full paint
-// job for a modal that had already closed. Aborting stops it at the next
-// checkpoint instead, and a mount cancelled while queued never starts at all.
-let modalViewerAbort: AbortController | null = null;
-function teardownModalViewer() {
-  modalViewerGen++;
-  modalViewerAbort?.abort();
-  modalViewerAbort = null;
-  modalViewerHandle?.dispose();
-  modalViewerHandle = null;
-  // An aborted mount bails before its `finally` can clear this, and the
-  // finally is gen-guarded anyway so a superseded build must not clear a
-  // spinner it no longer owns. Teardown is the one place that always runs.
-  modal3dBusy.value = false;
-}
+const modalViewer = useViewerMount({
+  label: "craft modal",
+  host: () => modalViewerEl.value,
+  onError: (e) => {
+    modal3d.value = false;
+    fail(e);
+  },
+});
+const teardownModalViewer = modalViewer.teardown;
 // Loading an item into the modal drives `modal3d` as BOOKKEEPING (off, then
 // back on once we know the model exists), not as a 2D/3D toggle. Its URL
 // watcher below must sit those out: view→edit reassigns `craft`, so the reset
@@ -2191,10 +2202,10 @@ watch(craft, async (open) => {
   // inside a single flush, which the watcher sees as no change at all. So the
   // teardown at the top of this watcher would take the viewer away and nothing
   // would bring it back — a blank stage on every view↔edit flip and every item
-  // switch made from the URL. `modalViewerAbort` is the "a mount has started
+  // switch made from the URL. `modalViewer.started()` is the "a mount has started
   // since that teardown" flag (teardown is what clears it), so a genuine
   // false→true edge, which HAS already mounted by now, doesn't mount twice.
-  if (modal3d.value && !modalViewerAbort) void mountModalViewer();
+  if (modal3d.value && !modalViewer.started()) void mountModalViewer();
 });
 
 // ---- Deep links: the URL owns which modal is open ---------------------------
@@ -2387,6 +2398,37 @@ watch(
 // How many sticker slots this weapon actually has — 4, 5 or 6 depending on the
 // weapon, never a flat 5. Offering more than exist means the extra ones have no
 // markup index, so the game drops those stickers silently.
+/**
+ * Patch slots the CURRENT agent actually has.
+ *
+ * The inventory schema stores five for every agent, but the positions belong to
+ * the model — most declare three, some five (see /api/catalog `patchSlots`). The
+ * form used to show five regardless, so you could fill all of them and the
+ * viewer would silently drop the overflow. A missing count means the backend
+ * could not read the model, and that has to fall back to five rather than to
+ * zero: capping on a failed lookup would make every agent unpatchable.
+ */
+const patchSlotCount = computed(() => {
+  const skin = craft.value?.skin;
+  if (!skin) return 5;
+  // TWO SOURCES ON PURPOSE. The craft page opens an owned item through the
+  // inventory row, whose item comes from the backend's synchronous getItem() —
+  // and that reads a cache warmed at boot, so a cold or failed warm silently
+  // yields null and the form falls back to five slots for every agent. The
+  // catalog's agents list is computed per request and cannot go stale that way,
+  // so it backstops the item. Matching on id, not model: the id is what both
+  // sides key on.
+  const n = skin.patchSlots ?? catalogAgents.value.find((a) => a.id === skin.id)?.patchSlots;
+  return typeof n === "number" && n > 0 ? Math.min(n, 5) : 5;
+});
+/** Slots beyond that count are cleared, so a saved craft cannot carry a patch
+ *  the model has nowhere to put — including one equipped before this cap, or
+ *  copied from another agent by the duplicate flow. */
+watch(patchSlotCount, (n) => {
+  const list = craft.value?.patches;
+  if (!list) return;
+  for (let i = n; i < list.length; i++) list[i] = null;
+});
 const stickerSlotCount = ref(5);
 watch([craft, craftModel], async () => {
   if (!craft.value || !craftModel.value) return;
@@ -2418,35 +2460,29 @@ function craftCharmPlacement(): CharmPlacement | null {
   return c?.image ? { image: c.image, x: c.x ?? null, y: c.y ?? null, z: c.z ?? null, seed: c.seed ?? null } : null;
 }
 async function mountModalViewer() {
-  teardownModalViewer();
-  const gen = modalViewerGen;
-  const ac = new AbortController();
-  modalViewerAbort = ac;
-  mdebug("viewer MOUNT start", { model: craftModel.value, gen });
-  modal3dBusy.value = true;
-  await nextTick();
-  if (!modalViewerEl.value) {
-    modal3dBusy.value = false;
-    return;
-  }
-  try {
-    const target = craftTarget.value;
-    if (!target) return;
-    const model = target.model;
-    // Weapon-only machinery, skipped by kind rather than by "did the lookup
-    // happen to come back empty": sticker slots and the charm attachment are
-    // meaningless on a charm that IS the model, and stickerGeom would fetch
-    // markup for a key no weapon has.
-    const isWeapon = target.kind === "weapon";
-    const handle = await mountViewer(modalViewerEl.value, model, {
-      signal: ac.signal,
+  const target = craftTarget.value;
+  if (!target) return;
+  const model = target.model;
+  await modalViewer.mount(
+    model,
+    async () => {
+      // Weapon-only machinery, skipped by kind rather than by "did the lookup
+      // happen to come back empty": sticker slots and the charm attachment are
+      // meaningless on a charm that IS the model, and stickerGeom would fetch
+      // markup for a key no weapon has.
+      const isWeapon = target.kind === "weapon";
+      return {
       kind: target.kind,
       charmSpec: target.charm ?? null,
       gloveArms: gloveArms.value,
       // A sticker or patch has no model to name, so it is addressed by its art.
+      // The sticker IS the item here, so its scratch is the item's own `wear` —
+      // the same field a weapon spends on its float. Hardcoded 0 before, which
+      // meant the one screen dedicated to a sticker was the one screen that
+      // could not show it scuffed. A patch has no scratch, so it stays at 0.
       decal:
         target.kind === "sticker" || target.kind === "patch"
-          ? { image: craft.value?.skin.image ?? "", wear: 0 }
+          ? { image: craft.value?.skin.image ?? "", wear: (craftHasScratch.value ? craft.value?.wear : 0) ?? 0 }
           : null,
       paintMaterial: craft.value?.skin.paintMaterial ?? null,
       legacyPaint: !!craft.value?.skin.legacyPaint,
@@ -2462,6 +2498,11 @@ async function mountModalViewer() {
       interactive: !viewOnly.value,
       ...(isWeapon ? await stickerGeom(model) : {}),
       stickers: isWeapon ? craftStickerPlacements() : [],
+      // Patches are the AGENT's equivalent of stickers, but they are not decals
+      // and share none of that machinery: the viewer stamps them into the body
+      // texture at UV rects the model itself declares. Just the art, in slot
+      // order — there is no geometry and nothing to place.
+      patches: target.kind === "agent" ? (craft.value?.patches ?? []).map((p) => p?.image ?? null) : undefined,
       charm: isWeapon ? craftCharmPlacement() : null,
       // Live 3D, so a real readout — the owned item's count when the modal is
       // showing one (craftInstId covers editing AND duplicating, which
@@ -2489,39 +2530,25 @@ async function mountModalViewer() {
           craft.value.charm.y = y;
           craft.value.charm.z = z; // vertical — dropping this pinned drags to a plane
         }
-      },
-    });
-    // Modal closed (or remounted for a new wear/seed) while the GLB was
-    // loading — this handle has no host left to draw into. Still checked
-    // alongside the abort: a teardown that lands in the window between the
-    // build's last checkpoint and here produces a live handle nobody wants.
-    if (gen !== modalViewerGen) {
-      handle.dispose();
-      mdebug("viewer MOUNT discarded (superseded)", { gen });
-      return;
-    }
-    modalViewerHandle = handle;
-    // The options above are a snapshot taken before the GLB loaded, and pressing
-    // Edit during that load flips viewOnly while there is no handle for the
-    // watcher below to talk to. Reconcile here so a mode change can't be lost in
-    // the gap — no-ops when it already matches.
-    handle.setInteractive(!viewOnly.value);
-    mdebug("viewer MOUNT done", { model: craftModel.value, gen });
-  } catch (e) {
-    // Cancelling is the expected outcome of closing the modal mid-load, not an
-    // error — surfacing it would flash a failure toast on a normal close.
-    if ((e as Error)?.name === "AbortError") {
-      mdebug("viewer MOUNT aborted", { gen });
-      return;
-    }
-    modal3d.value = false;
-    fail(e);
-  } finally {
-    // Only the CURRENT mount owns the busy flag. A superseded build landing
-    // late would otherwise clear the spinner belonging to the mount that
-    // replaced it.
-    if (gen === modalViewerGen) modal3dBusy.value = false;
-  }
+      },      };
+    },
+    (handle) => {
+      // Re-apply the chosen pose: the 2D/3D toggle remounts, and a viewer that
+      // came back in the default stance after the user picked "Open" would look
+      // like the control had stopped working.
+      if (craftTarget.value?.kind === "agent") handle.setAgentPose(agentPose.value);
+      // The charm's authored albedo, for the pattern rail's gradient. Sampled
+      // off the model because for most charms that is the only place it exists
+      // — see ViewerHandle.charmAlbedoTile. Taken here rather than in the rail
+      // so the rail never has to know a viewer exists.
+      charmAlbedo.value = handle.charmAlbedoTile();
+      // The options above are a snapshot taken before the GLB loaded, and
+      // pressing Edit during that load flips viewOnly while there is no handle
+      // for the watcher below to talk to. Reconcile here so a mode change can't
+      // be lost in the gap — no-ops when it already matches.
+      handle.setInteractive(!viewOnly.value);
+    },
+  );
 }
 watch(modal3d, (on) => {
   if (on) void mountModalViewer();
@@ -2539,9 +2566,81 @@ watch(gloveArms, () => {
 // ignored every attempt to drag a sticker, and showed the SPIN reticle over one
 // — while the same item opened straight into the editor worked. That's the
 // "sometimes I can't drag the sticker" report.
-watch(viewOnly, (on) => modalViewerHandle?.setInteractive(!on));
-// Wear/seed changes retexture the model — debounced remount so slider drags
-// don't recomposite on every tick.
+watch(viewOnly, (on) => modalViewer.current()?.setInteractive(!on));
+/**
+ * The mounted charm's authored albedo, for the pattern rail's gradient.
+ *
+ * Only the 23 community charms that share the blank mesh have a standalone
+ * material to fetch; every other charm keeps its textures inside its GLB, so
+ * the mounted model is the only cheap source. Held here rather than inside the
+ * rail so the rail stays a control that knows nothing about renderers.
+ */
+type CharmAlbedo = { data: Uint8ClampedArray; size: number; material: string | null };
+const charmAlbedo = ref<CharmAlbedo | null>(null);
+const previewAlbedo = ref<CharmAlbedo | null>(null);
+/**
+ * Charms whose pattern provably changes nothing, reported by their own rail.
+ *
+ * Held out here rather than inside the rail because what has to disappear is
+ * the ROW — the card, its heading, its padding. A control that hides itself and
+ * leaves an empty panel behind has moved the problem, not solved it.
+ */
+const craftCharmInert = ref(false);
+const previewCharmInert = ref(false);
+/**
+ * Reset on every change of subject, because hiding the row UNMOUNTS the rail
+ * that set the flag.
+ *
+ * Nothing is left to report `false` once the panel is gone, so a charm opened
+ * after an inert one would inherit the verdict and lose a control it should
+ * have. The flag has to be a claim about the CURRENT charm, and the only way to
+ * guarantee that is to drop it whenever the charm does.
+ */
+watch(() => craft.value?.skin.image ?? null, () => (craftCharmInert.value = false));
+// previewCharmInert's own reset lives next to preview3d — reaching a `const`
+// declared further down the file throws on the temporal dead zone, and a setup
+// that throws mounts nothing at all.
+/**
+ * Paint-atlas texel weights from the mounted weapon — see PatternScoreRail.
+ *
+ * A GETTER, not a value, and pulled only when a scan actually starts. Computing
+ * it eagerly would rasterise every triangle on every mount, and the card
+ * backfill mounts one viewer per inventory item — none of which will ever rank
+ * a pattern. The viewer memoises, so asking twice is free.
+ */
+function paintWeightsNow(): Float32Array | null {
+  return modalViewer.current()?.paintUvWeights(SCAN_READ_SIZE) ?? null;
+}
+/**
+ * Wear/pattern changes RE-PAINT the live viewer rather than rebuilding it.
+ *
+ * Both feed one thing — the paint composite — and a composite is two fullscreen
+ * passes over textures the mount already downloaded. Rebuilding to change them
+ * meant a fresh GLB load and a fresh context per tick, which is why these had to
+ * hide behind a 450ms debounce and still felt like a slideshow. Re-compositing
+ * keeps the camera, the decals and the charm exactly where they are, so a
+ * pattern slider is just a slider.
+ *
+ * THREE KINDS take three routes to the same place, because "the pattern" means
+ * something different to each compositor:
+ *
+ *  · a weapon or knife re-composites its paint (wear and seed both feed it);
+ *  · a glove re-composites too, but only wear reaches csgo_customglove — a seed
+ *    change there is answered without work rather than with a rebuild;
+ *  · a CHARM's pattern is not a composite at all. It drives a handful of shader
+ *    params through decoded Source 2 expressions, so it re-shades in place via
+ *    setCharmSeed. Sending it through the paint path found no composite to redo
+ *    and fell through to a full rebuild per pointer tick — a fresh GLB, a fresh
+ *    context and a re-settled cloth sim to change three floats, which is exactly
+ *    the slideshow the attached charm and the preview panel already stopped
+ *    having.
+ *
+ * The remount stays as the fallback for anything with nothing to re-do at all
+ * (an unpainted model, or a build whose paint failed): setPaintVariant says so
+ * rather than silently doing nothing. It is DEBOUNCED, because a fallback that
+ * fires per tick is the very thing this watcher exists to avoid — one rebuild
+ * once the gesture stops, not one per pointer move.
+ */
 let retexTimer: ReturnType<typeof setTimeout> | undefined;
 /** Which `craft` object the wear/seed this watcher last saw belonged to. */
 let retexCraft: object | null = null;
@@ -2563,20 +2662,86 @@ watch(
       return;
     }
     if (!modal3d.value) return;
+    // IMMEDIATE, not debounced. Debouncing meant nothing moved until you STOPPED
+    // moving, which is the worst possible response for a scrub: the gun sat
+    // still through the whole gesture and then jumped. The viewer coalesces
+    // instead — it keeps only the newest request while a composite is running —
+    // so firing on every tick costs one composite per frame the GPU can afford
+    // and never builds a queue.
+    repaint(true);
+    // ...then settle to full resolution once the pointer stops. The proxy is a
+    // quarter-resolution stand-in; this is the frame that stays on screen.
     clearTimeout(retexTimer);
-    retexTimer = setTimeout(() => {
-      if (modal3d.value) void mountModalViewer();
-    }, 450);
+    retexTimer = setTimeout(() => repaint(false), 220);
   },
 );
+/**
+ * Show a pattern on the viewer WITHOUT committing it to the item.
+ *
+ * Hovering the score rail and blinking two patterns are both looks, not edits —
+ * they must leave `craft.seed` alone, or browsing would dirty the form and a
+ * Save would ship whatever the pointer happened to be over. The viewer is the
+ * only thing that changes; null puts the committed pattern back.
+ *
+ * Proxy resolution for the preview, full for the restore: a preview is a
+ * glance, and the frame that stays on screen is the one worth the texels.
+ */
+function previewPattern(seed: number | null) {
+  if (!modal3d.value || !craft.value || !modalViewer.current()) return;
+  void modalViewer.current()!.setPaintVariant(
+    craft.value.wear ?? 0,
+    seed ?? craft.value.seed ?? 0,
+    seed != null,
+  );
+}
+/** Pending fallback rebuild — see the note on debouncing it, below. */
+let retexRebuild: ReturnType<typeof setTimeout> | undefined;
+/**
+ * The handle a fallback rebuild has already been spent on.
+ *
+ * One per mount, because the second one cannot help. A viewer that answers
+ * "nothing to re-paint" is either unpainted — where wear and pattern change no
+ * pixels at all, so rebuilding arrives at the identical picture — or its paint
+ * failed to load, and nothing about dragging a slider makes the next attempt go
+ * differently. One retry is worth having; a retry per gesture is a model reload
+ * charged to a scrub that had no visible effect either way.
+ */
+let retexRebuilt: object | null = null;
+function repaint(proxy: boolean) {
+  if (!modal3d.value || !craft.value) return;
+  const handle = modalViewer.current();
+  if (!handle) return void mountModalViewer();
+  // A CHARM's pattern is not paint. It grades the charm's material through
+  // shader params the mount already holds, so it is a synchronous re-shade with
+  // no composite, no fetch and no proxy resolution to settle out of.
+  if (craftTarget.value?.kind === "charm") {
+    clearTimeout(retexRebuild);
+    handle.setCharmSeed(craft.value.seed ?? 0);
+    return;
+  }
+  void handle.setPaintVariant(craft.value.wear ?? 0, craft.value.seed ?? 0, proxy).then((ok) => {
+    if (ok || !modal3d.value || modalViewer.current() !== handle) return;
+    if (retexRebuilt === handle) return;
+    // Nothing to re-composite — fall back to the rebuild this replaced, but
+    // ONCE the gesture stops. Firing it per tick is what made an unpainted item
+    // reload its GLB on every pointer move; the guard on the handle still being
+    // the live one keeps a remount that happened meanwhile from being redone.
+    clearTimeout(retexRebuild);
+    retexRebuild = setTimeout(() => {
+      if (!modal3d.value || modalViewer.current() !== handle) return;
+      retexRebuilt = handle;
+      void mountModalViewer();
+    }, 240);
+  });
+}
 // StatTrak toggle → attach/detach the module on the live viewer. Deliberately
 // NOT folded into the wear/seed remount above: the module is independent of the
 // paint composite, and remounting would reset the camera on every flip.
 watch(
   () => craft.value?.stattrak,
   (on) => {
-    if (!modalViewerHandle || !craft.value) return;
-    modalViewerHandle.setStatTrak(
+    if (!modalViewer.current() || !craft.value) return;
+    modalViewer.current()!.setStatTrak(
       on
         ? { count: inventory.value.find((i) => i.id === craftInstId.value)?.stattrak_count ?? 0 }
         : null,
@@ -2589,8 +2754,8 @@ watch(
 watch(
   () => craft.value?.nametag,
   (text) => {
-    if (!modalViewerHandle || !craft.value) return;
-    modalViewerHandle.setNameTag(text ?? null);
+    if (!modalViewer.current() || !craft.value) return;
+    modalViewer.current()!.setNameTag(text ?? null);
   },
 );
 // Numeric edits / picker changes → live decal + charm updates. The viewer
@@ -2598,9 +2763,27 @@ watch(
 watch(
   () => JSON.stringify([craft.value?.stickers, craft.value?.charm]),
   () => {
-    if (!modalViewerHandle || !craft.value) return;
-    modalViewerHandle.setStickers(craftStickerPlacements());
-    modalViewerHandle.setCharm(craftCharmPlacement());
+    const handle = modalViewer.current();
+    if (!handle || !craft.value) return;
+    handle.setStickers(craftStickerPlacements());
+    // Re-sample the albedo once the charm has actually landed — swapping charms
+    // does not remount the viewer, so the mount-time sample belongs to the
+    // previous one. Guarded on the handle still being the live one: a remount
+    // mid-swap would otherwise publish a torn-down viewer's colours.
+    void handle.setCharm(craftCharmPlacement()).then(() => {
+      if (modalViewer.current() === handle) charmAlbedo.value = handle.charmAlbedoTile();
+    });
+  },
+);
+// Patches → re-composite the agent's body texture on the live viewer. Its own
+// watcher rather than a remount for the same reason the three above have one:
+// remounting to show a patch resets the camera mid-edit. Without this the only
+// way to see a patch was to save and reopen.
+watch(
+  () => JSON.stringify(craft.value?.patches ?? []),
+  () => {
+    if (!modalViewer.current() || craftTarget.value?.kind !== "agent") return;
+    void modalViewer.current()!.setPatches((craft.value?.patches ?? []).map((p) => p?.image ?? null));
   },
 );
 
@@ -2727,6 +2910,9 @@ const PICKER_DEFAULT_GROUP: Record<"sticker" | "charm" | "patch", string> = {
   charm: "charm",
   patch: "",
 };
+/** Browsing to ATTACH — a slot on the item being edited is waiting for the
+ *  answer. Browsing to CRAFT is a different activity and has its own screen
+ *  (see Armory.vue), which is why this one has no mode. */
 const picker = ref<{ kind: "sticker" | "charm" | "patch"; slot: number } | null>(null);
 const pickerQuery = ref("");
 const pickerGroup = ref("");
@@ -2734,30 +2920,26 @@ const pickerCollection = ref("");
 const pickerRarity = ref("");
 // Remembered across pickers and sessions, like the inventory/sheet sorts — a
 // preference for how to read a catalog isn't per-visit.
-// Rarity by default: it is the one attribute that ranks these against each other,
-// and it's now visible on every tile (the coloured rule + glow), so the grid reads
-// top-down as best-first instead of as arrival order.
-const pickerSort = ref<AttachSort>((localStorage.getItem("cs2inv.pickerSort") as AttachSort | null) ?? "rarity");
-watch(pickerSort, (v) => localStorage.setItem("cs2inv.pickerSort", v));
-const PICKER_SORT_NATURAL: Record<AttachSort, SortDir> = { default: "asc", rarity: "desc", name: "asc" };
-const PICKER_SORT_KIND: Record<AttachSort, SortKind> = { default: "amount", rarity: "amount", name: "alpha" };
-const PICKER_DIR_HINT: Record<AttachSort, Record<SortDir, string>> = {
-  default: { asc: "Oldest capsules first", desc: "Newest capsules first" },
-  rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
-  name: { asc: "A \u2192 Z", desc: "Z \u2192 A" },
-};
-// Per mode, same reason as the grids above — see dirKey/loadDir.
-function loadPickerDir(mode: AttachSort): SortDir {
-  const stored = localStorage.getItem(dirKey("picker", mode));
-  return stored === "asc" || stored === "desc" ? stored : PICKER_SORT_NATURAL[mode];
-}
-const pickerDir = ref<SortDir>(loadPickerDir(pickerSort.value));
-watch(pickerDir, (v) => localStorage.setItem(dirKey("picker", pickerSort.value), v));
-const PICKER_SORTS: { value: AttachSort; label: string }[] = [
-  { value: "rarity", label: "Rarity" },
-  { value: "default", label: "Collection" },
-  { value: "name", label: "Name" },
-];
+//
+// Sort and direction both re-order the WHOLE match set server-side, so the
+// already-loaded pages stop being the right first pages -- `onChange` restarts
+// from page one, and cancels a debounced search first so a keystroke from a
+// moment ago can't land after and undo the change.
+const pickerSortCtl = useSortControl<AttachSortMode>({
+  scope: "picker",
+  fallback: DEFAULT_ATTACH_SORT,
+  natural: ATTACH_SORT_NATURAL,
+  hints: ATTACH_DIR_HINT,
+  kinds: ATTACH_SORT_KIND,
+  onChange: () => {
+    clearTimeout(pickerTimer);
+    void pickerSearch();
+  },
+});
+const {
+  mode: pickerSort, dir: pickerDir, setMode: setPickerSort, setDir: setPickerDir,
+  kind: pickerSortKind, hint: pickerSortHint,
+} = pickerSortCtl;
 const pickerGroups = ref<AttachFacet[]>([]);
 const pickerCollections = ref<AttachFacet[]>([]);
 const pickerRarities = ref<AttachFacet[]>([]);
@@ -2774,6 +2956,75 @@ let pickerTimer: ReturnType<typeof setTimeout> | undefined;
 // is now about something else — the pages would interleave.
 let pickerToken = 0;
 const pickerDone = computed(() => pickerResults.value.length >= pickerTotal.value);
+
+/**
+ * Which shelf the picker is browsing: the whole catalog, or your own drawer.
+ *
+ * Owned mode is answered entirely from `inventory` — no fetch, no paging. The
+ * client already holds every instance the user owns, and an attachment you own
+ * is a few dozen rows next to a catalog of ten thousand.
+ */
+const pickerSource = ref<"all" | "owned">("all");
+/** cs2-lib calls a charm a keychain; the picker calls it a charm. */
+const PICKER_TYPE: Record<string, string> = { sticker: "sticker", patch: "patch", charm: "keychain" };
+/**
+ * One row shape for both shelves, so the grid renders one loop.
+ *
+ * `inst` is what separates them: a catalog row has none and gets minted on save,
+ * an owned row carries the instance and links to it.
+ */
+type PickerRow = {
+  key: string;
+  id: number;
+  name: string;
+  image: string | null;
+  rarity?: string;
+  /** cs2-lib type. Carried so crafting one straight from here gets the right
+   *  form — without it the editor can't tell a sticker from a charm. */
+  type?: string;
+  inst?: string | null;
+  /** What this owned one is already applied to, if anything. */
+  attachedName?: string | null;
+  /** The owned row's own scratch / pattern, so picking it previews truthfully. */
+  wear?: number | null;
+  seed?: number | null;
+};
+const pickerOwned = computed<PickerRow[]>(() => {
+  const p = picker.value;
+  if (!p) return [];
+  const want = PICKER_TYPE[p.kind] ?? p.kind;
+  const q = pickerQuery.value.trim().toLowerCase();
+  return inventory.value
+    .filter((i) => i.item?.type === want && (!q || itemName(i.item).toLowerCase().includes(q)))
+    .map((i) => ({
+      key: `own-${i.id}`,
+      id: i.item!.id,
+      name: itemName(i.item),
+      image: i.item?.image ?? null,
+      rarity: i.item?.rarity,
+      type: i.item?.type,
+      inst: String(i.id),
+      attachedName: attachedName(i),
+      wear: i.wear,
+      seed: i.seed,
+    }))
+    // Spares first: the whole reason to open this shelf is to find one that
+    // isn't already spoken for, and burying those under the applied ones would
+    // make the common case the hard one.
+    .sort((a, b) => Number(!!a.attachedName) - Number(!!b.attachedName) || byName(a.name, b.name));
+});
+const pickerRows = computed<PickerRow[]>(() =>
+  pickerSource.value === "owned"
+    ? pickerOwned.value
+    : pickerResults.value.map((it) => ({
+        key: `cat-${it.id}`,
+        id: it.id,
+        name: it.name,
+        image: it.image,
+        rarity: it.rarity,
+        type: it.type ?? PICKER_TYPE[picker.value?.kind ?? "sticker"],
+      })),
+);
 
 async function pickerFetch(offset: number) {
   const p = picker.value;
@@ -2844,23 +3095,9 @@ watch(pickerQuery, () => {
   clearTimeout(pickerTimer);
   pickerTimer = setTimeout(pickerSearch, SEARCH_DEBOUNCE_MS);
 });
-// Facets are a click, not typing — refetch immediately, and cancel a debounced
+// Facets are a click, not typing - refetch immediately, and cancel a debounced
 // search so a keystroke from a moment ago can't land after and undo the filter.
-// Sort re-orders the WHOLE match set server-side, so the already-loaded pages are
-// no longer the right first pages — start over from page one.
-function setPickerSort(value: string) {
-  clearTimeout(pickerTimer);
-  pickerSort.value = value as AttachSort;
-  pickerDir.value = loadPickerDir(pickerSort.value);
-  void pickerSearch();
-}
-// Direction re-orders the whole match set server-side, so the loaded pages are no
-// longer the right first pages — same restart as changing the mode.
-function setPickerDir(value: SortDir) {
-  clearTimeout(pickerTimer);
-  pickerDir.value = value;
-  void pickerSearch();
-}
+// (Sort and direction do the same via useSortControl's onChange, above.)
 function setPickerFacet(facet: "group" | "collection" | "rarity", value: string) {
   // Re-picking what is already picked is not a state change, so it must not cost
   // a round trip. It did: clicking the active tab re-ran the search, and because
@@ -2897,15 +3134,6 @@ const pickerTabs = computed(() =>
     : [],
 );
 const pickerDefaultGroup = computed(() => (picker.value ? PICKER_DEFAULT_GROUP[picker.value.kind] : ""));
-// Unlike every other pill, these tabs are DATA — they arrive with the first
-// response and a search can change which ones exist at all, so the indicator has
-// to follow the tab list as well as the selection. `immediate` seeds the active
-// key before the list mounts, so the ResizeObserver's first fire measures the
-// selected tab instead of parking the indicator under "All" (key "", which is
-// also makePill's initial activeKey).
-watch([pickerGroup, pickerTabs], () => nextTick(() => pickerGroupPill.sync(pickerGroup.value)), {
-  immediate: true,
-});
 // "Filtered" means "not how it opened" — so Clear appears when there is something
 // to undo, and the default tab alone doesn't count as a filter to clear.
 const pickerFiltered = computed(
@@ -2947,21 +3175,38 @@ const fmtCount = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : St
 // "All" first, then the facet's own values with counts. The dropdowns show every
 // option regardless of count because the counts are already narrowed by the
 // facets above — a zero would mean the row shouldn't be there at all.
-const pickerCollectionOptions = computed(() => [
-  { value: "", label: `All collections (${fmtCount(pickerCollections.value.reduce((n, f) => n + f.count, 0))})` },
-  ...pickerCollections.value.map((f) => ({ value: f.value, label: `${f.label ?? f.value} (${f.count})` })),
-]);
-const pickerRarityOptions = computed(() => [
-  { value: "", label: "All rarities", color: null },
-  ...[...pickerRarities.value]
-    .sort((a, b) => rarityRank(b.value) - rarityRank(a.value))
-    .map((f) => ({ value: f.value, label: `${rarityName(f.value)} (${f.count})`, color: f.value })),
-]);
+/**
+ * The picker's narrowing axes, in the order they read.
+ *
+ * Counts ride INSIDE the label rather than in `count`: the shared bar puts a
+ * fixed-width badge on tabs, where the value changes as you type, but a
+ * dropdown row is only ever read when it is open and "IEM Katowice (42)" is
+ * shorter than the same thing spread across two columns.
+ */
+const pickerAxes = computed<FacetAxis[]>(() => {
+  const out: FacetAxis[] = [];
+  if (pickerCollections.value.length > 1) {
+    out.push({
+      key: "collection",
+      label: "Collection",
+      options: pickerCollections.value.map((f) => ({ value: f.value, label: `${f.label ?? f.value} (${f.count})` })),
+    });
+  }
+  if (pickerRarities.value.length > 1) {
+    out.push({
+      key: "rarity",
+      dots: true,
+      options: [...pickerRarities.value]
+        .sort((a, b) => sortRarityRank(b.value) - sortRarityRank(a.value))
+        .map((f) => ({ value: f.value, label: `${rarityName(f.value)} (${f.count})`, color: f.value })),
+    });
+  }
+  return out;
+});
 // Same adjustable-tile treatment as the inventory/loadout grids. Charm and
 // sticker art is small and busy — 92px is a lot of catalog on screen but too
 // little to tell two similar charms apart, so the size is the user's call.
-const attachCardSize = ref(Number(localStorage.getItem("cs2inv.attachCardSize")) || 92);
-watch(attachCardSize, (v) => localStorage.setItem("cs2inv.attachCardSize", String(v)));
+const attachCardSize = usePersistedNumber("cs2inv.attachCardSize", 92);
 const attachGridStyle = computed(() => ({
   display: "grid",
   gridTemplateColumns: `repeat(auto-fill, minmax(${attachCardSize.value}px, 1fr))`,
@@ -2973,6 +3218,9 @@ const attachGridStyle = computed(() => ({
 const advancedPlacement = ref(false);
 function openPicker(kind: "sticker" | "charm" | "patch", slot = 0) {
   picker.value = { kind, slot };
+  // Always opens on the catalog. Owned is the narrower shelf and is often
+  // empty, and a picker that opened on "no results" would read as broken.
+  pickerSource.value = "all";
   pickerQuery.value = "";
   pickerGroup.value = PICKER_DEFAULT_GROUP[kind];
   pickerCollection.value = "";
@@ -3051,82 +3299,209 @@ onBeforeUnmount(() => Object.values(catalogArt.value).forEach((u) => URL.revokeO
  * stage: it sits above the picker, the thing underneath keeps its state, and
  * dismissing it puts you back exactly where you were mid-decision.
  */
-const preview3d = ref<{ image: string; name: string; kind: string } | null>(null);
+const preview3d = ref<{
+  image: string;
+  name: string;
+  kind: string;
+  /**
+   * The slot on the weapon this was opened FROM, or null when it came from the
+   * picker. What it decides is where the panel's wear/seed write to — see
+   * preview3dWearBound. The charm is slot 0; it is the only one it has, and the
+   * game's own keychain message numbers it the same way.
+   */
+  slot: number | null;
+} | null>(null);
 const preview3dEl = ref<HTMLElement | null>(null);
-const preview3dBusy = ref(false);
-let preview3dHandle: ViewerHandle | null = null;
-let preview3dAbort: AbortController | null = null;
-let preview3dGen = 0;
+/** Resolved off the reactive state on purpose: a ViewerTarget carries the
+ *  charm's whole shading table, and there is nothing in it worth proxying. */
+let preview3dTarget: ViewerTarget | null = null;
+const preview3dViewer = useViewerMount({
+  label: "preview3d",
+  host: () => preview3dEl.value,
+  // Surfaced now, like the other three mounts. This one closed the panel and
+  // said nothing, so a preview that failed to load was indistinguishable from
+  // one you had dismissed yourself.
+  onError: (e) => {
+    preview3d.value = null;
+    fail(e);
+  },
+});
 function closePreview3d() {
-  preview3dGen++;
-  preview3dAbort?.abort();
-  preview3dAbort = null;
-  preview3dHandle?.dispose();
-  preview3dHandle = null;
-  preview3dBusy.value = false;
+  preview3dViewer.teardown();
+  preview3dTarget = null;
+  clearTimeout(preview3dRetex);
   preview3d.value = null;
 }
-/** Open the preview for any attachment-shaped thing (sticker, patch, charm). */
+/**
+ * Wear/seed for a preview with nothing to write to.
+ *
+ * Seeded from whatever is actually applied when there IS an applied value (see
+ * openPreview3d), so a view-only preview opens showing the real sticker rather
+ * than a pristine one, and scrubbing it is a non-destructive "what if".
+ */
+const preview3dScratch = ref({ wear: 0, seed: 0 });
+/**
+ * Does this panel edit the weapon for real, or a throwaway?
+ *
+ * Real when the preview was opened from a slot that still holds something and
+ * the modal is in edit mode. Then the slider and the one in the options column
+ * are two views of ONE value: the gun behind the panel retextures as you drag
+ * and Save keeps it. From the picker there is no slot yet, and in view mode
+ * there is nothing to change, so both fall back to the scratch.
+ */
+const preview3dWearBound = computed(() => {
+  const p = preview3d.value;
+  return !!p && p.kind === "sticker" && p.slot != null && !viewOnly.value && !!craft.value?.stickers[p.slot];
+});
+const preview3dSeedBound = computed(() => {
+  const p = preview3d.value;
+  return !!p && p.kind === "charm" && p.slot != null && !viewOnly.value && !!craft.value?.charm;
+});
+/** A patch gets neither: patches don't scratch and carry no pattern. */
+const preview3dHasWear = computed(() => preview3d.value?.kind === "sticker");
+const preview3dHasSeed = computed(() => preview3d.value?.kind === "charm");
+const preview3dWear = computed({
+  get: () =>
+    preview3dWearBound.value
+      ? craft.value!.stickers[preview3d.value!.slot!]!.w ?? 0
+      : preview3dScratch.value.wear,
+  set: (w: number) => {
+    if (preview3dWearBound.value) setStickerWear(preview3d.value!.slot!, w);
+    else preview3dScratch.value.wear = Math.min(1, Math.max(0, w));
+  },
+});
+const preview3dSeed = computed({
+  get: () => (preview3dSeedBound.value ? craft.value!.charm!.seed ?? 0 : preview3dScratch.value.seed),
+  set: (s: number) => {
+    const v = Math.min(100000, Math.max(0, Math.floor(Number(s) || 0)));
+    if (preview3dSeedBound.value) craft.value!.charm!.seed = v;
+    else preview3dScratch.value.seed = v;
+  },
+});
+// Declared HERE, not with its ref: hiding the pattern strip unmounts the rail
+// that reported the verdict, so the flag has to be dropped whenever the subject
+// changes or the next charm inherits it. See craftCharmInert for the full note.
+watch(preview3d, () => (previewCharmInert.value = false));
 /** Picker kind -> cs2-lib type. The picker says "charm"; the economy calls it a
  *  "keychain", and the resolver switches on the economy's name. Without this the
  *  charm preview resolved to null and the panel opened on nothing. */
 const ATTACH_TYPE: Record<string, string> = { sticker: "sticker", patch: "patch", charm: "keychain" };
-async function openPreview3d(item: { image?: string | null; name?: string | null; type?: string | null }, kind: string) {
+/**
+ * Open the preview for any attachment-shaped thing (sticker, patch, charm).
+ *
+ * `applied` is where it came from: a slot means it is already on the weapon and
+ * the panel's controls edit it for real; omitted means the PICKER, where
+ * nothing is attached yet and they drive a scratch value instead.
+ */
+async function openPreview3d(
+  item: { image?: string | null; name?: string | null; type?: string | null },
+  kind: string,
+  applied?: { slot: number },
+) {
   if (!item?.image) return;
   // The picker's rows are `Skin`s from an attachment catalog, which carry no
   // `type` — the PICKER knows what it is asking for, so the kind comes from the
   // caller and the resolver is fed a synthetic item.
   const target = await resolveViewerModel({ type: item.type ?? ATTACH_TYPE[kind] ?? kind, image: item.image });
   if (!target) return;
-  preview3d.value = { image: item.image, name: item.name ?? "", kind };
-  preview3dBusy.value = true;
-  const gen = ++preview3dGen;
-  await nextTick();
-  const host = preview3dEl.value;
-  if (!host || gen !== preview3dGen) {
-    preview3dBusy.value = false;
-    return;
-  }
-  try {
-    preview3dAbort?.abort();
-    const ac = new AbortController();
-    preview3dAbort = ac;
-    const handle = await mountViewer(host, target.model, {
-      signal: ac.signal,
+  preview3dScratch.value = {
+    wear: (applied && kind === "sticker" ? craft.value?.stickers[applied.slot]?.w : null) ?? 0,
+    seed: (applied && kind === "charm" ? craft.value?.charm?.seed : null) ?? 0,
+  };
+  preview3dTarget = target;
+  preview3d.value = { image: item.image, name: item.name ?? "", kind, slot: applied?.slot ?? null };
+  await mountPreview3d();
+}
+/**
+ * (Re)build the viewer for whatever `preview3d` currently describes.
+ *
+ * Split out of openPreview3d because wear and seed are MOUNT-time inputs — the
+ * decal's scratch is baked into its texture and a charm's pattern grades its
+ * material (tuneCharmShading), and neither has a live setter on the handle. So
+ * changing one rebuilds, exactly as the craft modal's retex watcher does.
+ */
+async function mountPreview3d() {
+  const p = preview3d.value;
+  const target = preview3dTarget;
+  if (!p || !target) return;
+  await preview3dViewer.mount(
+    target.model,
+    () => ({
       kind: target.kind,
       charmSpec: target.charm ?? null,
-      decal: target.kind === "sticker" || target.kind === "patch" ? { image: item.image, wear: 0 } : null,
+      // The slot's own scratch amount, not a hardcoded 0 — this panel is where
+      // you set it, and a preview that ignored it showed a sticker the weapon
+      // behind it disagreed with.
+      decal:
+        target.kind === "sticker" || target.kind === "patch"
+          ? { image: p.image, wear: preview3dWear.value }
+          : null,
+      // A charm's pattern drives real shader params on 36 of the 89 keychain
+      // materials. Unpassed, every charm previewed at its default grade.
+      seed: preview3dSeed.value,
       frame: "fit",
       // Orbitable but not draggable: there is no weapon to place anything on,
       // and a slow turn is what shows a holo sticker or a charm's depth.
       interactive: false,
-    });
-    // Dismissed (or another attachment picked) while the GLB loaded.
-    if (gen !== preview3dGen) {
-      handle.dispose();
+    }),
+    (handle) => (previewAlbedo.value = handle.charmAlbedoTile()),
+  );
+}
+// Debounced remount so dragging the wear slider doesn't recomposite the decal on
+// every tick. Identity-guarded for the same reason the craft modal's retex
+// watcher is: OPENING a preview trips this too (the values go to whatever the
+// new attachment carries) and that is not an edit — openPreview3d already
+// mounted it, and remounting again would restart the load and reset the spin.
+let preview3dRetex: ReturnType<typeof setTimeout> | undefined;
+let preview3dRetexOwner: object | null = null;
+watch(
+  () => [preview3d.value, preview3dWear.value, preview3dSeed.value] as const,
+  (now, before) => {
+    const owner = preview3d.value ?? null;
+    if (owner !== preview3dRetexOwner) {
+      preview3dRetexOwner = owner;
       return;
     }
-    preview3dHandle = handle;
-  } catch (e) {
-    if ((e as Error)?.name !== "AbortError") mdebug("preview3d MOUNT failed", { e: String(e) });
-    if (gen === preview3dGen) preview3d.value = null;
-  } finally {
-    if (gen === preview3dGen) preview3dBusy.value = false;
-  }
-}
+    // A PATTERN change on the same attachment is a re-shade, not a rebuild —
+    // the charm's seed drives a handful of shader params and nothing else, so
+    // the mounted model can just be told the new number. That is what lets the
+    // rail below scrub: at 300ms-debounced remounts a drag produced a slideshow
+    // of reloads, and every one of them restarted the spin. Wear still remounts
+    // (it recomposites a decal) and so does a swapped attachment.
+    if (before && now[0] === before[0] && now[1] === before[1] && now[2] !== before[2]) {
+      preview3dViewer.current()?.setCharmSeed(now[2]);
+      return;
+    }
+    clearTimeout(preview3dRetex);
+    preview3dRetex = setTimeout(() => {
+      if (preview3d.value) void mountPreview3d();
+    }, 300);
+  },
+);
 // The craft modal closing (or the picker) must not leave a live context
 // rendering into a detached node.
 watch([craft, picker], () => {
   if (preview3d.value) closePreview3d();
 });
 
-function pickAttachment(item: Skin) {
-  if (!craft.value || !picker.value) return;
-  const a: Attach = { id: item.id, name: item.name, image: item.image };
+function pickAttachment(item: PickerRow) {
+  if (!picker.value || !craft.value) return;
+  // `inst` rides along from an OWNED row: that is what links the gun to the
+  // sticker you already have instead of minting another one. A catalog row has
+  // none, and saving mints it.
+  const a: Attach = { id: item.id, name: item.name, image: item.image, inst: item.inst ?? null };
   const kind = picker.value.kind;
-  if (kind === "sticker") craft.value.stickers[picker.value.slot] = a;
-  else if (kind === "patch") craft.value.patches[picker.value.slot] = a;
-  else craft.value.charm = a;
+  if (kind === "sticker") {
+    // Its own scratch, carried over so the 3D preview is honest BEFORE the save
+    // that would resolve it server-side. Picking a sticker you'd worn down to
+    // 0.8 and seeing it render pristine reads as the wear having been lost.
+    if (item.inst) a.w = item.wear ?? null;
+    craft.value.stickers[picker.value.slot] = a;
+  } else if (kind === "patch") {
+    craft.value.patches[picker.value.slot] = a;
+  } else {
+    craft.value.charm = item.inst ? { ...a, seed: item.seed ?? null } : a;
+  }
   picker.value = null;
   // Anything you just stuck on the gun is something you'll want to place, so
   // switch the preview to 3D where you can actually see where it landed.
@@ -3158,6 +3533,13 @@ const confirmAsk = ref<{
   title: string;
   body: string;
   confirmLabel: string;
+  /**
+   * Destructive by default, because that is what this dialog was built for.
+   * "neutral" drops the red and the bin for the asks that aren't losing you
+   * anything — moving a sticker between two of your own guns is a decision
+   * worth confirming, not a deletion, and dressing it as one cries wolf.
+   */
+  tone?: "danger" | "neutral";
   onConfirm: () => void;
 } | null>(null);
 function runConfirm() {
@@ -3233,101 +3615,32 @@ function onCacheCleared(scope: "renders" | "composites") {
   queueLoadoutRenders();
 }
 
-// ---- animated sliding-pill tabs (mirrors the panel's TabsList indicator) ----
-// One reusable mechanism powers the view tabs, sheet-mode tabs, CT/T toggle
-// and the inventory origin filter. Self-healing: the loadout app remounts
-// inside an out-in Transition when leaving /admin, so nextTick watchers fire
-// before the entering tree is in the DOM and measure nothing — each pill
-// therefore re-measures via ResizeObserver whenever its tab list (re)mounts,
-// resizes (fonts, count badges) or flips hidden→visible.
-/**
- * The sliding indicator's transition. TRANSFORM ONLY — the `width 0.2s ease` that
- * used to ride along with it is gone on purpose.
- *
- * `transform` is composited: it keeps animating on its own thread even while the
- * main thread is busy. `width` is layout, so every frame of it is main-thread
- * work — and switching a tab is exactly when the main thread is busiest, rebuilding
- * the grid underneath. The width animation stalled there, which is why the pill
- * slid part way, hung, then snapped to the end. Width now applies instantly and
- * only the travel animates, so nothing the grid does can block it.
- */
-const pillTransition = (animated: boolean) =>
-  animated ? "transform 0.35s cubic-bezier(0.34,1.56,0.64,1)" : "none";
+// ---- sliding-pill tabs ------------------------------------------------------
+// Every strip is a <PillTabs>, which owns its own indicator and re-syncs itself
+// on the active tab, the tab SET and the breakpoint. That retired eight
+// makePill() instances here plus `syncAllPills` and its six watchers — each of
+// which existed only because the markup was pasted rather than shared.
 
-function makePill() {
-  const refs: Record<string, HTMLElement | null> = {};
-  let listEl: HTMLElement | null = null;
-  let activeKey = "";
-  const x = ref(0);
-  const w = ref(0);
-  const animated = ref(false);
-  function sync(key?: string) {
-    if (key !== undefined) activeKey = key;
-    const btn = refs[activeKey];
-    if (!listEl || !btn) {
-      w.value = 0;
-      return;
-    }
-    const listRect = listEl.getBoundingClientRect();
-    const btnRect = btn.getBoundingClientRect();
-    // Coming back from hidden: place the indicator instantly instead of
-    // sliding it in from wherever it last sat.
-    if (w.value === 0) animated.value = false;
-    x.value = btnRect.left - listRect.left;
-    w.value = btnRect.width;
-    requestAnimationFrame(() => (animated.value = true));
-  }
-  const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => sync()) : null;
-  return {
-    x,
-    w,
-    animated,
-    setListEl(el: unknown) {
-      const next = (el as HTMLElement | null) ?? null;
-      if (next === listEl) return;
-      if (listEl) ro?.unobserve(listEl);
-      listEl = next;
-      if (listEl) ro?.observe(listEl);
-    },
-    setRef(key: string, el: unknown) {
-      refs[key] = (el as HTMLElement | null) ?? null;
-    },
-    sync,
-  };
-}
-const viewPill = makePill();
-const sheetPill = makePill();
-const teamPill = makePill();
-const invOriginPill = makePill();
-const modal3dPill = makePill();
-const sheetOriginPill = makePill();
-const focus3dPill = makePill();
-const pickerGroupPill = makePill();
-const sheetGroupPill = makePill();
-function syncAllPills() {
-  viewPill.sync(view.value);
-  sheetPill.sync(sheetMode.value);
-  teamPill.sync(team.value);
-  invOriginPill.sync(invOrigin.value);
-  modal3dPill.sync(modal3d.value ? "3D" : "2D");
-  sheetOriginPill.sync(sheetOrigin.value);
-  focus3dPill.sync(focus3d.value ? "3D" : "2D");
-  sheetGroupPill.sync(sheetGroup.value);
-}
-// immediate: seeds the pill's active key before the modal ever opens, so the
-// ResizeObserver's initial fire on mount can position the indicator itself.
-watch(modal3d, () => nextTick(() => modal3dPill.sync(modal3d.value ? "3D" : "2D")), { immediate: true });
-// Sheet pill also tracks things that change tab widths (owned count) or tab
-// existence (Replace only on weapon slots).
-watch([sheetMode, selected, () => inventory.value.length], () => nextTick(() => sheetPill.sync(sheetMode.value)));
-watch([team, view], () => nextTick(syncAllPills));
-// Same reason as the picker's group pill: the tab list arrives with the catalog
-// and only exists for some of them, so the indicator has to follow the list as
-// well as the selection.
-watch([sheetGroup, sheetGroupTabs], () => nextTick(() => sheetGroupPill.sync(sheetGroup.value)), {
-  immediate: true,
-});
+/** The header's three screens. `to` is what the tab navigates to. */
+const viewTabs = computed(() => [
+  { key: "grid", label: "Loadout", icon: LayoutGrid, to: "/" },
+  ...(canEdit.value
+    ? [
+        { key: "inventory", label: "Inventory", icon: Package, to: "/items" },
+        { key: "armory", label: "Craft", icon: Hammer, to: "/craft" },
+      ]
+    : []),
+]);
 
+/** Owned only exists when signed in; Replace only on a weapon slot. */
+const sheetModeTabs = computed(() => [
+  ...(signedIn.value ? [{ key: "owned", label: "Owned" }] : []),
+  ...(isWeaponPos(selected.value) ? [{ key: "replace", label: "Replace" }] : []),
+  { key: "craft", label: "Craft" },
+]);
+
+/** The 2D/3D stage toggle, shared by the focus view and the craft modal. */
+const STAGE_TABS = ["2D", "3D"] as const;
 const linkOpening = ref(false);
 // The handoff is silent by design (see openInspectLink) — nothing in the page
 // changes and CS2 may take a while to surface, so without this the click reads
@@ -3489,117 +3802,17 @@ function openCtxFor(pos: string, at?: { x: number; y: number }) {
 const openCtx = (pos: string, e: MouseEvent) => openCtxFor(pos, { x: e.clientX, y: e.clientY });
 const closeCtx = () => (ctx.value = null);
 
-// ---- swipe down to dismiss (compact bottom sheets) --------------------------
-// Every compact menu already draws a grab pill, which promises a drag none of
-// them honoured: the only way out was tapping the backdrop, and on a tall sheet
-// that means reaching over the whole thing to the strip above it — one-handed,
-// the hardest pixel on the screen to hit. This makes the pill's promise true.
-//
-// Shared drag state rather than one set per sheet: only one of these can be
-// open at a time, and the sheet being dragged is the only one mounted.
-const swipeOffset = ref(0);
-/** Live transform for a sheet mid-swipe. No transition while the finger is
- *  down (it must track exactly), a spring back when it lifts without passing
- *  the threshold. */
-const swipeStyle = computed(() =>
-  swipeOffset.value
-    ? { transform: `translateY(${swipeOffset.value}px)`, transition: "none" }
-    : { transition: reducedMotion.value ? "none" : "transform 200ms cubic-bezier(0.22,1,0.36,1)" },
-);
-/**
- * Handlers for `v-on` on a sheet's grab area. Dismisses past a third of the
- * sheet's own height, or on a flick faster than 0.5px/ms — so a short sheet
- * needs a short drag and a tall one doesn't dismiss on a twitch.
- *
- * Capture is LAZY: taken only once the finger has actually travelled, never on
- * pointerdown. That is what lets the whole sheet header carry this without
- * swallowing taps on the controls inside it (the filter sheet's Reset button
- * sits in its header) — pointer capture retargets the click that follows, so
- * capturing eagerly would eat it.
- */
-const SWIPE_ARM_PX = 4;
-function swipeToDismiss(close: () => void) {
-  let sheet: HTMLElement | null = null;
-  let dragging = false;
-  let y0 = 0;
-  let t0 = 0;
-  const reset = () => {
-    sheet = null;
-    dragging = false;
-    swipeOffset.value = 0;
-  };
-  return {
-    pointerdown(e: PointerEvent) {
-      if (!isCompact.value) return;
-      sheet = (e.currentTarget as HTMLElement).closest<HTMLElement>("[data-sheet]");
-      dragging = false;
-      y0 = e.clientY;
-      t0 = e.timeStamp;
-    },
-    // Down only. Following a finger upwards would tear the sheet off the
-    // bottom edge it is anchored to and show background under it.
-    pointermove(e: PointerEvent) {
-      if (!sheet) return;
-      const dy = e.clientY - y0;
-      if (!dragging) {
-        if (dy < SWIPE_ARM_PX) return;
-        dragging = true;
-        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      }
-      swipeOffset.value = Math.max(0, dy);
-    },
-    pointerup(e: PointerEvent) {
-      if (!sheet || !dragging) return reset();
-      const dy = Math.max(0, e.clientY - y0);
-      const gone = dy > sheet.getBoundingClientRect().height / 3 || dy / Math.max(1, e.timeStamp - t0) > 0.5;
-      reset();
-      if (gone) close();
-    },
-    pointercancel: reset,
-  };
-}
-
-// ---- long-press → the slot menu (touch has no right-click) ------------------
-// Delegated from the loadout container instead of bound per-slot: every slot
-// already carries data-slot for the drag/drop system, and there are five
-// distinct slot markups that would each otherwise need the same four handlers.
-const LONG_PRESS_MS = 450;
-const LONG_PRESS_SLOP = 10; // movement past this is a scroll, not a press
-let lpTimer: ReturnType<typeof setTimeout> | undefined;
-let lpOrigin: { x: number; y: number } | null = null;
-let lpFired = false;
-
-function cancelLongPress() {
-  clearTimeout(lpTimer);
-  lpOrigin = null;
-}
-function onSlotPointerDown(e: PointerEvent) {
-  if (e.pointerType === "mouse") return; // mouse already has right-click
-  const pos = (e.target as HTMLElement | null)?.closest?.<HTMLElement>("[data-slot]")?.dataset.slot;
-  if (!pos) return;
-  lpFired = false;
-  lpOrigin = { x: e.clientX, y: e.clientY };
-  clearTimeout(lpTimer);
-  lpTimer = setTimeout(() => {
-    lpFired = true;
-    lpOrigin = null;
-    // Haptic confirmation the press "took" — without it the gesture feels
-    // broken for the frame or two before the menu paints.
-    navigator.vibrate?.(8);
-    openCtxFor(pos);
-  }, LONG_PRESS_MS);
-}
-function onSlotPointerMove(e: PointerEvent) {
-  if (lpOrigin && Math.hypot(e.clientX - lpOrigin.x, e.clientY - lpOrigin.y) > LONG_PRESS_SLOP) cancelLongPress();
-}
-// The browser still delivers a click when the finger lifts. Swallow it, or the
-// long-press would also select the slot sitting behind the menu it just opened.
-function onSlotClickCapture(e: MouseEvent) {
-  if (!lpFired) return;
-  lpFired = false;
-  e.stopPropagation();
-  e.preventDefault();
-}
+// ---- gestures ---------------------------------------------------------------
+// Swipe-to-dismiss now belongs to the sheets themselves — ContextMenu and
+// FilterSheet each call useSwipeDismiss(), so App no longer brokers it. Only the
+// slot long-press stays here, because it is DELEGATED from the loadout
+// container rather than bound to any one element.
+const {
+  onPointerDown: onSlotPointerDown,
+  onPointerMove: onSlotPointerMove,
+  cancel: cancelLongPress,
+  onClickCapture: onSlotClickCapture,
+} = useSlotLongPress((pos) => openCtxFor(pos));
 
 // ---- compact layout: one slot category at a time ----------------------------
 // The desktop grid shows all four groups side by side; a phone shows one, with
@@ -3637,9 +3850,6 @@ const compactEquipment = computed(() => [RAIL[2], RAIL[1], RAIL[0], ...EXTRAS]);
 const sheetFiltersOpen = ref(false);
 // The three compact bottom sheets, each wired to its own dismiss. Declared
 // here because the filter sheet's flag is — see swipeToDismiss above.
-const slotMenuSwipe = swipeToDismiss(closeCtx);
-const itemMenuSwipe = swipeToDismiss(closeItemCtx);
-const filterSheetSwipe = swipeToDismiss(() => (sheetFiltersOpen.value = false));
 // Search counts as an active filter on compact — it lives inside the sheet
 // there, so without it in the badge a search you forgot about is invisible.
 const sheetFilterCount = computed(
@@ -3668,6 +3878,9 @@ function resetSheetFilters() {
   clearSheetFacets();
   sheetOrigin.value = "all";
   sheetSort.value = DEFAULT_SORT;
+  // Direction too — resetInvFilters always did this and this one didn't, so the
+  // same button left the sheet sorted backwards on one screen and not the other.
+  sheetDir.value = sheetSortCtl.loadDir(DEFAULT_SORT);
 }
 
 // ---- desktop: the lifting picker sheet --------------------------------------
@@ -3697,8 +3910,7 @@ const SHEET_LIFT_MS = 240; // height transition; the reveal below waits it out
 const LIFT_SPACER_PAD = 12;
 const SHEET_COLLAPSED_CSS = `max(${SHEET_COLLAPSED_MIN}px, ${SHEET_COLLAPSED_VH}vh)`;
 
-const sheetLift = ref(localStorage.getItem("cs2inv.sheetLift") === "1");
-watch(sheetLift, (v) => localStorage.setItem("cs2inv.sheetLift", v ? "1" : "0"));
+const sheetLift = usePersistedBool("cs2inv.sheetLift", false);
 
 // The sheet only floats on desktop, and only when it's on screen at all — the
 // 3D viewer route replaces it entirely (`v-if="!viewerId"`), and reserving
@@ -4043,8 +4255,19 @@ function onSheetDragEnd() {
 // than the old fixed 164/132 — tiles now carry a model header + team dots, and
 // the art needs air under the type line. Compact clamps the floor so a phone
 // still fits two columns.
-const sheetCardSize = ref(Number(localStorage.getItem("cs2inv.sheetCardSize")) || 176);
-watch(sheetCardSize, (v) => localStorage.setItem("cs2inv.sheetCardSize", String(v)));
+const sheetCardSize = usePersistedNumber("cs2inv.sheetCardSize", 176);
+/**
+ * The sheet's card slider has two ranges — a phone cannot give a 260px card the
+ * room a desktop can. They were two hardcoded `min`/`max` pairs writing ONE
+ * value, so a desktop size of 260 left the compact slider pegged at its 168 max
+ * while the grid still laid out at 260. Clamp into whichever range is live.
+ */
+const SHEET_CARD_BOUNDS = computed<[number, number]>(() => (isCompact.value ? [120, 168] : [140, 260]));
+watch(
+  SHEET_CARD_BOUNDS,
+  ([lo, hi]) => (sheetCardSize.value = Math.min(hi, Math.max(lo, sheetCardSize.value))),
+  { immediate: true },
+);
 
 // ---- compact: rows for picking, cards for browsing --------------------------
 // Compact used to reuse the desktop card at a 168px clamp. With CARD_CHROME_PX
@@ -4164,59 +4387,7 @@ watch(
   ],
   () => requestAnimationFrame(() => measureSheetScroll(sheetScrollEl)),
 );
-/**
- * The same cue for any ORDINARY scroller — the picker sheet keeps its own
- * (measureSheetScroll) because part of its box deliberately hangs off the
- * bottom of the screen, which nothing else does.
- *
- * `remeasure` exists because the two things that change "is there more below"
- * on these grids — the render window growing as you scroll, and the filter set
- * shrinking — neither of them fires a scroll event.
- */
-function scrollFade() {
-  const more = ref(false);
-  let el: HTMLElement | null = null;
-  const measure = () => (more.value = !!el && el.scrollHeight - el.scrollTop - el.clientHeight > 8);
-  // Coalesced to one measurement per frame. `scrollHeight`/`clientHeight` are
-  // layout reads, and a scroll event can fire many times between paints — on a
-  // long inventory grid that is a forced reflow per event for a boolean that
-  // can only change once per frame anyway.
-  let pending = false;
-  const measureSoon = () => {
-    if (pending) return;
-    pending = true;
-    requestAnimationFrame(() => {
-      pending = false;
-      measure();
-    });
-  };
-  return {
-    more,
-    onScroll: (e: Event) => {
-      el = e.target as HTMLElement;
-      measureSoon();
-    },
-    /**
-     * Function ref for the WRAPPER, which then finds the scroller inside it by
-     * `data-scroller`. Indirect on purpose: the inventory grid is a
-     * <TransitionGroup>, and a ref on that hands back the component instance,
-     * not the element that actually scrolls.
-     */
-    setHost: (node: unknown) => {
-      el = (node as HTMLElement | null)?.querySelector<HTMLElement>("[data-scroller]") ?? null;
-      if (el) requestAnimationFrame(measure);
-      else more.value = false;
-    },
-    remeasure: () => requestAnimationFrame(measure),
-    /** Back to the top, for when the LIST is replaced rather than appended —
-     *  see scrollPanelToTop. The scroller is already resolved here, so callers
-     *  don't have to find it a second way. */
-    toTop: () => {
-      scrollPanelToTop(el);
-      requestAnimationFrame(measure);
-    },
-  };
-}
+// scrollFade (the ordinary "more below" cue) lives in dom.ts.
 const invFade = scrollFade();
 /**
  * The cell's place in the entrance cascade (`--i`, read by animate-cell-in).
@@ -4297,7 +4468,8 @@ async function ctxCopy() {
 }
 
 // ---- inventory view ---------------------------------------------------------
-const invSearch = ref("");
+const invSearchCtl = useDebouncedSearch();
+const invSearch = invSearchCtl.term;
 /**
  * What the GRID filters by, a beat behind what the box holds.
  *
@@ -4312,17 +4484,7 @@ const invSearch = ref("");
  * debounces its own search (see pickerTimer) — this is that treatment, which was
  * missing here.
  */
-const invSearchApplied = ref("");
-let invSearchTimer: ReturnType<typeof setTimeout> | undefined;
-watch(invSearch, (v) => {
-  clearTimeout(invSearchTimer);
-  if (!v.trim()) {
-    invSearchApplied.value = "";
-    return;
-  }
-  invSearchTimer = setTimeout(() => (invSearchApplied.value = v), SEARCH_DEBOUNCE_MS);
-});
-onBeforeUnmount(() => clearTimeout(invSearchTimer));
+const invSearchApplied = invSearchCtl.applied;
 watch(invSearchApplied, () => invFade.toTop());
 // Synced (steam) vs crafted filter + adjustable card size (persisted).
 const invOrigin = ref<OriginFilter>("all");
@@ -4420,18 +4582,8 @@ const invRail = computed(() => {
 const invRailShown = computed(
   () => !!inventory.value.length && invRail.value.weapons.length + invRail.value.gear.length > 1,
 );
-const filtersActive = computed(
-  () =>
-    !!invSearch.value.trim() ||
-    invOrigin.value !== "all" ||
-    !!invRarity.value ||
-    !!invModels.value.length ||
-    !!invTypes.value.length,
-);
 function clearInvFilters() {
-  clearTimeout(invSearchTimer);
-  invSearchApplied.value = "";
-  invSearch.value = "";
+  invSearchCtl.applyNow("");
   invOrigin.value = "all";
   invRarity.value = "";
   invModels.value = [];
@@ -4456,49 +4608,31 @@ const invFilterCount = computed(
     invModels.value.length +
     invTypes.value.length,
 );
+
+/**
+ * Derived from the count rather than restated. These were two separate
+ * predicates over the same state that disagreed: this one ignored sort, while
+ * `invFilterCount` (the compact sheet's badge) counted it — so the desktop
+ * Clear button could be hidden while the phone claimed one active filter.
+ *
+ * Declared AFTER invFilterCount, which is why this is a getter over it.
+ */
+const filtersActive = computed(() => invFilterCount.value > 0);
 function resetInvFilters() {
   clearInvFilters();
   invSort.value = DEFAULT_SORT;
-  invDir.value = loadDir("inv", DEFAULT_SORT);
+  invDir.value = invSortCtl.loadDir(DEFAULT_SORT);
 }
-const invFilterSheetSwipe = swipeToDismiss(() => (invFiltersOpen.value = false));
-watch(invOrigin, () => nextTick(() => invOriginPill.sync(invOrigin.value)));
 // ---- how tall are we, really ------------------------------------------------
-// The app's height is `100dvh - 6rem`, where 6rem is an ASSUMPTION about the
-// host chrome above us (breadcrumb + page padding). It holds on desktop. On a
-// phone the host header is shorter, so we subtract more than we should and the
-// app stops short of the bottom — a dead band under the picker sheet that no
-// amount of padding-hunting inside the plugin can explain, because it isn't
-// inside the plugin.
-//
-// So measure where we actually begin. Read after paint, and sanity-checked
-// against a runaway value: if the number looks wrong we keep the 6rem guess
-// rather than rendering an app taller than the window.
-const appRootEl = ref<HTMLElement | null>(null);
-const appTopPx = ref(0);
-function measureAppTop() {
-  const el = appRootEl.value;
-  if (!el) return;
-  const top = Math.round(el.getBoundingClientRect().top);
-  appTopPx.value = top >= 0 && top < window.innerHeight * 0.5 ? top : 0;
-}
-onMounted(() => {
-  requestAnimationFrame(measureAppTop);
-  window.addEventListener("resize", measureAppTop);
-});
-onBeforeUnmount(() => window.removeEventListener("resize", measureAppTop));
-/** Compact only: desktop's 6rem is correct there and well tested. */
-const appHeightStyle = computed(() =>
-  isCompact.value && !embedMode.value && appTopPx.value > 0
-    ? { height: `calc(100dvh - ${appTopPx.value}px)` }
-    : {},
+// See composables/useAppHeight.ts. Compact only: desktop's 6rem assumption is
+// correct there and well tested.
+const { el: appRootEl, style: appHeightStyle } = useAppHeight(
+  () => isCompact.value && !embedMode.value,
 );
 
-const cardSize = ref(Number(localStorage.getItem("cs2inv.cardSize")) || 164);
-watch(cardSize, (v) => {
-  localStorage.setItem("cs2inv.cardSize", String(v));
-  invFade.remeasure();
-});
+const cardSize = usePersistedNumber("cs2inv.cardSize", 164);
+// Resizing the cards re-flows the grid, so the "more below" cue has to re-measure.
+watch(cardSize, () => invFade.remeasure());
 const invGridStyle = computed(() => ({
   display: "grid",
   gridTemplateColumns: `repeat(auto-fill, minmax(${cardSize.value}px, 1fr))`,
@@ -4567,14 +4701,10 @@ watch(
     const r = route.value.name;
     if (r !== "inventory" && r !== "item") return;
     const q = router.query.value.q ?? "";
-    if (q !== invSearch.value) {
-      invSearch.value = q;
-      // Applied straight away, bypassing the debounce: this is a whole query
-      // arriving at once (a deep link or a back/forward), not someone typing, so
-      // there are no intermediate states to hide and no reason to wait.
-      clearTimeout(invSearchTimer);
-      invSearchApplied.value = q;
-    }
+    // Applied straight away, bypassing the debounce: this is a whole query
+    // arriving at once (a deep link or a back/forward), not someone typing, so
+    // there are no intermediate states to hide and no reason to wait.
+    if (q !== invSearch.value) invSearchCtl.applyNow(q);
     const o = router.query.value.origin;
     const nextOrigin: OriginFilter = o === "steam" || o === "crafted" ? o : "all";
     if (nextOrigin !== invOrigin.value) invOrigin.value = nextOrigin;
@@ -4612,7 +4742,7 @@ const filteredInventory = computed(() => {
 // and being inside a stack on one says nothing about the other.
 const invDesign = ref<number | null>(null);
 const inventoryStacks = computed(() =>
-  stackByDesign(filteredInventory.value, invDesign.value, (i) => i.item, (i) => i.id),
+  stackByDesign(filteredInventory.value, invDesign.value, (i) => i.item, (i) => i.id, tintColors.value),
 );
 const invDesignName = computed(() =>
   invDesign.value == null
@@ -4653,7 +4783,7 @@ watch([invSearchApplied, invOrigin, invRarity, invTypes, invModels], () => (invD
 const invFilterSig = computed(() =>
   [invSearchApplied.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
 );
-const inventoryWindow = renderWindow(inventoryStacks, () => invFilterSig.value);
+const inventoryWindow = useRenderWindow(inventoryStacks, () => invFilterSig.value);
 // Down HERE, not up beside invFade where it reads more naturally, because `watch`
 // runs its source getters once at creation to seed the old value — it does that
 // with or without `immediate`. Sitting above these two consts, both getters threw
@@ -4775,22 +4905,22 @@ const focusRow = computed(() => rowFor(selected.value));
 // starts false and flips per-slot once availability is known; the PREFERENCE
 // (last explicit 2D/3D pick) lives in localStorage so a slot with no model
 // forcing 2D doesn't overwrite what the user actually chose.
-const focus3dPref = () => localStorage.getItem("cs2inv.focus3d") !== "0";
+// The preference is its own persisted value, deliberately NOT `focus3d` itself:
+// a slot with no model forces the live ref to 2D, and that must not overwrite
+// what the user actually chose.
+const focus3dWanted = usePersistedBool("cs2inv.focus3d", true);
+const focus3dPref = () => focus3dWanted.value;
 function setFocus3d(on: boolean) {
   focus3d.value = on;
-  localStorage.setItem("cs2inv.focus3d", on ? "1" : "0");
+  focus3dWanted.value = on;
 }
 const focus3d = ref(false);
 const focus3dAvailable = ref(false);
-const focus3dBusy = ref(false);
 // immediate: seeds the active key before the focus stage mounts, so the pill's
 // initial ResizeObserver fire can position the indicator on its own.
-watch(focus3d, () => nextTick(() => focus3dPill.sync(focus3d.value ? "3D" : "2D")), { immediate: true });
 // Sheet origin tabs only exist in Owned mode (and behind the compact filter
 // disclosure), so re-seed on every condition that (re)mounts them.
-watch([sheetOrigin, sheetMode, sheetFiltersOpen], () => nextTick(() => sheetOriginPill.sync(sheetOrigin.value)), { immediate: true });
 const viewer3dEl = ref<HTMLElement | null>(null);
-let viewerHandle: ViewerHandle | null = null;
 /**
  * What the focus stage mounts, as a TARGET rather than a bare key.
  *
@@ -4917,15 +5047,19 @@ const loadout3dReportHref = computed(() =>
     : ISSUE_NEW_URL,
 );
 
-// Same abort discipline as the modal viewer: switching slots quickly on the
-// focus screen used to leave every superseded mount running to completion.
-let focusViewerAbort: AbortController | null = null;
-function teardownViewer() {
-  focusViewerAbort?.abort();
-  focusViewerAbort = null;
-  viewerHandle?.dispose();
-  viewerHandle = null;
-}
+// Same abort discipline as every other stage — see useViewerMount. `waitForHost`
+// is this one's peculiarity: the focus stage arrives inside a view swap, so the
+// host element can be a frame or two late.
+const focusViewer = useViewerMount({
+  label: "focus",
+  host: () => viewer3dEl.value,
+  waitForHost: () => waitForViewerEl(),
+  onError: (e) => {
+    focus3d.value = false;
+    fail(e);
+  },
+});
+const teardownViewer = focusViewer.teardown;
 watch([focusModelKey, focusPaint], async ([key]) => {
   teardownViewer();
   focus3dAvailable.value = key ? await hasModel(key) : false;
@@ -4945,13 +5079,39 @@ const focusInstance = computed(() => {
   return instanceById(focusRow.value?.item_instance_id) ?? null;
 });
 // InventoryItem → viewer placement shapes (Focus + loadout 3D overlay).
+/**
+ * "Applied to AK-47 | Redline", for an attachment that is currently on a gun.
+ *
+ * The API says WHICH item (`attached_to`, an owned-item id) and the name is
+ * looked up here, because only this screen holds the whole inventory. Null for
+ * anything loose — which is every weapon, and every spare sticker.
+ *
+ * Ids are compared as strings on purpose: owned_items.id is a bigint and
+ * node-postgres serialises those as strings, so both sides of this are `"1014"`.
+ */
+function attachedName(inst?: InventoryItem | null): string | null {
+  const to = inst?.attached_to;
+  if (to == null) return null;
+  const host = inventory.value.find((i) => String(i.id) === String(to));
+  return host ? itemName(host.item) : null;
+}
 function instPlacements(inst?: InventoryItem | null) {
   return {
     stickers: (inst?.stickers ?? []).flatMap((st, i) =>
       st?.image ? [{ slot: i, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null }] : [],
     ),
     charm: inst?.charm?.image
-      ? { image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null }
+      ? {
+          image: inst.charm.image,
+          x: inst.charm.x ?? null,
+          y: inst.charm.y ?? null,
+          z: inst.charm.z ?? null,
+          // The charm's own pattern grades its material, exactly as it does in
+          // the craft modal (craftCharmPlacement passes it). Dropped here, every
+          // charm in Focus and on the loadout stage rendered at its default
+          // grade while the editor showed the real one.
+          seed: inst.charm.seed ?? null,
+        }
       : null,
     // Live kill count — right for every on-screen 3D viewer. The card bake
     // overrides this to a dark display (see generateRenderNow).
@@ -4972,24 +5132,13 @@ async function waitForViewerEl(timeoutMs = 1500): Promise<HTMLElement | null> {
 }
 async function mount3d() {
   const key = focusModelKey.value;
-  focus3dBusy.value = true;
-  const host = await waitForViewerEl();
-  // A newer selection (or leaving 3D entirely) won while we waited.
-  if (!key || !host || focusModelKey.value !== key || !focus3d.value) {
-    focus3dBusy.value = false;
-    return;
-  }
-  try {
-    teardownViewer();
-    const ac = new AbortController();
-    focusViewerAbort = ac;
-    mdebug("focus viewer MOUNT start", { model: key });
+  if (!key) return;
+  await focusViewer.mount(key, async () => {
     // Weapon-only machinery, skipped by kind — sticker slots and the charm
     // attachment mean nothing on an agent or a glove, and stickerGeom would
     // fetch markup for a key no weapon has.
     const isWeapon = (focusTarget.value?.kind ?? "weapon") === "weapon";
-    const handle = await mountViewer(host, key, {
-      signal: ac.signal,
+    return {
       kind: focusTarget.value?.kind,
       paintMaterial: focusPaint.value,
       legacyPaint: focusLegacyPaint.value,
@@ -4997,6 +5146,12 @@ async function mount3d() {
       seed: focusRow.value?.seed ?? focusInstance.value?.seed,
       ...(isWeapon ? await stickerGeom(key) : {}),
       ...(isWeapon ? instPlacements(focusInstance.value) : {}),
+      // See the craft modal for why patches are their own option rather than
+      // part of instPlacements.
+      patches:
+        focusTarget.value?.kind === "agent"
+          ? (focusInstance.value?.patches ?? []).map((p) => p?.image ?? null)
+          : undefined,
       // Focus can be showing a loadout DEFAULT rather than an owned item, and
       // a default can be StatTrak too — instPlacements sees no instance there
       // and would drop the module, so fall back to the row.
@@ -5004,29 +5159,8 @@ async function mount3d() {
         focusInstance.value?.stattrak || focusRow.value?.stattrak
           ? { count: focusInstance.value?.stattrak_count ?? focusRow.value?.stattrak_count ?? 0 }
           : null,
-    });
-    // The mount takes seconds on a cold cache (GLB fetch + paint composite) and
-    // the user may well have moved on during it. Adopting the handle anyway
-    // would strand a live context rendering into a detached node forever.
-    if (focusModelKey.value !== key || !focus3d.value) {
-      handle.dispose();
-      mdebug("focus viewer MOUNT discarded (superseded)", { model: key });
-      return;
-    }
-    viewerHandle = handle;
-    mdebug("focus viewer MOUNT done", { model: key });
-  } catch (e) {
-    if ((e as Error)?.name === "AbortError") {
-      mdebug("focus viewer MOUNT aborted", { model: key });
-      return;
-    }
-    focus3d.value = false;
-    fail(e);
-  } finally {
-    // Only the mount that still owns the slot clears the spinner — a late
-    // superseded build would otherwise unmask a viewer that isn't ready.
-    if (focusModelKey.value === key) focus3dBusy.value = false;
-  }
+    };
+  });
 }
 
 // ---- 3D overlay for a DEFAULT weapon (ctx menu → View in 3D) ----------------
@@ -5037,19 +5171,21 @@ async function mount3d() {
 const loadout3d = ref<{ pos: string; model: string; name: string } | null>(null);
 const loadout3dEl = ref<HTMLElement | null>(null);
 // Mounting downloads a GLB and composites the paint — seconds on a cold cache,
-// during which the canvas is just empty black. Covered by a spinner instead.
-const loadout3dBusy = ref(false);
-let loadout3dHandle: ViewerHandle | null = null;
+// during which the canvas is just empty black. Covered by a spinner instead
+// (`loadout3dViewer.busy`).
+const loadout3dViewer = useViewerMount({
+  label: "loadout3d",
+  host: () => loadout3dEl.value,
+  onError: (e) => {
+    closeLoadout3d();
+    fail(e);
+  },
+});
 // Pure teardown. The route watcher calls this, so it must NOT navigate — see
 // dismissLoadout3d for the button the user actually presses.
-let loadout3dAbort: AbortController | null = null;
 function closeLoadout3d() {
-  loadout3dAbort?.abort();
-  loadout3dAbort = null;
-  loadout3dHandle?.dispose();
-  loadout3dHandle = null;
+  loadout3dViewer.teardown();
   loadout3d.value = null;
-  loadout3dBusy.value = false;
 }
 /** The ✕ on the 3D overlay: pop back to wherever it was opened from. */
 function dismissLoadout3d() {
@@ -5060,43 +5196,21 @@ function dismissLoadout3d() {
   }
   closeLoadout3d();
 }
-async function openViewer3d(model: string, name: string, paint: string | null, legacyPaint = false) {
+/**
+ * `kind` is REQUIRED, and was the bug: this mount alone passed none, so a
+ * default knife, glove or agent opened from a slot's context menu was mounted
+ * as a weapon. It also fetched sticker geometry unconditionally, for models
+ * that have no sticker slots — the other three mounts gate that on being a
+ * weapon.
+ */
+async function openViewer3d(model: string, name: string, paint: string | null, legacyPaint = false, kind: ViewerKind = "weapon") {
   loadout3d.value = { pos: "", model, name };
-  loadout3dBusy.value = true;
-  await nextTick();
-  if (!loadout3dEl.value) {
-    loadout3dBusy.value = false;
-    return;
-  }
-  const ac = new AbortController();
-  loadout3dAbort = ac;
-  mdebug("loadout3d viewer MOUNT start", { model });
-  try {
-    const handle = await mountViewer(loadout3dEl.value, model, {
-      signal: ac.signal,
-      paintMaterial: paint,
-      legacyPaint: legacyPaint,
-      ...(await stickerGeom(model)),
-    });
-    // Overlay dismissed mid-load — closeLoadout3d already nulled the handle it
-    // knew about, so adopting this one would leak it past the close.
-    if (!loadout3d.value || loadout3d.value.model !== model) {
-      handle.dispose();
-      mdebug("loadout3d viewer MOUNT discarded (superseded)", { model });
-      return;
-    }
-    loadout3dHandle = handle;
-    mdebug("loadout3d viewer MOUNT done", { model });
-  } catch (e) {
-    if ((e as Error)?.name === "AbortError") {
-      mdebug("loadout3d viewer MOUNT aborted", { model });
-      return;
-    }
-    closeLoadout3d();
-    fail(e);
-  } finally {
-    if (loadout3d.value?.model === model) loadout3dBusy.value = false;
-  }
+  await loadout3dViewer.mount(model, async () => ({
+    kind,
+    paintMaterial: paint,
+    legacyPaint,
+    ...(kind === "weapon" ? await stickerGeom(model) : {}),
+  }));
 }
 async function ctxView3d() {
   const pos = ctx.value?.pos;
@@ -5113,7 +5227,9 @@ async function ctxView3d() {
   }
   const model = occupantModel(pos);
   const name = skinLabel(pos) === "Default" ? occupantWeapon(pos)?.name ?? model : `${occupantWeapon(pos)?.name} | ${skinLabel(pos)}`;
-  await openViewer3d(model, name, isSkinned(row) ? row?.item?.paintMaterial ?? null : null, isSkinned(row) && !!row?.item?.legacyPaint);
+  // A default has no instance to resolve a kind from, so it comes from the SLOT.
+  const kind: ViewerKind = pos === "gloves" ? "glove" : pos === "agent" ? "agent" : "weapon";
+  await openViewer3d(model, name, isSkinned(row) ? row?.item?.paintMaterial ?? null : null, isSkinned(row) && !!row?.item?.legacyPaint, kind);
 }
 /**
  * UI entry point for 3D on an owned item — navigates; the route watcher mounts.
@@ -5134,7 +5250,6 @@ watch(focus3d, (on) => {
   else teardownViewer();
 });
 onBeforeUnmount(() => {
-  clearInterval(buildTimer);
   clearTimeout(pulseTimer);
   clearTimeout(pendingDeleteTimer);
   clearTimeout(revealSettleTimer);
@@ -5149,6 +5264,20 @@ onBeforeUnmount(() => {
   teardownViewer();
   teardownModalViewer();
   closeLoadout3d();
+  // preview3d was the one viewer NOT torn down here — it relied on
+  // watch([craft, picker]) firing, which unmount does not do. A live WebGL
+  // context rendering into a detached node outlives the whole plugin.
+  closePreview3d();
+  // Timers that used to outlive the component. Each one fires into a torn-down
+  // setup: the retex pair remount viewers that no longer have a host, and the
+  // preview/craft ones write to refs nothing reads.
+  clearTimeout(craftSettleTimer);
+  clearTimeout(retexTimer);
+  clearTimeout(retexRebuild);
+  clearTimeout(craftPreviewTimer);
+  clearTimeout(pickerTimer);
+  clearTimeout(preview3dRetex);
+  peekRO?.disconnect();
 });
 
 // Pre-bake everything equipped in the loadout (queued, one at a time; items
@@ -5192,6 +5321,7 @@ async function load() {
       // default (unskinned) loadout as the backdrop.
       const catalog = await fetchCatalog();
       weapons.value = catalog.weapons;
+      catalogAgents.value = catalog.agents ?? [];
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = [];
       inventory.value = [];
@@ -5199,6 +5329,7 @@ async function load() {
     } else {
       const [catalog, current, inv] = await Promise.all([fetchCatalog(), fetchLoadout(), fetchInventory()]);
       weapons.value = catalog.weapons;
+      catalogAgents.value = catalog.agents ?? [];
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = current;
       inventory.value = inv;
@@ -5218,7 +5349,14 @@ async function load() {
 // the z-index stack, so what you see on top is what closes.
 function onGlobalKey(e: KeyboardEvent) {
   if (e.key === "Escape") {
-    if (preview3d.value) {
+    if (devHudOpen.value) {
+      // Ahead of everything: it is a popover anchored inside the craft modal's
+      // 3D stage, so Escape has to dismiss IT before the modal underneath.
+      // DevHud also listens for Escape itself; both closing it is the same
+      // outcome, and this branch is what stops the modal going with it.
+      devHudOpen.value = false;
+      e.stopPropagation();
+    } else if (preview3d.value) {
       // Topmost of the lot (z-1400) — it sits over the picker, which sits over
       // the craft modal. Missing from this chain meant Escape fell straight
       // through to `craft` and shut the whole editor from a look at a sticker.
@@ -5284,32 +5422,13 @@ function onGlobalKey(e: KeyboardEvent) {
 // "/"-shortcut targets (see onGlobalKey).
 const invSearchEl = ref<HTMLInputElement | null>(null);
 const sheetSearchEl = ref<HTMLInputElement | null>(null);
-// Which build is the plugin server actually serving? Fetched fresh (no-store),
-// logged, displayed in the gear dialog, and POLLED — if the server ships a
-// newer bundle while this page is open, a banner says so. Staleness becomes
-// a fact you can read, never a guess.
-const serverBuild = ref("");
-const reloadPage = () => window.location.reload();
-const staleBuild = ref(false);
-let buildTimer: ReturnType<typeof setInterval> | undefined;
-async function checkBuild() {
-  try {
-    const res = await fetch(`${API_ORIGIN}/build-info.json`, { cache: "no-store" });
-    const { builtAt } = (await res.json()) as { builtAt?: string };
-    if (!builtAt) return;
-    if (!serverBuild.value) {
-      serverBuild.value = builtAt;
-      console.log(`[cs2-inventory] server bundle built at ${builtAt} (loaded ${new Date().toISOString()})`);
-    } else if (builtAt !== serverBuild.value) {
-      staleBuild.value = true; // server rebuilt since this page loaded
-    }
-  } catch {
-    /* older server image without the stamp */
-  }
-}
+// `serverBuild` is intentionally not destructured: it was only ever passed to
+// AdminConsole as `:server-build`, which never declared the prop, so the value
+// has never been displayed anywhere. The composable still logs the stamp and
+// still drives `staleBuild`. Surfacing it in the admin gear dialog would be a
+// small follow-up, not a refactor.
+const { staleBuild, reloadPage } = useBuildCheck();
 onMounted(() => {
-  checkBuild();
-  buildTimer = setInterval(checkBuild, 30000);
   window.addEventListener("keydown", onGlobalKey);
   load();
   // Admin app load hits the key endpoint, which makes the backend sync the
@@ -5325,9 +5444,6 @@ onMounted(() => {
       .then((s) => (extractWarn.value = extractWarnFrom(s)))
       .catch(() => { /* older backend or no mount — nothing to warn about */ });
   }
-  nextTick(syncAllPills);
-  setTimeout(syncAllPills, 120);
-  window.addEventListener("resize", syncAllPills);
   // Loading straight into a remembered lift never trips the watcher below, so
   // the slot a deep link selected would start out under the sheet.
   void revealSelectedSlot(false);
@@ -5430,19 +5546,24 @@ function itemShareLinks(id: number | string): ShareLink[] {
   // the self-contained craft link first.
   const links = here === "detail" ? [itemPage, ...state] : [...state, itemPage];
   // No live craft (item page with the editor closed) — fall back to the plain
-  // per-view routes rather than offering nothing.
+  // per-view routes rather than offering nothing. `itemPage` is reused rather
+  // than rebuilt: it was constructed twice with identical arguments.
   return links.length
     ? links
     : [
-        shareLink("Item page", `/items/${id}`, {}, ITEM_LINK_NOTE),
+        itemPage,
         shareLink("3D view", `/items/${id}/3d`, {}, ITEM_LINK_NOTE),
         shareLink("Craft editor", `/items/${id}/craft`, {}, ITEM_LINK_NOTE),
       ];
 }
-function instanceShareLinks(id: number | string | null | undefined): ShareLink[] {
-  const links = id == null ? [] : itemShareLinks(id);
+/** Append the public loadout link when there is one — the tail both list
+ *  builders below used to spell out separately. */
+function withPublicLink(links: ShareLink[]): ShareLink[] {
   const pub = publicLoadoutLink.value;
   return pub ? [...links, pub] : links;
+}
+function instanceShareLinks(id: number | string | null | undefined): ShareLink[] {
+  return withPublicLink(id == null ? [] : itemShareLinks(id));
 }
 // The current screen, filters/team/slot and all — the payoff for putting view
 // state in the query in the first place.
@@ -5452,8 +5573,7 @@ const viewShareLinks = computed<ShareLink[]>(() => {
     router.path.value,
     transientQuery(),
   );
-  const pub = publicLoadoutLink.value;
-  return pub ? [here, pub] : [here];
+  return withPublicLink([here]);
 });
 // The editor's own link: a saved item by id, or an unsaved draft with its whole
 // state packed into the query.
@@ -5531,10 +5651,30 @@ async function runSteamImport() {
 
 // ---- bulk select/delete (inventory view) ----
 const selectMode = ref(false);
-// The browse toolbar (and its origin tabs) unmounts while selecting, so the
-// pill has to re-measure when it comes back.
-watch(selectMode, (v) => {
-  if (!v) nextTick(() => invOriginPill.sync(invOrigin.value));
+
+/**
+ * Craft something, with no loadout slot involved.
+ *
+ * Crafting used to start at a loadout POSITION — pick the r2 slot, browse what
+ * fits it, build one. That is the right flow when you're filling a loadout and
+ * the wrong one when you just want to make a thing, and it could not express an
+ * attachment at all: a sticker fits no slot, so there was no way in.
+ *
+ * This is a whole SCREEN rather than a menu (see Armory.vue). A menu was the
+ * first attempt and it had to punt the weapon case back to the loadout, which
+ * is the detour the button exists to avoid — and a nine-item list is a poor
+ * front door for ten thousand stickers besides. Browsing is the activity here,
+ * so it gets somewhere to happen.
+ */
+function openArmory() {
+  go(buildPath({ name: "armory" }));
+}
+/** A finish chosen in the armory: straight into the editor, over the armory. */
+function armoryPick(skin: Skin) {
+  modalBackdrop.value = "armory";
+  openCraft(skin);
+}
+watch(selectMode, () => {
   // Bulk actions operate on instances and a colour deck isn't one, so selecting
   // starts from the flat grid.
   invDesign.value = null;
@@ -5717,29 +5857,17 @@ if (MDEBUG) {
            pills, h-8 on the buttons. Four pixels a control does not sound like
            much, but this bar plus the category rail under it were eating two
            bands off the top of a phone before any loadout showed. -->
-      <div v-if="view !== 'inventory'" :ref="(el) => teamPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted" :class="isCompact ? 'p-0.5' : 'p-1'">
-        <div
-          v-show="teamPill.w.value > 0"
-          class="pointer-events-none absolute left-0 z-0 rounded-md shadow-sm"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-          :style="{
-            transform: `translateX(${teamPill.x.value}px)`,
-            width: teamPill.w.value + 'px',
-            background: gradient,
-            transition: pillTransition(teamPill.animated.value),
-          }"
-        ></div>
-        <button
-          v-for="t in (['CT', 'T'] as Team[])"
-          :key="t"
-          :ref="(el) => teamPill.setRef(t, el)"
-          class="relative z-[1] flex h-7 items-center rounded-md font-bold uppercase tracking-widest transition-colors"
-          :class="[isCompact ? 'px-2.5 text-f13' : 'px-5 text-sm', team === t ? 'text-black' : 'text-muted-foreground hover:text-foreground']"
-          @click="switchTeam(t)"
-        >
-          {{ t }}
-        </button>
-      </div>
+      <PillTabs
+        v-if="view !== 'inventory'"
+        :items="(['CT', 'T'] as Team[])"
+        :item-key="(t) => t"
+        :active="team"
+        variant="solid"
+        :solid-background="gradient"
+        :button-class="`relative z-[1] flex h-7 items-center rounded-md font-bold uppercase tracking-widest transition-colors ${isCompact ? 'px-2.5 text-f13' : 'px-5 text-sm'}`"
+        active-class="text-black"
+        @select="(t) => switchTeam(t as Team)"
+      />
       <button
         v-if="view === 'grid' || view === 'focus'"
         class="flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider transition-colors"
@@ -5834,45 +5962,32 @@ if (MDEBUG) {
         <!-- The divider earns its keep at desktop spacing; at compact gaps it's
              just another 13px between two already-distinct pills. -->
         <span v-if="user && !isCompact && !embedMode" class="h-5 w-px flex-none bg-border"></span>
-        <div v-if="!embedMode" :ref="(el) => viewPill.setListEl(el)" class="relative inline-flex items-center rounded-lg bg-muted" :class="isCompact ? 'p-0.5' : 'p-1'">
-          <div
-            v-show="viewPill.w.value > 0"
-            class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-            :style="{
-              transform: `translateX(${viewPill.x.value}px)`,
-              width: viewPill.w.value + 'px',
-              border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-              background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-              boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-              transition: pillTransition(viewPill.animated.value),
-            }"
-          ></div>
-          <button
-            :ref="(el) => viewPill.setRef('grid', el)"
-            class="relative z-[1] flex h-7 items-center gap-1.5 rounded-md px-3 text-f11 uppercase tracking-wider transition-colors"
-            :class="view === 'grid' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-            @click="go('/')"
-          >
-            <!-- Compact drops BOTH labels, not just the inactive one. Two tabs
-                 with distinct icons and a sliding indicator under the live one
-                 say which is which; the words were ~70px of a ~376px row, which
-                 is what pushed the header into scrolling sideways. -->
-            <LayoutGrid class="h-3.5 w-3.5" />
-            <span v-if="!isCompact">Loadout</span>
-          </button>
-          <button
-            v-if="canEdit"
-            :ref="(el) => viewPill.setRef('inventory', el)"
-            class="relative z-[1] flex h-7 items-center gap-1.5 rounded-md px-3 text-f11 uppercase tracking-wider transition-colors"
-            :class="view === 'inventory' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-            @click="go('/items')"
-          >
-            <Package class="h-3.5 w-3.5" />
-            <span v-if="!isCompact">Inventory</span>
-            <span v-if="inventory.length" class="font-mono text-f10 text-muted-foreground">{{ inventory.length }}</span>
-          </button>
-        </div>
+        <!-- Craft is a PEER of the other two, not a button inside the
+             inventory. The three tabs are the three things you do here — wear
+             it, keep it, make it — and burying the third inside the second
+             said it was a mode of managing what you own, which is the opposite
+             of what that screen is for: nothing in it is yours yet.
+             Gated on canEdit like Inventory: with no account to craft into,
+             the tab is a dead end. -->
+        <PillTabs
+          v-if="!embedMode"
+          :items="viewTabs"
+          :item-key="(t) => t.key"
+          :active="view"
+          button-class="relative z-[1] flex h-7 items-center gap-1.5 rounded-md px-3 text-f11 uppercase tracking-wider transition-colors"
+          @select="(k) => go(viewTabs.find((t) => t.key === k)!.to)"
+        >
+          <template #default="{ item: t }">
+            <!-- Compact drops EVERY label, not just the inactive ones. Tabs with
+                 distinct icons and a sliding indicator under the live one say
+                 which is which; the words were ~70px of a ~376px row, which is
+                 what pushed the header into scrolling sideways — and that was
+                 with two of them. -->
+            <component :is="t.icon" class="h-3.5 w-3.5" />
+            <span v-if="!isCompact">{{ t.label }}</span>
+            <span v-if="t.key === 'inventory' && inventory.length" class="font-mono text-f10 text-muted-foreground">{{ inventory.length }}</span>
+          </template>
+        </PillTabs>
       </div>
     </header>
 
@@ -5923,8 +6038,19 @@ if (MDEBUG) {
       leave-active-class="transition duration-150 ease-in"
       :leave-to-class="viewLeaveTo"
     >
+      <!-- ============ ARMORY (catalog browser) ============
+           Its own screen in the cross-slide, so arriving from the inventory
+           reads as travel rather than the page redrawing itself. -->
+      <Armory
+        v-if="view === 'armory'"
+        key="armory"
+        :weapons="weapons"
+        :compact="isCompact"
+        @pick="armoryPick"
+      />
+
       <!-- ============ INVENTORY VIEW ============ -->
-      <div v-if="view === 'inventory'" key="inventory" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div v-else-if="view === 'inventory'" key="inventory" class="flex min-h-0 flex-1 flex-col overflow-hidden">
         <!-- Toolbar. Two states that never coexist: BROWSE (find things) and
              SELECT (act on things). The old bar stacked both, so five
              equally-weighted outlined buttons competed for the same eye. -->
@@ -6014,31 +6140,16 @@ if (MDEBUG) {
           </div>
           <!-- Origin filter: same sliding-pill animated tabs as the
                Loadout/Inventory switcher, so filters read as filters, not actions. -->
-          <div :ref="(el) => invOriginPill.setListEl(el)" class="relative inline-flex shrink-0 items-center rounded-lg bg-muted p-1">
-            <div
-              v-show="invOriginPill.w.value > 0"
-              class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-              :style="{
-                transform: `translateX(${invOriginPill.x.value}px)`,
-                width: invOriginPill.w.value + 'px',
-                border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: pillTransition(invOriginPill.animated.value),
-              }"
-            ></div>
-            <button
-              v-for="f in ORIGIN_FILTERS"
-              :key="f[0]"
-              :ref="(el) => invOriginPill.setRef(f[0], el)"
-              class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
-              :class="invOrigin === f[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-              @click="invOrigin = f[0]"
-            >
-              {{ f[1] }}
-            </button>
-          </div>
+          <PillTabs
+            :items="ORIGIN_FILTERS"
+            :item-key="(f) => f[0]"
+            :active="invOrigin"
+            list-class="shrink-0"
+            button-class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
+            @select="(v) => (invOrigin = v as OriginFilter)"
+          >
+            <template #default="{ item: f }">{{ f[1] }}</template>
+          </PillTabs>
           <FilterDropdown
             v-if="invRarityFacets.length"
             v-model="invRarity"
@@ -6053,12 +6164,12 @@ if (MDEBUG) {
             :options="SORTS.map((s) => ({ value: s[0], label: s[0] === 'default' ? 'Newest' : s[1] }))"
             @update:model-value="setInvSort"
           />
-          <SortDirection v-model="invDir" :kind="SORT_DIR_KIND[invSort]" :hint="SORT_DIR_HINT[invSort][invDir]" />
+          <SortDirection v-model="invDir" :kind="invSortKind" :hint="invSortHint" />
           <button
             v-if="filtersActive"
             class="flex h-8 shrink-0 items-center gap-1 rounded-md px-2 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
             title="Clear all filters"
-            @click="clearInvFilters"
+            @click="resetInvFilters"
           >
             <X class="h-3 w-3" /> Clear
           </button>
@@ -6091,34 +6202,13 @@ if (MDEBUG) {
              styling — "filters" should mean one thing in this plugin. It also
              carries the type/model facets, which live in the `lg:` rail and so
              had no mobile home at all before this. -->
-        <Transition enter-active-class="animate-sheet-enter" leave-active-class="animate-sheet-leave">
-        <div
-          v-if="isCompact && invFiltersOpen"
-          class="fixed inset-0 z-[998] bg-background/60"
-          @click="invFiltersOpen = false"
+        <FilterSheet
+          :open="invFiltersOpen"
+          :active-count="invFilterCount"
+          @close="invFiltersOpen = false"
+          @reset="resetInvFilters"
         >
-          <div
-            data-role="inv-filter-sheet"
-            data-sheet
-            class="absolute inset-x-0 bottom-0 max-h-[85%] overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-card shadow-2xl"
-            :style="swipeStyle"
-            @click.stop
-          >
-            <div class="sticky top-0 z-[2] touch-none bg-card pt-1" v-on="invFilterSheetSwipe">
-              <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
-              <div class="flex items-center gap-2 border-b border-border px-4 pb-2">
-                <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">Filter inventory</span>
-                <button
-                  v-if="invFilterCount"
-                  class="ml-auto rounded-md border border-border px-2 py-1 text-f9 uppercase tracking-cs1 text-muted-foreground"
-                  @click="resetInvFilters"
-                >
-                  Reset
-                </button>
-              </div>
-            </div>
-
-            <div class="flex flex-col gap-4 px-4 pb-5 pt-3">
+          <template #title>Filter inventory</template>
               <div class="relative">
                 <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <input
@@ -6165,7 +6255,7 @@ if (MDEBUG) {
               <section class="flex flex-col gap-2">
                 <div class="flex items-center gap-2">
                   <span class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Sort</span>
-                  <SortDirection v-model="invDir" :kind="SORT_DIR_KIND[invSort]" :hint="SORT_DIR_HINT[invSort][invDir]" class="ml-auto" />
+                  <SortDirection v-model="invDir" :kind="invSortKind" :hint="invSortHint" class="ml-auto" />
                 </div>
                 <div class="flex flex-wrap gap-2">
                   <button
@@ -6239,10 +6329,7 @@ if (MDEBUG) {
               >
                 Show {{ filteredInventory.length }} item{{ filteredInventory.length === 1 ? '' : 's' }}
               </button>
-            </div>
-          </div>
-        </div>
-        </Transition>
+        </FilterSheet>
 
         <div class="flex min-h-0 flex-1 overflow-hidden">
         <!-- Filter rail: the same visual language as the focus view's slot rail,
@@ -6400,7 +6487,17 @@ if (MDEBUG) {
           <div v-if="!inventory.length" key="empty" class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground">
             <Package class="h-8 w-8 opacity-40" />
             <div>Your inventory is empty.</div>
-            <div class="text-f13">Open the <b class="text-foreground">Loadout</b>, pick a weapon, and craft a finish.</div>
+            <!-- Points at the armory, not the loadout. Sending someone to pick a
+                 loadout slot first was the detour that screen exists to remove,
+                 and this is the one place in the app that gets read by someone
+                 who owns nothing yet. -->
+            <div class="text-f13">Open the <b class="text-foreground">Armory</b> and craft your first item.</div>
+            <button
+              class="mt-2 flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              @click="openArmory()"
+            >
+              <Hammer class="h-3.5 w-3.5" /> Browse the Armory
+            </button>
           </div>
           <div
             v-else-if="!inventoryStacks.length"
@@ -6412,7 +6509,7 @@ if (MDEBUG) {
             <button
               v-if="filtersActive"
               class="rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
-              @click="clearInvFilters"
+              @click="resetInvFilters"
             >
               Clear filters
             </button>
@@ -6426,49 +6523,23 @@ if (MDEBUG) {
             <!-- A deck is not an item: no single instance to open, select or
                  act on, so its only verb is "open me". Selecting is done inside
                  it, where the instances are. -->
-            <div v-if="st.variants.length > 1" class="cv-tile relative h-full" :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }">
-              <span
-                v-for="(hex, n) in st.behind"
-                :key="n"
-                class="pointer-events-none absolute inset-0 rounded-lg border"
-                :style="{
-                  transform: `rotate(${n === 0 ? -5 : 5}deg) scale(0.88)`,
-                  transformOrigin: 'bottom center',
-                  borderColor: hex,
-                  background: `color-mix(in srgb, ${hex} 70%, hsl(var(--card)))`,
-                }"
-              ></span>
-              <button
-                data-role="inv-item"
-                class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
-                :style="st.face.item?.rarity ? { borderBottom: `3px solid ${st.face.item.rarity}` } : {}"
-                :title="`${st.variants.length} colours — open`"
-                @click="invDesign = st.face.item?.design ?? null"
-              >
-                <span class="pointer-events-none absolute inset-0" :style="glowStyle(st.face.item?.rarity, 0.22)"></span>
-                <span class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 font-mono text-f8 text-[color:var(--acc)]">
-                  <Palette class="h-2.5 w-2.5" /> {{ st.variants.length }}
-                </span>
-                <div :class="CARD_ART">
-                  <img
-                    :src="st.face.item?.image ?? undefined"
-                    alt=""
-                    loading="lazy" decoding="async"
-                    class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
-                  />
-                </div>
-                <ItemName
-                  :item="{ ...st.face.item, name: (st.face.item?.name ?? '').replace(TINT_SUFFIX, '') }"
-                  strip
-                  class="relative z-[2]"
-                />
-              </button>
-            </div>
+            <DeckCard
+              v-if="st.variants.length > 1"
+              class="cv-tile"
+              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
+              :face="st.face"
+              :behind="st.behind"
+              :count="st.variants.length"
+              role="inv-item"
+              :strip-suffix="TINT_SUFFIX"
+              @open="invDesign = st.face.item?.design ?? null"
+            />
             <ItemTile
               v-else
               class="cv-tile"
               :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
               :inst="st.face"
+              :attached-name="attachedName(st.face)"
               show-header
               :selected="selectMode && selectedIds.has(st.face.id)"
               :hide-actions="selectMode"
@@ -6621,8 +6692,12 @@ if (MDEBUG) {
                   selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
                   pulsePos === s.slot && 'animate-equip-pulse',
                 ]"
-                :style="[selRing(selected === s.slot), rowFor(s.slot)?.item?.rarity ? { borderLeft: `3px solid ${rowFor(s.slot)!.item!.rarity}` } : {}]"
+                :style="[selRing(selected === s.slot), rowFor(s.slot)?.item?.rarity ? { borderLeft: `3px solid ${rowFor(s.slot)!.item!.rarity}` } : {}, dropStyle(s.slot)]"
                 @click="selectPos(s.slot)"
+                @contextmenu.prevent="openCtx(s.slot, $event)"
+                @dragover="onSlotDragOver(s.slot, $event)"
+                @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
+                @drop.prevent="onSlotDrop(s.slot)"
               >
                 <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
                 <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" />
@@ -6665,7 +6740,7 @@ if (MDEBUG) {
                 v-for="(cell, ci) in compactCells"
                 :key="cell.pos"
                 :data-slot="cell.pos" data-role="weapon"
-                class="relative flex min-h-[118px] flex-col overflow-hidden rounded-lg border p-2 text-left transition-colors"
+                class="group relative flex min-h-[118px] flex-col overflow-hidden rounded-lg border p-2 text-left transition-colors"
                 :class="[
                   selected === cell.pos ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
                   pulsePos === cell.pos && 'animate-equip-pulse',
@@ -6673,14 +6748,33 @@ if (MDEBUG) {
                 :style="[
                   selRing(selected === cell.pos),
                   rarityOf(cell.pos) ? { borderLeft: `3px solid ${rarityOf(cell.pos)}` } : {},
+                  dropStyle(cell.pos),
                 ]"
                 @click="selectPos(cell.pos)"
+                @contextmenu.prevent="openCtx(cell.pos, $event)"
+                @dragover="onSlotDragOver(cell.pos, $event)"
+                @dragleave="dragOverPos === cell.pos && (dragOverPos = null)"
+                @drop.prevent="onSlotDrop(cell.pos)"
               >
                 <span class="pointer-events-none absolute inset-0" :style="glowStyle(rarityOf(cell.pos), 0.35)"></span>
                 <div class="relative z-[2] truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
                   {{ cell.weapon?.name ?? cell.pos }}
                 </div>
                 <SlotStatus :teams="cellTeams(cell.pos)" :inst="cellInstance(cell.pos)" />
+                <!-- These cells had NO actions at all, while the equipment cells
+                     beside them in the same compact layout had the full cluster.
+                     Hidden on touch by TileActions itself, so in practice this
+                     only lights up on a narrow desktop window. -->
+                <TileActions
+                  :inst="cellInstance(cell.pos) ?? null"
+                  focus
+                  @focus="selectPos(cell.pos); go('/focus')"
+                  @view3d="view3dForInstance(cellInstance(cell.pos)!)"
+                  @inspect="openInspectLink(cellInstance(cell.pos)!.id)"
+                  @edit="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
+                  @duplicate="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
+                  @remove="deleteOwned(cellInstance(cell.pos)!)"
+                />
                 <div
                   :key="team + ':' + occupantModel(cell.pos)"
                   :class="['animate-cell-in', CARD_ART]"
@@ -6779,7 +6873,7 @@ if (MDEBUG) {
                 selected === 'agent' ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                 pulsePos === 'agent' && 'animate-equip-pulse',
               ]"
-              :style="[selected === 'agent' ? { boxShadow: '0 0 0 1px var(--acc)' } : {}, dropStyle('agent')]"
+              :style="[selRing(selected === 'agent'), dropStyle('agent')]"
               data-slot="agent" data-role="agent"
               @click="selectPos('agent')"
               @contextmenu.prevent="openCtx('agent', $event)"
@@ -6902,38 +6996,21 @@ if (MDEBUG) {
                   <span class="pointer-events-none absolute inset-0" :style="glowStyle(rarityOf(previewPos(cell.pos)), 0.35)"></span>
                   <div class="relative z-[2] flex items-center justify-between gap-2">
                     <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ occupantWeapon(previewPos(cell.pos))?.name ?? cell.pos }}</span>
-                    <span class="flex flex-none gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-                      <span
-                        class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-                        title="Focus"
-                        @click.stop="selectPos(cell.pos); go('/focus')"
-                      ><Crosshair class="h-3 w-3" /></span>
-                      <template v-if="cellInstance(cell.pos)">
-                        <span
-                          class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-                          title="View in 3D"
-                          @click.stop="view3dForInstance(cellInstance(cell.pos)!)"
-                        ><Box class="h-3 w-3" /></span>
-                        <span
-                          v-if="!isCoarse && canInspect(cellInstance(cell.pos)?.item)"
-                          class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-                          title="Inspect in game"
-                          @click.stop="openInspectLink(cellInstance(cell.pos)!.id)"
-                        ><ExternalLink class="h-3 w-3" /></span>
-                        <span
-                          v-if="isCustomizable(cellInstance(cell.pos)?.item)"
-                          class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-foreground"
-                          title="Edit item"
-                          @click.stop="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
-                        ><Pencil class="h-3 w-3" /></span>
-                        <span
-                          class="rounded border border-border/60 bg-background/70 p-1 text-muted-foreground hover:text-[#ff7a6a]"
-                          title="Delete from inventory"
-                          @click.stop="deleteOwned(cellInstance(cell.pos)!)"
-                        ><Trash2 class="h-3 w-3" /></span>
-                      </template>
-                    </span>
                   </div>
+                  <!-- The same cluster every other slot and tile carries. This
+                       used to be five hand-rolled spans that had drifted: no
+                       read-only branch (a Steam item offered Edit), no model
+                       check (3D on things with no model), and no touch hide. -->
+                  <TileActions
+                    :inst="cellInstance(cell.pos) ?? null"
+                    focus
+                    @focus="selectPos(cell.pos); go('/focus')"
+                    @view3d="view3dForInstance(cellInstance(cell.pos)!)"
+                    @inspect="openInspectLink(cellInstance(cell.pos)!.id)"
+                    @edit="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
+                    @duplicate="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
+                    @remove="deleteOwned(cellInstance(cell.pos)!)"
+                  />
                   <!-- Fades for the hover actions, which occupy this corner. -->
                   <SlotStatus
                     :teams="cellTeams(previewPos(cell.pos))"
@@ -7019,37 +7096,19 @@ if (MDEBUG) {
                    anchored to nothing. -->
               <div class="flex flex-none items-center gap-2.5">
                 <!-- Same sliding-pill animated tabs as every other tab group. -->
-                <div v-if="focus3dAvailable" :ref="(el) => focus3dPill.setListEl(el)" class="relative flex h-8 items-center rounded-lg bg-muted p-1">
-                  <div
-                    v-show="focus3dPill.w.value > 0"
-                    class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-                    :style="{
-                      transform: `translateX(${focus3dPill.x.value}px)`,
-                      width: focus3dPill.w.value + 'px',
-                      border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                      background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                      boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                      transition: pillTransition(focus3dPill.animated.value),
-                    }"
-                  ></div>
-                  <button
-                    :ref="(el) => focus3dPill.setRef('2D', el)"
-                    class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
-                    :class="!focus3d ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-                    @click="setFocus3d(false)"
-                  >
-                    <ImageIcon class="h-3.5 w-3.5" /> 2D
-                  </button>
-                  <button
-                    :ref="(el) => focus3dPill.setRef('3D', el)"
-                    class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
-                    :class="focus3d ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-                    @click="setFocus3d(true)"
-                  >
-                    <Box class="h-3.5 w-3.5" /> 3D
-                  </button>
-                </div>
+                <PillTabs
+                  v-if="focus3dAvailable"
+                  :items="STAGE_TABS"
+                  :item-key="(s) => s"
+                  :active="focus3d ? '3D' : '2D'"
+                  list-class="h-8"
+                  button-class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
+                  @select="(s) => setFocus3d(s === '3D')"
+                >
+                  <template #default="{ item: s }">
+                    <component :is="s === '3D' ? Box : ImageIcon" class="h-3.5 w-3.5" /> {{ s }}
+                  </template>
+                </PillTabs>
                 <!-- Edit + Inspect + Share live top right, same corner as every
                      other surface (3D overlay, craft modal, item detail).
                      Edit leads: focus is where you land on a slot, and until now
@@ -7082,7 +7141,7 @@ if (MDEBUG) {
 
             <div class="relative z-[2] grid min-h-0 place-items-center">
               <div v-show="focus3d" ref="viewer3dEl" class="h-full min-h-[240px] w-full"></div>
-              <div v-if="focus3d && focus3dBusy" class="absolute inset-0 z-[3] grid place-items-center">
+              <div v-if="focus3d && focusViewer.busy.value" class="absolute inset-0 z-[3] grid place-items-center">
                 <div class="flex flex-col items-center gap-3 text-muted-foreground">
                   <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
                   <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
@@ -7124,7 +7183,7 @@ if (MDEBUG) {
                    the model almost never is, and sits at 70% until hovered so it
                    reads as chrome rather than as part of the item. -->
               <ViewerControls
-                v-if="focus3d && !focus3dBusy"
+                v-if="focus3d && !focusViewer.busy.value"
                 variant="overlay"
                 class="absolute bottom-1 left-1/2 z-[3] -translate-x-1/2"
               />
@@ -7215,92 +7274,48 @@ if (MDEBUG) {
                every size — stretching it full-width on compact left the three
                tabs marooned at the left of a wide empty bar, and desynced the
                sliding indicator that measures against button positions. -->
-          <div :ref="(el) => sheetPill.setListEl(el)" class="relative inline-flex flex-none items-center rounded-lg bg-muted p-1">
-            <div
-              v-show="sheetPill.w.value > 0"
-              class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-              :style="{
-                transform: `translateX(${sheetPill.x.value}px)`,
-                width: sheetPill.w.value + 'px',
-                border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: pillTransition(sheetPill.animated.value),
-              }"
-            ></div>
-            <button
-              v-if="signedIn"
-              :ref="(el) => sheetPill.setRef('owned', el)"
-              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
-              :class="sheetMode === 'owned' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-              @click="sheetMode = 'owned'"
-            >
-              Owned
+          <!-- Text only. These are three tabs in one pill with the sliding
+               indicator already saying which is active; glyphs were spending
+               ~60px of the row on decoration, and that was the difference
+               between the search box fitting and wrapping. -->
+          <PillTabs
+            :items="sheetModeTabs"
+            :item-key="(t) => t.key"
+            :active="sheetMode"
+            list-class="flex-none"
+            @select="(m) => (sheetMode = m as 'owned' | 'craft' | 'replace')"
+          >
+            <template #default="{ item: t }">
+              {{ t.label }}
               <!-- Counts the origin-filtered pool (a persistent setting) but not
                    search/rarity, so the badge doesn't twitch as you type. -->
-              <span class="ml-1 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full border border-border bg-background/70 px-1 font-mono text-f9 leading-none">{{ inventory.filter((i) => i.slot === sheetKey && matchesOrigin(i, sheetOrigin)).length }}</span>
-            </button>
-            <button
-              v-if="isWeaponPos(selected)"
-              :ref="(el) => sheetPill.setRef('replace', el)"
-              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
-              :class="sheetMode === 'replace' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-              @click="sheetMode = 'replace'"
-            >
-              Replace
-            </button>
-            <!-- Text only. These are three tabs in one pill with the sliding
-                 indicator already saying which is active; the glyphs were
-                 spending ~60px of the row on decoration, and that was the
-                 difference between the search box fitting and wrapping. -->
-            <button
-              :ref="(el) => sheetPill.setRef('craft', el)"
-              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
-              :class="sheetMode === 'craft' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-              @click="sheetMode = 'craft'"
-            >
-              Craft
-            </button>
-          </div>
+              <span
+                v-if="t.key === 'owned'"
+                class="ml-1 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full border border-border bg-background/70 px-1 font-mono text-f9 leading-none"
+              >{{ inventory.filter((i) => i.slot === sheetKey && matchesOrigin(i, sheetOrigin)).length }}</span>
+            </template>
+          </PillTabs>
           <!-- Catalog facets. Craft only — Owned and Replace list inventory
                instances and weapons, which carry none of this — and each one
                hides itself when the loaded catalog has nothing to split, so
                only graffiti shows them today and no weapon sheet changed.
                Same sliding-pill tabs as every other tab group here. -->
-          <div
+          <PillTabs
             v-if="sheetMode === 'craft' && sheetGroupTabs.length && (!isCompact || sheetFiltersOpen)"
-            :ref="(el) => sheetGroupPill.setListEl(el)"
-            class="relative inline-flex h-8 flex-none items-center rounded-lg bg-muted p-1"
+            :items="sheetGroupTabs"
+            :item-key="(g) => g.value"
+            :active="sheetGroup"
+            list-class="h-8 flex-none"
+            @select="setSheetGroup"
           >
-            <div
-              v-show="sheetGroupPill.w.value > 0"
-              class="pointer-events-none absolute left-0 z-0 rounded-md"
-              :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-              :style="{
-                transform: `translateX(${sheetGroupPill.x.value}px)`,
-                width: sheetGroupPill.w.value + 'px',
-                border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: pillTransition(sheetGroupPill.animated.value),
-              }"
-            ></div>
-            <button
-              v-for="g in sheetGroupTabs"
-              :key="g.value"
-              :ref="(el) => sheetGroupPill.setRef(g.value, el)"
-              class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
-              :class="sheetGroup === g.value ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-              @click="setSheetGroup(g.value)"
-            >
+            <template #default="{ item: g }">
               {{ g.label }}
               <!-- Fixed width + tabular figures — see the picker's tab strip: a
                    self-sizing count resizes the tab and drags the sliding pill on
                    every keystroke. -->
               <span class="ml-1.5 inline-flex h-[15px] w-[34px] flex-none items-center justify-center rounded border border-border bg-background/70 px-1 font-mono text-f9 leading-none tabular-nums">{{ fmtCount(g.count) }}</span>
-            </button>
-          </div>
+            </template>
+          </PillTabs>
           <FilterDropdown
             v-if="sheetMode === 'craft' && sheetCollectionOptions.length && (!isCompact || sheetFiltersOpen)"
             :model-value="sheetCollection"
@@ -7335,45 +7350,27 @@ if (MDEBUG) {
               :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
               @update:model-value="setSheetSort"
             />
-            <SortDirection v-model="sheetDir" :kind="SORT_DIR_KIND[sheetSort]" :hint="SORT_DIR_HINT[sheetSort][sheetDir]" />
+            <SortDirection v-model="sheetDir" :kind="sheetSortKind" :hint="sheetSortHint" />
           </template>
           <!-- Owned only: same Synced/Crafted filter as the Inventory grid, so
                read-only Steam imports can be kept out of the equip picker. -->
-          <div
+          <PillTabs
             v-if="sheetMode === 'owned' && (!isCompact || sheetFiltersOpen)"
-            :ref="(el) => sheetOriginPill.setListEl(el)"
-            class="relative inline-flex flex-none items-center rounded-lg bg-muted p-1"
+            :items="ORIGIN_FILTERS"
+            :item-key="(f) => f[0]"
+            :active="sheetOrigin"
+            list-class="flex-none"
+            button-class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
+            @select="(v) => (sheetOrigin = v as OriginFilter)"
           >
-            <div
-              v-show="sheetOriginPill.w.value > 0"
-              class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-              :style="{
-                transform: `translateX(${sheetOriginPill.x.value}px)`,
-                width: sheetOriginPill.w.value + 'px',
-                border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: pillTransition(sheetOriginPill.animated.value),
-              }"
-            ></div>
-            <button
-              v-for="f in ORIGIN_FILTERS"
-              :key="f[0]"
-              :ref="(el) => sheetOriginPill.setRef(f[0], el)"
-              class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
-              :class="sheetOrigin === f[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-              @click="sheetOrigin = f[0]"
-            >
-              {{ f[1] }}
-            </button>
-          </div>
+            <template #default="{ item: f }">{{ f[1] }}</template>
+          </PillTabs>
           <!-- No weapon name here: the cards below all show it, and at ~220px of
                label it was the one element that pushed the search input onto a
                second row whenever a longer name was selected. -->
           <div v-if="!isCompact" class="ml-auto flex flex-none items-center gap-2 text-muted-foreground" title="Card size">
             <LayoutGrid class="h-3.5 w-3.5" />
-            <input v-model.number="sheetCardSize" type="range" min="140" max="260" step="4" class="w-24 accent-[#e0a24a]" />
+            <input v-model.number="sheetCardSize" type="range" :min="SHEET_CARD_BOUNDS[0]" :max="SHEET_CARD_BOUNDS[1]" step="4" class="w-24 accent-[#e0a24a]" />
           </div>
           <!-- Search stays pinned to the right and resets on slot/mode switches -->
           <!-- Compact moves search into the filter sheet: sharing the row with
@@ -7450,36 +7447,13 @@ if (MDEBUG) {
              desktop controls reflowed: those are a popover dropdown and a
              native <select>, and opening a popover from inside a bottom sheet
              put the rarity list on top of the item grid it was filtering. -->
-        <Transition enter-active-class="animate-sheet-enter" leave-active-class="animate-sheet-leave">
-        <div
-          v-if="isCompact && sheetFiltersOpen"
-          class="fixed inset-0 z-[998] bg-background/60"
-          @click="sheetFiltersOpen = false"
+        <FilterSheet
+          :open="sheetFiltersOpen"
+          :active-count="sheetFilterCount"
+          @close="sheetFiltersOpen = false"
+          @reset="resetSheetFilters"
         >
-          <div
-            data-role="filter-sheet"
-            data-sheet
-            class="absolute inset-x-0 bottom-0 max-h-[85%] overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-card shadow-2xl"
-            :style="swipeStyle"
-            @click.stop
-          >
-            <!-- Whole header grabs, Reset included — the lazy capture in
-                 swipeToDismiss keeps that button's tap working. -->
-            <div class="sticky top-0 z-[2] touch-none bg-card pt-1" v-on="filterSheetSwipe">
-              <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
-              <div class="flex items-center gap-2 border-b border-border px-4 pb-2">
-                <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">Filter · {{ sheetWeaponName }}</span>
-                <button
-                  v-if="sheetFilterCount"
-                  class="ml-auto rounded-md border border-border px-2 py-1 text-f9 uppercase tracking-cs1 text-muted-foreground"
-                  @click="resetSheetFilters"
-                >
-                  Reset
-                </button>
-              </div>
-            </div>
-
-            <div class="flex flex-col gap-4 px-4 pb-5 pt-3">
+          <template #title>Filter · {{ sheetWeaponName }}</template>
               <div class="relative">
                 <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                 <input
@@ -7607,8 +7581,8 @@ if (MDEBUG) {
                     class="flex items-center gap-1.5 rounded-md border border-border/60 px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors"
                     @click="sheetDir = sheetDir === 'desc' ? 'asc' : 'desc'"
                   >
-                    <component :is="SORT_DIR_ICON[SORT_DIR_KIND[sheetSort]][sheetDir]" class="h-3.5 w-3.5" />
-                    {{ SORT_DIR_HINT[sheetSort][sheetDir] }}
+                    <component :is="SORT_DIR_ICON[sheetSortKind][sheetDir]" class="h-3.5 w-3.5" />
+                    {{ sheetSortHint }}
                   </button>
                 </div>
               </section>
@@ -7617,7 +7591,7 @@ if (MDEBUG) {
                 <div class="text-f9 uppercase tracking-cs3 text-muted-foreground/60">Card size</div>
                 <div class="flex items-center gap-3 text-muted-foreground">
                   <LayoutGrid class="h-4 w-4 flex-none" />
-                  <input v-model.number="sheetCardSize" type="range" min="120" max="168" step="4" class="w-full accent-[#e0a24a]" />
+                  <input v-model.number="sheetCardSize" type="range" :min="SHEET_CARD_BOUNDS[0]" :max="SHEET_CARD_BOUNDS[1]" step="4" class="w-full accent-[#e0a24a]" />
                 </div>
               </section>
 
@@ -7644,10 +7618,7 @@ if (MDEBUG) {
               >
                 Show {{ sheetResultCount }} result{{ sheetResultCount === 1 ? '' : 's' }}
               </button>
-            </div>
-          </div>
-        </div>
-        </Transition>
+        </FilterSheet>
 
         <!-- Inside a colour stack. Its own strip rather than a cell in the grid:
              the grid's rows are a fixed card height, so a col-span-full header
@@ -7754,43 +7725,17 @@ if (MDEBUG) {
                    no single instance to equip, so it gets a plain card whose only
                    verb is "open me" rather than an ItemTile with actions that
                    would each need an owner. -->
-              <div v-if="st.variants.length > 1" class="relative h-full" :class="sheetCellClass(idx)" :style="{ '--i': idx + 2 }">
-                <span
-                  v-for="(hex, i) in st.behind"
-                  :key="i"
-                  class="pointer-events-none absolute inset-0 rounded-lg border"
-                  :style="{
-                    transform: `rotate(${i === 0 ? -5 : 5}deg) scale(0.88)`,
-                    transformOrigin: 'bottom center',
-                    borderColor: hex,
-                    background: `color-mix(in srgb, ${hex} 70%, hsl(var(--card)))`,
-                  }"
-                ></span>
-                <button
-                  data-role="skin"
-                  class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
-                  :style="st.face.item?.rarity ? { borderBottom: `3px solid ${st.face.item.rarity}` } : {}"
-                  @click="sheetDesign = st.face.item?.design ?? null"
-                >
-                  <span class="pointer-events-none absolute inset-0" :style="glowStyle(st.face.item?.rarity, 0.22)"></span>
-                  <span class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 font-mono text-f8 text-[color:var(--acc)]">
-                    <Palette class="h-2.5 w-2.5" /> {{ st.variants.length }}
-                  </span>
-                  <div :class="CARD_ART">
-                    <img
-                      :src="st.face.item?.image ?? undefined"
-                      alt=""
-                      loading="lazy" decoding="async"
-                      class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
-                    />
-                  </div>
-                  <ItemName
-                    :item="{ ...st.face.item, name: (st.face.item?.name ?? '').replace(TINT_SUFFIX, '') }"
-                    strip
-                    class="relative z-[2]"
-                  />
-                </button>
-              </div>
+              <DeckCard
+                v-if="st.variants.length > 1"
+                :class="sheetCellClass(idx)"
+                :style="{ '--i': idx + 2 }"
+                :face="st.face"
+                :behind="st.behind"
+                :count="st.variants.length"
+                role="skin"
+                :strip-suffix="TINT_SUFFIX"
+                @open="sheetDesign = st.face.item?.design ?? null"
+              />
               <ItemTile
                 v-else
                 :inst="st.face"
@@ -7800,6 +7745,7 @@ if (MDEBUG) {
                 @dragstart="onTileDragStart(st.face, $event)"
                 @dragend="onTileDragEnd"
                 strip-weapon-name
+                :attached-name="attachedName(st.face)"
                 show-header
                 :row="sheetRows"
                 :active="String(rowFor(selected)?.item_instance_id) === String(st.face.id)"
@@ -7849,17 +7795,7 @@ if (MDEBUG) {
                      the gap, and 0.88 at 5° puts the corners ~5px out — half
                      the gap, so two adjacent stacks never touch. Saturated,
                      because 5px of a wash is 5px of nothing. -->
-                <span
-                  v-for="(hex, i) in st.behind"
-                  :key="i"
-                  class="pointer-events-none absolute inset-0 rounded-lg border"
-                  :style="{
-                    transform: `rotate(${i === 0 ? -5 : 5}deg) scale(0.88)`,
-                    transformOrigin: 'bottom center',
-                    borderColor: hex,
-                    background: `color-mix(in srgb, ${hex} 70%, hsl(var(--card)))`,
-                  }"
-                ></span>
+                <DeckFan :colors="st.behind" />
                 <button
                   data-role="skin"
                   class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
@@ -7979,7 +7915,6 @@ if (MDEBUG) {
       class="min-h-0 flex-1"
       :user="user"
       :section="adminSection"
-      :server-build="serverBuild"
       @notify="notify"
       @navigate="(section: string) => go(section ? `/admin/${section}` : '/admin')"
       @cfg-sync="onCfgSync"
@@ -7988,6 +7923,8 @@ if (MDEBUG) {
       @back="go('/')"
     />
     </Transition>
+
+
 
     <!-- Craft confirm modal (inventory-simulator style) -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
@@ -8010,7 +7947,8 @@ if (MDEBUG) {
          of it out of the 3D viewer, which is the whole reason to open this. -->
     <div
       v-if="craft"
-      class="fixed inset-0 z-[999] flex items-center justify-center bg-background/85 backdrop-blur-sm"
+      class="fixed inset-0 flex items-center justify-center bg-background/85 backdrop-blur-sm" :style="{ zIndex: Z.modal }"
+      role="dialog" aria-modal="true" aria-label="Item editor"
       :class="isCompact ? 'p-0' : 'p-4'"
       @click.self="picker ? (picker = null) : closeCraft()"
     >
@@ -8155,41 +8093,127 @@ if (MDEBUG) {
                    the host out of flow makes that impossible — the parent's
                    min-h-[320px] still sets the stage height. -->
               <div v-show="modal3d" ref="modalViewerEl" class="absolute inset-0 z-[2]"></div>
-              <div v-if="modal3d && modal3dBusy" class="absolute inset-0 z-[3] grid place-items-center">
+              <div v-if="modal3d && modalViewer.busy.value" class="absolute inset-0 z-[3] grid place-items-center">
                 <div class="flex flex-col items-center gap-3 text-muted-foreground">
                   <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
                   <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
                 </div>
               </div>
+              <!-- Agent poses. An agent's patch positions sit on the chest,
+                   sides and sleeves, and no single pose shows all of them — the
+                   arms cover the sides in any stance a person actually stands
+                   in. So the pose is the user's to pick rather than something
+                   to compromise on. Agents only: nothing else has a skeleton to
+                   re-pose. -->
+              <!-- Developer cog, INSIDE the pane. It was `position: fixed` in
+                   the app root and never rendered: this plugin is federated into
+                   the 5stack panel, and `fixed` resolves against the nearest
+                   transformed ancestor rather than the viewport. The pane is
+                   already an absolute context that demonstrably works — the
+                   2D/3D pill lives in it — and the switches belong next to the
+                   model they change anyway.
+
+                   Beside the 2D/3D pill: it is a view control like the others,
+                   and that spot came free when the pose tabs moved to their own
+                   row. The panel drops below both rows (top-20) so it never
+                   covers the controls that opened it. -->
+              <template v-if="modal3d && showDevCog">
+                <!-- Click-away catcher, the same idiom FilterDropdown and
+                     ShareMenu use. `absolute inset-0`, not `fixed`: a fixed
+                     element in this plugin resolves against the nearest
+                     TRANSFORMED ancestor rather than the viewport, and the host
+                     panel has several — see the note on DevHud itself. The stage
+                     is the right scope anyway.
+
+                     It sits UNDER the cog so the cog stays live and the button
+                     toggles the panel shut, and OVER the 2D/3D and pose pills so
+                     the first click anywhere else just dismisses. -->
+                <div v-if="devHudOpen" class="absolute inset-0 z-[4]" @click="devHudOpen = false"></div>
+                <!-- Wrapped in the same `bg-muted p-1` shell the 2D/3D pill
+                     uses, so the two sit on one baseline at one height. A bare
+                     button here was 2px shorter and read as misaligned.
+                     `relative` is on the wrapper too so the panel below can hang
+                     off the BUTTON rather than off the stage corner. -->
+                <div class="absolute left-[5rem] top-0 z-[5] inline-flex items-center rounded-lg bg-muted p-1">
+                  <!-- OPEN gets the same amber indicator an active pill tab
+                       gets, because it sits in the same `bg-muted` shell as the
+                       2D/3D pill and "this one is engaged" should look the same
+                       in both. Without it the cog was identical open or shut —
+                       only ever its hover state — so nothing said the click had
+                       landed except the panel appearing.
+
+                       An INSET ring, not a border: this plugin ships without
+                       Tailwind's preflight, so `box-sizing` is not guaranteed to
+                       be border-box and a real 1px border would grow the 22×26
+                       button and shift the count badge pinned to its corner.
+                       `active:scale-95` is the press itself. -->
+                  <button
+                    class="relative grid h-[22px] w-[26px] place-items-center rounded-md transition-all active:scale-95"
+                    :class="devHudOpen
+                      ? 'text-foreground'
+                      : devFlagCount > 0 ? 'text-[#f2c14e]' : 'text-muted-foreground hover:text-foreground'"
+                    :style="devHudOpen
+                      ? {
+                          background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
+                          boxShadow: 'inset 0 0 0 1px hsl(var(--tac-amber, 33 94% 58%) / 0.45), 0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
+                        }
+                      : {}"
+                    :title="`Developer options (Ctrl/Cmd + Shift + D)${devFlagCount ? ` — ${devFlagCount} flag(s) on` : ''}`"
+                    :aria-expanded="devHudOpen"
+                    @click="devHudOpen = !devHudOpen"
+                  >
+                    <Settings class="h-3.5 w-3.5" />
+                    <span
+                      v-if="devFlagCount"
+                      class="absolute -right-0.5 -top-0.5 grid h-3 w-3 place-items-center rounded-full bg-[#e0a92e] font-mono text-[8px] text-background"
+                    >{{ devFlagCount }}</span>
+                  </button>
+                  <!-- Anchored to the cog (`top-full`) and scaling out of its own
+                       top-left corner, so it reads as belonging to the button
+                       that opened it. It used to be parked at `left-0 top-20` —
+                       a slab in the stage's corner that sat over the model
+                       whether or not you had just asked for it. -->
+                  <DevHud
+                    :open="devHudOpen"
+                    class="absolute left-0 top-full z-[6] mt-1.5 origin-top-left animate-menu-in"
+                    @close="devHudOpen = false"
+                  />
+                </div>
+              </template>
+              <!-- BELOW the 2D/3D toggle, not beside it: they are different
+                   questions (which renderer vs which pose), and stacking keeps
+                   the top edge free for the model. Not the bottom-left corner
+                   either — that is where the perf HUD draws, and the two
+                   overlapped. top-10 clears the 2D/3D pill's own height. -->
+              <PillTabs
+                v-if="modal3d && craftTarget?.kind === 'agent'"
+                :items="AGENT_POSES"
+                :item-key="(p) => p.id"
+                :item-title="(p) => p.hint"
+                :active="agentPose"
+                position="absolute"
+                list-class="left-0 top-10 z-[3]"
+                button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
+                @select="(id) => setAgentPose(id as 'stand' | 'open' | 'ready')"
+              >
+                <template #default="{ item: p }">{{ p.label }}</template>
+              </PillTabs>
               <span v-if="craftPreviewBusy && !modal3d" class="animate-sheen pointer-events-none absolute inset-0 z-[3]"></span>
               <span
                 v-if="craftPreviewBusy && !modal3d"
                 class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
               ><Loader2 class="h-3 w-3 animate-spin" /> rendering</span>
               <!-- 2D / 3D toggle: same sliding-pill animated tabs as the rest -->
-              <div v-if="modal3dAvailable" :ref="(el) => modal3dPill.setListEl(el)" class="absolute left-0 top-0 z-[3] inline-flex items-center rounded-lg bg-muted p-1">
-                <div
-                  v-show="modal3dPill.w.value > 0"
-                  class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-                  :style="{
-                    transform: `translateX(${modal3dPill.x.value}px)`,
-                    width: modal3dPill.w.value + 'px',
-                    border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                    background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                    boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                    transition: pillTransition(modal3dPill.animated.value),
-                  }"
-                ></div>
-                <button
-                  v-for="m in ([[false, '2D'], [true, '3D']] as [boolean, string][])"
-                  :key="m[1]"
-                  :ref="(el) => modal3dPill.setRef(m[1], el)"
-                  class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
-                  :class="modal3d === m[0] ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-                  @click="modal3d = m[0]"
-                >{{ m[1] }}</button>
-              </div>
+              <PillTabs
+                v-if="modal3dAvailable"
+                :items="STAGE_TABS"
+                :item-key="(s) => s"
+                :active="modal3d ? '3D' : '2D'"
+                position="absolute"
+                list-class="left-0 top-0 z-[3]"
+                button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
+                @select="(s) => (modal3d = s === '3D')"
+              />
             </div>
             <!-- Footer. The report link used to hold a column of its own on the
                  same baseline as the name and the controls legend, which meant
@@ -8263,7 +8287,7 @@ if (MDEBUG) {
                  rather than to a slot on it — buried under five sticker wells
                  it read as an afterthought. -->
             <label
-              v-if="!['agent', 'musickit', 'graffiti'].includes(selected)"
+              v-if="craftHasNameTag"
               class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5"
               :style="{ '--i': 0 }"
             >
@@ -8277,9 +8301,9 @@ if (MDEBUG) {
             </label>
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
-              <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
+              <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${patchSlotCount}, minmax(0, 1fr))` }">
                 <button
-                  v-for="(pt, idx) in craft.patches"
+                  v-for="(pt, idx) in craft.patches.slice(0, patchSlotCount)"
                   :key="idx"
                   class="group/pt relative grid h-10 place-items-center rounded border transition-colors"
                   :class="pt ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]'"
@@ -8298,7 +8322,7 @@ if (MDEBUG) {
                     v-if="pt"
                     class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/pt:opacity-100"
                     :title="`View ${pt.name} in 3D`"
-                    @click.stop="openPreview3d(pt, 'patch')"
+                    @click.stop="openPreview3d(pt, 'patch', { slot: idx })"
                   ><Box class="h-3 w-3" /></span>
                 </button>
               </div>
@@ -8336,7 +8360,7 @@ if (MDEBUG) {
                     v-if="st"
                     class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/st:opacity-100"
                     :title="`View ${st.name} in 3D`"
-                    @click.stop="openPreview3d(st, 'sticker')"
+                    @click.stop="openPreview3d(st, 'sticker', { slot: idx })"
                   ><Box class="h-3 w-3" /></span>
                 </button>
               </div>
@@ -8389,7 +8413,7 @@ if (MDEBUG) {
                 </label>
               </div>
             </div>
-            <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
+            <div v-if="attachTakesCharm" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
               <div class="mb-1.5 flex items-baseline gap-2">
                 <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Charm</span>
                 <button
@@ -8416,7 +8440,7 @@ if (MDEBUG) {
                     v-if="craft.charm"
                     class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/ch:opacity-100"
                     :title="`View ${craft.charm.name} in 3D`"
-                    @click.stop="openPreview3d(craft!.charm, 'charm')"
+                    @click.stop="openPreview3d(craft!.charm, 'charm', { slot: 0 })"
                   ><Box class="h-3 w-3" /></span>
                 </button>
                 <span v-if="craft.charm" class="truncate text-f10 text-muted-foreground">{{ craft.charm.name }}</span>
@@ -8424,18 +8448,20 @@ if (MDEBUG) {
               <!-- A charm carries its own pattern, exactly as the weapon does,
                    and it is a tradeable attribute rather than a placement
                    detail — so it sits with the charm itself and NOT behind
-                   Advanced with the x/y/z nudges. Same label / field / die
-                   rhythm as the weapon's Pattern row so the two read as the
-                   same control for the same idea. -->
-              <div v-if="craft.charm" class="mt-2 flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-                <input
-                  v-model.number="craft.charm.seed"
-                  type="number" min="0" max="100000" placeholder="0"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random charm pattern" @click="randomCharmSeed">🎲</button>
-              </div>
+                   Advanced with the x/y/z nudges.
+                   The number FIELD that used to be here is gone: a charm's
+                   pattern is a colour, and picking a colour by typing
+                   coordinates at it is the problem the rail solves. The rail
+                   owns the readout and it is still click-to-edit, so a pattern
+                   quoted from a trade site is no harder to enter than before. -->
+              <PatternRail
+                v-if="craft.charm"
+                class="mt-2"
+                :model-value="craft.charm.seed ?? 0"
+                :image="craft.charm.image"
+                :albedo="charmAlbedo"
+                @update:model-value="craft!.charm!.seed = $event"
+              />
               <div v-if="craft.charm && advancedPlacement" class="mt-1.5 flex items-center gap-1.5">
                 <span class="w-4 flex-none"></span>
                 <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">X
@@ -8452,19 +8478,56 @@ if (MDEBUG) {
                 </label>
               </div>
             </div>
-            <div v-if="craftHasSeed" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
-              <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-              <!-- flex-1, not a fixed width: Pattern sat at w-24 and Wear at
-                   w-28, so two stacked rows with the same label column ended in
-                   fields of different lengths and a pocket of dead space before
-                   each die. Filling the row is what the Name tag input above
-                   already does — this makes the whole stack one column. -->
-              <input
-                v-model.number="craft.seed"
-                type="number" min="1" max="1000"
-                class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+            <!-- A CHARM's pattern gets the rail, wherever the charm is.
+                 It was only wired up for a charm hanging off a weapon, so
+                 opening one on its own fell through to the weapon control
+                 below — a 1..1000 slider for an attribute that runs to 100,000,
+                 scrubbing a continuum for something that is really a colour.
+                 Same component, same reasoning as the attached case: you aim at
+                 a pattern, you don't scrub to it. -->
+            <!-- The panel goes with the rail when the charm has no pattern to
+                 pick. Hiding the control alone would leave an empty card. -->
+            <div
+              v-if="craftHasSeed && craftSeedIsCharm && !craftCharmInert"
+              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+              :style="{ '--i': 3 }"
+            >
+              <PatternRail
+                :model-value="craft.seed ?? 0"
+                :image="craft.skin.image"
+                :albedo="charmAlbedo"
+                @update:model-value="craft!.seed = $event"
+                @update:inert="craftCharmInert = $event"
               />
-              <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random pattern" @click="randomSeed">🎲</button>
+            </div>
+            <!-- The scored rail, which is the charm rail's twin: same drag,
+                 same needle, same click-to-edit readout — but plotting a
+                 MEASUREMENT of every pattern, because a weapon's pattern
+                 moves artwork rather than being a colour we can compute.
+                 It is only usable at all because the viewer re-composites in
+                 place now: the seed feeds six uniforms, so dragging re-runs
+                 two fullscreen passes over textures already on the GPU.
+
+                 Shown only on a finish whose pattern can actually move the
+                 artwork — `=== true`, not `!== false`, so a finish still being
+                 resolved never appears and then vanishes. A fixed-pattern
+                 finish used to get the field back with a line explaining that
+                 it did nothing; the row is simply gone now.
+
+                 The tradeoff, stated: on those finishes the pattern can no
+                 longer be typed. It remains a real tradeable attribute and it
+                 still round-trips through save and share — there is just no
+                 longer a control for a number with nothing to show for it. -->
+            <div v-else-if="craftHasSeed && patternMoves === true" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+              <PatternScoreRail
+                :model-value="craft.seed"
+                :paint-material="craft.skin.paintMaterial"
+                :model="craftTarget?.model ?? craftModel"
+                :legacy-paint="!!craft.skin.legacyPaint"
+                :weights-for="modal3d ? paintWeightsNow : null"
+                @update:model-value="craft!.seed = $event"
+                @preview="previewPattern"
+              />
             </div>
             <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
               <div class="flex items-center gap-2">
@@ -8480,6 +8543,26 @@ if (MDEBUG) {
                 <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
               </div>
               <div class="mt-1 text-right font-mono text-f9 text-muted-foreground">{{ wearTier(craft.wear) }}</div>
+            </div>
+            <!-- A sticker's scratch. Same box and rhythm as the weapon's Wear
+                 above but NO tier caption: "Factory New" is a float's vocabulary
+                 and a sticker doesn't have one — it's just how scuffed it is.
+                 Mutually exclusive with that box in practice (nothing has both a
+                 float and a scratch), so they can share the slot. -->
+            <div v-if="craftHasScratch" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
+              <div class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
+                <input
+                  v-model.number="craft.wear"
+                  type="number" min="0" max="1" step="0.01"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                />
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random wear" @click="randomWear">🎲</button>
+              </div>
+              <div class="mt-2 flex items-center gap-2">
+                <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
+              </div>
+              <div class="mt-1 text-right font-mono text-f9 text-muted-foreground">{{ (craft.wear ?? 0).toFixed(2) }} scratched</div>
             </div>
             <div
               v-if="craftHasStatTrak"
@@ -8532,12 +8615,23 @@ if (MDEBUG) {
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
                 <span class="font-mono text-f13">#{{ craftInst.seed }}</span>
               </div>
-              <div v-if="craftInst?.wear != null" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+              <!-- Type-gated, not just null-gated. A sticker spends the same
+                   `wear` column on its SCRATCH, so the moment one could be set
+                   this box started captioning a sticker "Factory New" over an
+                   empty track (WearBar drops the ramp itself, the tier caption
+                   was left saying it anyway). The scratch gets its own box
+                   below, with a number instead of a tier. -->
+              <div v-if="craftInst?.wear != null && hasWear(craftInst.item)" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
                 <div class="flex items-baseline gap-2">
                   <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
                   <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ wearTier(craftInst.wear) }}</span>
                 </div>
                 <div class="mt-2"><WearBar :item="craftInst.item" :wear="craftInst.wear" /></div>
+              </div>
+              <div v-if="craftInst?.wear != null && hasScratch(craftInst.item)" class="animate-sheet-in flex items-baseline gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
+                <span class="font-mono text-f13">{{ craftInst.wear.toFixed(2) }}</span>
+                <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">scratched</span>
               </div>
               <div v-if="craftInst?.stattrak" class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
                 <span class="text-f10 uppercase tracking-cs1 text-[#f2c14e]">StatTrak™</span>
@@ -8546,260 +8640,6 @@ if (MDEBUG) {
 
           </div>
         </div>
-        <!-- Sticker / charm picker -->
-        <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-        <!-- fixed + above the 3D overlay (z-1200): the picker is reachable from
-             both the form and the 3D editor, and must cover whichever is up. -->
-        <div v-if="picker" class="fixed inset-0 z-[1300] flex flex-col bg-card/[0.985] p-4">
-          <div class="mb-3 flex items-center gap-3">
-            <span class="text-f11 font-semibold uppercase tracking-cs1">Pick a {{ picker.kind }}</span>
-            <div class="ml-auto flex flex-none items-center gap-2 text-muted-foreground" title="Card size">
-              <LayoutGrid class="h-3.5 w-3.5" />
-              <input v-model.number="attachCardSize" type="range" min="72" max="200" step="4" class="w-24 accent-[#e0a24a]" />
-            </div>
-            <div class="relative w-[240px]">
-              <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <input
-                v-model="pickerQuery"
-                placeholder="Search…"
-                class="w-full rounded-md border border-border bg-background py-2 pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
-                autofocus
-              />
-              <button
-                v-if="pickerQuery"
-                class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
-                title="Clear search"
-                @click="pickerQuery = ''"
-              ><X class="h-3.5 w-3.5" /></button>
-            </div>
-            <!-- Says where it goes. A bare ✕ in the same corner as the craft
-                 modal's own ✕ reads as "close everything", which is the one thing
-                 it must not do — the edit underneath is unsaved. -->
-            <button
-              class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
-              title="Back to the editor — nothing is applied"
-              @click="picker = null"
-            >
-              <X class="h-3.5 w-3.5" /> Back
-            </button>
-          </div>
-
-          <!-- Facet bar. Counts are on every control on purpose: with 10.5k
-               stickers the useful question is never "does this exist" but "how
-               much am I about to wade through". Each NARROWING control hides
-               itself when the catalog behind it has nothing to split (patches have
-               no groups and no collections, so a patch picker shows rarity alone),
-               while the bar itself always renders — Sort is always meaningful, and
-               a bar that can vanish could strand an active filter with no visible
-               control to switch it off. -->
-          <div class="mb-3 flex flex-wrap items-center gap-2">
-            <!-- Same sliding-pill animated tabs as every other tab group, with
-                 the list driven by the facets rather than hardcoded. -->
-            <div
-              v-if="pickerTabs.length > 1"
-              :ref="(el) => pickerGroupPill.setListEl(el)"
-              class="relative inline-flex h-8 flex-none items-center rounded-lg bg-muted p-1"
-            >
-              <div
-                v-show="pickerGroupPill.w.value > 0"
-                class="pointer-events-none absolute left-0 z-0 rounded-md"
-          :class="isCompact ? 'bottom-0.5 top-0.5' : 'bottom-1 top-1'"
-                :style="{
-                  transform: `translateX(${pickerGroupPill.x.value}px)`,
-                  width: pickerGroupPill.w.value + 'px',
-                  border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
-                  background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                  boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                  transition: pillTransition(pickerGroupPill.animated.value),
-                }"
-              ></div>
-              <button
-                v-for="g in pickerTabs"
-                :key="g.value"
-                :ref="(el) => pickerGroupPill.setRef(g.value, el)"
-                class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
-                :class="pickerGroup === g.value ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
-                @click="setPickerFacet('group', g.value)"
-              >
-                {{ g.label }}
-                <!-- Wider than the other count badges and square-cornered, not a
-                     circle: these read "10.6k", where a pill sized for "12" put
-                     the text against its own border.
-                     FIXED width, not min-width, and tabular figures: the count is
-                     the one thing here that changes while you type, and letting it
-                     size itself resized the TAB — which moved every tab after it
-                     and dragged the sliding indicator along, on every keystroke.
-                     Sized for "10.6k", the widest value the formatter emits. -->
-                <span class="ml-1.5 inline-flex h-[15px] w-[34px] flex-none items-center justify-center rounded border border-border bg-background/70 px-1 font-mono text-f9 leading-none tabular-nums">{{ fmtCount(g.count) }}</span>
-              </button>
-            </div>
-            <FilterDropdown
-              v-if="pickerCollections.length > 1"
-              :model-value="pickerCollection"
-              :options="pickerCollectionOptions"
-              prefix="Collection"
-              @update:model-value="setPickerFacet('collection', $event)"
-            />
-            <FilterDropdown
-              v-if="pickerRarities.length > 1"
-              :model-value="pickerRarity"
-              :options="pickerRarityOptions"
-              dots
-              @update:model-value="setPickerFacet('rarity', $event)"
-            />
-            <button
-              v-if="pickerFiltered"
-              class="flex h-8 items-center gap-1.5 rounded-md px-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:text-foreground"
-              @click="clearPickerFacets"
-            >
-              <X class="h-3 w-3" /> Clear
-            </button>
-            <!-- Sort sits apart from the narrowing controls: it changes the ORDER
-                 of the same set, so Clear has nothing to do with it. -->
-            <FilterDropdown
-              class="ml-auto"
-              :model-value="pickerSort"
-              :options="PICKER_SORTS"
-              prefix="Sort"
-              @update:model-value="setPickerSort"
-            />
-            <SortDirection
-              :model-value="pickerDir"
-              :kind="PICKER_SORT_KIND[pickerSort]"
-              :hint="PICKER_DIR_HINT[pickerSort][pickerDir]"
-              @update:model-value="setPickerDir"
-            />
-          </div>
-
-          <!-- The results are NOT unmounted while the next set loads. They used to
-               be — `v-if="pickerLoading"` swapped the whole grid for a centred
-               "Searching…" — so every keystroke collapsed the grid to one line,
-               jumped the scroll height and popped it back. Now the outgoing set
-               dims in place and the incoming one waves in over it, which is the
-               same treatment the inventory grid gives a filter change. -->
-          <div
-            ref="pickerScrollEl"
-            data-scroller
-            class="flex-1 content-start gap-2 overflow-y-auto transition-opacity duration-200 ease-out"
-            :class="pickerLoading ? 'opacity-45' : 'opacity-100'"
-            :style="attachGridStyle"
-          >
-            <!-- Rarity is read the same way as on a weapon card: the tier's colour
-                 as a bottom rule plus a soft glow behind the art. Without it the
-                 grid is a wall of identical grey boxes and the one attribute that
-                 sorts them is invisible. -->
-            <!-- animate-cell-in is the loadout grid's stagger, reused — but ONLY
-                 for the first page. cs2CellIn is `both`-filled with a delay, so an
-                 appended tile holds opacity 0 for up to 420ms while the grid has
-                 ALREADY grown to fit it: you scroll, the layout jumps down, and
-                 the stickers fade in afterwards. That is the infinite-scroll jank.
-                 Pages after the first appear immediately; there is nothing to
-                 announce, they were prefetched below the fold on purpose.
-                 Honours prefers-reduced-motion via the global animate-* rule. -->
-            <button
-              v-for="(it, i) in pickerResults"
-              :key="it.id"
-              class="cv-tile group relative flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
-              :class="i < PICKER_PAGE ? 'animate-cell-in' : ''"
-              :style="{ ...(it.rarity ? { borderBottom: `3px solid ${it.rarity}` } : {}), '--i': i, '--cis': attachCardSize + 12 + 'px' }"
-              :title="it.name"
-              @click="pickAttachment(it)"
-            >
-              <span class="pointer-events-none absolute inset-0" :style="glowStyle(it.rarity, 0.22)"></span>
-              <!-- Inspect before committing. A `button` inside the tile's button
-                   is invalid HTML, so this is a span with a click that stops
-                   propagation — otherwise picking is the only thing a tile can
-                   do, and choosing a holo sticker from a flat icon is a guess. -->
-              <span
-                role="button"
-                tabindex="0"
-                class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-[color:var(--acc)] group-hover:flex"
-                :title="`View ${it.name} in 3D`"
-                @click.stop="openPreview3d(it, picker?.kind ?? 'sticker')"
-                @keydown.enter.stop.prevent="openPreview3d(it, picker?.kind ?? 'sticker')"
-              ><Box class="h-3.5 w-3.5" /></span>
-              <div :class="CARD_ART" class="relative z-[2]">
-                <!-- decoding="async" keeps the decode off the main thread. With
-                     `lazy`, a fast scroll brings dozens of images into view at
-                     once and the default synchronous decode lands all of them in
-                     the scroll frames — the "logos rendering in" stutter. -->
-                <img :src="it.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
-              </div>
-              <span class="relative z-[2] w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm|Sticker Slab) \| /, '') }}</span>
-            </button>
-            <div v-if="!pickerLoading && !pickerResults.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
-              No results — try a different search.
-            </div>
-            <!-- Scrolling to the bottom pulls the next page. `done` also carries
-                 the first-page spinner: without it the sentinel is on screen
-                 under an empty grid and would fire a second, duplicate page.
-                 A deeper rootMargin than the 500px default: one page is 120 tiles,
-                 which at any card size is several screens, so firing further ahead
-                 costs one request that was coming anyway and buys the page landing
-                 before you reach the end — the difference between infinite scroll
-                 and scroll-then-wait. -->
-            <InfiniteSentinel
-              :count="pickerResults.length"
-              :done="pickerDone || pickerLoading"
-              root-margin="1200px"
-              @hit="pickerMore"
-            />
-          </div>
-          <!-- OUTSIDE the scroller, and a fixed height that is always present.
-               This row used to be the last cell of the grid, so it was pushed down
-               by every appended page and its own content swaps ("Loading more…"
-               has a spinner, "1200 of 10565" does not) resized it mid-scroll. A
-               loading state must not be able to move anything: as a sibling of the
-               scroll area it is outside the grid's layout entirely, it reserves
-               its space whether or not there is anything to say, and the status
-               text now stays visible instead of scrolling away. -->
-          <div class="flex h-11 flex-none items-center justify-center gap-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
-            <template v-if="pickerLoading"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Searching…</template>
-            <template v-else-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
-            <!-- Nothing to say on an empty result set; `h-11` holds the space
-                 regardless, so the grid above never resizes either way. -->
-            <template v-else-if="!pickerResults.length"></template>
-            <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
-            <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
-          </div>
-        </div>
-        </Transition>
-
-        <!-- Attachment preview — a SIBLING of the picker's Transition, not a
-             child of it: <Transition> takes exactly one child, and nesting this
-             inside it silently stopped the picker from opening at all.
-             z-1400 puts it above the picker (z-1300) it is opened from.
-             Deliberately a small panel rather than a full stage — the picker
-             keeps its scroll position and its search, so this is a look, not a
-             detour. -->
-        <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-          <div
-            v-if="preview3d"
-            class="fixed inset-0 z-[1400] grid place-items-center bg-background/80 p-4 backdrop-blur-sm"
-            @click.self="closePreview3d()"
-          >
-            <div class="flex w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
-              <div class="flex items-center gap-2 border-b border-border px-3 py-2">
-                <span class="min-w-0 flex-1 truncate text-f11 uppercase tracking-cs1">{{ preview3d.name }}</span>
-                <button
-                  class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
-                  title="Close"
-                  @click="closePreview3d()"
-                >
-                  <X class="h-4 w-4" />
-                </button>
-              </div>
-              <!-- Square: a sticker is square, a charm is portrait, and a fixed
-                   aspect keeps the panel from resizing as you flick between them. -->
-              <div class="relative aspect-square w-full bg-background">
-                <div ref="preview3dEl" class="absolute inset-0" />
-                <div v-if="preview3dBusy" class="pointer-events-none absolute inset-0 grid place-items-center">
-                  <Loader2 class="h-5 w-5 animate-spin text-muted-foreground" />
-                </div>
-              </div>
-            </div>
-          </div>
-        </Transition>
 
         <!-- Same row, same positions in both modes: dismiss on the left, the
              commit on the right. Editing commits a change to the item; viewing
@@ -8881,7 +8721,7 @@ if (MDEBUG) {
     >
     <div
       v-if="pendingDelete"
-      class="fixed bottom-5 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-3 rounded-md border border-border bg-card px-4 py-2.5 text-f13 shadow-2xl"
+      class="fixed bottom-5 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-md border border-border bg-card px-4 py-2.5 text-f13 shadow-2xl" :style="{ zIndex: Z.toast }"
     >
       <Trash2 class="h-3.5 w-3.5 flex-none text-muted-foreground" />
       <span class="max-w-[380px] truncate">{{ pendingDeleteLabel }}</span>
@@ -8898,80 +8738,41 @@ if (MDEBUG) {
     <!-- Right-click context menu (weapon slots). Compact swaps the plain
          cross-fade for sheet motion — the backdrop fades while the panel
          travels, which a single opacity transition on the root can't express. -->
-    <Transition
-      :enter-active-class="isCompact ? 'animate-sheet-enter' : 'transition duration-150'"
-      :enter-from-class="isCompact ? '' : 'opacity-0'"
-      :leave-active-class="isCompact ? 'animate-sheet-leave' : 'transition duration-100'"
-      :leave-to-class="isCompact ? '' : 'opacity-0'"
-    >
-    <div
-      v-if="ctx"
-      class="fixed inset-0 z-[999]"
-      :class="isCompact && 'bg-background/60'"
-      @click="closeCtx"
-      @contextmenu.prevent="closeCtx"
-    >
-      <!-- Compact drops the cursor anchoring for a bottom sheet: the menu is
-           opened by long-press (no cursor to anchor to), and the desktop
-           clamp assumes a window wide enough for `innerWidth - 220` to be a
-           sane left edge, which at 400px it is not. -->
-      <div
-        data-role="slot-menu"
-        data-sheet
-        :class="isCompact
-          ? 'absolute inset-x-0 bottom-0 overflow-hidden rounded-t-2xl border-t border-border bg-card shadow-2xl'
-          : 'absolute min-w-[204px] origin-top-left animate-menu-in overflow-hidden rounded-md border border-border bg-card py-1 shadow-2xl'"
-        :style="isCompact ? swipeStyle : { left: (ctx?.x ?? 0) + 'px', top: (ctx?.y ?? 0) + 'px' }"
-        @click.stop
-      >
-        <!-- The WHOLE header is the grab area, pill and title together. A 20px
-             pill is not a target anyone hits on a phone, and a swipe that
-             misses it lands on the page — where the browser reads it as
-             pull-to-refresh and reloads the panel out from under you.
-             touch-none is what denies the browser that gesture; it has to be on
-             the element the finger actually starts on, hence the whole strip. -->
-        <div v-if="isCompact" class="touch-none border-b border-border" v-on="slotMenuSwipe">
-          <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
-          <div class="px-3 pb-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
-            {{ ctx ? (occupantWeapon(ctx.pos)?.name ?? ctx.pos) : '' }}
-          </div>
-        </div>
-        <div v-else class="border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
-          {{ ctx ? (occupantWeapon(ctx.pos)?.name ?? ctx.pos) : '' }}
-        </div>
+    <ContextMenu :at="ctx" @close="closeCtx">
+      <template #title>{{ ctx ? (occupantWeapon(ctx.pos)?.name ?? ctx.pos) : '' }}</template>
         <!-- 3D leads, same as the item menu: looking at the gun is the most
              common reason this menu gets opened, and it's the one row that
              never depends on what's already in the slot. -->
         <button
           v-if="ctx3dOk"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          :class="MENU_ROW"
           @click="ctxView3d"
         >
           <Box class="h-3.5 w-3.5" /> View in 3D
         </button>
-        <button class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxOwned">
+        <button :class="[MENU_ROW, 'border-t border-border']" @click="ctxOwned">
           <Search class="h-3.5 w-3.5" /> Pick / change skin
         </button>
-        <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="ctxCraft">
+        <button :class="MENU_ROW" @click="ctxCraft">
           <Hammer class="h-3.5 w-3.5" /> Craft new skin
         </button>
         <button
           v-if="ctx && isWeaponPos(ctx.pos)"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          :class="MENU_ROW"
           @click="ctxReplace"
         >
           <Replace class="h-3.5 w-3.5" /> Replace weapon…
         </button>
         <button
           v-if="ctx && equippedInstance(ctx.pos) && !isCoarse && canInspect(equippedInstance(ctx.pos)?.item)"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          :class="MENU_ROW"
           @click="ctxInspect"
         >
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button
           v-if="ctx && !['agent', 'graffiti', 'musickit'].includes(ctx.pos)"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+          :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent']"
           :disabled="!equippedInstance(ctx.pos)"
           @click="ctxStatTrak"
         >
@@ -8979,7 +8780,7 @@ if (MDEBUG) {
         </button>
         <button
           v-if="ctx && !isShared(ctx.pos) && ctx.pos !== 'agent'"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+          :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent']"
           :disabled="!equippedInstance(ctx.pos)"
           @click="ctxCopy"
         >
@@ -8992,9 +8793,7 @@ if (MDEBUG) {
         >
           <RotateCcw class="h-3.5 w-3.5" /> Reset to default
         </button>
-      </div>
-    </div>
-    </Transition>
+    </ContextMenu>
 
 
 
@@ -9006,7 +8805,8 @@ if (MDEBUG) {
       <!-- Edge to edge on compact, same reasoning as the craft modal above. -->
       <div
         v-if="loadout3d"
-        class="fixed inset-0 z-[998] flex items-center justify-center bg-background"
+        class="fixed inset-0 flex items-center justify-center bg-background" :style="{ zIndex: Z.stage }"
+        role="dialog" aria-modal="true" aria-label="3D view"
         :class="isCompact ? 'p-0' : 'p-6'"
         @click="dismissLoadout3d"
       >
@@ -9019,7 +8819,7 @@ if (MDEBUG) {
         >
           <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
             <span class="truncate text-f11 uppercase tracking-cs3 text-muted-foreground">{{ loadout3d.name }}</span>
-            <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" @click="dismissLoadout3d">
+            <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="Close" aria-label="Close" @click="dismissLoadout3d">
               <X class="h-4 w-4" />
             </button>
           </div>
@@ -9034,7 +8834,7 @@ if (MDEBUG) {
             >
               Report a problem
             </a>
-            <div v-if="loadout3dBusy" class="absolute inset-0 grid place-items-center bg-card">
+            <div v-if="loadout3dViewer.busy.value" class="absolute inset-0 grid place-items-center bg-card">
               <div class="flex flex-col items-center gap-3 text-muted-foreground">
                 <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
                 <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
@@ -9045,19 +8845,310 @@ if (MDEBUG) {
       </div>
     </Transition>
 
+    <!-- Sticker / charm picker -->
+    <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
+    <!-- fixed + above the 3D overlay (z-1200): the picker is reachable from
+         both the form and the 3D editor, and must cover whichever is up. -->
+    <div v-if="picker" class="fixed inset-0 flex flex-col bg-card/[0.985] p-4" :style="{ zIndex: Z.picker }" role="dialog" aria-modal="true" aria-label="Pick an attachment">
+      <div class="mb-3 flex items-center gap-3">
+        <span class="text-f11 font-semibold uppercase tracking-cs1">Pick a {{ picker.kind }}</span>
+        <!-- Catalog vs your own drawer. Owned counts the SPARES, not the
+             total: the question this shelf answers is "have I got one going
+             spare", and a badge counting ones already stuck to a gun would
+             answer a different one. -->
+        <div class="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5">
+          <button
+            v-for="src in (['all', 'owned'] as const)"
+            :key="src"
+            class="flex items-center gap-1.5 rounded px-2.5 py-1 text-f10 uppercase tracking-cs1 transition-colors"
+            :class="pickerSource === src ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'"
+            :title="src === 'all' ? 'Browse every ' + picker.kind + ' in the game' : 'Only ' + picker.kind + 's you own'"
+            @click="pickerSource = src"
+          >
+            {{ src === 'all' ? 'Catalog' : 'Owned' }}
+            <span
+              v-if="src === 'owned' && pickerOwned.length"
+              class="rounded bg-background/70 px-1 font-mono text-f8"
+            >{{ pickerOwned.filter((r) => !r.attachedName).length }}</span>
+          </button>
+        </div>
+        <div class="ml-auto flex flex-none items-center gap-2 text-muted-foreground" title="Card size">
+          <LayoutGrid class="h-3.5 w-3.5" />
+          <input v-model.number="attachCardSize" type="range" min="72" max="200" step="4" class="w-24 accent-[#e0a24a]" />
+        </div>
+        <div class="relative w-[240px]">
+          <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <input
+            v-model="pickerQuery"
+            placeholder="Search…"
+            class="w-full rounded-md border border-border bg-background py-2 pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
+            autofocus
+          />
+          <button
+            v-if="pickerQuery"
+            class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+            title="Clear search"
+            @click="pickerQuery = ''"
+          ><X class="h-3.5 w-3.5" /></button>
+        </div>
+        <!-- Says where it goes. A bare ✕ in the same corner as the craft
+             modal's own ✕ reads as "close everything", which is the one thing
+             it must not do — the edit underneath is unsaved. -->
+        <button
+          class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+          title="Back to the editor — nothing is applied"
+          @click="picker = null"
+        >
+          <X class="h-3.5 w-3.5" /> Back
+        </button>
+      </div>
+
+      <!-- Facets. THE shared bar — same component the armory uses, so a rarity
+           dropdown behaves identically wherever you meet it.
+           The cascade and the no-op guard stay here in setPickerFacet: they are
+           this catalog's rules (a collection only exists within a group), not
+           the bar's, and the bar only reports what was clicked.
+           Catalog only: every facet is a slice of the CATALOG query, and the
+           owned shelf is a local list of a few dozen rows that ignores all of
+           them. Leaving them up would offer controls that silently do nothing. -->
+      <CatalogFilters
+        v-if="pickerSource === 'all'"
+        class="mb-3"
+        :tabs="pickerTabs.map((t) => ({ value: t.value, label: t.label ?? t.value, count: t.count }))"
+        :tab="pickerGroup"
+        :axes="pickerAxes"
+        :axis-values="{ collection: pickerCollection, rarity: pickerRarity }"
+        :sorts="ATTACH_SORTS"
+        :sort="pickerSort"
+        :dir="pickerDir"
+        :sort-kind="pickerSortKind"
+        :dir-hint="pickerSortHint"
+        :default-tab="pickerDefaultGroup"
+        :compact="isCompact"
+        @update:tab="setPickerFacet('group', $event)"
+        @update:axis="(k, v) => setPickerFacet(k as 'collection' | 'rarity', v)"
+        @update:sort="setPickerSort"
+        @update:dir="setPickerDir"
+        @clear="clearPickerFacets"
+      />
+
+      <!-- The results are NOT unmounted while the next set loads. They used to
+           be — `v-if="pickerLoading"` swapped the whole grid for a centred
+           "Searching…" — so every keystroke collapsed the grid to one line,
+           jumped the scroll height and popped it back. Now the outgoing set
+           dims in place and the incoming one waves in over it, which is the
+           same treatment the inventory grid gives a filter change. -->
+      <div
+        ref="pickerScrollEl"
+        data-scroller
+        class="flex-1 content-start gap-2 overflow-y-auto transition-opacity duration-200 ease-out"
+        :class="pickerLoading ? 'opacity-45' : 'opacity-100'"
+        :style="attachGridStyle"
+      >
+        <!-- Rarity is read the same way as on a weapon card: the tier's colour
+             as a bottom rule plus a soft glow behind the art. Without it the
+             grid is a wall of identical grey boxes and the one attribute that
+             sorts them is invisible. -->
+        <!-- animate-cell-in is the loadout grid's stagger, reused — but ONLY
+             for the first page. cs2CellIn is `both`-filled with a delay, so an
+             appended tile holds opacity 0 for up to 420ms while the grid has
+             ALREADY grown to fit it: you scroll, the layout jumps down, and
+             the stickers fade in afterwards. That is the infinite-scroll jank.
+             Pages after the first appear immediately; there is nothing to
+             announce, they were prefetched below the fold on purpose.
+             Honours prefers-reduced-motion via the global animate-* rule. -->
+        <button
+          v-for="(it, i) in pickerRows"
+          :key="it.key"
+          class="cv-tile group relative flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
+          :class="i < PICKER_PAGE ? 'animate-cell-in' : ''"
+          :style="{ ...(it.rarity ? { borderBottom: `3px solid ${it.rarity}` } : {}), '--i': i, '--cis': attachCardSize + 12 + 'px' }"
+          :title="it.attachedName ? it.name + ' — applied to ' + it.attachedName : it.name"
+          @click="pickAttachment(it)"
+        >
+          <span class="pointer-events-none absolute inset-0" :style="glowStyle(it.rarity, 0.22)"></span>
+          <!-- Already on something. Not disabled: picking it is legal and
+               means "move it here", which the save confirms before doing —
+               so this marks the cost rather than blocking the choice. -->
+          <span
+            v-if="it.attachedName"
+            class="pointer-events-none absolute left-1 top-1 z-[3] flex items-center rounded bg-background/90 p-0.5 text-[color:var(--acc)]"
+          ><Link2 class="h-3 w-3" /></span>
+          <!-- Inspect before committing. A `button` inside the tile's button
+               is invalid HTML, so this is a span with a click that stops
+               propagation — otherwise picking is the only thing a tile can
+               do, and choosing a holo sticker from a flat icon is a guess. -->
+          <span
+            role="button"
+            tabindex="0"
+            class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-[color:var(--acc)] group-hover:flex"
+            :title="`View ${it.name} in 3D`"
+            @click.stop="openPreview3d(it, picker?.kind ?? 'sticker')"
+            @keydown.enter.stop.prevent="openPreview3d(it, picker?.kind ?? 'sticker')"
+          ><Box class="h-3.5 w-3.5" /></span>
+          <div :class="CARD_ART" class="relative z-[2]">
+            <!-- decoding="async" keeps the decode off the main thread. With
+                 `lazy`, a fast scroll brings dozens of images into view at
+                 once and the default synchronous decode lands all of them in
+                 the scroll frames — the "logos rendering in" stutter. -->
+            <img :src="it.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
+          </div>
+          <span class="relative z-[2] w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm|Sticker Slab) \| /, '') }}</span>
+        </button>
+        <div v-if="!pickerLoading && !pickerRows.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
+          <template v-if="pickerSource === 'owned' && !pickerQuery">
+            You don't own any {{ picker.kind }}s yet — pick one from the catalog and it's
+            yours once you save.
+          </template>
+          <template v-else>No results — try a different search.</template>
+        </div>
+        <!-- Scrolling to the bottom pulls the next page. `done` also carries
+             the first-page spinner: without it the sentinel is on screen
+             under an empty grid and would fire a second, duplicate page.
+             A deeper rootMargin than the 500px default: one page is 120 tiles,
+             which at any card size is several screens, so firing further ahead
+             costs one request that was coming anyway and buys the page landing
+             before you reach the end — the difference between infinite scroll
+             and scroll-then-wait. -->
+        <!-- Catalog only. The owned shelf is already whole — it came out of
+             memory, not a paged endpoint. -->
+        <InfiniteSentinel
+          v-if="pickerSource === 'all'"
+          :count="pickerResults.length"
+          :done="pickerDone || pickerLoading"
+          root-margin="1200px"
+          @hit="pickerMore"
+        />
+      </div>
+      <!-- OUTSIDE the scroller, and a fixed height that is always present.
+           This row used to be the last cell of the grid, so it was pushed down
+           by every appended page and its own content swaps ("Loading more…"
+           has a spinner, "1200 of 10565" does not) resized it mid-scroll. A
+           loading state must not be able to move anything: as a sibling of the
+           scroll area it is outside the grid's layout entirely, it reserves
+           its space whether or not there is anything to say, and the status
+           text now stays visible instead of scrolling away. -->
+      <div class="flex h-11 flex-none items-center justify-center gap-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
+        <template v-if="pickerLoading"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Searching…</template>
+        <template v-else-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
+        <!-- Nothing to say on an empty result set; `h-11` holds the space
+             regardless, so the grid above never resizes either way. -->
+        <template v-else-if="!pickerRows.length"></template>
+        <!-- Owned counts spares against the total, because "3 of 11 spare"
+             is the number you are actually shopping against. -->
+        <template v-else-if="pickerSource === 'owned'">
+          {{ pickerOwned.filter((r) => !r.attachedName).length }} spare of {{ pickerOwned.length }} owned
+        </template>
+        <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
+        <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
+      </div>
+    </div>
+    </Transition>
+
+    <!-- Attachment preview — a SIBLING of the picker's Transition, not a
+         child of it: <Transition> takes exactly one child, and nesting this
+         inside it silently stopped the picker from opening at all.
+         z-1400 puts it above the picker (z-1300) it is opened from.
+         Deliberately a small panel rather than a full stage — the picker
+         keeps its scroll position and its search, so this is a look, not a
+         detour. -->
+    <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
+      <div
+        v-if="preview3d"
+        class="fixed inset-0 grid place-items-center bg-background/80 p-4 backdrop-blur-sm" :style="{ zIndex: Z.previewStage }"
+        role="dialog" aria-modal="true" aria-label="Attachment preview"
+        @click.self="closePreview3d()"
+      >
+        <div class="flex w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
+          <div class="flex items-center gap-2 border-b border-border px-3 py-2">
+            <span class="min-w-0 flex-1 truncate text-f11 uppercase tracking-cs1">{{ preview3d.name }}</span>
+            <button
+              class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
+              title="Close"
+              @click="closePreview3d()"
+            >
+              <X class="h-4 w-4" />
+            </button>
+          </div>
+          <!-- Square: a sticker is square, a charm is portrait, and a fixed
+               aspect keeps the panel from resizing as you flick between them. -->
+          <div class="relative aspect-square w-full bg-background">
+            <div ref="preview3dEl" class="absolute inset-0" />
+            <div v-if="preview3dViewer.busy.value" class="pointer-events-none absolute inset-0 grid place-items-center">
+              <Loader2 class="h-5 w-5 animate-spin text-muted-foreground" />
+            </div>
+          </div>
+          <!-- Wear (sticker) / Pattern (charm), on the panel where you are
+               already looking at the thing they change. Opened from a slot
+               while editing, these write STRAIGHT THROUGH to that slot —
+               the same value the options column shows, so the gun behind
+               this panel retextures as you drag and Save keeps it.
+               From the picker, or in view mode, there is nothing to write
+               to and they drive a scratch instead. Worth having anyway:
+               "what does this look like scratched" is the question you
+               opened the panel to answer, and answering it before you
+               commit is the whole point. The chip is what says which mode
+               you're in — an unlabelled slider that silently discards its
+               value is the worse half of an either/or. -->
+          <!-- The whole strip goes when there is nothing to set: an inert
+               charm leaves the rail rendering nothing, and a bordered band of
+               empty space is a worse answer than no band. -->
+          <div
+            v-if="preview3dHasWear || (preview3dHasSeed && !previewCharmInert)"
+            class="flex gap-2 border-t border-border px-3 py-2"
+            :class="preview3dHasWear ? 'items-center' : 'items-start'"
+          >
+            <template v-if="preview3dHasWear">
+              <span class="w-9 flex-none font-mono text-f8 uppercase tracking-cs1 text-muted-foreground">Wear</span>
+              <input
+                :value="preview3dWear"
+                type="range" min="0" max="1" step="0.01"
+                class="wear-range min-w-0 flex-1"
+                :title="preview3dWearBound ? preview3d!.name + ' scratch wear' : preview3d!.name + ' scratch wear (preview only — not saved)'"
+                @input="preview3dWear = ($event.target as HTMLInputElement).valueAsNumber"
+              />
+              <span class="w-8 flex-none text-right font-mono text-f9 text-muted-foreground">{{ preview3dWear.toFixed(2) }}</span>
+            </template>
+            <!-- The rail belongs here more than anywhere: this panel is the
+                 charm on its own, big, with nothing else to look at while you
+                 drag. It carries its own label and readout, so the row's
+                 Pattern caption and number field would both be duplicates. -->
+            <PatternRail
+              v-else
+              class="min-w-0 flex-1"
+              :model-value="preview3dSeed"
+              :image="preview3d?.image ?? null"
+              :albedo="previewAlbedo"
+              @update:model-value="preview3dSeed = $event"
+              @update:inert="previewCharmInert = $event"
+            />
+          </div>
+          <div
+            v-if="(preview3dHasWear && !preview3dWearBound) || (preview3dHasSeed && !preview3dSeedBound)"
+            class="border-t border-border px-3 py-1.5 text-center text-f8 uppercase tracking-cs1 text-muted-foreground/60"
+          >Preview only — not saved</div>
+        </div>
+      </div>
+    </Transition>
+
     <!-- Destructive-action confirm. Above every other overlay (modals 998,
          context menus 999, share popovers 1001) because it can be raised from
          any of them and must never open behind the thing that triggered it. -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
       <div
         v-if="confirmAsk"
-        class="fixed inset-0 z-[1010] grid place-items-center bg-background/80 p-4"
+        class="fixed inset-0 grid place-items-center bg-background/80 p-4 backdrop-blur-sm" :style="{ zIndex: Z.confirm }"
+        role="alertdialog" aria-modal="true"
         @click.self="confirmAsk = null"
       >
         <div class="w-[min(92vw,420px)] animate-pop-in overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
           <div class="flex items-start gap-3 p-5">
-            <span class="mt-0.5 grid h-9 w-9 flex-none place-items-center rounded-md border border-[#e04a3a]/40 bg-[#e04a3a]/10">
-              <Trash2 class="h-4 w-4 text-[#ff7a6a]" />
+            <span
+              class="mt-0.5 grid h-9 w-9 flex-none place-items-center rounded-md border"
+              :class="confirmAsk.tone === 'neutral' ? 'border-border bg-secondary/40' : 'border-[#e04a3a]/40 bg-[#e04a3a]/10'"
+            >
+              <Link2 v-if="confirmAsk.tone === 'neutral'" class="h-4 w-4 text-[color:var(--acc)]" />
+              <Trash2 v-else class="h-4 w-4 text-[#ff7a6a]" />
             </span>
             <div class="min-w-0">
               <div class="text-f13 font-semibold uppercase tracking-cs1">{{ confirmAsk.title }}</div>
@@ -9072,6 +9163,15 @@ if (MDEBUG) {
               Cancel
             </button>
             <button
+              v-if="confirmAsk.tone === 'neutral'"
+              class="flex items-center gap-1.5 rounded-md px-4 py-2 text-f11 font-bold uppercase tracking-wider text-black shadow-sm transition-[filter] hover:brightness-110"
+              style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16))"
+              @click="runConfirm"
+            >
+              <Link2 class="h-3.5 w-3.5" /> {{ confirmAsk.confirmLabel }}
+            </button>
+            <button
+              v-else
               class="flex items-center gap-1.5 rounded-md bg-[#e04a3a] px-4 py-2 text-f11 font-bold uppercase tracking-wider text-white shadow-sm transition-[filter] hover:brightness-110"
               @click="runConfirm"
             >
@@ -9083,42 +9183,12 @@ if (MDEBUG) {
     </Transition>
 
     <!-- Right-click context menu (owned items) -->
-    <Transition
-      :enter-active-class="isCompact ? 'animate-sheet-enter' : 'transition duration-150'"
-      :enter-from-class="isCompact ? '' : 'opacity-0'"
-      :leave-active-class="isCompact ? 'animate-sheet-leave' : 'transition duration-100'"
-      :leave-to-class="isCompact ? '' : 'opacity-0'"
-    >
-    <div
-      v-if="itemCtx"
-      class="fixed inset-0 z-[999]"
-      :class="isCompact && 'bg-background/60'"
-      @click="closeItemCtx"
-      @contextmenu.prevent="closeItemCtx"
-    >
-      <div
-        data-role="slot-menu"
-        data-sheet
-        :class="isCompact
-          ? 'absolute inset-x-0 bottom-0 max-h-[80%] overflow-y-auto overscroll-contain rounded-t-2xl border-t border-border bg-card shadow-2xl'
-          : 'absolute min-w-[214px] origin-top-left animate-menu-in overflow-hidden rounded-md border border-border bg-card py-1 shadow-2xl'"
-        :style="isCompact ? swipeStyle : { left: (itemCtx?.x ?? 0) + 'px', top: (itemCtx?.y ?? 0) + 'px' }"
-        @click.stop
-      >
-        <!-- Same whole-header grab area as the slot menu above. -->
-        <div v-if="isCompact" class="sticky top-0 z-[2] touch-none border-b border-border bg-card" v-on="itemMenuSwipe">
-          <div class="flex justify-center py-2"><span class="h-1 w-9 rounded-full bg-muted-foreground/30"></span></div>
-          <div class="truncate px-3 pb-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
-            <ItemName :item="itemCtx?.inst.item" />
-          </div>
-        </div>
-        <div v-else class="truncate border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
-          <ItemName :item="itemCtx?.inst.item" />
-        </div>
+    <ContextMenu :at="itemCtx" @close="closeItemCtx">
+      <template #title><ItemName :item="itemCtx?.inst.item" /></template>
         <!-- 3D leads. It is the only row that always applies — every equip
              below it can be already-done and greyed out, and looking at the
              thing is what you came for anyway. -->
-        <button class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxView3d">
+        <button :class="MENU_ROW" @click="itemCtxView3d">
           <Box class="h-3.5 w-3.5" /> View in 3D
         </button>
         <!-- Equip rows go DISABLED, not hidden, once the item is already on
@@ -9127,7 +9197,7 @@ if (MDEBUG) {
              the row would otherwise raise. -->
         <template v-if="itemCtxTeams === 'shared'">
           <button
-            class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+            :class="[MENU_ROW, 'border-t border-border', 'disabled:opacity-40 disabled:hover:bg-transparent']"
             :disabled="itemCtxSharedEquipped"
             @click="ctxEquipTeams(['CT', 'T'])"
           >
@@ -9138,8 +9208,7 @@ if (MDEBUG) {
           <button
             v-for="(t, ti) in itemCtxTeams"
             :key="t"
-            class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
-            :class="ti === 0 && 'border-t border-border'"
+            :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent', ti === 0 && 'border-t border-border']"
             :disabled="itemCtxEquippedOn.has(t)"
             @click="ctxEquipTeams([t])"
           >
@@ -9149,7 +9218,7 @@ if (MDEBUG) {
                one-tap way to finish the pair. -->
           <button
             v-if="itemCtxTeams.length === 2"
-            class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted disabled:opacity-40 disabled:hover:bg-transparent"
+            :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent']"
             :disabled="itemCtxSharedEquipped"
             @click="ctxEquipTeams(['CT', 'T'])"
           >
@@ -9158,30 +9227,28 @@ if (MDEBUG) {
         </template>
         <button
           v-if="itemCtx && !['agent', 'graffiti', 'musickit'].includes(itemCtx.inst.slot ?? '')"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          :class="MENU_ROW"
           @click="itemCtxStatTrak"
         >
           <Sparkles class="h-3.5 w-3.5" /> {{ itemCtx.inst.stattrak ? 'Remove' : 'Add' }} StatTrak™
         </button>
         <button
           v-if="isCustomizable(itemCtx?.inst.item)"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted"
+          :class="MENU_ROW"
           @click="itemCtxEdit"
         >
           <Pencil class="h-3.5 w-3.5" /> Edit…
         </button>
-        <button v-if="!isCoarse && canInspect(itemCtx?.inst.item)" class="flex w-full items-center gap-2 px-3 py-2 text-left text-f13 transition-colors hover:bg-muted" @click="itemCtxInspect">
+        <button v-if="!isCoarse && canInspect(itemCtx?.inst.item)" :class="MENU_ROW" @click="itemCtxInspect">
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button
-          class="flex w-full items-center gap-2 border-t border-border px-3 py-2 text-left text-f13 text-muted-foreground transition-colors hover:bg-muted hover:text-[#ff7a6a]"
+          :class="[MENU_ROW, 'border-t border-border text-muted-foreground hover:!text-[#ff7a6a]']"
           @click="itemCtxDelete"
         >
           <Trash2 class="h-3.5 w-3.5" /> Delete from inventory
         </button>
-      </div>
-    </div>
-    </Transition>
+    </ContextMenu>
   </div>
   </div>
   </div>

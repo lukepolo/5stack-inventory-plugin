@@ -39,6 +39,56 @@
     box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
     cursor: pointer;
   }
+
+  /* Pattern slider: the same pin-style thumb, a deliberately NEUTRAL track.
+     It borrowed the wear track at first and that was a wrong statement, not
+     just a plain one — that ramp is CS2's wear scale, so green-to-red says
+     "factory new to battle scarred". A pattern is an INDEX: 1 is not better
+     than 1000, there is no bad end, and colouring it implied an ordering the
+     number does not have.
+     What replaces the ramp is a scale you can read your position on — hairlines
+     every tenth, a brighter one at the middle — because "where am I in the
+     range" is the only thing the track can honestly tell you. */
+  [data-cs2-inventory] .pattern-range {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 9999px;
+    outline: none;
+    /* Literal rather than a theme token: the panel owns `--secondary` and this
+       remote's CSS is injected separately, so a var that fails to resolve here
+       would silently render the track invisible. Same reason WearBar's shadows
+       are literal rgba. */
+    background:
+      repeating-linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.2) 0 1px,
+        transparent 1px 10%
+      ),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02)),
+      rgba(0, 0, 0, 0.42);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+      inset 0 1px 2px rgba(0, 0, 0, 0.55);
+  }
+  [data-cs2-inventory] .pattern-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 16px;
+    width: 6px;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
+    cursor: ew-resize;
+  }
+  [data-cs2-inventory] .pattern-range::-moz-range-thumb {
+    height: 16px;
+    width: 6px;
+    border: none;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
+    cursor: ew-resize;
+  }
 }
 
 
@@ -278,17 +328,21 @@
       contain-intrinsic-size: auto 132px auto 132px;
     }
   }
-  /* The slot menu becomes a thumb-reachable sheet — 8 rows of `py-2` (32px)
+  /* A context menu becomes a thumb-reachable sheet — 8 rows of `py-2` (32px)
      is a comfortable pointer target and a frustrating finger one. Done here
-     rather than per-button so the desktop menu markup stays untouched. */
-  [data-cs2-inventory] [data-role="slot-menu"] button {
+     rather than per-button so the desktop menu markup stays untouched.
+
+     `menu-sheet`, not `slot-menu`: the slot menu and the item menu BOTH used to
+     carry `data-role="slot-menu"`, so the item menu was picking up this padding
+     and the inset below purely by accident. One shared role now says so. */
+  [data-cs2-inventory] [data-role="menu-sheet"] button {
     padding-top: 0.7rem;
     padding-bottom: 0.7rem;
   }
   /* Clear the home indicator / gesture bar. Written as plain CSS rather than
      a `pb-[env(...)]` utility because arbitrary bracket values get mangled in
      this remote's injected CSS — same reason as the fontSize/tracking tokens. */
-  [data-cs2-inventory] [data-role="slot-menu"] {
+  [data-cs2-inventory] [data-role="menu-sheet"] {
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   /* The compact header is a nowrap scroller, so its groups must keep their
@@ -315,14 +369,14 @@
 [data-cs2-inventory] .animate-sheet-enter {
   animation: cs2FadeIn 200ms ease-out both;
 }
-[data-cs2-inventory] .animate-sheet-enter > [data-role="slot-menu"],
+[data-cs2-inventory] .animate-sheet-enter > [data-role="menu-sheet"],
 [data-cs2-inventory] .animate-sheet-enter > [data-role="filter-sheet"] {
   animation: cs2SheetUp 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 [data-cs2-inventory] .animate-sheet-leave {
   animation: cs2FadeOut 180ms ease-in both;
 }
-[data-cs2-inventory] .animate-sheet-leave > [data-role="slot-menu"],
+[data-cs2-inventory] .animate-sheet-leave > [data-role="menu-sheet"],
 [data-cs2-inventory] .animate-sheet-leave > [data-role="filter-sheet"] {
   animation: cs2SheetDown 180ms cubic-bezier(0.4, 0, 1, 1) both;
 }
@@ -330,9 +384,9 @@
    the panels don't carry — they're selected as descendants. Neutralise them
    explicitly so the sheets still appear, just without the travel. */
 @media (prefers-reduced-motion: reduce) {
-  [data-cs2-inventory] .animate-sheet-enter > [data-role="slot-menu"],
+  [data-cs2-inventory] .animate-sheet-enter > [data-role="menu-sheet"],
   [data-cs2-inventory] .animate-sheet-enter > [data-role="filter-sheet"],
-  [data-cs2-inventory] .animate-sheet-leave > [data-role="slot-menu"],
+  [data-cs2-inventory] .animate-sheet-leave > [data-role="menu-sheet"],
   [data-cs2-inventory] .animate-sheet-leave > [data-role="filter-sheet"] {
     animation-duration: 1ms !important;
   }

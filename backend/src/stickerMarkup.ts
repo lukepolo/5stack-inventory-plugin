@@ -219,6 +219,32 @@ export async function getCharmShading(): Promise<Record<string, CharmShading>> {
   }
 }
 
+const PATCH_FILE = path.join(MODELS_DIR, "patch-materials.json");
+let patchCache: { mtimeMs: number; map: Record<string, string> } | null = null;
+
+/**
+ * Kit index -> patch material path, or {} on a mount without the step.
+ *
+ * The one place a patch's material is knowable. cs2-lib gives a patch no
+ * `paintMaterial` — 0 of 112 — so this file, written from the econ schema's
+ * `patch_material`, is what lets stickerMaterialFor answer for a patch at all.
+ */
+export async function getPatchMaterials(): Promise<Record<string, string>> {
+  try {
+    const { mtimeMs } = await stat(PATCH_FILE);
+    if (patchCache && patchCache.mtimeMs === mtimeMs) return patchCache.map;
+    const doc = JSON.parse(await readFile(PATCH_FILE, "utf8")) as Record<string, unknown>;
+    const map: Record<string, string> = {};
+    for (const [index, raw] of Object.entries(doc)) {
+      if (typeof raw === "string" && raw.startsWith("/materials/")) map[index] = raw;
+    }
+    patchCache = { mtimeMs, map };
+    return map;
+  } catch {
+    return {};
+  }
+}
+
 /** Charm model map, or {} when the mount predates the charm-models step. */
 export async function getCharmModels(): Promise<Record<string, CharmModel>> {
   try {

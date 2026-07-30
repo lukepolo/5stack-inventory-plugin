@@ -21,6 +21,7 @@ import {
   Plus,
 } from "lucide-vue-next";
 import SkinTests from "./SkinTests.vue";
+import { FLAGS, activeFlags, devToolsEnabled, flagValue, flagsVersion, setDevToolsEnabled, setFlag } from "../devFlags";
 import {
   API_ORIGIN,
   fetchServerApiKey,
@@ -38,7 +39,7 @@ import {
   type CfgSyncResult,
   type DirStat,
   type ExtractStatus,
-} from "./api";
+} from "../api";
 
 const props = defineProps<{
   user?: { steam_id: string; name: string; role: string } | null;
@@ -76,6 +77,7 @@ const TABS = [
   { key: "assets", label: "Asset Cache" },
   { key: "models", label: "3D Models" },
   { key: "tests", label: "Skin Tests" },
+  { key: "dev", label: "Developer" },
 ] as const;
 const activeKey = computed(() => {
   const s = props.section ?? "";
@@ -248,6 +250,22 @@ const extractedGroups = computed(() => {
   ];
 });
 // ---- shared asset CDN (opt-in) ----------------------------------------------
+// Browser-local developer tooling switch — see devFlags.ts.
+const devTools = ref(devToolsEnabled());
+function toggleDevTools(on: boolean) {
+  setDevToolsEnabled(on);
+  devTools.value = on;
+  emit("notify", on ? "Developer cog shown in the header." : "Developer cog hidden.", "success");
+}
+const flagOn = (name: string) => {
+  void flagsVersion.value;
+  return flagValue(name);
+};
+const activeFlagCount = computed(() => {
+  void flagsVersion.value;
+  return activeFlags().length;
+});
+const toggleFlag = (name: string) => setFlag(name, !flagValue(name));
 const assetCdn = ref<AssetCdnStatus | null>(null);
 const assetCdnBusy = ref(false);
 async function refreshAssetCdn() {
@@ -1011,6 +1029,74 @@ const BTN_DANGER =
           :is-admin="isAdmin"
           @notify="(m: string, k: 'error' | 'success') => emit('notify', m, k)"
         />
+
+        <!-- Developer. Its own tab rather than a row buried in Asset Cache,
+             which is where it started and where nobody found it — a switch you
+             have to already know about is not a switch. -->
+        <section v-else-if="activeKey === 'dev'" :class="CARD">
+          <div class="space-y-6 p-6">
+            <div class="flex items-start gap-3">
+              <span :class="RULE" />
+              <div class="min-w-0 flex-1 space-y-0.5">
+                <h3 class="text-sm font-semibold uppercase tracking-wider text-foreground">Developer tools</h3>
+                <p class="text-sm text-muted-foreground">
+                  Switches that change how the 3D viewer renders. Browser-local — nothing here is a server setting, and
+                  nothing here affects anyone else.
+                </p>
+              </div>
+            </div>
+
+            <div class="rounded-md border border-border">
+              <div class="flex items-start justify-between gap-4 px-4 py-3">
+                <span class="min-w-0">
+                  <span class="block text-sm text-foreground">Show the developer cog</span>
+                  <span class="block text-xs text-muted-foreground">
+                    Adds a cog in the bottom-right that opens these switches in context, over the 3D viewer.
+                    <span class="font-mono">Ctrl/Cmd + Shift + D</span> toggles it too. Always on when the app is served
+                    from localhost.
+                  </span>
+                </span>
+                <button :class="BTN" @click="toggleDevTools(!devTools)">{{ devTools ? "Hide" : "Show" }}</button>
+              </div>
+            </div>
+
+            <!-- The flags themselves, here as well as in the cog panel. The cog
+                 is the better place to use them (it is next to the model you are
+                 looking at) but it is reachable only once this page has been
+                 found — so the page cannot be the only thing the cog unlocks. -->
+            <div class="space-y-2">
+              <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Viewer flags
+                <span v-if="activeFlagCount" class="ml-1 font-mono text-[hsl(var(--tac-amber))]">{{ activeFlagCount }} on</span>
+              </p>
+              <div class="divide-y divide-border rounded-md border border-border">
+                <button
+                  v-for="f in FLAGS"
+                  :key="f.name"
+                  class="flex w-full items-start justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-secondary/40"
+                  @click="toggleFlag(f.name)"
+                >
+                  <span class="min-w-0">
+                    <span class="block text-sm text-foreground">{{ f.label }}</span>
+                    <span class="block text-xs text-muted-foreground">{{ f.hint }}</span>
+                  </span>
+                  <span
+                    class="mt-1 h-4 w-7 flex-none rounded-full transition-colors"
+                    :class="flagOn(f.name) ? 'bg-[hsl(var(--tac-amber))]' : 'bg-muted'"
+                  >
+                    <span
+                      class="block h-3.5 w-3.5 translate-y-[1px] rounded-full bg-background transition-transform"
+                      :class="flagOn(f.name) ? 'translate-x-[13px]' : 'translate-x-[1px]'"
+                    ></span>
+                  </span>
+                </button>
+              </div>
+              <p class="text-xs text-muted-foreground">
+                Read when a model mounts — reopen the item, or reload, for a change to show.
+              </p>
+            </div>
+          </div>
+        </section>
 
         <!-- 3D Models -->
         <section v-else :class="CARD">

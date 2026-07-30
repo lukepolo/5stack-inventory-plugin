@@ -12,6 +12,14 @@ measurement that lied, a combo you decompiled — add it here and to the relevan
 memory. The catalogue at the bottom is the highest-value part of the document
 and it should keep growing.
 
+**Companion documents**, for subsystems with enough of their own detail to
+warrant one:
+
+- `GLOVES-GEN2.md` — `csgo_customglove.vfx`'s second parameter generation
+  (`g_tSubstrate` / `g_tSurface`, 22 finishes). Renders; colours still wrong.
+  Carries its own ruled-out table and the open leads, in priority order.
+- `CHARM-PHYSICS.md` — charm softbody / swing.
+
 ---
 
 ## The single most important rule

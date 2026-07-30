@@ -287,7 +287,14 @@ export async function applyStickerSfx(
          }
          if (uHasSfxMask) {
            vec4 sfxM = texture2D(uSfxMaskTex, vMapUv);
-           vec3 V = normalize(vViewPosition);
+           // The viewer is ORTHOGRAPHIC, so this branch is the live path — the
+           // same guard three.js puts on its own materials. Under a parallel
+           // projection the eye ray is the view axis, and normalize(vViewPosition)
+           // would make the holo band sweep with SCREEN POSITION rather than with
+           // the surface's angle. Correctly guarded, V is constant across the
+           // surface, so the band no longer sweeps as the weapon turns — that is
+           // the projection, not a regression.
+           vec3 V = isOrthographic ? vec3(0.0, 0.0, 1.0) : normalize(vViewPosition);
            if (uHasHolo && sfxM.x > 0.0) {
              // The spectrum is a rainbow RAMP and the mask's G/B are where this
              // texel sits in it. The view term SHIFTS along U, which is the

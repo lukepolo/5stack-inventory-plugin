@@ -15,8 +15,8 @@
 // rides under the icon instead and the glyphs swap mouse for fingertips.
 import { computed } from "vue";
 import Tooltip from "./Tooltip.vue";
-import { isCoarse } from "./responsive";
-import { CONTROL_ICON, CONTROL_ICON_VIEWBOX, type ControlIcon } from "./viewerControlIcons";
+import { isCoarse } from "../responsive";
+import { CONTROL_ICON, CONTROL_ICON_VIEWBOX, type ControlIcon } from "../viewerControlIcons";
 
 const props = withDefaults(
   defineProps<{

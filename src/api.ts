@@ -51,6 +51,15 @@ export interface Skin {
   type?: string;
   /** Game defindex. Absent = no inspect link is possible for this item. */
   def?: number;
+  /**
+   * AGENTS only: how many patches this agent's model can actually carry.
+   *
+   * 3 to 5, read from the model's own materials. The inventory schema stores
+   * five for every agent, but the POSITIONS belong to the model and most declare
+   * three. Null means the backend could not tell (model not on the mount), which
+   * must read as "do not restrict" rather than as zero.
+   */
+  patchSlots?: number | null;
   // ---- sheet facets. Only graffiti carries these today; the sheet's filter bar
   // is driven entirely by which of them appear on the list it loaded, so a
   // catalog without them renders exactly as it did before.
@@ -138,8 +147,11 @@ export interface LoadoutEntry {
 // An owned, crafted item instance in the user's inventory.
 // `w` is the sticker's own scratch wear (0 pristine .. 1 scratched off) — the
 // game's "sticker slot N wear" attribute, not the weapon's float wear.
-export type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null } | null;
-export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; r?: number | null; w?: number | null }) | null;
+// `inst` is the owned_items row this attachment IS. Present once it has been
+// saved; absent on a catalog pick, which is what tells the server to mint one.
+// It must survive the round trip — see the Attach type in App.vue.
+export type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null } | null;
+export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null }) | null;
 
 export interface InventoryItem {
   id: number;
@@ -153,11 +165,17 @@ export interface InventoryItem {
   nametag: string | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
-  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null }) | null;
+  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
   slot: string | null;
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];
   origin?: "crafted" | "steam" | "copied";
+  /** The owned item this one is currently attached to, if it's a sticker,
+   *  patch or charm sitting on a weapon. Null when it's loose in the
+   *  inventory. Derived server-side from what the weapons actually reference.
+   *  A string, like every other owned-item id on the wire — node-postgres
+   *  renders bigints as strings, so `id` is `"1014"` and this must match it. */
+  attached_to?: string | null;
 }
 
 // Item artwork lives on our own mount, served under /images by the plugin host

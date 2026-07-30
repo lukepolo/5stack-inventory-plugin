@@ -5,8 +5,8 @@
 // the same way, so they get the identical mark rather than a lookalike.
 import { RefreshCw } from "lucide-vue-next";
 import TeamDots from "./TeamDots.vue";
-import type { InventoryItem, Team } from "./api";
-import { STEAM_BLUE } from "./itemVisuals";
+import type { InventoryItem, Team } from "../api";
+import { STEAM_BLUE } from "../itemVisuals";
 
 // `compact` is for the 70px extras tiles, where the full-size cluster would
 // crowd the art — same marks, tighter.

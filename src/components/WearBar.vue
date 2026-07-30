@@ -9,7 +9,7 @@
 // context, and the float's own position gets the light — a lit zone in its tier
 // colour plus a white needle. The eye lands on the value, not the rainbow.
 import { computed } from "vue";
-import { hasSeed, hasWear, WEAR_BOUNDS, WEAR_GRADIENT, wearColor, wearTier } from "./itemVisuals";
+import { hasSeed, hasWear, WEAR_BOUNDS, WEAR_GRADIENT, wearColor, wearTier } from "../itemVisuals";
 
 const props = withDefaults(
   defineProps<{

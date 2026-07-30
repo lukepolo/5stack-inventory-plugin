@@ -10,7 +10,7 @@
 // for the CURRENT direction — "ascending" means nothing to someone looking for a
 // clean float, "Lowest float first" is the thing they're actually after.
 import { computed } from "vue";
-import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
+import { SORT_DIR_ICON, type SortDir, type SortKind } from "../sortIcons";
 
 const props = withDefaults(defineProps<{ modelValue: SortDir; kind?: SortKind; hint?: string }>(), {
   kind: "amount",

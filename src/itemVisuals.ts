@@ -146,15 +146,66 @@ export const hasWear = (item?: { type?: string | null } | null) => !!item?.type 
 export const hasSeed = (item?: { type?: string | null } | null) => !!item?.type && TYPES_SEED.has(item.type);
 
 /**
+ * Scratch wear — how scuffed a sticker is, 0 pristine .. 1 nearly gone.
+ *
+ * ITS OWN GATE, deliberately not folded into TYPES_WEAR. The two are different
+ * numbers that happen to share a range: a float is the weapon's condition and
+ * drives the wear BAR and the tier name, and putting a sticker in TYPES_WEAR
+ * would start captioning it "Factory New" and drawing it a float bar — which is
+ * the exact misreading the comment above says the split exists to prevent.
+ *
+ * A patch is excluded because patches don't scratch: nothing in the craft form,
+ * the equipped feed or the inspect link carries a wear for one.
+ */
+const TYPES_SCRATCH = new Set(["sticker"]);
+export const hasScratch = (item?: { type?: string | null } | null) =>
+  !!item?.type && TYPES_SCRATCH.has(item.type);
+
+/**
+ * Rarity, named and ranked. cs2-lib gives a hex colour and nothing else.
+ *
+ * Here rather than in a view because three screens need it now — the inventory
+ * rail's facets, the sheet's, and the armory's hero — and a second copy of this
+ * table is a second place for "#eb4b4b" to stop meaning Covert.
+ *
+ * `rank` is the game's own order, least to greatest, which is what the facet
+ * lists sort by.
+ */
+export const RARITY_META: Record<string, { name: string; rank: number }> = {
+  "#b0c3d9": { name: "Consumer", rank: 1 },
+  "#5e98d9": { name: "Industrial", rank: 2 },
+  "#4b69ff": { name: "Mil-Spec", rank: 3 },
+  "#8847ff": { name: "Restricted", rank: 4 },
+  "#d32ce6": { name: "Classified", rank: 5 },
+  "#eb4b4b": { name: "Covert", rank: 6 },
+  "#e4ae39": { name: "★ Rare", rank: 7 },
+  "#ffd700": { name: "★ Rare", rank: 7 },
+  "#ffae39": { name: "★ Rare", rank: 7 },
+};
+export function rarityName(hex?: string | null) {
+  return (hex && RARITY_META[hex.toLowerCase()]?.name) || "Special";
+}
+// Ternary, not `hex && …`: an empty-string rarity makes that expression `""`,
+// and `??` only catches null/undefined — so the fallback was skipped and a rank
+// of "" flowed into the sort comparators.
+export const rarityRank = (hex?: string | null) =>
+  (hex ? RARITY_META[hex.toLowerCase()]?.rank : undefined) ?? 8;
+
+/**
  * Is there anything on this item you could change?
  *
  * The union of every editable attribute's types: float and pattern (weapon,
  * melee, glove, and the charm's own pattern), StatTrak (+ music kits), name tag,
- * and attachment slots (weapon: stickers + charm; agent: patches). A graffiti
- * has none of them — its Edit button opened a form with nothing in it, so the
- * only verb it has is equip. Same for stickers, patches and pins.
+ * attachment slots (weapon: stickers + charm; agent: patches), and a sticker's
+ * scratch wear. A graffiti has none of them — its Edit button opened a form with
+ * nothing in it, so the only verb it has is equip. Same for patches and pins.
+ *
+ * A sticker earns its place through hasScratch alone: everything else on the
+ * form is gated off for it, so the editor it opens is one slider. That is the
+ * point — a sticker you own is a thing you can scuff, and until it was here the
+ * only way to scratch one was to put it on a gun first.
  */
-const TYPES_EDITABLE = new Set(["weapon", "melee", "glove", "musickit", "agent", "keychain"]);
+const TYPES_EDITABLE = new Set(["weapon", "melee", "glove", "musickit", "agent", "keychain", "sticker"]);
 export const isCustomizable = (item?: { type?: string | null } | null) =>
   !!item?.type && TYPES_EDITABLE.has(item.type);
 

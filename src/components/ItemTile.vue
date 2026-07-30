@@ -8,10 +8,10 @@
 // Steam-synced items are read-only server-side, so they get a Duplicate action
 // where crafted items get Edit — never both.
 import { computed, inject } from "vue";
-import { Check, Clock, Loader2, RefreshCw } from "lucide-vue-next";
-import type { InventoryItem } from "./api";
+import { Check, Clock, Link2, Loader2, RefreshCw } from "lucide-vue-next";
+import type { InventoryItem } from "../api";
 import ItemArt from "./ItemArt.vue";
-import { ART_FADE_B, attachmentsOf, CARD_ART, glowStyle, isAgentArt, isReadOnly, STEAM_BLUE, weaponName } from "./itemVisuals";
+import { ART_FADE_B, attachmentsOf, CARD_ART, glowStyle, isAgentArt, isReadOnly, STEAM_BLUE, weaponName } from "../itemVisuals";
 import TeamDots from "./TeamDots.vue";
 import ItemName from "./ItemName.vue";
 import TileActions from "./TileActions.vue";
@@ -33,6 +33,15 @@ const props = withDefaults(
     title?: string;
     /** Sheet columns are narrow and already say "AK-47" in the header. */
     stripWeaponName?: boolean;
+    /**
+     * The item this one is currently applied to ("AK-47 | Redline"), for a
+     * sticker, patch or charm sitting on a weapon.
+     *
+     * Resolved by the caller rather than looked up here: the tile is handed one
+     * instance and knows nothing about the rest of the inventory, and `inst`
+     * carries only the id (`attached_to`). Passing the NAME keeps it that way.
+     */
+    attachedName?: string | null;
     /** Model name + equipped-team dots. Off in the sheet (one weapon there). */
     showHeader?: boolean;
     /** Hide per-item actions (bulk-select mode, read-only viewer). */
@@ -205,6 +214,11 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       </div>
       <span class="relative z-[2] flex flex-none items-center gap-1.5">
         <TeamDots :teams="equippedTeams" />
+        <Link2
+          v-if="attachedName"
+          class="h-3 w-3 flex-none text-[color:var(--acc)]"
+          :title="'Applied to ' + attachedName"
+        />
         <RefreshCw
           v-if="readOnly"
           class="h-3 w-3 flex-none"
@@ -222,6 +236,15 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ weaponName(inst.item) || inst.slot }}</span>
       <span class="flex flex-none items-center gap-1.5">
         <TeamDots :teams="equippedTeams" />
+        <!-- Applied to something. A sticker can only be on one weapon at a
+             time, so this is the difference between "I own this" and "this is
+             already spoken for" — without it, a drawer of owned stickers gives
+             no clue which are spare. -->
+        <Link2
+          v-if="attachedName"
+          class="h-3 w-3 flex-none text-[color:var(--acc)]"
+          :title="'Applied to ' + attachedName"
+        />
         <RefreshCw
           v-if="readOnly"
           class="h-3 w-3 flex-none"
@@ -234,6 +257,11 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
          would have put it — top right, under the hover actions. -->
     <span v-if="!showHeader" class="absolute right-2 top-2 z-[2] flex items-center gap-1.5">
       <TeamDots :teams="equippedTeams" />
+      <Link2
+        v-if="attachedName"
+        class="h-3 w-3 text-[color:var(--acc)]"
+        :title="'Applied to ' + attachedName"
+      />
       <RefreshCw
         v-if="readOnly"
         class="h-3 w-3"

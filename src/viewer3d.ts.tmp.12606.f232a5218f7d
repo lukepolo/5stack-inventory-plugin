@@ -15,7 +15,6 @@
 // Skin rendering is a faithful port of CS2's compositing pipeline — see
 // paintComposite.ts for the shader and its provenance.
 import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
-import { FLAGS, flagValue, setFlag } from "./devFlags";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, tuneCharmShading } from "./charmMaterial";
 import {
@@ -493,18 +492,16 @@ async function loadGltf(model: string, variant: GltfVariant) {
  */
 function debugFlag(name: string, dflt = false): boolean {
   try {
-    // `?name=1` still writes the switch, so debug URLs shared before the HUD
-    // existed keep working — the HUD and the query string are two doors onto the
-    // same localStorage key. The registry in devFlags.ts owns the DEFAULT, so a
-    // flag listed there does not need its default repeated at the call site.
+    const key = `viewer3d.${name}`;
     const q = new URLSearchParams(location.search).get(name);
-    if (q === "1" || q === "0") setFlag(name, q === "1");
+    if (q === "1") localStorage.setItem(key, "1");
+    if (q === "0") localStorage.setItem(key, "0");
+    const stored = localStorage.getItem(key);
+    return stored === null ? dflt : stored === "1";
   } catch {
-    /* no location/localStorage — fall through to the stored/default read */
+    return dflt;
   }
-  return FLAGS.some((f) => f.name === name) ? flagValue(name) : dflt;
 }
-
 
 /**
  * Sticker drag tracing — `?stickerlog=1`. Reports what a press actually hit (and
@@ -512,39 +509,6 @@ function debugFlag(name: string, dflt = false): boolean {
  * triggers. Costs nothing when off: every timing call is behind this flag.
  */
 const STICKER_LOG = debugFlag("stickerlog");
-
-/**
- * Agent patch footprints — `?patchboxes=1`.
- *
- * Paints every patch position the model declares as a flat colour (slot 1 red,
- * 2 green, 3 blue) instead of its art, whether or not anything is equipped in
- * it. A patch whose icon has an opaque background is indistinguishable from a
- * patch that is placed or sized wrong when you are looking at the art; this
- * separates them. Sticky in localStorage like every other flag here.
- */
-const PATCH_BOXES = debugFlag("patchboxes");
-
-/**
- * Whether a patch offset's V is flipped — `?patchflipv=1` to compare.
- *
- * OFF, because the shader says so: it places the patch at `0.5 + offset` in both
- * axes, in the same UV it samples g_tColor with, and taking it literally is the
- * default until something proves the export flips underneath us.
- *
- * It was briefly ON. The evidence for flipping was a rect drawn over
- * tm_professional_varf3's atlas — and that agent cannot discriminate, because
- * its atlas holds TWO mirrored epaulettes, so slot 0 lands on a shoulder strap
- * either way and slot 1 lands on the shirt either way. What settles it is an
- * agent whose slot has a known purpose: ctm_st6_variantg's slot 0 is the
- * built-in team stitch (`g_bEnablePatch0 = 1`), and with ?patchboxes=1 it sits
- * on the SHOULDER unflipped and on the HIP flipped. A hip is not where a team
- * stitch goes.
- *
- * Keep the toggle. This is the single most likely thing to be wrong about patch
- * placement, and one reload with ?patchboxes=1&patchflipv=1 rules it in or out
- * without re-deriving anything.
- */
-const PATCH_FLIP_V = debugFlag("patchflipv", false);
 
 /**
  * Stickers are cut out of the body in TEXCOORD_1 space (cutDecalInUv) rather
@@ -572,39 +536,6 @@ const UV_DECAL = debugFlag("uvdecal", true);
  * per-viewer HUD element isn't created until the very end of the build.
  */
 const PERF = debugFlag("perf");
-
-/**
- * THE VIEWER IS ORTHOGRAPHIC. Every mount, interactive and baked alike.
- *
- * It used to be a 35-degree perspective camera, which is wide for an inspect
- * view: a weapon's near end rendered about 1.5x its far end, and how much it did
- * changed as you orbited and zoomed — the swelling and shrinking through an
- * auto-rotate being the most visible of it. A parallel projection removes that
- * entirely, which is the look Luke picked after comparing all three side by side
- * (35 degrees, CS2's own 26, and this).
- *
- * Two consequences worth knowing before changing anything here:
- *  - The view vector is CONSTANT across the surface, so glitter, pearlescence
- *    and sticker holo no longer sweep as the weapon turns. That is inherent to
- *    a parallel projection, not a regression to chase — see the isOrthographic
- *    branches in paintSfx.ts and stickerShader.ts, which three.js requires and
- *    which are the difference between "flat" and "wrong".
- *  - Cards bake through this same path and are CACHED. A framing change here is
- *    invisible until the render cache is cleared.
- */
-
-/**
- * The constant that carries the old perspective tuning into the parallel frustum.
- *
- * Every framing magnitude in this file — the `camDir` lengths, the "fit"
- * margins, the zoom clamps — was measured through a 35-degree lens, where
- * apparent size came out as `distance * tan(fov/2)`. An orthographic camera has
- * no distance term at all, so those distances have to be converted into a
- * frustum HEIGHT exactly once. This is that conversion, and it is the only
- * thing left of the perspective camera. Retuning the framing means changing the
- * magnitudes, not this.
- */
-const FRAMING_TAN = Math.tan((35 * Math.PI) / 360);
 
 /**
  * Mount-phase stopwatch.
@@ -1011,58 +942,9 @@ function clipRotation(
  * 4.8in and 4.0in. The sideways step is about one gun thickness: enough that the
  * two read as stacked in depth instead of intersecting, without opening a gap.
  */
-/**
- * How far off vertical a rested arm hangs.
- *
- * A real person stands at roughly 10-12, and that is where this started — but an
- * agent is not just a figure to look at, it is a thing you put PATCHES on, and
- * at 12 the upper arms lie flat against the ribs and hide the side and lower
- * chest positions completely. The slots are the reason for the pose, so the pose
- * gives way: 26 clears the torso on both sides while still reading as someone
- * standing rather than a mannequin. Above ~35 it starts to look like a T-pose
- * again.
- *
- * See `?patchboxes=1` — that is the view this number is tuned against, because
- * it shows every position at once whether or not anything is equipped in it.
- */
-const ARM_REST_DEGREES = 26;
-
-/**
- * The "arms out" pose, for reading patch positions off the model.
- *
- * Deliberately past what a person stands like: at this angle nothing on the
- * torso, sides or sleeves is occluded, which is the whole job. It is a pose you
- * pick, never the default — see AgentPose.
- */
-const ARM_OPEN_DEGREES = 55;
-
-/**
- * Poses an agent can be shown in.
- *
- *   stand  arms at ARM_REST_DEGREES — the default, reads as a person standing
- *   open   arms at ARM_OPEN_DEGREES — nothing occluded, for placing patches
- *   ready  the model's own `tools_preview` clip, i.e. how CS2 poses it
- *
- * Only three because only three exist to offer: an agent GLB ships exactly two
- * clips and one of them is a face-rig test, so everything other than "ready" is
- * synthesised from the bind pose.
- */
-export type AgentPose = "stand" | "open" | "ready";
-
-/**
- * The pose an agent mounts in.
- *
- * `ready` — the model's own `tools_preview` clip — because that is how CS2
- * presents the agent and so what someone expects to see first. Note the framing
- * is measured AFTER this is applied, so changing it changes how agents are
- * framed; that is deliberate, and it is why the mount pose is a constant rather
- * than whatever the caller last selected.
- *
- * This was `stand` while the bind pose was the only usable one. What made
- * `tools_preview` unusable then was bakePose mangling the bounding box, not the
- * pose — with the bake gone, Box3 reflects the skinned result honestly.
- */
-const DEFAULT_AGENT_POSE: AgentPose = "ready";
+/** How far off vertical a rested arm hangs. Real people stand at roughly this;
+ *  0 reads as rigid and anything past ~20 still looks like a mannequin. */
+const ARM_REST_DEGREES = 12;
 const DUAL_OFFSET_INCHES = { forward: -4.8, left: -1.4, up: 4.0 };
 /** Bone-name suffixes that make a dual-wield rig: `weapon_r` / `weapon_l` and
  *  their per-part twins (slide_l/slide_r, magazine_l/magazine_r, ...). */
@@ -1511,17 +1393,6 @@ export const viewersIdle = () =>
 
 const COARSE_POINTER = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
 /**
- * Resolution a composite runs at DURING a wear/pattern drag.
- *
- * A scrub is answering "where does the artwork sit, and what colour is it" —
- * both survive a quarter of the texels intact. What does not survive is
- * waiting: the full cap is 2048², sixteen times these pixels, and 4096² on a
- * projected skin is sixty-four, which is long enough per frame that the slider
- * feels like it is fighting back. The real composite runs the moment the
- * pointer stops, so this is only ever what you see mid-gesture.
- */
-const PROXY_COMPOSITE_SIZE = 512;
-/**
  * How long a phone must stay viewer-free before bakes are allowed back.
  *
  * "Idle" used to mean the instant the last viewer released, which is true but
@@ -1563,32 +1434,6 @@ function releaseViewer() {
  * builds are in flight. The number that matters for "will this kill the
  * browser" — a leak shows as a count that climbs and never comes back down.
  */
-/**
- * Run something against the app's ONE WebGL context.
- *
- * Exported for the pattern scan, which composites a thousand times and must not
- * do it on a renderer of its own: the composite's input textures are ~38MB per
- * weapon and are cached as three Textures, so a second context would re-upload
- * every one of them and hold a duplicate for as long as it lived. Browsers cap
- * live contexts at around sixteen, too, and this app already spends them on
- * viewers.
- *
- * The callback gets the same renderer the viewers draw with, so it MUST leave
- * the render target unbound and must yield often enough that the rAF loops
- * still get frames.
- */
-export async function withSharedRenderer<T>(
-  fn: (three: ThreeBundle["THREE"], renderer: import("three").WebGLRenderer) => Promise<T>,
-): Promise<T> {
-  const { THREE, RoomEnvironment } = await loadThree();
-  const { renderer } = getSharedGL(THREE, RoomEnvironment);
-  try {
-    return await fn(THREE, renderer);
-  } finally {
-    renderer.setRenderTarget(null);
-  }
-}
-
 export const viewerStats = () => ({
   live: liveViewers,
   building: buildsInFlight,
@@ -1745,27 +1590,19 @@ export interface ViewerHandle {
    *
    * Covers the standalone mount, where the charm IS the model and so never goes
    * through setCharm. Wear needs no equivalent — a charm has none — and a
-   * weapon's pattern goes through setPaintVariant instead, because there the
-   * seed feeds the paint composite rather than a handful of uniforms.
+   * weapon's pattern deliberately still remounts, because there the seed feeds
+   * the paint composite rather than a handful of uniforms.
    */
   setCharmSeed: (seed: number) => void;
   /**
    * Re-paint at a new wear/pattern without rebuilding — what makes a live
-   * pattern slider possible on a weapon, and a live wear slider possible on a
-   * glove (whose own compositor has no pattern input, so a seed change there
-   * resolves true having done nothing).
+   * pattern slider possible on a weapon.
    *
    * Resolves false when this viewer has no paint to re-composite (an unpainted
    * model, or a build whose paint failed), so the caller can fall back to the
    * remount that used to be the only option.
    */
-  setPaintVariant: (wear: number, seed: number, proxy?: boolean) => Promise<boolean>;
-  /**
-   * Per-texel weights for the paint atlas — surface area × how much it faces
-   * the camera. What turns a measurement of the ATLAS into a measurement of
-   * the GUN; see the implementation. Null when this model has no paint UVs.
-   */
-  paintUvWeights: (size: number) => Float32Array | null;
+  setPaintVariant: (wear: number, seed: number) => Promise<boolean>;
   /**
    * The charm's authored albedo, downsampled — what the pattern grade operates
    * on, for anything that wants to predict a pattern's colour without rendering.
@@ -1808,15 +1645,6 @@ export interface ViewerHandle {
   setPatches: (images: (string | null)[]) => Promise<void>;
   /** How many patch positions this model actually has (3-5), 0 for non-agents. */
   patchSlots: () => number;
-  /**
-   * Re-pose an AGENT without remounting — see AgentPose.
-   *
-   * No-op on every other kind. Patches are a texture composite, so switching
-   * pose never touches them.
-   */
-  setAgentPose: (pose: AgentPose) => void;
-  /** The pose currently showing. */
-  agentPose: () => AgentPose;
   /**
    * Turn placement gestures on/off on a LIVE viewer — see ViewerOpts.interactive
    * for what they are. The craft modal shows one item in two modes (view and
@@ -2412,49 +2240,7 @@ async function buildViewer(
   // `attachments: false` means no poseXform or bone table is ever read. So the
   // skeleton is simply left posed and three skins it at draw time, which also
   // keeps the bounding box the honest bind-pose one.
-  //
-  // POSE IS SWITCHABLE, so the bind transforms are snapshotted first. Every pose
-  // is applied FROM the bind pose, not on top of whatever is showing: restArms
-  // rotates bones by a delta, so re-running it without restoring would swing the
-  // arms further each time, and the clip pose writes bones the arm rest never
-  // touches. Cheap — a few dozen bones — and it is what makes setAgentPose a
-  // toggle rather than a one-way trip.
-  const bindPose = pres.restArms
-    ? (() => {
-        const snap: { bone: import("three").Object3D; q: import("three").Quaternion; p: import("three").Vector3; s: import("three").Vector3 }[] = [];
-        object.traverse((n) => {
-          if ((n as unknown as { isBone?: boolean }).isBone) {
-            snap.push({ bone: n, q: n.quaternion.clone(), p: n.position.clone(), s: n.scale.clone() });
-          }
-        });
-        return snap;
-      })()
-    : null;
-  let agentPose: AgentPose = DEFAULT_AGENT_POSE;
-  const applyAgentPose = (pose: AgentPose) => {
-    if (!bindPose) return;
-    for (const b of bindPose) {
-      b.bone.quaternion.copy(b.q);
-      b.bone.position.copy(b.p);
-      b.bone.scale.copy(b.s);
-    }
-    if (pose === "ready") {
-      // The game's own model-viewer pose. Crouched and leaning, so it is a bad
-      // DEFAULT (see PRESENTATION.agent), but it is the only real animation an
-      // agent ships and it shows the model as CS2 poses it.
-      const clip = gltf.animations?.find((a) => /^tools_preview$/i.test(a.name));
-      if (clip) {
-        const mixer = new THREE.AnimationMixer(object);
-        mixer.clipAction(clip).play();
-        mixer.update(0);
-      }
-    } else {
-      restArms(THREE, object, pose === "open" ? ARM_OPEN_DEGREES : ARM_REST_DEGREES);
-    }
-    object.updateMatrixWorld(true);
-    agentPose = pose;
-  };
-  if (pres.restArms) applyAgentPose(DEFAULT_AGENT_POSE);
+  if (pres.restArms) restArms(THREE, object, ARM_REST_DEGREES);
   if (poseClip) {
     object.updateMatrixWorld(true);
     // Drop the props and the skeleton, keeping the bind pose. This also settles
@@ -2615,9 +2401,9 @@ async function buildViewer(
     patchDispose?.();
     patchDispose = null;
     const { readPatchSlots, applyAgentPatches } = await import("./agentPatches");
-    const slots = readPatchSlots(object, PATCH_FLIP_V);
+    const slots = readPatchSlots(object);
     patchSlotCount = slots.length;
-    if (!slots.length || (!images.some(Boolean) && !PATCH_BOXES)) return;
+    if (!slots.length || !images.some(Boolean)) return;
     const arts = await Promise.all(
       slots.map(async (_, i) => {
         const img = images[i];
@@ -2639,7 +2425,7 @@ async function buildViewer(
         return { art, backing };
       }),
     );
-    const applied = applyAgentPatches(THREE, renderer, object, slots, arts, PATCH_BOXES);
+    const applied = applyAgentPatches(THREE, renderer, object, slots, arts);
     patchDispose = applied.dispose;
     const wanted = images.filter(Boolean).length;
     if (applied.placed < wanted) {
@@ -2731,39 +2517,6 @@ async function buildViewer(
   }
   // Frees the glove composite's render targets on dispose — see below.
   let gloveRelease: (() => void) | null = null;
-  /**
-   * Only the three maps and the disposer are used here; the two generations'
-   * composites differ solely in the resolve targets they expose for the flat-map
-   * debug view. Declared out here so the re-composite path below can name it.
-   */
-  type GloveMaps = {
-    albedo: import("three").Texture;
-    rm: import("three").Texture;
-    normal: import("three").Texture;
-    dispose: () => void;
-  };
-  /**
-   * Everything a glove RE-composite needs — the weapon side's paintCtx, for the
-   * other compositor.
-   *
-   * A glove's wear is the same kind of knob a weapon's is: it feeds uniforms in
-   * a shader whose inputs are already decoded and resident (texCache), so a new
-   * float is seven fullscreen passes, not a new model. Without this the wear
-   * slider had no live setter at all, so every tick of a drag fell back to a
-   * full rebuild — a fresh GLB load, a fresh context and a fresh 2048² composite
-   * per pointer move, which is the slideshow the weapon path stopped having.
-   *
-   * The SEED is deliberately absent: csgo_customglove never reads it (see the
-   * patternMoves gate in App.vue), so a pattern change on a glove is a no-op
-   * rather than a repaint.
-   */
-  let gloveCtx: {
-    run: (wear: number, size?: number) => Promise<GloveMaps | null>;
-    /** The materials wearing the composite — the ones to re-point. */
-    mats: import("three").MeshStandardMaterial[];
-    /** What is on those materials right now, to be freed once replaced. */
-    current: GloveMaps;
-  } | null = null;
   // The glove compositor. Its own shader, its own passes — see gloveComposite.
   // Bound the same way the weapon composite is (map / roughnessMap+metalnessMap
   // / normalMap), so from here on a glove is ordinary PBR like everything else.
@@ -2787,27 +2540,23 @@ async function buildViewer(
       // g_tSubstrate/g_tSurface set. Each loader answers null for the other's
       // materials, so try both rather than deciding up front — the shader NAME
       // does not distinguish them (see gloveCompositeModern's header).
-      // WHICH compositor, kept as a closure rather than a branch taken once.
-      // The re-composite below has to run the same generation this mount
-      // resolved to, and re-deciding it per tick would re-fetch both defs and
-      // re-run the whole "try 73, fall back to 22" probe on every pointer move.
-      let run: ((wear: number, size?: number) => Promise<GloveMaps | null>) | null = def
-        ? (w, s) => compositeGlove(THREE, renderer, def, { wear: w, size: s })
-        : null;
-      let right: GloveMaps | null = run ? await run(opts?.wear ?? 0) : null;
+      // Only the three maps and the disposer are used here; the two generations'
+      // composites differ solely in the resolve targets they expose for the
+      // flat-map debug view.
+      type GloveMaps = {
+        albedo: import("three").Texture;
+        rm: import("three").Texture;
+        normal: import("three").Texture;
+        dispose: () => void;
+      };
+      let right: GloveMaps | null = def && (await compositeGlove(THREE, renderer, def, { wear: opts?.wear ?? 0 }));
       if (!right) {
         const mdef = await loadGloveModernDef(opts.paintMaterial);
-        run = mdef ? (w, s) => compositeGloveModern(THREE, renderer, mdef, { wear: w, size: s }) : null;
-        if (run) right = await run(opts?.wear ?? 0);
+        if (mdef) right = await compositeGloveModern(THREE, renderer, mdef, { wear: opts?.wear ?? 0 });
       }
       const left = right;
       if (right && left) {
-        const first = right;
-        // Reads gloveCtx rather than closing over `first`: a re-composite
-        // replaces what is on the materials, and disposing the mount's original
-        // would leave the live one leaked and the dead one double-freed.
-        gloveRelease = () => (gloveCtx?.current ?? first).dispose();
-        const gloveMats: import("three").MeshStandardMaterial[] = [];
+        gloveRelease = () => right.dispose();
         object.traverse((n) => {
           const mesh = n as import("three").Mesh;
           if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
@@ -2826,12 +2575,7 @@ async function buildViewer(
           mat.metalness = 1;
           mat.normalMap = comp.normal;
           mat.needsUpdate = true;
-          gloveMats.push(mat);
         });
-        // Collected AFTER the traverse for the same reason the weapon side's
-        // paintedMats is: one list, built once, so a later re-composite has
-        // somewhere to point.
-        if (run) gloveCtx = { run, mats: gloveMats, current: first };
       } else {
         // A paintable glove's BASE mesh is a near-black placeholder meant to be
         // replaced by its finish, so failing to composite does not degrade to
@@ -2883,8 +2627,6 @@ async function buildViewer(
   } | null = null;
   let paintWear = opts?.wear ?? 0;
   let paintSeed = opts?.seed ?? 0;
-  /** Whether what is on the meshes right now is the drag's proxy resolution. */
-  let paintProxy = false;
   if (weaponPaint) {
     try {
       const [paint, weaponInputs] = await Promise.all([
@@ -3184,63 +2926,42 @@ async function buildViewer(
         ? flatDir()
         : new THREE.Vector3(1.4, 0.35, 1.1);
 
-  // THE FRAMING, as a frustum half-height at the pivot.
-  //
-  // Under the perspective camera this used to be a DISTANCE, and every magnitude
-  // above — the camDir lengths, the fit margins — is still stated that way
-  // because that is how they were measured. A parallel projection has no
-  // distance term, so the one thing that decides apparent size is the frustum,
-  // and each branch below converts its tuned distance into one through
-  // FRAMING_TAN. Same numbers, same crop, no perspective.
-  const viewDir = camDir.clone().normalize();
-  const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), viewDir).normalize();
-  const upv = new THREE.Vector3().crossVectors(viewDir, right);
-  let halfH: number;
+  const camera = new THREE.PerspectiveCamera(35, 1, radius / 100, radius * 100);
   if (opts?.frame === "fit") {
-    // Exact fit, and now genuinely exact: a parallel frustum needs no distance
-    // solve at all, because the silhouette does not grow as the box approaches.
-    // Project every corner onto the screen axes and take the extent. This is
-    // strictly tighter than the perspective solve it replaces — the near corners
-    // no longer demand room they only needed because they were near — so a card
-    // comes out marginally larger, which is free pixels on the weapon.
+    // Exact-fit: solve the minimum camera distance where every bbox corner is
+    // inside the frustum, then add a small margin. Max gun, zero edge-clip.
     const aspect = (container.clientWidth || 640) / (container.clientHeight || 480);
-    let extentUp = 0;
-    let extentRight = 0;
+    const tanV = Math.tan((35 * Math.PI) / 360);
+    const tanH = tanV * aspect;
+    const dir = camDir.clone().normalize();
+    const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), dir).normalize();
+    const upv = new THREE.Vector3().crossVectors(dir, right);
+    let dist = 0;
     for (const cx of [cboxFit.min.x, cboxFit.max.x])
       for (const cy of [cboxFit.min.y, cboxFit.max.y])
         for (const cz of [cboxFit.min.z, cboxFit.max.z]) {
           const c = new THREE.Vector3(cx, cy, cz);
-          extentUp = Math.max(extentUp, Math.abs(c.dot(upv)));
-          extentRight = Math.max(extentRight, Math.abs(c.dot(right)));
+          const depth = c.dot(dir);
+          dist = Math.max(dist, depth + Math.abs(c.dot(right)) / tanH, depth + Math.abs(c.dot(upv)) / tanV);
         }
     // Guns want a tight crop; a knife tilted to 30 degrees needs slack or it
-    // reads as zoomed-in against the frame. The dual-wield tent is flat-on but
-    // NOT tilted, so it wants the tight one — the slack costs it a third of its
-    // pixels, and since cropToContent trims the empty margin away afterwards,
-    // all that buys is a blurrier card.
-    halfH = Math.max(extentUp, extentRight / aspect) * (flatOn && !stillTent ? 1.35 : 1.07);
+    // reads as zoomed-in and clips its own corners against the frame. The
+    // dual-wield tent is flat-on but NOT tilted, so it wants the tight one —
+    // the slack costs it a third of its pixels, and since cropToContent trims
+    // the empty margin away afterwards, all that buys is a blurrier card.
+    camera.position.copy(dir.multiplyScalar(dist * (flatOn && !stillTent ? 1.35 : 1.07)));
   } else {
-    // |camDir| was the camera's distance in radii. Through the old lens that
-    // came out as `dist * tan(fov/2)` of visible half-height, so that is what it
-    // converts to — every kind keeps the framing it was tuned to.
-    halfH = radius * camDir.length() * (opts?.frame ?? 1) * FRAMING_TAN;
+    const frame = opts?.frame ?? 1;
+    camera.position.set(radius * camDir.x * frame, radius * camDir.y * frame, radius * camDir.z * frame);
   }
-  // The standoff is arbitrary under a parallel projection — it changes nothing
-  // about what is drawn. It is picked far enough out that no orbit can push
-  // geometry through the near plane, and so that `camera.position` still reads
-  // as "where the viewer is" for the facing tests and the charm's camera-frame
-  // gravity, both of which take a direction from it.
-  const camStandoff = radius * 8;
-  const camera = new THREE.OrthographicCamera(-halfH, halfH, halfH, -halfH, radius / 100, camStandoff + radius * 100);
-  camera.position.copy(viewDir).multiplyScalar(camStandoff);
   if (opts?.viewAngle) {
     // Deterministic orbit for measurement sweeps — see ViewerOpts.viewAngle.
     const a = opts.viewAngle;
     const { x, z } = camera.position;
     camera.position.x = x * Math.cos(a) - z * Math.sin(a);
     camera.position.z = x * Math.sin(a) + z * Math.cos(a);
+    camera.lookAt(0, 0, 0);
   }
-  camera.lookAt(0, 0, 0);
 
   // Placement mode, MUTABLE — see setInteractive() on the handle. `opts` only
   // seeds it: view mode and edit mode are the same mounted viewer (the modal
@@ -3267,15 +2988,8 @@ async function buildViewer(
   // gun swings around it.
   controls.enablePan = false;
   controls.screenSpacePanning = true;
-  // The zoom range, stated as the two DISTANCES it was tuned as and converted to
-  // this camera's terms. An orthographic camera dollies by `zoom` and ignores
-  // min/maxDistance entirely, so setting those instead is the silent way to ship
-  // a viewer that zooms to infinity in both directions.
-  //
-  // Inverted deliberately: zoom is a ratio of the frustum, so the CLOSE distance
-  // is the LARGEST zoom.
-  controls.minZoom = halfH / (radius * 4 * FRAMING_TAN);
-  controls.maxZoom = halfH / (radius * 0.22 * FRAMING_TAN);
+  controls.minDistance = radius * 0.22;
+  controls.maxDistance = radius * 4;
   // Coarse pointers get a slower orbit — a thumb sweep is far larger than a
   // mouse gesture, so 1:1 rotate speed makes small adjustments overshoot.
   if (typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches) controls.rotateSpeed = 0.6;
@@ -3303,29 +3017,20 @@ async function buildViewer(
   const panPx = new THREE.Vector2();
   /** Last pair actually pushed into the projection — see applyPan. */
   const panApplied = new THREE.Vector2(NaN, NaN);
-  /**
-   * World units per CSS pixel — the conversion both the pan leash and the
-   * sticker grab radius are stated in.
-   *
-   * No distance argument, and that is the whole difference from the perspective
-   * camera this replaced: a parallel frustum is the same width everywhere, so a
-   * decal's size on screen depends only on the zoom, not on how far away it is.
-   * One function rather than two inline copies of the projection math, because
-   * the two used to disagree about which element's height they measured.
-   */
-  const worldPerPx = () => (camera.top - camera.bottom) / camera.zoom / Math.max(1, cssH);
   const applyPan = () => {
-    // The leash is in WORLD units, converted to pixels at the current zoom —
+    // The leash is in WORLD units, converted to pixels at the pivot's depth —
     // NOT a fraction of the viewport. A fixed pixel budget is a shrinking
     // fraction of the weapon as you zoom in: at full zoom the receiver alone
     // fills several viewports, so "45% of the screen" would not reach the stock.
     //
-    // Zoom is what the limit rides on. Half the longest edge reaches either tip
-    // of the weapon from the centre; 0.6 leaves a little past it. The same
-    // number then means "one weapon length of travel" at every zoom level, and
-    // still guarantees some of the gun stays in frame, which is all the old
-    // clamp was really for.
-    const maxPx = (radius * 0.6) / Math.max(worldPerPx(), 1e-9);
+    // Distance is what changes with zoom, so it is what the limit rides on. Half
+    // the longest edge reaches either tip of the weapon from the centre; 0.6
+    // leaves a little past it. The same number then means "one weapon length of
+    // travel" at every zoom level, and still guarantees some of the gun stays in
+    // frame, which is all the old clamp was really for.
+    const dist = camera.position.distanceTo(controls.target);
+    const worldPerPx = (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / Math.max(1, cssH);
+    const maxPx = (radius * 0.6) / Math.max(worldPerPx, 1e-9);
     panPx.x = clamp(panPx.x, -maxPx, maxPx);
     panPx.y = clamp(panPx.y, -maxPx, maxPx);
     // Cheap enough to call every frame from the zoom re-clamp below, because
@@ -3366,7 +3071,6 @@ async function buildViewer(
   // actually appears to rotate. Fraction of the box height rather than an
   // absolute, so it holds for the shortest and tallest agents alike.
   if (pres.frame === "upright") controls.target.y = cbox.min.y + (cbox.max.y - cbox.min.y) * 0.62;
-
   // Every decision PRESENTATION drives, in one line, for
   // tools/shadertest/item3d.html. Off unless the rig sets the flag, so
   // production pays nothing. This is the fixture that proves a `kind` renders
@@ -3390,10 +3094,6 @@ async function buildViewer(
       camDir: camDir.toArray().map(n3),
       camPos: camera.position.toArray().map(n3),
       target: controls.target.toArray().map(n3),
-      // The frustum half-height, which under a parallel projection is the whole
-      // of "how big is it on screen" — camPos alone no longer says, because the
-      // standoff is a constant and carries no framing information at all.
-      halfH: n3(halfH),
     });
     (globalThis as { __item3d?: string }).__item3d = line;
     console.log(`[item3d] ${line}`);
@@ -4624,43 +4324,11 @@ async function buildViewer(
    * to the rebuild it would otherwise have done.
    */
   let repaintSeq = 0;
-  let repainting = false;
-  /** Latest request that arrived while a composite was already running. */
-  let repaintPending: { wear: number; seed: number; proxy: boolean } | null = null;
-  async function setPaintVariant(wear: number, seed: number, proxy = false): Promise<boolean> {
-    if (disposed || (!paintCtx && !gloveCtx)) return false;
-    if (wear === paintWear && seed === paintSeed && proxy === paintProxy) return true;
-    // COALESCE, never queue. A drag emits far faster than a composite completes,
-    // and awaiting each one in turn would run the gun through every pattern the
-    // pointer crossed, arriving at the right one seconds late. Only the newest
-    // request survives the wait, so the work done is bounded by how fast the GPU
-    // is rather than by how fast the user moves.
-    if (repainting) {
-      repaintPending = { wear, seed, proxy };
-      return true;
-    }
-    repainting = true;
-    try {
-      while (true) {
-        const ok = await repaintOnce(wear, seed, proxy);
-        if (!ok) return false;
-        const next = repaintPending;
-        repaintPending = null;
-        if (!next) return true;
-        ({ wear, seed, proxy } = next);
-      }
-    } finally {
-      repainting = false;
-    }
-  }
-
-  async function repaintOnce(wear: number, seed: number, proxy: boolean): Promise<boolean> {
-    if (disposed || (!paintCtx && !gloveCtx)) return false;
-    if (wear === paintWear && seed === paintSeed && proxy === paintProxy) return true;
-    if (!paintCtx) return repaintGloveOnce(wear, seed, proxy);
+  async function setPaintVariant(wear: number, seed: number): Promise<boolean> {
+    if (disposed || !paintCtx) return false;
+    if (wear === paintWear && seed === paintSeed) return true;
     paintWear = wear;
     paintSeed = seed;
-    paintProxy = proxy;
     // Last writer wins: a drag fires faster than a composite completes, and an
     // earlier one landing after a later one would leave the gun showing a
     // pattern the slider has already moved past.
@@ -4671,8 +4339,6 @@ async function buildViewer(
       seed,
       weapon: ctx.weaponInputs,
       model,
-      // Mid-drag, trade texels for frames — see compositePaint's maxSize.
-      maxSize: proxy ? PROXY_COMPOSITE_SIZE : undefined,
     }).catch(() => null);
     if (!next) return false;
     if (disposed || seq !== repaintSeq) {
@@ -4700,176 +4366,6 @@ async function buildViewer(
     releaseComposite = next.release;
     prev?.();
     return true;
-  }
-
-  /**
-   * The same move for a glove — see gloveCtx.
-   *
-   * Its own function rather than a branch inside repaintOnce because almost
-   * nothing is shared: a different compositor, three maps instead of two, no
-   * SFX pass, no refcounted store, and an owned render target that has to be
-   * disposed rather than released.
-   *
-   * The SEED is accepted and ignored. csgo_customglove has no pattern input, so
-   * a seed-only change is genuinely already on screen — and answering `true` is
-   * what stops the caller falling back to a rebuild that would produce the exact
-   * same pixels.
-   */
-  async function repaintGloveOnce(wear: number, seed: number, proxy: boolean): Promise<boolean> {
-    const ctx = gloveCtx;
-    if (!ctx) return false;
-    const wearSame = wear === paintWear;
-    paintWear = wear;
-    paintSeed = seed;
-    // Nothing to redo when the wear held: the seed moved nothing, and a PROXY
-    // request for a float already on screen at full resolution would only spend
-    // seven passes to make it blurrier. The one same-wear case worth running is
-    // the other direction — the settle back up from a drag's proxy.
-    if (wearSame && (proxy || proxy === paintProxy)) return true;
-    paintProxy = proxy;
-    const seq = ++repaintSeq;
-    const next = await ctx.run(wear, proxy ? PROXY_COMPOSITE_SIZE : undefined).catch(() => null);
-    if (!next) return false;
-    if (disposed || gloveCtx !== ctx || seq !== repaintSeq) {
-      next.dispose();
-      return true;
-    }
-    for (const mat of ctx.mats) {
-      mat.map = next.albedo;
-      mat.roughnessMap = next.rm;
-      mat.metalnessMap = next.rm;
-      mat.aoMap = next.rm;
-      mat.normalMap = next.normal;
-      mat.needsUpdate = true;
-    }
-    // Disposed only once the new maps are on the materials, for the same reason
-    // the weapon side releases late: freeing a render target still bound to a
-    // mesh drops it out from under the next frame.
-    const prev = ctx.current;
-    ctx.current = next;
-    prev.dispose();
-    return true;
-  }
-
-  /**
-   * How much of the gun each texel of the paint atlas is actually worth.
-   *
-   * A composited albedo is a UV ATLAS: both sides of the weapon, every island,
-   * and the gutters between them, all the same size on the page regardless of
-   * how much gun they represent. Measuring a pattern over it flat — which is
-   * what the scan did first — scores unused space and the underside equally
-   * with the slide you spend the whole time looking at.
-   *
-   * Two weights fix that, and both come off the mesh:
-   *
-   *  · SURFACE AREA. A texel is worth the world-space area of the triangles
-   *    that land on it. Gutters get zero for free, because no triangle maps
-   *    there, and a stretched island stops counting for more than it covers.
-   *  · FACING. Scaled by how squarely the surface turns toward the framing
-   *    camera, so the playside dominates and the underside contributes little.
-   *
-   * The view vector is the FRAMING one, captured here rather than read live:
-   * orbiting the model must not silently invalidate a scan someone already ran.
-   */
-  let uvWeightCache: { size: number; mask: Float32Array | null } | null = null;
-  function paintUvWeights(size: number): Float32Array | null {
-    if (disposed) return null;
-    // Memoised, and computed only when ASKED. Rasterising every triangle costs
-    // a few milliseconds — nothing against a mount, but the card backfill mounts
-    // one viewer per inventory item and none of those will ever rank a pattern.
-    // The geometry and its framing are both fixed after the build, so the answer
-    // never changes for a given viewer.
-    if (uvWeightCache?.size === size) return uvWeightCache.mask;
-    const mask = new Float32Array(size * size);
-    const view = camDir.clone().normalize();
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const c = new THREE.Vector3();
-    const e1 = new THREE.Vector3();
-    const e2 = new THREE.Vector3();
-    const nrm = new THREE.Vector3();
-    let any = false;
-    object.updateMatrixWorld(true);
-    object.traverse((node) => {
-      const mesh = node as import("three").Mesh;
-      if (!(mesh as unknown as { isMesh?: boolean }).isMesh || isUnpaintedMesh(mesh)) return;
-      const geo = mesh.geometry;
-      const pos = geo?.getAttribute("position");
-      const uv = geo?.getAttribute("uv");
-      if (!pos || !uv) return;
-      const idx = geo.getIndex();
-      const tris = idx ? idx.count / 3 : pos.count / 3;
-      for (let t = 0; t < tris; t++) {
-        const i0 = idx ? idx.getX(t * 3) : t * 3;
-        const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
-        const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
-        a.fromBufferAttribute(pos, i0).applyMatrix4(mesh.matrixWorld);
-        b.fromBufferAttribute(pos, i1).applyMatrix4(mesh.matrixWorld);
-        c.fromBufferAttribute(pos, i2).applyMatrix4(mesh.matrixWorld);
-        e1.subVectors(b, a);
-        e2.subVectors(c, a);
-        nrm.crossVectors(e1, e2);
-        const area = nrm.length() * 0.5;
-        if (area <= 0) continue;
-        // Both faces count, but the one turned away counts for much less. Not
-        // zero: a pattern that only ever lands on the far side would otherwise
-        // score identically to one that lands nowhere at all.
-        const facing = 0.15 + 0.85 * Math.max(0, nrm.normalize().dot(view));
-        splat(mask, size, uv, i0, i1, i2, area * facing);
-        any = true;
-      }
-    });
-    uvWeightCache = { size, mask: any ? mask : null };
-    return uvWeightCache.mask;
-  }
-
-  /** Rasterise one UV triangle, adding `w` spread over the texels it covers. */
-  function splat(
-    mask: Float32Array,
-    size: number,
-    uv: import("three").BufferAttribute | import("three").InterleavedBufferAttribute,
-    i0: number,
-    i1: number,
-    i2: number,
-    w: number,
-  ) {
-    const u0 = uv.getX(i0) * size;
-    const v0 = uv.getY(i0) * size;
-    const u1 = uv.getX(i1) * size;
-    const v1 = uv.getY(i1) * size;
-    const u2 = uv.getX(i2) * size;
-    const v2 = uv.getY(i2) * size;
-    const minX = Math.max(0, Math.floor(Math.min(u0, u1, u2)));
-    const maxX = Math.min(size - 1, Math.ceil(Math.max(u0, u1, u2)));
-    const minY = Math.max(0, Math.floor(Math.min(v0, v1, v2)));
-    const maxY = Math.min(size - 1, Math.ceil(Math.max(v0, v1, v2)));
-    const den = (v1 - v2) * (u0 - u2) + (u2 - u1) * (v0 - v2);
-    if (!den) return;
-    // A triangle smaller than a texel covers no sample point and would vanish.
-    // Guns are dense enough that a lot of them are: drop the whole triangle's
-    // weight on the texel its centroid lands in instead of losing it.
-    if (maxX - minX < 1 && maxY - minY < 1) {
-      const x = Math.min(size - 1, Math.max(0, Math.floor((u0 + u1 + u2) / 3)));
-      const y = Math.min(size - 1, Math.max(0, Math.floor((v0 + v1 + v2) / 3)));
-      mask[y * size + x] += w;
-      return;
-    }
-    let hits = 0;
-    const covered: number[] = [];
-    for (let y = minY; y <= maxY; y++) {
-      for (let x = minX; x <= maxX; x++) {
-        const px = x + 0.5;
-        const py = y + 0.5;
-        const l0 = ((v1 - v2) * (px - u2) + (u2 - u1) * (py - v2)) / den;
-        const l1 = ((v2 - v0) * (px - u2) + (u0 - u2) * (py - v2)) / den;
-        if (l0 < 0 || l1 < 0 || l0 + l1 > 1) continue;
-        covered.push(y * size + x);
-        hits++;
-      }
-    }
-    if (!hits) return;
-    const share = w / hits;
-    for (const i of covered) mask[i] += share;
   }
 
   function setStickers(stickers: StickerPlacement[]) {
@@ -5062,24 +4558,32 @@ async function buildViewer(
     if (charmCollider && charmColliderAt && charmColliderAt.distanceTo(pivot) <= colliderSlack) return charmCollider;
     const r = reach + colliderSlack;
     const verts: number[] = [];
-    // Rejected against a PRECOMPUTED centroid and radius per triangle.
-    //
-    // The rebake used to push all three vertices of all 18k triangles through
-    // getVertexPosition and a matrix multiply just to decide which few hundred
-    // were near enough to keep — 3.5ms, and a drag rebakes on every frame the
-    // pivot moves past the slack (37 times in one measured drag, worst frame
-    // 6.6ms against a 0.96ms average). The weapon is recentered once at load and
-    // never animated, so all of that is constant: do it once, and the rejection
-    // becomes a flat scan of two Float32Arrays.
-    const cache = weaponTriangleCache();
-    const { mid: mids, rad: rads, xyz } = cache;
-    for (let t = 0; t < rads.length; t++) {
-      const m3 = t * 3;
-      const dx = mids[m3] - pivot.x, dy = mids[m3 + 1] - pivot.y, dz = mids[m3 + 2] - pivot.z;
-      const reject = r + rads[t];
-      if (dx * dx + dy * dy + dz * dz > reject * reject) continue;
-      const o = t * 9;
-      for (let k = 0; k < 9; k++) verts.push(xyz[o + k]);
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const mid = new THREE.Vector3();
+    for (const mesh of weaponMeshes) {
+      const pos = mesh.geometry.getAttribute("position");
+      if (!pos) continue;
+      const index = mesh.geometry.getIndex();
+      const count = index ? index.count : pos.count;
+      for (let i = 0; i + 2 < count; i += 3) {
+        // getVertexPosition, NOT the raw position attribute: on a SkinnedMesh
+        // three overrides it to push the vertex through its bones, which is
+        // exactly what Raycaster does. Reading the attribute directly would
+        // collide the charm against the bind pose while the eye sees the posed
+        // model — silently, since a miss just reads as "no collision".
+        mesh.getVertexPosition(index ? index.getX(i) : i, a).applyMatrix4(mesh.matrixWorld);
+        mesh.getVertexPosition(index ? index.getX(i + 1) : i + 1, b).applyMatrix4(mesh.matrixWorld);
+        mesh.getVertexPosition(index ? index.getX(i + 2) : i + 2, c).applyMatrix4(mesh.matrixWorld);
+        // Triangle bounding sphere vs the reach sphere — cheap, and unlike a
+        // per-vertex test it never drops a large triangle that spans the reach
+        // without any of its own corners landing inside it.
+        mid.copy(a).add(b).add(c).multiplyScalar(1 / 3);
+        const rad = Math.max(mid.distanceTo(a), mid.distanceTo(b), mid.distanceTo(c));
+        if (mid.distanceTo(pivot) > r + rad) continue;
+        verts.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+      }
     }
     charmCollider?.geometry.dispose();
     const geom = new THREE.BufferGeometry();
@@ -5118,64 +4622,6 @@ async function buildViewer(
     big: Int32Array; // triangles too large to bucket; tested by every query
   };
   let charmColliderGrid: ContactGrid | null = null;
-
-  /**
-   * The weapon's triangles in world space, with a bounding sphere each — built
-   * once, on the first collider bake.
-   *
-   * Everything here is constant for the life of the viewer (the model is
-   * recentered at load and never animated), and it is all the rebake needs to
-   * decide what to keep. Doing it per rebake was the single worst hitch in a
-   * drag; see charmColliderFor.
-   *
-   * getVertexPosition, NOT the raw position attribute: on a SkinnedMesh three
-   * overrides it to push the vertex through its bones, which is exactly what
-   * Raycaster does. Reading the attribute directly would collide the charm
-   * against the bind pose while the eye sees the posed model — silently, since
-   * a miss just reads as "no collision".
-   */
-  let triCache: { xyz: Float32Array; mid: Float32Array; rad: Float32Array } | null = null;
-  function weaponTriangleCache() {
-    if (triCache) return triCache;
-    let total = 0;
-    for (const mesh of weaponMeshes) {
-      const pos = mesh.geometry.getAttribute("position");
-      if (!pos) continue;
-      const index = mesh.geometry.getIndex();
-      total += Math.floor((index ? index.count : pos.count) / 3);
-    }
-    const xyz = new Float32Array(total * 9);
-    const mid = new Float32Array(total * 3);
-    const rad = new Float32Array(total);
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const c = new THREE.Vector3();
-    const m = new THREE.Vector3();
-    let t = 0;
-    for (const mesh of weaponMeshes) {
-      const pos = mesh.geometry.getAttribute("position");
-      if (!pos) continue;
-      const index = mesh.geometry.getIndex();
-      const count = index ? index.count : pos.count;
-      for (let i = 0; i + 2 < count; i += 3, t++) {
-        mesh.getVertexPosition(index ? index.getX(i) : i, a).applyMatrix4(mesh.matrixWorld);
-        mesh.getVertexPosition(index ? index.getX(i + 1) : i + 1, b).applyMatrix4(mesh.matrixWorld);
-        mesh.getVertexPosition(index ? index.getX(i + 2) : i + 2, c).applyMatrix4(mesh.matrixWorld);
-        const o = t * 9;
-        xyz[o] = a.x; xyz[o + 1] = a.y; xyz[o + 2] = a.z;
-        xyz[o + 3] = b.x; xyz[o + 4] = b.y; xyz[o + 5] = b.z;
-        xyz[o + 6] = c.x; xyz[o + 7] = c.y; xyz[o + 8] = c.z;
-        // Bounding sphere, not the corners: unlike a per-vertex test it never
-        // drops a large triangle that spans the reach without any of its own
-        // corners landing inside it.
-        m.copy(a).add(b).add(c).multiplyScalar(1 / 3);
-        mid[t * 3] = m.x; mid[t * 3 + 1] = m.y; mid[t * 3 + 2] = m.z;
-        rad[t] = Math.max(m.distanceTo(a), m.distanceTo(b), m.distanceTo(c));
-      }
-    }
-    triCache = { xyz, mid, rad };
-    return triCache;
-  }
 
   function buildContactGrid(verts: number[]): ContactGrid | null {
     const n = verts.length / 9;
@@ -5451,52 +4897,6 @@ async function buildViewer(
    * re-hanging it reads as part of the gesture rather than as the charm twitching
    * on its own.
    */
-  /**
-   * The outward normal of the surface the charm is clipped to.
-   *
-   * Derived from the geometry, not from the camera, so it is the same answer
-   * whether the anchor arrived from a drag or from stored offsets: aim from the
-   * anchor into the body and the first face met is the one it sits on, pointing
-   * back out at us. Recomputed only when the anchor moves.
-   */
-  const charmMountNrm = new THREE.Vector3(0, 1, 0);
-  const charmMountAt = new THREE.Vector3(NaN, NaN, NaN);
-  const mountScratch = new THREE.Vector3();
-  function mountNormal(c: Charm) {
-    if (charmMountAt.equals(c.pivot)) return charmMountNrm;
-    charmMountAt.copy(c.pivot);
-    // The NEAREST surface in any axis direction, not a ray at the body's centre.
-    // That aim looked reasonable and misses outright on anything that overhangs
-    // — from an anchor under a magazine it leaves through open air and finds
-    // nothing, which left this holding a stale normal and the check below never
-    // fired. The anchor sits a hair off its own surface, so the closest thing to
-    // it in ANY direction is that surface.
-    const probe = charmReach || sizeL * 0.05;
-    const collider = charmColliderFor(c.pivot, charmReach);
-    let nearest = Infinity;
-    for (const ax of [0, 1, 2]) {
-      for (const sign of [1, -1]) {
-        probeDir.set(0, 0, 0).setComponent(ax, sign);
-        raycaster.far = probe;
-        raycaster.set(c.pivot, probeDir);
-        const hit = raycaster.intersectObject(collider, false)[0];
-        raycaster.far = Infinity;
-        if (!hit?.face || hit.distance >= nearest) continue;
-        // Front face of the surface we are outside of: its normal already points
-        // back out at us, which is the outward direction we want.
-        if (hit.face.normal.dot(probeDir) >= 0) continue;
-        nearest = hit.distance;
-        charmMountNrm.copy(hit.face.normal);
-      }
-    }
-    return charmMountNrm;
-  }
-
-  /** Consecutive awake frames the charm has been through the body. */
-  let behindFrames = 0;
-  /** About a fifth of a second at 60fps — long enough that a swing which passes
-   *  through and comes back out on its own is left alone. */
-  const BEHIND_FRAMES = 12;
   function reseatIfBehind(c: Charm) {
     if (!c.sim?.space) return;
     const bulk = charmBodyWorld(c).sub(c.pivot);
@@ -5504,32 +4904,18 @@ async function buildViewer(
     // legitimately hangs below its own tangent plane by most of its length, so
     // this alone would fire on a perfectly good hang — all it decides is whether
     // the raycast is worth paying for.
-    if (bulk.dot(mountNormal(c)) > -c.d) {
-      behindFrames = 0;
-      return;
-    }
+    if (bulk.dot(anchorNormal) > -c.d) return;
     // The test that means something: is there WEAPON between the anchor and the
     // charm? Hanging in open air past an edge is fine however far round it goes.
     // Hanging with the body in the way is the stuck case, and it is not a state
     // the solver can leave on its own.
-    //
-    // Against the collider, like enclosedSpot: this runs on every frame the
-    // cloth is awake, and the same query costs 6.0ms against the weapon.
     const len = bulk.length();
-    if (len < 1e-6) {
-      behindFrames = 0;
-      return;
-    }
+    if (len < 1e-6) return;
     raycaster.far = len;
     raycaster.set(c.pivot, bulk.divideScalar(len));
-    const through = raycaster.intersectObject(charmColliderFor(c.pivot, charmReach), false).length > 0;
+    const through = raycaster.intersectObjects(weaponMeshes, false).length > 0;
     raycaster.far = Infinity;
-    if (!through) {
-      behindFrames = 0;
-      return;
-    }
-    if (++behindFrames < BEHIND_FRAMES) return;
-    behindFrames = 0;
+    if (!through) return;
     // The anchor is untouched — reseatCharmSim rebuilds the rig around wherever
     // it is now — so charmClipLocal and the pivot both stay valid.
     reseatCharmSim(c.sim);
@@ -6488,16 +5874,7 @@ async function buildViewer(
     charmLastT = now;
     const steps = stepCharmSim(sim, dt, charmGravity(sim), charmContact);
     charmCost.steps += steps;
-    if (steps) {
-      invalidateCharmBounds();
-      // EVERY awake frame, not just during a drag. The charm goes through the
-      // body on a swing — a flick's release kick, or the gravity change from an
-      // orbit — which is long after the pointer has let go, so checking only in
-      // applyDrag caught none of it. Reproduced by flicking a charm across an
-      // M4A4: it settled 7mm behind the visible surface with the receiver
-      // between it and its own anchor.
-      reseatIfBehind(charm!);
-    }
+    if (steps) invalidateCharmBounds();
     if (sim.asleep && !charmAsleep) {
       charmAsleep = true;
       charmCost.sleptAt = performance.now();
@@ -6590,6 +5967,9 @@ async function buildViewer(
     }
     const halfW = (el.clientWidth || 1) * 0.5;
     const halfH = (el.clientHeight || 1) * 0.5;
+    // Pixels per world unit at a given distance, for this camera. Derived from
+    // the projection rather than measured with a second project() call.
+    const pxPerWorld = halfH / Math.tan(((camera.fov * Math.PI) / 180) * 0.5);
     const ndc = new THREE.Vector3();
     const toCam = new THREE.Vector3();
     let best: { slot: number; d: number } | null = null;
@@ -6613,12 +5993,7 @@ async function buildViewer(
       // counts as aiming at it. The cost of being too small is a gesture that
       // does the wrong thing entirely.
       const radius = (mesh.userData.stickerRadius as number | undefined) ?? 0;
-      // The decal's size on screen — derived from the projection rather than
-      // measured with a second project() call. No depth term: under a parallel
-      // projection a sticker is the same size wherever it sits on the weapon,
-      // so near and far decals get the same grab radius, which is also the more
-      // predictable thing to aim at.
-      const onScreen = radius / Math.max(worldPerPx(), 1e-9);
+      const onScreen = radius * (pxPerWorld / Math.max(camera.position.distanceTo(center), 1e-6));
       const grab = Math.max(GRAB_SLOP_PX, onScreen * 1.25);
       if (STICKER_LOG && (!nearest || d < nearest.d)) nearest = { slot, d, grab, away };
       if (away) continue; // facing away — never grabbed through the body
@@ -6643,14 +6018,6 @@ async function buildViewer(
     // else stacked in there — the perf HUD, a future overlay — are not ours.
     if (!placeable || e.button !== 0 || e.target !== el) return;
     updatePointer(e);
-    // Restored before every camera pick, not just the one that narrowed it.
-    // The raycaster is shared with the surface probes (stepCharm, liftOutOfBody,
-    // the seating rays), which set `far` to a fraction of the model and put it
-    // back afterwards — and a camera ray now has to cross the orthographic
-    // camera's standoff, several model-lengths, before it reaches anything. A
-    // leaked probe `far` used to still be long enough to hit; it is not now, and
-    // the symptom would be a press that silently grabs nothing.
-    raycaster.far = Infinity;
     raycaster.setFromCamera(pointerNdc, camera);
     if (STICKER_LOG) resetStickerCost();
     if (charm) {
@@ -6804,7 +6171,6 @@ async function buildViewer(
   function applyDrag(e: PointerEvent) {
     if (!drag) return;
     updatePointer(e);
-    raycaster.far = Infinity; // see onPointerDown — the standoff outruns a leaked probe
     raycaster.setFromCamera(pointerNdc, camera);
     if (drag.type === "sticker") {
       const entryNow = decals.get(drag.slot);
@@ -7159,7 +6525,6 @@ async function buildViewer(
       hoverPending = null;
       if (disposed || drag || !ev) return;
       updatePointer(ev);
-      raycaster.far = Infinity; // see onPointerDown — the standoff outruns a leaked probe
       raycaster.setFromCamera(pointerNdc, camera);
       // Same test the press uses, slop included — the reticle must promise
       // exactly what a click would grab.
@@ -8224,13 +7589,7 @@ async function buildViewer(
     // exactly, so a frame is never resampled on its way to the screen.
     view.width = Math.max(1, Math.round(cssW * dpr));
     view.height = Math.max(1, Math.round(cssH * dpr));
-    // An orthographic frustum has no `aspect` field — its width IS the aspect,
-    // so a resize restates left/right against the height the framing solved for.
-    // Height is what stays fixed: a pane that gets narrower should crop the
-    // sides, not shrink the weapon.
-    const halfW = halfH * (cssW / cssH);
-    camera.left = -halfW;
-    camera.right = halfW;
+    camera.aspect = cssW / cssH;
     camera.updateProjectionMatrix();
     // The pan's view offset is stated in the OLD viewport's pixels — re-apply it
     // against the new size, which also re-clamps it so a shrink cannot strand
@@ -8287,13 +7646,10 @@ async function buildViewer(
     setNameTag: (text) => void setNameTag(text),
     setPatches: (images) => applyPatches(images),
     patchSlots: () => patchSlotCount,
-    setAgentPose: (pose) => applyAgentPose(pose),
-    agentPose: () => agentPose,
     setStickers,
     flashSticker,
     setCharm: (c) => setCharm(c),
-    setPaintVariant: (wear, seed, proxy) => setPaintVariant(wear, seed, proxy),
-    paintUvWeights: (size) => paintUvWeights(size),
+    setPaintVariant: (wear, seed) => setPaintVariant(wear, seed),
     setCharmSeed(seed) {
       if (disposed) return;
       // The standalone mount: the charm is the model, so it has no charm record

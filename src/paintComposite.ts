@@ -194,6 +194,30 @@ export interface PaintDef {
   rotation: [number, number];
 }
 
+/**
+ * Can the pattern index move this finish's artwork at all?
+ *
+ * The seed is not a knob the shader reads: it seeds a PRNG that draws the
+ * pattern's offset and rotation out of envelopes the vcompmat declares (see
+ * seededVisuals). A finish that declares those envelopes as a single value —
+ * every style 0 solid, every style 3 anodized, and most style 6 custom
+ * paintjobs, whose placement is authored rather than random — has already
+ * decided where its artwork sits, and no pattern will move it.
+ *
+ * Worth answering BEFORE offering to browse a thousand of them: it costs one
+ * already-cached JSON fetch, and it is the difference between a control that
+ * does nothing and a control that says so.
+ *
+ * Narrower than "the seed does nothing". The same draw also places the wear and
+ * grunge masks (again, seededVisuals), and those envelopes are never flat — so
+ * on a worn item the pattern still shuffles the scratches. Say "fixed pattern",
+ * not "no effect".
+ */
+export function seedMovesPattern(def: PaintDef): boolean {
+  const flat = (r: [number, number]) => r[0] === r[1];
+  return !(flat(def.offsetX) && flat(def.offsetY) && flat(def.rotation));
+}
+
 const paintCache = new Map<string, Promise<PaintDef | null>>();
 export function loadPaintDef(paintMaterial: string): Promise<PaintDef | null> {
   let cached = paintCache.get(paintMaterial);
@@ -1781,13 +1805,35 @@ export async function compositePaint(
      *  snapshot viewers read the cache and let an interactive viewer, which
      *  renders one skin at a time while the user looks at it, fill it. */
     persistWrite?: boolean;
+    /**
+     * Ceiling on the composite's resolution, for callers that would rather have
+     * the frame than the texels — see sizeCap. Only ever lowers the cap; it
+     * cannot raise a skin past what its own textures or the device allow.
+     */
+    maxSize?: number;
   },
 ): Promise<CompositeResult | null> {
   const THREE = three;
   const wear = Math.min(Math.max(opts.wear, 0), 1);
   const seed = Math.max(0, Math.trunc(opts.seed));
   const wkey = opts.weapon ? (opts.weapon.color ?? "w") : "";
-  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}|${def.caseHardening ? `ch${def.caseHardeningRamp ?? "-"}${def.chRampOffset}` : ""}|a${def.patternAddrH}_${def.patternAddrV}`;
+  // Resolved BEFORE the cache key, because it is part of the identity: a scrub
+  // composites at a proxy resolution on purpose, and without the cap in the key
+  // the small pair would be handed straight back to the full-size request that
+  // follows the drag — the gun would keep whatever resolution it was last
+  // dragged at, permanently.
+  const wantsProjection = def.style === 2 || def.style === 5;
+  // `maxSize` lets a caller composite SMALL on purpose. A pattern scrub wants
+  // frames more than it wants texels: the drag is answering "where does the
+  // artwork sit", which reads at a quarter of the resolution, and a 4096²
+  // projected skin is sixteen times the pixels of a 1024² one for an answer the
+  // eye cannot use mid-gesture. The full-size composite still runs when the
+  // drag stops, so nothing ships at proxy resolution.
+  const sizeCap = Math.min(
+    wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE,
+    opts.maxSize ?? Infinity,
+  );
+  const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}|${def.caseHardening ? `ch${def.caseHardeningRamp ?? "-"}${def.chRampOffset}` : ""}|a${def.patternAddrH}_${def.patternAddrV}|c${sizeCap}`;
   const cache = cacheFor(renderer);
   const hit = cache.get(key);
   if (hit) {
@@ -1802,9 +1848,6 @@ export async function compositePaint(
   // triplanar projection and composite at a higher cap — see the constants. Read
   // straight off the def so the store lookup below can run before ANY texture
   // fetch; that ordering is the entire optimisation.
-  const wantsProjection = def.style === 2 || def.style === 5;
-  const sizeCap = wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE;
-
   // A debug pass is a diagnostic render of intermediate values, not the skin —
   // it must never be served from the shared store, nor written to it.
   const storeStem =

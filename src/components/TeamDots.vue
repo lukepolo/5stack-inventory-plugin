@@ -3,7 +3,7 @@
 // cluster next to the Steam-synced mark — both answer "what's the state of this
 // item?", so they read as one group instead of being split across two corners,
 // and the dots stop costing a whole line under the model name.
-import type { Team } from "./api";
+import type { Team } from "../api";
 
 defineProps<{ teams?: readonly Team[] | null }>();
 

@@ -7,6 +7,7 @@
  * for its observer root, and the loadout needs it to reveal a slot that the
  * lifted picker sheet is covering.
  */
+import { ref } from "vue";
 
 /** The nearest scrollable ancestor, or null if nothing above it scrolls. */
 export function scrollRoot(from: HTMLElement): HTMLElement | null {
@@ -68,4 +69,59 @@ export function scrollPanelToTop(el: HTMLElement | null | undefined): void {
   if (!el) return;
   const sc = el.matches("[data-scroller]") || el.scrollHeight > el.clientHeight ? el : scrollRoot(el);
   (sc ?? el).scrollTo({ top: 0, behavior: "auto" });
+}
+
+/**
+ * The "there is more below" cue for any ORDINARY scroller.
+ *
+ * The picker sheet keeps its own (`measureSheetScroll`) because part of its box
+ * deliberately hangs off the bottom of the screen, which nothing else does.
+ *
+ * `remeasure` exists because the two things that change "is there more below" on
+ * these grids — the render window growing as you scroll, and the filter set
+ * shrinking — neither of them fires a scroll event.
+ */
+export function scrollFade() {
+  const more = ref(false);
+  let el: HTMLElement | null = null;
+  const measure = () => (more.value = !!el && el.scrollHeight - el.scrollTop - el.clientHeight > 8);
+  // Coalesced to one measurement per frame. `scrollHeight`/`clientHeight` are
+  // layout reads, and a scroll event can fire many times between paints — on a
+  // long inventory grid that is a forced reflow per event for a boolean that
+  // can only change once per frame anyway.
+  let pending = false;
+  const measureSoon = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      measure();
+    });
+  };
+  return {
+    more,
+    onScroll: (e: Event) => {
+      el = e.target as HTMLElement;
+      measureSoon();
+    },
+    /**
+     * Function ref for the WRAPPER, which then finds the scroller inside it by
+     * `data-scroller`. Indirect on purpose: the inventory grid is a
+     * <TransitionGroup>, and a ref on that hands back the component instance,
+     * not the element that actually scrolls.
+     */
+    setHost: (node: unknown) => {
+      el = (node as HTMLElement | null)?.querySelector<HTMLElement>("[data-scroller]") ?? null;
+      if (el) requestAnimationFrame(measure);
+      else more.value = false;
+    },
+    remeasure: () => requestAnimationFrame(measure),
+    /** Back to the top, for when the LIST is replaced rather than appended —
+     *  see scrollPanelToTop. The scroller is already resolved here, so callers
+     *  don't have to find it a second way. */
+    toTop: () => {
+      scrollPanelToTop(el);
+      requestAnimationFrame(measure);
+    },
+  };
 }

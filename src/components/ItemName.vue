@@ -9,7 +9,7 @@
 // they use itemName() from itemVisuals instead, which folds the phase into
 // "Doppler (Ruby)".
 import { computed } from "vue";
-import { stripName } from "./itemVisuals";
+import { stripName } from "../itemVisuals";
 
 const props = defineProps<{
   item?: { name?: string | null; altName?: string | null } | null;

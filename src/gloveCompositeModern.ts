@@ -96,6 +96,9 @@ export interface GloveModernDef {
   /** g_bId1Pattern..g_bId8Pattern — which palette slots the pattern paints. */
   idPattern: boolean[];
   pattern: boolean;
+  /** g_bPatternPaintLayer (F_PATTERN_PAINT). Picks which of the shader's two
+   *  pattern branches runs — see the header. */
+  patternPaintLayer: boolean;
   patternEmboss: boolean;
   patternRespectsTintMask: boolean;
   tintId: boolean;
@@ -245,9 +248,14 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
   // The discriminator. Not m_shaderName — see the header.
   if (!tex.g_tSubstrate1 || !tex.g_tLayerId) return null;
 
-  const floats = new Map((doc.m_floatParams ?? []).map((p) => [p.m_name ?? "", p.m_flValue]));
+  const floatParams = new Map((doc.m_floatParams ?? []).map((p) => [p.m_name ?? "", p.m_flValue]));
   const ints = new Map((doc.m_intParams ?? []).map((p) => [p.m_name ?? "", p.m_nValue]));
   const vecs = new Map((doc.m_vectorParams ?? []).map((p) => [p.m_name ?? "", p.m_value]));
+  // Valve does NOT sort params by their g_f / g_b prefix into m_floatParams /
+  // m_intParams — g_fPatternPaintRespectsTintMask is an int on all 22 of these
+  // finishes despite the g_f. Reading only one map silently takes the default,
+  // which is how that one read as 0 everywhere while every material sets it.
+  const floats = { get: (k: string) => floatParams.get(k) ?? ints.get(k) };
 
   const vec: Record<string, number[]> = {};
   for (const [k, v] of vecs) if (Array.isArray(v)) vec[k] = v.map((x) => NUM(x, 0));
@@ -279,14 +287,24 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
 
   // The blended colour adjusts. Each is a mat4 the shader builds column-wise
   // from the four per-layer matrices weighted by the layer weights.
+  //
+  // THE MATRIX NAME IS NOT THE PARAM NAME. Only four artist stems exist across
+  // all 22 finishes — Surface, Substrate, Burnishing, DamageBevel — while the
+  // shader declares five matrices. g_mDamageColorAdjust is fed by DamageBevel*,
+  // and the surface and substrate BURNISHING matrices share one Burnishing* set
+  // (only their roughness params are per-family). Deriving the stem from the
+  // matrix name found nothing for three of the five, so damage and both
+  // burnishing grades were identity on every finish — including a
+  // g_fBurnishingColorBrightness of 2.312, the largest number in the material.
   const mat: Record<string, number[][]> = {};
-  for (const base of [
-    "g_mSurfaceColorAdjust",
-    "g_mSubstrateColorAdjust",
-    "g_mDamageColorAdjust",
-    "g_mSurfaceBurnishingColorAdjust",
-    "g_mSubstrateBurnishingColorAdjust",
-  ]) {
+  const ADJUST_STEMS: Record<string, string[]> = {
+    g_mSurfaceColorAdjust: ["Surface"],
+    g_mSubstrateColorAdjust: ["Substrate"],
+    g_mDamageColorAdjust: ["DamageBevel", "Damage"],
+    g_mSurfaceBurnishingColorAdjust: ["SurfaceBurnishing", "Burnishing"],
+    g_mSubstrateBurnishingColorAdjust: ["SubstrateBurnishing", "Burnishing"],
+  };
+  for (const [base, candidates] of Object.entries(ADJUST_STEMS)) {
     // NOT read from the material — it does not contain them. g_m*ColorAdjust*
     // is VariableSource=__Expression__, VfxType=Float4x4 in the .vcs variable
     // table: the shader BUILDS it at compile time from four artist params, the
@@ -294,7 +312,16 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
     // 16-float param and falling back to identity, as this used to, silently
     // discarded every layer's grade — which is most of "it renders but the
     // colour is flat".
-    const stem = base.replace(/^g_m/, "").replace(/ColorAdjust$/, "");
+    const stem =
+      candidates.find((s) =>
+        LAYERS.some(
+          (i) =>
+            floats.get(`g_f${s}ColorBrightness${i}`) !== undefined ||
+            floats.get(`g_f${s}ColorContrast${i}`) !== undefined ||
+            floats.get(`g_f${s}ColorSaturation${i}`) !== undefined ||
+            vec[`g_v${s}ColorTint${i}`] !== undefined,
+        ),
+      ) ?? candidates[candidates.length - 1];
     mat[base] = LAYERS.map((i) => {
       const f = (suffix: string, d: number) => NUM(floats.get(`g_f${stem}Color${suffix}${i}`), NUM(floats.get(`g_f${stem}Color${suffix}1`), d));
       const tintRaw = vec[`g_v${stem}ColorTint${i}`] ?? vec[`g_v${stem}ColorTint1`] ?? [1, 1, 1, 0];
@@ -332,6 +359,10 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
     idColor,
     idPattern,
     pattern: BOOL(ints.get("F_PATTERN")) || BOOL(ints.get("g_bPattern")),
+    // The shared glove_compositor.vmat compiles BOTH pattern branches in
+    // (F_PATTERN and F_PATTERN_PAINT are 1 on it), so the finish's own flags
+    // pick between them at runtime as g_bPattern / g_bPatternPaintLayer.
+    patternPaintLayer: BOOL(ints.get("F_PATTERN_PAINT")) || BOOL(ints.get("g_bPatternPaintLayer")),
     patternEmboss: BOOL(ints.get("g_bPatternPaintEmboss")),
     patternRespectsTintMask: NUM(floats.get("g_fPatternPaintRespectsTintMask"), 0) !== 0,
     tintId: BOOL(ints.get("F_TINT_ID")) && !!tex.g_tTintId,
@@ -389,17 +420,17 @@ out vec4 fragColor;
 uniform sampler2D uId, uTintId, uPattern, uPatternProps, uObjProps, uNormal;
 uniform sampler2D uSub, uSubN, uSubP, uSurf, uSurfN, uSurfP, uDamage, uGrime;
 
-uniform mat4 uSurfAdj[4], uSubAdj[4], uDmgAdj[4];
+uniform mat4 uSurfAdj[4], uSubAdj[4], uDmgAdj[4], uSurfBurnAdj[4], uSubBurnAdj[4];
 uniform vec4 uIdColor[8];
-uniform bool uIdPattern[8];
+uniform float uIdPattern[8];
 uniform vec4 uDamageMin, uDamageMax;
 uniform vec4 uSurfBurnMin, uSurfBurnMax, uSubBurnMin, uSubBurnMax;
 uniform vec4 uDmgBevelMetal, uDmgBevelCloth, uDmgBevelRough;
-uniform vec4 uBurnMetal, uBurnCloth, uGrimeTranslucency;
+uniform vec4 uBurnMetal, uBurnCloth, uGrimeTranslucency, uSubTranslucency;
 uniform vec4 uPatternXform;      // scale.xy, offset.xy
 uniform vec2 uPatternCenter;
-uniform float uWear, uTexel, uPatternThreshold;
-uniform bool uHasPattern, uEmboss, uRespectsTintMask, uHasTint;
+uniform float uWear, uPatternThreshold;
+uniform bool uHasPattern, uEmboss, uRespectsTintMask, uHasTint, uPatternPaintLayer;
 uniform int uMode;
 
 const vec3 LUMA709 = vec3(0.2125, 0.7154, 0.0721);
@@ -414,6 +445,16 @@ vec4 layerWeights(vec2 uv) {
 }
 
 float blend4(vec4 v, vec4 w) { return dot(v, w); }
+
+/**
+ * smoothstep with the edges guarded. The shader calls smoothstep raw, but some
+ * of these min/max pairs are authored INVERTED — Tech Gradient's
+ * g_vSubstrateGrimeMinMax3 is (0.965, 0.937) — and smoothstep(a, b, x) with
+ * a >= b is undefined in GLSL, so it renders differently per driver.
+ */
+float ramp(float lo, float hi, float x) {
+  return hi > lo ? smoothstep(lo, hi, x) : step(lo, x);
+}
 
 mat4 blendAdj(mat4 m[4], vec4 w) {
   return mat4(
@@ -438,9 +479,14 @@ mat4 blendAdj(mat4 m[4], vec4 w) {
  * typo for t1 — and is transcribed as-is rather than "fixed".
  */
 vec4 tintColour(vec2 uv, out float weights[8]) {
+  // ONE TINT-ID TEXEL, not one composite texel. The shader takes the step from
+  // textureSize(g_tTintId) — these masks are 1024 while we composite at 2048, so
+  // a 1/size step samples the same texel nine times, every texel reads as
+  // interior and the edge kernel never runs.
+  vec2 texel = vec2(1.0) / vec2(textureSize(uTintId, 0));
   int idx[9];
   for (int t = 0; t < 9; t++) {
-    vec2 o = vec2(float(t % 3) - 1.0, float(t / 3) - 1.0) * uTexel;
+    vec2 o = vec2(float(t % 3) - 1.0, float(t / 3) - 1.0) * texel;
     idx[t] = int(ceil(texture(uTintId, uv + o).x * 7.0));
   }
   vec4 acc = vec4(0.0);
@@ -554,29 +600,81 @@ void main() {
   float subCloth  = subP.z * (1.0 - subMetal);
   float surfAo = surfP.x, subAo = subP.x;
 
-  // Tint mask lives in the albedo's alpha. g_fPatternPaintRespectsTintMask
-  // decides whether a negative mask is clamped or honoured.
-  float surfTintAmt = uRespectsTintMask ? surf.w : max(surf.w, 0.0);
-  float subTintAmt  = uRespectsTintMask ? sub.w  : max(sub.w,  0.0);
-
-  // Pattern. The shader offsets this lookup by a view-dependent parallax vector
-  // which a baked composite cannot have; see the header.
+  // ---- pattern ------------------------------------------------------------
+  // The shader offsets this lookup by a view-dependent parallax vector which a
+  // baked composite cannot have; see the header.
   vec2 patUv = (uv - uPatternCenter) * uPatternXform.xy + uPatternCenter + uPatternXform.zw;
   vec4 pat = uHasPattern ? texture(uPattern, patUv) : vec4(0.0);
-  float patAlpha = pat.w;
   if (uHasPattern && uEmboss) {
-    patAlpha = clamp(patAlpha * (1.0 + uPatternThreshold) - uPatternThreshold, 0.0, 1.0);
+    pat.w = smoothstep(uPatternThreshold, uPatternThreshold + 0.04, pat.w);
   }
-  // Only the palette slots flagged g_bId<n>Pattern take the pattern.
-  float patMask = 0.0;
-  if (uHasPattern) for (int i = 0; i < 8; i++) if (uIdPattern[i]) patMask += tw[i];
-  patMask = clamp(patMask * patAlpha, 0.0, 1.0);
+  // Only the palette slots flagged g_bId<n>Pattern take the pattern, weighted by
+  // how much of this texel each of those slots owns.
+  float patSlots = 0.0;
+  if (uHasPattern) for (int i = 0; i < 8; i++) patSlots += uIdPattern[i] * tw[i];
+  float patAmt = clamp(patSlots * pat.w, 0.0, 1.0);
+
+  // THE PATTERN IS A TINT, NOT A DECAL — on the branch every Sport/Specialist
+  // gradient finish takes (g_bPatternPaintLayer == 0). It replaces the palette
+  // colour that gets pushed into the fabric, so the weave survives underneath
+  // and the hue comes out of tintPush's saturation boost rather than off the
+  // texture. Ultra Violent is the case that proves it: nothing in its eight
+  // palette slots is magenta and its gradient is only a pale lilac
+  // (169,110,205), yet the glove is vividly magenta in game — that is tintPush
+  // taking the lilac's HUE and rebuilding it fully saturated. Painting the
+  // gradient straight onto the albedo, as this did, draws the pale lilac
+  // literally and flattens the mesh weave away.
+  vec4 surfTint = tint, subTint = tint;
+  if (uHasPattern && !uPatternPaintLayer) {
+    float noTint = float(tint.w == 0.0);
+    float surfT = (tint.w > 0.0 ? clamp(pat.w / tint.w, 0.0, 1.0) : noTint) * patAmt;
+    float subT  = max(noTint, pat.w) * patAmt;
+    float a = max(tint.w, pat.w * patAmt);
+    surfTint = vec4(mix(tint.rgb, pat.rgb, surfT), a);
+    subTint  = vec4(mix(tint.rgb, pat.rgb, subT),  a);
+  }
+
+  // Tint MASK lives in the albedo's alpha and only decides how much of the
+  // tinted colour replaces the raw one. g_fPatternPaintRespectsTintMask=0 lets
+  // the pattern force tinting on where the mask says no.
+  float surfMask = uRespectsTintMask ? surf.w : max(surf.w, patAmt);
+  float subMask  = uRespectsTintMask ? sub.w  : max(sub.w,  patAmt);
+  // The tint AMOUNT inside tintPush is the palette's own alpha, NOT that mask.
+  // Passing the mask for both (0.58 mean here) undertinted everything by half.
+  // The substrate additionally rides g_fSubstrateCompositeColorTranslucency,
+  // which was not applied at all.
+  float surfAmt = surfTint.w;
+  float subAmt  = subTint.w * blend4(uSubTranslucency, w);
 
   vec3 surfAdj = (vec4(surf.rgb, 1.0) * blendAdj(uSurfAdj, w)).xyz;
   vec3 subAdj  = (vec4(sub.rgb,  1.0) * blendAdj(uSubAdj,  w)).xyz;
 
-  vec3 surfCol = mix(surf.rgb, tintPush(surfAdj, tint, surfMetal, surfTintAmt), surfTintAmt);
-  vec3 subCol  = mix(sub.rgb,  tintPush(subAdj,  tint, subMetal,  subTintAmt),  subTintAmt);
+  vec3 surfCol = mix(surf.rgb, tintPush(surfAdj, surfTint, surfMetal, surfAmt), surfMask);
+  vec3 subCol  = mix(sub.rgb,  tintPush(subAdj,  subTint,  subMetal,  subAmt),  subMask);
+
+  // Wear drives both burnishing and damage. obj.z is the high-touch mask; the
+  // height term is the shader's own (a layer only wears where it is proud),
+  // where this used to substitute the ambient occlusion.
+  float touch = clamp((uWear - 1.0) + obj.z, 0.0, 1.0) * (max(surfP.w, subP.w) + uWear);
+
+  // Burnishing — the polished sheen on rubbed-back areas, and the largest
+  // numbers in the material (brightness 2.312 against 1.0 for the other
+  // grades). It grades the RAW albedo, not the tinted one, and replaces the
+  // tinted colour by its own min/max ramp. Zero at factory new by construction:
+  // touch needs wear before saturate((wear-1)+obj.z) leaves 0.
+  vec3 surfBurn = (vec4(surf.rgb, 1.0) * blendAdj(uSurfBurnAdj, w)).xyz;
+  vec3 subBurn  = (vec4(sub.rgb,  1.0) * blendAdj(uSubBurnAdj,  w)).xyz;
+  float surfBurnAmt = ramp(blend4(uSurfBurnMin, w), blend4(uSurfBurnMax, w), touch);
+  float subBurnAmt  = ramp(blend4(uSubBurnMin,  w), blend4(uSubBurnMax,  w), touch);
+  surfCol = mix(surfCol, surfBurn, surfBurnAmt);
+  subCol  = mix(subCol,  subBurn,  subBurnAmt);
+
+  // The other branch: the pattern really is painted over, as a decal on top of
+  // the tinted colour. Flames, pinstripes, the dragons and Racer 80 take this.
+  if (uHasPattern && uPatternPaintLayer) {
+    surfCol = mix(surfCol, pat.rgb, patAmt * (uRespectsTintMask ? surfMask : 1.0));
+    subCol  = mix(subCol,  pat.rgb, patAmt * (uRespectsTintMask ? subMask  : 1.0));
+  }
 
   // Surface sits over substrate by the surface layer's height.
   float cover = clamp(surfP.w, 0.0, 1.0);
@@ -584,20 +682,22 @@ void main() {
   float rough = mix(subRough, surfRough, cover);
   float metal = mix(subMetal, surfMetal, cover);
   float cloth = mix(subCloth, surfCloth, cover);
-  // Layer AO times the object-level occlusion (g_tObjectProperties.y).
-  float ao = clamp(mix(subAo, surfAo, cover) * obj.y, 0.0, 1.0);
+  // Layer AO times the object-level occlusion, which is g_tObjectProperties.RED
+  // (_19374.x in the decompile). Not .y — the three channels of this map are
+  // (ao, height, high-touch mask), and .y here means 0.506 where .x means 0.909,
+  // so reading .y halved the ambient term over the whole glove and read as a
+  // uniformly dark render with otherwise correct hues. Burnished areas are
+  // polished back to unoccluded.
+  float ao = clamp(mix(subAo, surfAo, cover) * obj.x, 0.0, 1.0);
+  ao = mix(ao, 1.0, max(surfBurnAmt, subBurnAmt));
 
-  if (uHasPattern) albedo = mix(albedo, pat.rgb, patMask);
-
-  // Wear. obj.z is the high-touch mask, obj.y the ambient term; damage carries
-  // the height field the bevel would key off.
+  // Damage carries the height field the bevel would key off.
   float dmg = texture(uDamage, uv).x;
   float grime = texture(uGrime, uv).x;
   float dmgLo = blend4(uDamageMin, w), dmgHi = blend4(uDamageMax, w);
-  float touch = clamp((uWear - 1.0) + obj.z, 0.0, 1.0) * (obj.y + uWear);
-  float wearAmt = smoothstep(dmgLo, dmgHi, touch * dmg);
+  float wearAmt = ramp(dmgLo, dmgHi, touch * dmg);
   vec3 dmgCol = (vec4(albedo, 1.0) * blendAdj(uDmgAdj, w)).xyz;
-  albedo = mix(albedo, tintPush(dmgCol, tint, metal, surfTintAmt), wearAmt);
+  albedo = mix(albedo, tintPush(dmgCol, surfTint, metal, surfAmt), wearAmt);
   rough = mix(rough, rough * blend4(uDmgBevelRough, w), wearAmt);
   metal = mix(metal, blend4(uDmgBevelMetal, w), wearAmt);
   cloth = mix(cloth, blend4(uDmgBevelCloth, w), wearAmt);
@@ -783,8 +883,12 @@ export async function compositeGloveModern(
     uSurfAdj: { value: adj("g_mSurfaceColorAdjust") },
     uSubAdj: { value: adj("g_mSubstrateColorAdjust") },
     uDmgAdj: { value: adj("g_mDamageColorAdjust") },
+    uSurfBurnAdj: { value: adj("g_mSurfaceBurnishingColorAdjust") },
+    uSubBurnAdj: { value: adj("g_mSubstrateBurnishingColorAdjust") },
     uIdColor: { value: def.idColor.map((c) => new THREE.Vector4(c[0], c[1], c[2], c[3])) },
-    uIdPattern: { value: def.idPattern },
+    // Numbers, not booleans: the shader takes these as float[8] the way the
+    // decompile does, so they multiply the slot weights directly.
+    uIdPattern: { value: def.idPattern.map((b) => (b ? 1 : 0)) },
     uDamageMin: { value: v4("g_vDamageMinMax_min") },
     uDamageMax: { value: v4("g_vDamageMinMax_max") },
     uSurfBurnMin: { value: v4("g_vSurfaceBurnishingMinMax_min") },
@@ -797,6 +901,7 @@ export async function compositeGloveModern(
     uBurnMetal: { value: v4("g_fBurnishingMetalness") },
     uBurnCloth: { value: v4("g_fBurnishingCloth") },
     uGrimeTranslucency: { value: v4("g_fGrimeTranslucency") },
+    uSubTranslucency: { value: v4("g_fSubstrateCompositeColorTranslucency") },
     uPatternXform: {
       value: new THREE.Vector4(
         def.vec.g_vPatternTexCoordScale?.[0] ?? 1,
@@ -809,9 +914,9 @@ export async function compositeGloveModern(
       value: new THREE.Vector2(def.vec.g_vPatternTexCoordCenter?.[0] ?? 0.5, def.vec.g_vPatternTexCoordCenter?.[1] ?? 0.5),
     },
     uWear: { value: opts.wear },
-    uTexel: { value: 1 / size },
     uPatternThreshold: { value: def.scalar.g_fPatternTranslucencyThreshold },
     uHasPattern: { value: def.pattern && !!loaded.get("g_tPattern") },
+    uPatternPaintLayer: { value: def.patternPaintLayer },
     uEmboss: { value: def.patternEmboss },
     uRespectsTintMask: { value: def.patternRespectsTintMask },
     uHasTint: { value: def.tintId },

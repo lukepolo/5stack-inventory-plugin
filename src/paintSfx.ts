@@ -154,7 +154,20 @@ export async function applyPaintSfx(
          vSfxK = 0.0;
          {
            float sfx = sfxMask(vMapUv);
-           vec3 V = normalize(vViewPosition);
+           // The viewer is ORTHOGRAPHIC, so this branch is the live path.
+           //
+           // Under a parallel projection every eye ray IS the view axis, so
+           // normalize(vViewPosition) — the fragment's own view-space offset —
+           // stops being the direction to the camera and becomes a fan
+           // spreading out from screen centre. three.js guards its own
+           // materials with exactly this branch; without it the sparkle picks
+           // up a radial swirl that is a projection artefact and nothing to do
+           // with the flakes.
+           //
+           // The consequence of getting it RIGHT is that V is now constant
+           // across the surface, so the sparkle no longer sweeps as the weapon
+           // turns. That is inherent to the projection, not a bug to chase.
+           vec3 V = isOrthographic ? vec3(0.0, 0.0, 1.0) : normalize(vViewPosition);
            float nDotV = clamp(dot(V, normal), 0.0, 1.0);
            if (uHasGlitter) {
              float gate = sfx * min(1.0, uGlitterIntensity);
@@ -195,7 +208,7 @@ export async function applyPaintSfx(
          {
            float sfx = sfxMask(vMapUv);
            if (uPearlScale != 0.0) {
-             float nDotV = clamp(dot(normalize(vViewPosition), normal), 0.0, 1.0);
+             float nDotV = clamp(dot(isOrthographic ? vec3(0.0, 0.0, 1.0) : normalize(vViewPosition), normal), 0.0, 1.0);
              diffuseColor.rgb = sfxPearlescent(diffuseColor.rgb, nDotV, sfx);
            }
            if (vSfxK > 0.0) {

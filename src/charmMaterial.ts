@@ -71,6 +71,172 @@ export function evalVfx(node: VfxNode, t: number): number[] {
   }
 }
 
+/** Does this expression tree actually read the pattern? */
+function hasSeedLeaf(node: VfxNode): boolean {
+  if (typeof node === "number") return false;
+  return node.f === "seed" || node.a.some(hasSeedLeaf);
+}
+
+/**
+ * Does this material's look VARY with the pattern?
+ *
+ * Not the same question as "does it have dynamic params": a dynamic expression
+ * can be a constant folded by the compiler, and a material can carry a static
+ * metalness/roughness correction while ignoring the seed entirely. Only a
+ * `$KeychainSeed` leaf makes the pattern matter, which is what the pattern rail
+ * needs to know before it offers to browse a space that has nothing in it.
+ */
+export function seedDrivenShading(tune?: CharmShading): boolean {
+  const dyn = tune?.dynamic;
+  return !!dyn && Object.values(dyn).some(hasSeedLeaf);
+}
+
+/**
+ * The shading map's key for a material path.
+ *
+ * charm-shading.json is keyed by the vmat stem the econ schema names; the
+ * extracted file carries the CDN's `_<8hex>` suffix on top. Shared so the rail
+ * and the renderer cannot drift on the derivation — they did not before only
+ * because there was exactly one caller.
+ */
+export function charmMaterialName(material: string): string {
+  return material
+    .split("/")
+    .pop()!
+    .replace(/\.vmat\.json$/i, "")
+    .replace(/_[0-9a-f]{8}$/i, "");
+}
+
+/*
+ * There was a charmSeedAffects() here that answered "does this charm's pattern
+ * do anything" from the econ spec alone. It is gone deliberately.
+ *
+ * For a charm that owns its model it could only GUESS — matching the shading
+ * map's keys against the model stem — and a guess that misses reads as "this
+ * charm looks the same at every pattern", which is a confident lie about a
+ * charm the renderer is re-shading perfectly well. Charm | Glitter Bomb was
+ * exactly that.
+ *
+ * The question is now answered where the evidence is: PatternRail's resolve(),
+ * against the material the MOUNTED MODEL reports it tuned. See it for the order
+ * of authority and for why an unsettled charm stays draggable.
+ */
+/** The colour knobs csgo_weapon.vfx grades with — see charmAdjustSrgb. */
+export interface CharmAdjust {
+  /** `g_fHueShift`, in RADIANS: the shader's cos/sin take them that way. */
+  hueRad: number;
+  sat: number;
+  contrast: number;
+  bright: number;
+}
+
+interface CharmTune extends CharmAdjust {
+  roughScale: number;
+  roughOffset: number;
+  metalness?: number;
+  /** True when any colour knob is off identity at THIS pattern. */
+  graded: boolean;
+}
+
+/**
+ * Resolve a material's shading at one pattern.
+ *
+ * Split out of tuneCharmShading so the pattern rail can ask what a seed looks
+ * like without a renderer, a model, or a GL context — which is the whole reason
+ * the rail can paint 100000 patterns instantly instead of rendering a hundred.
+ */
+function charmTune(tune: CharmShading, seed: number): CharmTune {
+  // CS2 hands the shader the pattern normalised over its 1..100000 range.
+  const t = Math.min(1, Math.max(0, seed / 100000));
+  const dyn = tune.dynamic ?? {};
+  const one = (name: string, dflt: number) => (dyn[name] ? evalVfx(dyn[name], t)[0] : dflt);
+  const hueDeg = one("g_fHueShift", 0);
+  const sat = one("g_fSaturation", 1);
+  const bright = one("g_fBrightness", 1);
+  const contrast = one("g_fContrast", 1);
+  // Seed-driven params OVERRIDE the material's baked constants — the baked
+  // value is just whatever pattern the artist authored against.
+  let metalness = tune.metalness;
+  if (dyn.g_vMetalnessRemapRange) {
+    const range = evalVfx(dyn.g_vMetalnessRemapRange, t);
+    if (range.length >= 2) metalness = range[1];
+  }
+  // Roughness: the game's own adjust is affine, and a seed-driven contrast
+  // folds into it the same way the baked one does.
+  let roughScale = tune.roughness ?? 1;
+  let roughOffset = tune.roughnessOffset ?? 0;
+  if (dyn.g_fTextureRoughnessContrast || dyn.g_fTextureRoughnessBrightness) {
+    const rc = one("g_fTextureRoughnessContrast", 1);
+    const rb = one("g_fTextureRoughnessBrightness", 1);
+    roughScale = rc * rb;
+    roughOffset = rb * 0.5 * (1 - rc);
+  }
+  return {
+    hueRad: (hueDeg * Math.PI) / 180,
+    sat,
+    contrast,
+    bright,
+    roughScale,
+    roughOffset,
+    metalness,
+    graded: hueDeg !== 0 || sat !== 1 || bright !== 1 || contrast !== 1,
+  };
+}
+
+/** What a pattern grades to, for callers with no renderer. See charmTune. */
+export function charmSeedAdjust(tune: CharmShading, seed: number): CharmAdjust {
+  const { hueRad, sat, contrast, bright } = charmTune(tune, seed);
+  return { hueRad, sat, contrast, bright };
+}
+
+const LUM = [0.2125, 0.7154, 0.0721] as const;
+/** 1/sqrt(3) — the normalised RGB grey axis the hue rotation turns about. */
+const GREY_AXIS = 0.57735027;
+
+/**
+ * csCharmAdjust, in JS, over sRGB bytes — the same grade the shader applies.
+ *
+ * Transcribed from CHARM_ADJUST_GLSL below rather than approximated with a CSS
+ * hue-rotate filter, because the two disagree exactly where it matters: CSS
+ * rotates every pixel equally, while the game fades the rotation out on
+ * near-grey pixels by `pow(hsvSaturation, 0.125)`. That fade is what stops a
+ * charm's metal parts smearing colour as the pattern sweeps, so a rail drawn
+ * without it would promise colours on chrome that the render never shows.
+ *
+ * Mutates RGBA in place. The GLSL's sRGB encode/decode wrapper is deliberately
+ * absent: canvas bytes are already sRGB, which is the space the game grades in.
+ * The final clamp is left to Uint8ClampedArray — unlike the contrast clamp,
+ * which feeds the rest of the math and so has to be explicit.
+ */
+export function charmAdjustSrgb(px: Uint8ClampedArray, adj: CharmAdjust): void {
+  const ca = Math.cos(adj.hueRad);
+  const sa = Math.sin(adj.hueRad);
+  const k = GREY_AXIS;
+  for (let i = 0; i < px.length; i += 4) {
+    // Contrast about mid-grey, then brightness.
+    const r = Math.min(1, Math.max(0, (0.5 + (px[i] / 255 - 0.5) * adj.contrast) * adj.bright));
+    const g = Math.min(1, Math.max(0, (0.5 + (px[i + 1] / 255 - 0.5) * adj.contrast) * adj.bright));
+    const b = Math.min(1, Math.max(0, (0.5 + (px[i + 2] / 255 - 0.5) * adj.contrast) * adj.bright));
+    const mx = Math.max(r, g, b);
+    const hsvSat = mx === 0 ? 0 : (mx - Math.min(r, g, b)) / mx;
+    // Rodrigues about the grey axis. cross(K, c) collapses to k * (b-g, r-b, g-r)
+    // because every component of K is the same.
+    const axial = k * (r + g + b) * k * (1 - ca);
+    const rotR = r * ca + k * (b - g) * sa + axial;
+    const rotG = g * ca + k * (r - b) * sa + axial;
+    const rotB = b * ca + k * (g - r) * sa + axial;
+    const fade = Math.pow(hsvSat, 0.125);
+    const lum = r * LUM[0] + g * LUM[1] + b * LUM[2];
+    const hueR = lum + (rotR - lum) * fade;
+    const hueG = lum + (rotG - lum) * fade;
+    const hueB = lum + (rotB - lum) * fade;
+    const hueLum = hueR * LUM[0] + hueG * LUM[1] + hueB * LUM[2];
+    px[i] = 255 * (hueLum + (hueR - hueLum) * adj.sat);
+    px[i + 1] = 255 * (hueLum + (hueG - hueLum) * adj.sat);
+    px[i + 2] = 255 * (hueLum + (hueB - hueLum) * adj.sat);
+  }
+}
+
 /**
  * csgo_weapon.vfx's colour adjustment, transcribed from the decompiled shader
  * (static combo 225 of csgo_weapon_vulkan_50_ps.vcs) rather than reinvented.
@@ -124,6 +290,12 @@ vec3 csCharmAdjust( vec3 linear ) {
  * matters because the clasp is a separate material shared across a whole
  * collection: keyed by charm instead, one charm's tuning would land on
  * everyone's chain.
+ *
+ * SAFE TO RE-RUN on an already-tuned model, which is what makes scrubbing a
+ * pattern live possible: the second call finds the material this mesh already
+ * owns and writes the new numbers into the very Vector2/Vector4 the uniforms
+ * are bound to. No clone, no program recompile, no `needsUpdate` — so dragging
+ * the rail recolours at frame rate instead of rebuilding the charm per tick.
  */
 export function tuneCharmShading(
   THREE: Three,
@@ -132,60 +304,47 @@ export function tuneCharmShading(
   seed: number,
 ) {
   if (!shading || !Object.keys(shading).length) return;
-  // CS2 hands the shader the pattern normalised over its 1..100000 range.
-  const t = Math.min(1, Math.max(0, seed / 100000));
   model.traverse((n) => {
     const mesh = n as ThreeNS.Mesh;
     if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
     const mat = mesh.material as ThreeNS.MeshStandardMaterial;
-    let tune = mat && shading[mat.name];
+    const tune = mat && shading[mat.name];
     if (!tune) return;
-    // Seed-driven params OVERRIDE the material's baked constants — the baked
-    // value is just whatever pattern the artist authored against.
-    const dyn = tune.dynamic ?? {};
-    const one = (name: string, dflt: number) =>
-      dyn[name] ? evalVfx(dyn[name], t)[0] : dflt;
-    const hueDeg = one("g_fHueShift", 0);
-    const saturation = one("g_fSaturation", 1);
-    const brightness = one("g_fBrightness", 1);
-    const contrast = one("g_fContrast", 1);
-    if (dyn.g_vMetalnessRemapRange) {
-      const range = evalVfx(dyn.g_vMetalnessRemapRange, t);
-      if (range.length >= 2) tune = { ...tune, metalness: range[1] };
+    const v = charmTune(tune, seed);
+    // Already ours? Then the uniforms are live objects and a re-shade is three
+    // assignments. Identity-checked against THIS mesh's current material rather
+    // than a boolean flag: the model comes out of a shared LRU, so a stale flag
+    // on a re-cloned mesh would have us writing into a Vector4 no program reads.
+    if (mesh.userData.charmTuned === mat) {
+      (mat.userData.colorAdjust as ThreeNS.Vector4).set(v.hueRad, v.sat, v.contrast, v.bright);
+      (mat.userData.roughAdjust as ThreeNS.Vector2).set(v.roughScale, v.roughOffset);
+      if (v.metalness !== undefined) mat.metalness = v.metalness;
+      return;
     }
-    // Roughness: the game's own adjust is affine, and a seed-driven contrast
-    // folds into it the same way the baked one does.
-    let scale = tune.roughness ?? 1;
-    let offset = tune.roughnessOffset ?? 0;
-    if (dyn.g_fTextureRoughnessContrast || dyn.g_fTextureRoughnessBrightness) {
-      const rc = one("g_fTextureRoughnessContrast", 1);
-      const rb = one("g_fTextureRoughnessBrightness", 1);
-      scale = rc * rb;
-      offset = rb * 0.5 * (1 - rc);
-    }
-    const grades = hueDeg !== 0 || saturation !== 1 || brightness !== 1 || contrast !== 1;
-    if (scale === 1 && offset === 0 && !grades && tune.metalness === undefined) return;
-    // CLONED, not mutated in place — and only now that something is actually
-    // being applied, so an untouched charm keeps sharing the cached material
-    // and its compiled program. The gltf comes out of a shared LRU and the
+    // Clone whenever the shading is SEED-DRIVEN, even where this particular
+    // pattern happens to land on identity. Deciding per seed instead would mean
+    // a scrub that starts on an identity pattern owns nothing, and the first
+    // drag past it would have to swap the material mid-gesture — a program
+    // recompile and a visible hitch, exactly where the motion should be smooth.
+    // A material the seed cannot touch still takes the old early exit, so an
+    // untouched charm keeps sharing the cached material and its program.
+    const seedDriven = seedDrivenShading(tune);
+    if (!seedDriven && v.roughScale === 1 && v.roughOffset === 0 && !v.graded && v.metalness === undefined) return;
+    // CLONED, not mutated in place: the gltf comes out of a shared LRU and the
     // tuning is seed-dependent, so two viewers showing the same charm at
     // different patterns would otherwise overwrite each other's colour. (It
     // was safe to mutate in place while every correction was a constant.)
     const owned = mat.clone();
     owned.name = mat.name;
     mesh.material = owned;
-    if (tune.metalness !== undefined) owned.metalness = tune.metalness;
+    mesh.userData.charmTuned = owned;
+    if (v.metalness !== undefined) owned.metalness = v.metalness;
     // `roughness` is a plain multiplier on the map, so the scale rides there;
     // the offset has no equivalent knob and needs the one line of shader. Both
     // go through the uniform so every tuned charm still shares one program.
     owned.roughness = 1;
-    owned.userData.roughAdjust = new THREE.Vector2(scale, offset);
-    owned.userData.colorAdjust = new THREE.Vector4(
-      (hueDeg * Math.PI) / 180, // the shader's cos/sin take RADIANS
-      saturation,
-      contrast,
-      brightness,
-    );
+    owned.userData.roughAdjust = new THREE.Vector2(v.roughScale, v.roughOffset);
+    owned.userData.colorAdjust = new THREE.Vector4(v.hueRad, v.sat, v.contrast, v.bright);
     owned.onBeforeCompile = (shader) => {
       shader.uniforms.uRoughAdjust = { value: owned.userData.roughAdjust };
       shader.uniforms.uColorAdjust = { value: owned.userData.colorAdjust };
@@ -217,26 +376,72 @@ export function tuneCharmShading(
  * "do not render this charm in 3D at all": an undressed blank is the same grey
  * shape for every community charm, so the flat art carries more information.
  */
+interface TexParam {
+  m_name?: string;
+  m_pValue?: string;
+}
+
+const materialParamsCache = new Map<string, Promise<TexParam[] | null>>();
+
+/**
+ * A charm material's texture list, fetched once per material per session.
+ *
+ * Cached because two things want it now — the mesh dressing below and the
+ * pattern rail, which needs the colour texture to know what the grade is
+ * operating on. A failed fetch is evicted rather than remembered: a charm that
+ * lost a race with a restarting backend must not stay undressed for the rest
+ * of the session.
+ */
+function charmMaterialParams(material: string): Promise<TexParam[] | null> {
+  let p = materialParamsCache.get(material);
+  if (!p) {
+    // paintTextureUrl is really "paint asset URL" — it prefixes /paints and
+    // stamps the extraction version, which materials need exactly as textures do.
+    p = fetch(paintTextureUrl(material))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((doc) => (doc as { m_textureParams?: TexParam[] } | null)?.m_textureParams ?? null)
+      .catch(() => null);
+    materialParamsCache.set(material, p);
+    void p.then((v) => {
+      if (!v) materialParamsCache.delete(material);
+    });
+  }
+  return p;
+}
+
+function pickTexture(params: TexParam[], ...names: string[]): string | null {
+  for (const n of names) {
+    const hit = params.find((t) => t.m_name === n)?.m_pValue;
+    if (typeof hit === "string" && hit.startsWith("/textures/")) return hit;
+  }
+  return null;
+}
+
+/**
+ * A charm's authored colour texture — what the seed grade actually operates on.
+ *
+ * The grade runs at `#include <map_fragment>`, i.e. on the albedo BEFORE any
+ * lighting, so this unlit texture is the correct input to predict a pattern's
+ * colour from. Grading the charm's lit catalog art instead would be doubly
+ * wrong: it is already lit, and it is already graded at whatever pattern the
+ * artist happened to author against — a pattern we do not record anywhere.
+ */
+export async function charmColorTextureUrl(material: string): Promise<string | null> {
+  const params = await charmMaterialParams(material);
+  if (!params) return null;
+  const path = pickTexture(params, "g_tColor", "g_tColorTexture");
+  return path ? paintTextureUrl(path) : null;
+}
+
 export async function dressCharm(
   THREE: Three,
   loadTexture: (url: string) => Promise<ThreeNS.Texture>,
   model: ThreeNS.Object3D,
   material: string,
 ): Promise<boolean> {
-  // paintTextureUrl is really "paint asset URL" — it prefixes /paints and
-  // stamps the extraction version, which materials need exactly as textures do.
-  const doc = await fetch(paintTextureUrl(material))
-    .then((r) => (r.ok ? r.json() : null))
-    .catch(() => null);
-  const params = (doc as { m_textureParams?: { m_name?: string; m_pValue?: string }[] } | null)?.m_textureParams;
+  const params = await charmMaterialParams(material);
   if (!params) return false;
-  const pick = (...names: string[]) => {
-    for (const n of names) {
-      const hit = params.find((t) => t.m_name === n)?.m_pValue;
-      if (typeof hit === "string" && hit.startsWith("/textures/")) return hit;
-    }
-    return null;
-  };
+  const pick = (...names: string[]) => pickTexture(params, ...names);
   const load = async (path: string | null) => {
     if (!path) return null;
     const tex = await loadTexture(paintTextureUrl(path)).catch(() => null);
@@ -278,7 +483,7 @@ export async function dressCharm(
     });
     // Named after the vmat it was built from, so tuneCharmShading can find it
     // the same way it finds a material the decompiler wrote.
-    mat.name = material.split("/").pop()!.replace(/\.vmat\.json$/i, "").replace(/_[0-9a-f]{8}$/i, "");
+    mat.name = charmMaterialName(material);
     (mesh.material as ThreeNS.Material)?.dispose?.();
     mesh.material = mat;
   });

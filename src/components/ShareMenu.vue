@@ -8,10 +8,10 @@
 // sharing before you paste it somewhere.
 import { ref, onBeforeUnmount } from "vue";
 import { Share2, Check, Link2 } from "lucide-vue-next";
-import type { ShareLink } from "./routes";
+import type { ShareLink } from "../routes";
 import Tooltip from "./Tooltip.vue";
 // TEMPORARY — overlay tracing, remove with the rest of the mdebug wiring.
-import { traceLayer } from "./mdebug";
+import { traceLayer } from "../mdebug";
 
 const props = defineProps<{
   links: ShareLink[];

@@ -19,6 +19,8 @@ export type Route =
   | { name: "loadout" }
   | { name: "focus" }
   | { name: "inventory" }
+  /** The catalog browser. `/craft` with no id — `/craft/<id>` is a draft of one. */
+  | { name: "armory" }
   | { name: "item"; id: string; modal: ItemModal }
   | { name: "draft"; skinId: number }
   | { name: "admin"; section: string };
@@ -40,6 +42,9 @@ export function parsePath(path: string): Route {
     return { name: "admin", section: path.replace(/^\/admin\/?/, "") };
   }
 
+  // Bare /craft is the browser; /craft/<id> is a draft of one particular finish.
+  // Checked before the draft pattern so the two can share the segment.
+  if (path === "/craft" || path === "/craft/") return { name: "armory" };
   const draft = path.match(/^\/craft\/(\d+)$/);
   if (draft) return { name: "draft", skinId: Number(draft[1]) };
 
@@ -64,6 +69,8 @@ export function buildPath(route: Route): string {
       return "/focus";
     case "inventory":
       return "/items";
+    case "armory":
+      return "/craft";
     case "item":
       return route.modal === "detail"
         ? `/items/${encodeURIComponent(route.id)}`
@@ -76,12 +83,14 @@ export function buildPath(route: Route): string {
 }
 
 /** Which top-level screen renders behind whatever modal is open. */
-export function screenFor(route: Route): "grid" | "focus" | "inventory" | "admin" {
+export function screenFor(route: Route): "grid" | "focus" | "inventory" | "armory" | "admin" {
   switch (route.name) {
     case "focus":
       return "focus";
     case "inventory":
       return "inventory";
+    case "armory":
+      return "armory";
     case "admin":
       return "admin";
     // An item modal is layered over the inventory; a draft over wherever you
@@ -243,7 +252,13 @@ export function decodeDraft(
     // Clamped, not just parsed — ?wear=99 from a mangled link would otherwise
     // reach the renderer and the game server as a nonsense float.
     wear: wear === null ? defaultWear : Math.min(1, Math.max(0, wear)),
-    seed: seed === null ? 1 : Math.min(1000, Math.max(0, Math.round(seed))),
+    // 100,000, not 1,000. The ceiling is here to stop a mangled link handing the
+    // game server a nonsense pattern, so it has to be the WIDEST an item's
+    // pattern can legitimately be — and a charm's is two orders past a weapon's.
+    // At 1,000 a shared charm draft came back silently clamped, which reads as
+    // the link having lost the pattern. The per-type range is the editor's job;
+    // this is only a sanity bound. See craftSeedIsCharm.
+    seed: seed === null ? 1 : Math.min(100000, Math.max(0, Math.round(seed))),
     stattrak: q.st === "1",
     nametag: q.name ?? "",
     stickers: [0, 1, 2, 3, 4, 5].map((i) => attach(q[`s${i}`])),

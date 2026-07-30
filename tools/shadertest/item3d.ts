@@ -63,6 +63,8 @@ interface Probe {
   size: string[];
   camDir: string[];
   camPos: string[];
+  /** Frustum half-height — see below; camPos alone no longer says how big. */
+  halfH: string;
   target: string[];
 }
 
@@ -76,6 +78,8 @@ async function probe(
     wear?: number;
     seed?: number;
     shoot?: boolean;
+    patches?: (string | null)[];
+    pose?: "stand" | "open" | "ready" | null;
   },
 ): Promise<{ probe?: Probe; raw?: string; png?: string; error?: string }> {
   const host = document.createElement("div");
@@ -91,12 +95,14 @@ async function probe(
       ...(opts.kind ? { kind: opts.kind } : {}),
       charmSpec: opts.charmSpec ?? null,
       paintMaterial: opts.paintMaterial ?? null,
+      ...(opts.patches?.length ? { patches: opts.patches } : {}),
       wear: opts.wear ?? 0,
       seed: opts.seed ?? 0,
       interactive: false,
       still: true,
       frame: "fit",
     });
+    if (opts.pose) handle.setAgentPose(opts.pose);
     // Textures and the composite land after the mount resolves; a snapshot
     // before they do is a picture of an untextured model.
     await new Promise((r) => setTimeout(r, opts.shoot ? 1800 : 400));
@@ -215,7 +221,12 @@ async function one() {
   line(`clips:     ${p.clips.join(", ") || "(none)"}`, "dim");
   line(`size:      ${p.size.join(" x ")} m`);
   line(`camDir:    ${p.camDir.join(", ")}`);
-  line(`camPos:    ${p.camPos.join(", ")}`);
+  // The camera is ORTHOGRAPHIC, so camPos is a fixed standoff along camDir and
+  // carries no framing information at all — halfH is the number that says how
+  // large the item renders. Both are printed because a wrong camDir and a wrong
+  // halfH look identical in a thumbnail.
+  line(`camPos:    ${p.camPos.join(", ")}  (standoff only — parallel projection)`);
+  line(`halfH:     ${p.halfH}  (frustum half-height = apparent size)`);
   line(`target:    ${p.target.join(", ")}  (orbit pivot)`);
   line(`flags:     flatOn=${p.flatOn} dual=${p.dual} weaponPaint=${p.weaponPaint} body=${p.bodyVariant}`);
   line(`props:     ${p.propStats}`);
@@ -458,8 +469,15 @@ async function agents() {
     "agents/models/ctm_swat/ctm_swat_variante",
     "agents/models/tm_phoenix/tm_phoenix_variantf",
   ].join(",")).split(",").filter(Boolean);
+  // `?patches=<img>,<img>` fills the model's slots in order. Patches are a UV
+  // composite into the body's base colour, not a placed decal, so there is
+  // nothing to drag and the only question a fixture can answer is whether they
+  // land in the right place at the right size — which needs the 3D render.
+  const patches = (params.get("patches") ?? "").split(",").filter(Boolean);
+  // ?pose=stand|open|ready — the three the viewer offers. See AgentPose.
+  const pose = params.get("pose") as "stand" | "open" | "ready" | null;
   for (const model of list) {
-    const r = await probe(model, { kind: "agent", shoot: true });
+    const r = await probe(model, { kind: "agent", shoot: true, patches, pose });
     if (r.error) {
       line(`FAIL ${model}: ${r.error}`, "fail");
       continue;
@@ -679,7 +697,13 @@ async function flatModern(
 ) {
   if (!def) return;
   line(`generation = substrate/surface (combo 5)`, "pass");
-  line(`pattern=${def.pattern} emboss=${def.patternEmboss} tintId=${def.tintId} respectsTintMask=${def.patternRespectsTintMask}`, "dim");
+  // paintLayer picks between the shader's two pattern branches — tint vs decal —
+  // which are different enough that knowing which one ran is the first question
+  // to ask of a wrong-looking pattern. See GLOVES-GEN2.md.
+  line(
+    `pattern=${def.pattern} paintLayer=${def.patternPaintLayer} emboss=${def.patternEmboss} tintId=${def.tintId} respectsTintMask=${def.patternRespectsTintMask}`,
+    "dim",
+  );
   line(`  textures = ${Object.keys(def.tex).length}`, "dim");
   line(`  scalars = ${JSON.stringify(def.scalar)}`, "dim");
   line(`  uvScale = ${JSON.stringify(def.layer.uvScaleX)} / ${JSON.stringify(def.layer.uvScaleY)}`, "dim");

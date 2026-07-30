@@ -1,4 +1,5 @@
 import { CS2Economy, CS2_ITEMS } from "@ianlucas/cs2-lib";
+import { patchSlotsSync } from "./agentPatchSlots.ts";
 import { english } from "@ianlucas/cs2-lib/translations/english";
 
 // Load the CS2 economy catalog once at startup (~27k items). This is the same
@@ -51,6 +52,18 @@ export interface CatalogSkin {
   model?: string | null;
   paintMaterial?: string | null;
   legacyPaint?: boolean;
+  /**
+   * cs2-lib type — "weapon", "melee", "glove", "musickit", "agent", …
+   *
+   * Every listing carries it, and that is load-bearing: the craft editor decides
+   * which controls an item gets by asking its TYPE, and falls back to the
+   * loadout slot only when the type is unknown. Agents and gloves said so;
+   * knives, music kits and weapon finishes did not — which was invisible while
+   * crafting always started from a matching slot, and wrong the moment it could
+   * start anywhere else. Opened from the armory, a knife inherited whatever
+   * rifle position was last selected and was offered five sticker slots.
+   */
+  type?: string;
   /** Game defindex. Absent means the item CANNOT be expressed as an inspect
    *  link (1,767 of the 2,205 graffiti have none), which is the one thing the
    *  frontend can't work out for itself — so every listing says. */
@@ -118,6 +131,7 @@ export function getWeaponSkins(model: string): {
       model: (i.model as string) ?? null,
       paintMaterial: i.paintMaterial ?? null,
       legacyPaint: !!i.legacy,
+      type: i.type,
       def: i.def,
     }));
   return {
@@ -167,6 +181,7 @@ export function getKnives(): CatalogSkin[] {
       model: (k.model as string) ?? null,
       paintMaterial: k.paintMaterial ?? null,
       legacyPaint: !!k.legacy,
+      type: k.type,
       def: k.def,
     }));
 }
@@ -179,6 +194,7 @@ export function getMusicKits(): CatalogSkin[] {
       name: m.name,
       rarity: m.rarity as string,
       image: img(m.image),
+      type: m.type,
       def: m.def,
     }));
 }
@@ -416,7 +432,12 @@ export function searchAttachments(query: AttachQuery): AttachPage {
     }
     // Keep counting past the page — `total` drives the infinite scroll.
     if (total <= offset || out.length >= limit) continue;
-    out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image });
+    // `type` rides along on every row. The craft editor picks an item's whole
+    // FORM off its type — a sticker gets a scratch slider, a charm a pattern —
+    // and falls back to the loadout slot when it's missing. From a picker that
+    // was harmless (a slot was always in play); from the armory it meant a
+    // sticker opened the gun editor, because `selected` was still on a rifle.
+    out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image, type: ATTACH_TYPE[query.kind] });
   }
   if (ordered) {
     // Rarity naturally descending (covert first, like the weapon sheets), with
@@ -428,7 +449,7 @@ export function searchAttachments(query: AttachQuery): AttachPage {
       matched.sort((a, b) => flip * (rarityRank(b.rarity) - rarityRank(a.rarity)) || a.name.localeCompare(b.name));
     } else matched.reverse(); // "default" reversed = newest capsules first
     for (const e of matched.slice(offset, offset + (limit === Infinity ? matched.length : limit))) {
-      out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image });
+        out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image, type: ATTACH_TYPE[query.kind] });
     }
   }
   return {
@@ -764,6 +785,10 @@ export function getItem(id: number) {
       def: i.def,
       index: i.index,
       tint: i.tint,
+      // Agents only, null for everything else: how many patches this model can
+      // actually carry. The craft page opens an OWNED item through here, so
+      // without it the form falls back to five slots — wrong for 62 of 63.
+      patchSlots: i.type === "agent" ? patchSlotsSync(i.model as string) : null,
       // Same two the graffiti catalog derives, under the same names, so the
       // OWNED list can stack colourways exactly the way the craft grid does.
       // `index` and `tint` are already right here, but they're the game's
@@ -820,7 +845,7 @@ export function slotForItem(id: number): string | null {
  * first ask — cs2-lib is already in memory, so this is a walk, not a load.
  */
 let stickerMaterials: Map<string, string> | null = null;
-export function stickerMaterialFor(image: string): string | null {
+export function stickerMaterialFor(image: string, patchMaterials?: Record<string, string>): string | null {
   if (!stickerMaterials) {
     stickerMaterials = new Map();
     for (const i of items) {
@@ -829,5 +854,22 @@ export function stickerMaterialFor(image: string): string | null {
       stickerMaterials.set(i.image, i.paintMaterial);
     }
   }
-  return stickerMaterials.get(image) ?? null;
+  const direct = stickerMaterials.get(image);
+  if (direct) return direct;
+  // A PATCH NEVER HAS ONE. cs2-lib gives 0 of 112 patches a `paintMaterial`, so
+  // the loop above cannot see them and every patch resolved to null — which is
+  // why patches rendered from their inventory icon while stickers got the real
+  // game art. The extraction already resolves them from the econ schema's
+  // `patch_material` into models/patch-materials.json, keyed by the same kit
+  // index cs2-lib exposes as `index`, so the answer only ever needed joining up.
+  if (!patchMaterials) return null;
+  for (const i of items) {
+    if (i.type !== "patch" || i.image !== image) continue;
+    const hit = patchMaterials[String(i.index)];
+    if (hit) {
+      stickerMaterials.set(image, hit);
+      return hit;
+    }
+  }
+  return null;
 }

@@ -62,6 +62,94 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+-- Attachments become owned instances.
+--
+-- Stickers and charms used to live on the weapon as bare catalog ids, so the
+-- sticker on your AK was not a thing you owned and could not carry its own
+-- scratch. Each spec now also stores `inst`: the owned_items row it IS. This
+-- backfills the ones that predate the link, so an existing collection keeps its
+-- charms and stickers instead of only new crafts getting them.
+--
+-- IDEMPOTENT, which matters because this file is re-applied on every boot (see
+-- applySchema): the only branch that mints is the one for a spec with no
+-- `inst`, and after the first pass there aren't any.
+--
+-- Steam-origin rows are deliberately skipped. Their attachments are SCRAPED out
+-- of a description blob and rewritten wholesale on every re-sync, which would
+-- drop the links and mint a fresh set each time — the inventory would grow a
+-- new copy of every sticker on every sync. Those keep their inline `w` forever,
+-- which is exactly what that fallback is for.
+DO $$
+DECLARE
+  r       RECORD;
+  el      jsonb;
+  out_arr jsonb;
+  new_id  bigint;
+BEGIN
+  FOR r IN
+    SELECT id, steam_id, stickers, patches, charm_id, charm_offset
+      FROM inventory.owned_items
+     WHERE origin <> 'steam'
+       AND (jsonb_typeof(stickers) = 'array'
+         OR jsonb_typeof(patches) = 'array'
+         OR charm_id IS NOT NULL)
+  LOOP
+    IF jsonb_typeof(r.stickers) = 'array' THEN
+      out_arr := '[]'::jsonb;
+      FOR el IN SELECT value FROM jsonb_array_elements(r.stickers) LOOP
+        IF jsonb_typeof(el) = 'null' THEN
+          out_arr := out_arr || 'null'::jsonb;
+        ELSIF jsonb_typeof(el) = 'number' THEN
+          -- Legacy entry: the slot stored a plain item id, no placement at all.
+          INSERT INTO inventory.owned_items (steam_id, item_id, origin)
+          VALUES (r.steam_id, (el #>> '{}')::int, 'crafted') RETURNING id INTO new_id;
+          out_arr := out_arr || jsonb_build_object('id', (el #>> '{}')::int, 'inst', new_id);
+        ELSIF jsonb_typeof(el->'inst') = 'number' THEN
+          out_arr := out_arr || el;
+        ELSE
+          INSERT INTO inventory.owned_items (steam_id, item_id, wear, origin)
+          VALUES (r.steam_id, (el->>'id')::int, (el->>'w')::real, 'crafted') RETURNING id INTO new_id;
+          out_arr := out_arr || (el || jsonb_build_object('inst', new_id));
+        END IF;
+      END LOOP;
+      UPDATE inventory.owned_items SET stickers = out_arr WHERE id = r.id;
+    END IF;
+
+    IF jsonb_typeof(r.patches) = 'array' THEN
+      out_arr := '[]'::jsonb;
+      FOR el IN SELECT value FROM jsonb_array_elements(r.patches) LOOP
+        IF jsonb_typeof(el) = 'null' THEN
+          out_arr := out_arr || 'null'::jsonb;
+        ELSIF jsonb_typeof(el) = 'number' THEN
+          INSERT INTO inventory.owned_items (steam_id, item_id, origin)
+          VALUES (r.steam_id, (el #>> '{}')::int, 'crafted') RETURNING id INTO new_id;
+          out_arr := out_arr || jsonb_build_object('id', (el #>> '{}')::int, 'inst', new_id);
+        ELSIF jsonb_typeof(el->'inst') = 'number' THEN
+          out_arr := out_arr || el;
+        ELSE
+          INSERT INTO inventory.owned_items (steam_id, item_id, origin)
+          VALUES (r.steam_id, (el->>'id')::int, 'crafted') RETURNING id INTO new_id;
+          out_arr := out_arr || (el || jsonb_build_object('inst', new_id));
+        END IF;
+      END LOOP;
+      UPDATE inventory.owned_items SET patches = out_arr WHERE id = r.id;
+    END IF;
+
+    -- The charm's own PATTERN moves onto its row, same as a sticker's scratch.
+    -- IS DISTINCT FROM, not <>: a charm_offset with no `inst` key gives SQL
+    -- NULL, and `NULL <> 'number'` is NULL rather than true — so a plain <>
+    -- silently skipped every unlinked charm, which is the exact set this is
+    -- here to convert.
+    IF r.charm_id IS NOT NULL AND jsonb_typeof(COALESCE(r.charm_offset, '{}'::jsonb)->'inst') IS DISTINCT FROM 'number' THEN
+      INSERT INTO inventory.owned_items (steam_id, item_id, seed, origin)
+      VALUES (r.steam_id, r.charm_id, (r.charm_offset->>'seed')::int, 'crafted') RETURNING id INTO new_id;
+      UPDATE inventory.owned_items
+         SET charm_offset = COALESCE(r.charm_offset, '{}'::jsonb) || jsonb_build_object('inst', new_id)
+       WHERE id = r.id;
+    END IF;
+  END LOOP;
+END $$;
+
 -- Plugin settings (single-row values). Holds the panel-generated server API
 -- key used by the CS2 game-server plugin (invsim_apikey).
 CREATE TABLE IF NOT EXISTS inventory.settings (

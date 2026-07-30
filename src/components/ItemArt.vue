@@ -6,7 +6,7 @@
 // gets to invent its own fallback chain, that's how the tiles drifted apart).
 // Un-crafted items (or none) just show catalog art.
 import { computed, inject } from "vue";
-import type { InventoryItem } from "./api";
+import type { InventoryItem } from "../api";
 
 const props = defineProps<{
   inst?: InventoryItem | null;

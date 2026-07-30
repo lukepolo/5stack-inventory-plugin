@@ -6,7 +6,7 @@
 // self-consistent — it cannot see a bug in the shipped GLSL, in uniform wiring,
 // or in a flag that gates a texture. Those are the bugs that have actually
 // shipped.
-import { loadPaintDef, loadWeaponInputs, compositePaint } from "../../src/paintComposite";
+import { loadPaintDef, loadWeaponInputs, compositePaint, seedMovesPattern } from "../../src/paintComposite";
 import { mountViewer } from "../../src/viewer3d";
 
 export interface Stat {
@@ -116,8 +116,10 @@ export async function runOne(
     out.overlayBlendMode = def.overlayBlendMode;
     out.overlayMaskMode = def.overlayMaskMode;
     out.seedRanges = { offsetX: def.offsetX, offsetY: def.offsetY, rotation: def.rotation };
-    const flat = (r: [number, number]) => r[0] === r[1];
-    out.seedInert = flat(def.offsetX) && flat(def.offsetY) && flat(def.rotation);
+    // Shared with the app, which gates the pattern browser on the same answer.
+    // Two copies of this predicate would be two definitions of "the seed cannot
+    // matter", and the rig is what proves the app's one is right.
+    out.seedInert = !seedMovesPattern(def);
 
     const weapon = await loadWeaponInputs(model, !!legacyPaint);
     out.weaponInputs = weapon

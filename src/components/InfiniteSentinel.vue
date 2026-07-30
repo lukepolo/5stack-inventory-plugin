@@ -19,7 +19,7 @@
  * stops growing simply stops being asked.
  */
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { scrollRoot } from "./dom";
+import { scrollRoot } from "../dom";
 
 const props = withDefaults(
   defineProps<{
