@@ -29,6 +29,33 @@ CS2Economy.load({ items: CS2_ITEMS, language: english });
 // reports the two separately; don't collapse them.
 const RENDERED_IN_3D = new Set(["weapon", "melee"]);
 
+// ---- sticker kit id, the ONLY thing that tells two same-named decals apart ---
+//
+// A stem is not unique for decals. The archive files sticker art by EVENT
+// (`.../stickers/emskatowice2014/ibuypower_png.vtex_c` vs
+// `.../stickers/cologne2014/ibuypower_png.vtex_c` vs `.../stickers/dhw2014/...`)
+// and cs2-lib keeps only the basename, so a stem-only match collapses all three
+// onto whichever the extractor indexed first. Measured on this catalogue: 16,992
+// of 26,878 icons share a stem with at least one other item, and 13,163 archive
+// assets are unreachable — every iBUYPOWER Katowice 2014 rendered as the Cologne
+// one, and so did most of the tournament sticker set.
+//
+// `index` on a sticker/patch/graffiti IS the game's sticker_kit id, and that kit
+// names the folder (`sticker_material`/`patch_material`). The extractor reads
+// items_game.txt and turns the id into a directory; here we only have to say
+// which kit each file belongs to.
+//
+// Sticker SLABS (keychains) have their own index in the keychain namespace, but
+// carry `stickerId` — their art sits in the sticker's own event folder under a
+// `_1355_37` name — so they borrow the kit through that.
+const kitOfItem = new Map(CS2Economy.itemsAsArray.map((i) => [i.id, i.index]));
+const DECAL_KIT_TYPES = new Set(["sticker", "patch", "graffiti"]);
+function kitOf(item) {
+  if (DECAL_KIT_TYPES.has(item.type)) return item.index;
+  if (item.type === "keychain" && item.stickerId != null) return kitOfItem.get(item.stickerId);
+  return undefined;
+}
+
 const icons = [];
 const seen = new Set();
 for (const item of CS2Economy.itemsAsArray) {
@@ -37,6 +64,7 @@ for (const item of CS2Economy.itemsAsArray) {
   if (seen.has(image)) continue;
   seen.add(image);
   const file = image.slice("/images/".length);
+  const kit = kitOf(item);
   icons.push({
     // Exact filename to write under <mount>/images/.
     out: file,
@@ -44,6 +72,7 @@ for (const item of CS2Economy.itemsAsArray) {
     stem: file.replace(/\.webp$/, "").replace(/_[0-9a-f]{8}$/, ""),
     type: item.type ?? "unknown",
     placeholderOnly: RENDERED_IN_3D.has(item.type),
+    ...(kit != null ? { kit } : {}),
   });
 }
 
@@ -87,13 +116,18 @@ for (const item of CS2Economy.itemsAsArray) {
   const file = pm.slice("/materials/".length);
   const m = /^(.*?)\.(vcompmat|vmat)\.json$/.exec(file);
   if (!m) continue;
+  const kit = kitOf(item);
   paints.push({
     out: file,
     stem: m[1].replace(/_[0-9a-f]{8}$/, ""),
     kind: m[2],
     // Follow one texture, not the whole chain. The extractor reads this.
     ...(decal ? { decal: true } : {}),
+    // Same collision as the icons, and worse: the sticker's vmat is what the
+    // viewer actually DRAWS on a weapon, so a stem-only match put the wrong
+    // event's art on the gun as well as on the tile.
+    ...(kit != null ? { kit } : {}),
   });
 }
 
-process.stdout.write(JSON.stringify({ version: 3, icons, paints }));
+process.stdout.write(JSON.stringify({ version: 4, icons, paints }));

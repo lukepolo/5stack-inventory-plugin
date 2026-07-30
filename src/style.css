@@ -60,6 +60,20 @@
   [data-cs2-inventory] .sheet-settled .animate-sheet-in {
     animation: none;
   }
+  /* Catalog tiles in the long scrollers (picker, sheet, inventory).
+     `content-visibility: auto` lets the browser skip style, layout and paint for
+     tiles that are off screen. These grids hold every page fetched so far — a few
+     thousand tiles after some scrolling, each with art, a rarity glow and a name —
+     and the whole lot was being styled and painted on every scroll frame, which is
+     the jitter that shows up only when scrolling FAST.
+     `contain-intrinsic-size: auto <h>` gives the skipped tile a stand-in height so
+     the scrollbar stays honest, and `auto` makes the browser remember the real one
+     once rendered. The row height is already fixed by the grid's `gridAutoRows`,
+     so the placeholder can't be wrong. --cis is set inline from the card size. */
+  [data-cs2-inventory] .cv-tile {
+    content-visibility: auto;
+    contain-intrinsic-size: auto var(--cis, 120px);
+  }
   /* Loadout cell art: replays when the occupant changes (team switch, weapon
      replace) — a wave across the grid instead of 15 images teleporting. */
   [data-cs2-inventory] .animate-cell-in {
@@ -75,6 +89,22 @@
   /* Inventory grid reflow (TransitionGroup move) when filters change. */
   [data-cs2-inventory] .inv-move {
     transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  /* Leaving cards must go NOW, all together.
+     This class exists because of how Vue decides when a leaving element may be
+     removed: it reads the element's own computed animation/transition and waits
+     that long. Our cards keep `animate-cell-in` after it has played, and that
+     rule carries `animation-delay: min(var(--i) * 26ms, 420ms)` — a DIFFERENT
+     delay per card, by grid position. With no leave class to override it, Vue
+     honoured each card's own delay and removed them in index order: the grid
+     visibly filtering itself one weapon at a time, which is exactly what it
+     looked like. Cancelling both here makes Vue measure zero and drop the whole
+     set on the next frame.
+     `!important` because it has to beat the animation shorthand on the element
+     itself, which is set by a class in this same layer. */
+  [data-cs2-inventory] .inv-leave {
+    animation: none !important;
+    transition: none !important;
   }
   /* Grid <-> focus. The two views are separate DOM trees swapped by v-if, so
      there is nothing for a Vue <Transition> to cross-fade without collapsing
@@ -180,6 +210,31 @@
   transition: --acc 400ms ease;
 }
 
+/* The CT half of the team accent. The T half is the panel's own brand token
+   (--tac-amber), but the panel publishes no global CT colour — the value lives
+   scoped inside web/components/match/ReplayChrome.vue:
+       --accent: #57cdff;  --ct: #57cdff;  --t: #ffb049;
+   where it is the UI accent for the replay chrome: border-color, a 20%
+   color-mix fill, accent-color. That is the same role --acc plays here, so it
+   is the right colour to borrow, and this is the ONE place to change if the
+   panel ever promotes it to a real token. (web/components/match/Replay3DLite.vue
+   has a second pair, CT #4799eb / T #f5a623, but those tint 3D player markers —
+   data-viz, not chrome.)
+
+   Declared as HSL channels to match --tac-amber's shape, so both halves of the
+   accent compose the same way. Was a hand-picked #4a8fe0 that appeared nowhere
+   in the panel.
+
+   CTA endpoints derived exactly as the panel derives its amber ones (lighter
+   tint -> base -> darker shade). The old CT gradient ran dark -> light, i.e.
+   backwards from the T gradient sitting next to it. */
+[data-cs2-inventory] {
+  --tac-ct: 198 100% 67%;
+  --tac-ct-foreground: 0 0% 10%;
+  --tac-ct-cta-from: color-mix(in hsl, hsl(var(--tac-ct)), white 15%);
+  --tac-ct-cta-to: color-mix(in hsl, hsl(var(--tac-ct)), black 12%);
+}
+
 /* Modal/menu motion is decoration, never the thing that makes state legible —
    so honouring the OS setting costs nothing. Overlays still appear and
    disappear, they just arrive instantly. */
@@ -195,13 +250,21 @@
 }
 
 /* Cheap list virtualization: offscreen cards skip layout/paint entirely.
-   The intrinsic size is a placeholder for unrendered cards, so it has to track
-   whatever the picker grid is actually using — see the compact override. */
+   The intrinsic size is a placeholder for unrendered cards. It USED to be a bare
+   `164px 152px`, which is one card size out of a slider's worth — every other
+   setting gave the scrollbar a length the content didn't have. Leading `auto`
+   makes the browser substitute the real size once a card has been rendered
+   even once, and keeps the px pair only as the never-yet-seen fallback.
+
+   Note what this costs elsewhere: a skipped subtree that something then MEASURES
+   has to be laid out on the spot. That is why the inventory grid keys its cards
+   on the filter signature — a TransitionGroup move would measure every one of
+   them (see invFilterSig). */
 @layer components {
   [data-cs2-inventory] [data-role="skin"],
   [data-cs2-inventory] [data-role="inv-item"] {
     content-visibility: auto;
-    contain-intrinsic-size: 164px 152px;
+    contain-intrinsic-size: auto 164px auto 152px;
   }
 }
 
@@ -212,7 +275,7 @@
   @layer components {
     [data-cs2-inventory] [data-role="skin"],
     [data-cs2-inventory] [data-role="inv-item"] {
-      contain-intrinsic-size: 132px 132px;
+      contain-intrinsic-size: auto 132px auto 132px;
     }
   }
   /* The slot menu becomes a thumb-reachable sheet — 8 rows of `py-2` (32px)

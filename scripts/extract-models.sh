@@ -92,6 +92,20 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v18 (2026-07-29): decal art is resolved by STICKER KIT FOLDER, not by basename
+# (step 3f + steps 4/5). The archive files sticker art per event, cs2-lib keeps
+# only the basename, and the icon/material indexes were keyed on that — so all
+# three `ibuypower` stickers (emskatowice2014 / cologne2014 / dhw2014) collapsed
+# onto whichever the archive listed first, and every player who owned the
+# Katowice one saw Cologne art. 3,907 basenames were ambiguous, hiding 13,163
+# assets. Measured on this catalogue: 13,102 icons and 6,410 sticker materials
+# resolved to the WRONG asset, some not stickers at all (sticker `metal` was an
+# Inferno bookshelf material, `aces_high` a collectible pin). The kit id is
+# cs2-lib's `index`, and items_game.txt turns it into the folder: 10,565/10,565
+# stickers, 112/112 patches, 2,205/2,205 graffiti, 10,545/10,565 slabs — the 20
+# are Budapest 2025, newer than this build, and are now reported blank rather
+# than dressed in another event's art. Re-extraction required; card bakes and
+# composites keyed on this version invalidate with it.
 # v17 (2026-07-29): charm-shading.json gains `dynamic` — the SEED-DRIVEN shader
 # params, decoded from each keychain vmat's Source 2 dynamic-expression
 # bytecode. A charm's pattern is not just a tradeable number: 36 of the 89
@@ -118,7 +132,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=17
+EXTRACT_VERSION=18
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -1847,6 +1861,78 @@ if not charms:
           "flat art. Check that scripts/items/items_game.txt extracted.")
 PYEOF
 
+# ---- 3f. Sticker kit -> archive FOLDER ---------------------------------------
+# Read here because this is where items_game.txt already is; consumed by steps 4
+# and 5.
+#
+# Decal art is filed by EVENT and cs2-lib keeps only the basename, so
+# `ibuypower` names three different stickers (emskatowice2014, cologne2014,
+# dhw2014) and a basename-keyed index silently serves one of them as all three.
+# That was 13,163 unreachable archive assets — most of the tournament sticker set
+# wearing the wrong event's art, on the tile AND on the gun.
+#
+# The kit id (cs2-lib's `index` for a sticker/patch/graffiti) names the folder:
+#   "59" { name kat2014_ibuypower  sticker_material "emskatowice2014/ibuypower" }
+#   "4550" { name patch_banana     patch_material   "case01/patch_banana" }
+# Only the DIRECTORY is kept — sticker slabs live in the same folder under a
+# different stem (`ibuypower_1355_37`), so the file name has to stay the
+# manifest's. Like keychain_definitions these arrive in ~55 blocks, so merge.
+STICKER_KITS="$WORK/sticker-kits.json"
+ITEMS_GAME="$ITEMS_GAME" STICKER_KITS="$STICKER_KITS" python3 - <<'PYEOF'
+import json, os, re
+
+src, out_path = os.environ.get("ITEMS_GAME", ""), os.environ["STICKER_KITS"]
+KV = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"\s*$')
+INDEX = re.compile(r'^"(\d+)"$')
+
+dirs = {}
+if src and os.path.exists(src):
+    lines = open(src, encoding="utf8", errors="replace").read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != '"sticker_kits"':
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != "{":
+            j += 1
+        depth, j = 1, j + 1
+        cur, entry = None, None
+        while j < len(lines) and depth > 0:
+            stripped = lines[j].strip()
+            if stripped == "{":
+                depth += 1
+            elif stripped == "}":
+                depth -= 1
+                if depth == 1 and cur is not None:
+                    # `stickers/` and `patches/` are the archive trees these two
+                    # keys are relative to, for both the icon and the material.
+                    mat = entry.get("sticker_material")
+                    tree = "stickers"
+                    if mat is None:
+                        mat, tree = entry.get("patch_material"), "patches"
+                    if mat:
+                        dirs[cur] = f"{tree}/{mat}".rsplit("/", 1)[0]
+                    cur, entry = None, None
+            elif depth == 1:
+                m = INDEX.match(stripped)
+                if m:
+                    cur, entry = m.group(1), {}
+            elif depth == 2 and entry is not None:
+                m = KV.match(lines[j])
+                if m:
+                    entry[m.group(1)] = m.group(2)
+            j += 1
+        i = j
+
+with open(out_path, "w") as fh:
+    json.dump(dirs, fh)
+print(f"--- Sticker kits: {len(dirs)} kit folders (disambiguates same-named decal art)")
+if not dirs:
+    print("!!! No sticker kits recovered — decal art falls back to a basename match, "
+          "which serves ONE event's art for every same-named sticker.")
+PYEOF
+
 # ---- 4. Econ item icons ------------------------------------------------------
 step "econ-icons"
 # Flat item artwork for everything the UI lists. We serve this ourselves — there
@@ -1862,8 +1948,13 @@ step "econ-icons"
 # The filenames are cs2-lib's (`item.image`), because that is what the catalog
 # hands the frontend. cs2-lib names assets `<game-stem>_<hash8>.webp` using its
 # own content hash, which we can't recompute — but stripping the suffix leaves
-# the game asset's name, and that we can resolve. Measured on build 14116:
-# 26872/26878 resolve; the 6 misses are items newer than the installed game.
+# the game asset's name, and that we can resolve.
+#
+# The stem is not enough on its own for DECALS: the archive files sticker art by
+# event and a stem names one file per event, so those resolve by kit folder
+# (§3f) and only everything else falls back to the basename rules. Measured on
+# build 14116: 26849/26878 resolve — 8 vanilla gloves (ambiguous, see below) and
+# 21 items newer than the installed game.
 echo ""
 echo "--- Extracting econ item icons…"
 
@@ -1940,6 +2031,7 @@ else
   rm -rf "$RAW_ICONS"
 
   CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_ICONS="$RAW_ICONS" \
+  STICKER_KITS="$STICKER_KITS" \
   ASSET_MANIFEST="$ASSET_MANIFEST" IMG_DEST="$IMG_DEST" python3 - <<'PYEOF'
 import glob, json, os, re, shutil, subprocess, sys
 from collections import defaultdict
@@ -1972,15 +2064,28 @@ def pool_size(cap=8):
 
 ECON = "panorama/images/econ/"
 
+# Kit id -> archive folder, for the decals whose basename is not unique. Empty
+# if items_game.txt did not extract; the stem rules below still apply, they just
+# can't tell two same-named stickers apart.
+try:
+    kit_dirs = json.load(open(os.environ["STICKER_KITS"]))
+except Exception:
+    kit_dirs = {}
+
 # ---- index the archive's icons -------------------------------------------
 # Key on the lowercased basename with the trailing `_png` dropped: the archive
 # spells some assets in mixed case (cu_bizon_Curse) while cs2-lib lowercases,
 # so an exact byte match silently loses items.
+#
+# BASENAMES COLLIDE — 3,907 of them, hiding 13,163 assets — so this map is the
+# fallback, not the primary. Anything with a kit is resolved by full path below.
 by_name = {}
+by_path = {}
 for line in open(os.environ["VPK_LIST"]):
     p = line.strip()
     if not p.startswith(ECON):
         continue
+    by_path[p.lower()] = p
     base = re.sub(r"\.(vtex_c|vsvg_c)$", "", p.split("/")[-1])
     base = re.sub(r"_png$", "", base).lower()
     by_name.setdefault(base, p)
@@ -1995,11 +2100,43 @@ for name in by_name:
 
 TINT = re.compile(r"_([0-9a-f]{6})$")
 
-def resolve(stem):
+def in_kit(kit, stem):
+    """The asset at <kit folder>/<stem>, if the archive has it. Icons are
+    `<name>_png.vtex_c`; a few are `<name>.vsvg_c`."""
+    folder = kit_dirs.get(str(kit)) if kit is not None else None
+    if not folder:
+        return None
+    for cand in (f"{ECON}{folder}/{stem}_png.vtex_c", f"{ECON}{folder}/{stem}.vsvg_c"):
+        hit = by_path.get(cand.lower())
+        if hit:
+            return hit
+    return None
+
+
+def resolve(stem, kit=None):
     """-> (archive path or None, tint hex or None, reason). Order matters: the
     wear/tint rules must not fire before an exact hit, or e.g. a skin literally
     named ..._light would resolve to the wrong asset."""
     s = stem.lower()
+    # A kit names the exact folder, which is the only way to tell the three
+    # `ibuypower` stickers apart. Tried FIRST and by full path: a basename hit is
+    # not evidence of anything when 3,907 basenames are ambiguous.
+    folder = kit_dirs.get(str(kit)) if kit is not None else None
+    if folder:
+        hit = in_kit(kit, s)
+        if hit:
+            return hit, None, "kit"
+        m = TINT.search(s)
+        if m:
+            hit = in_kit(kit, s[: m.start()])
+            if hit:
+                return hit, m.group(1), "kit-tint"
+        # The folder is known and the art is not in it: the item is newer than
+        # the installed game (the 20 Budapest 2025 slabs on build 14116). Falling
+        # through to the basename rules would find a SAME-NAMED sticker from
+        # another event and publish it as this one — the wrong-art-that-looks-
+        # right failure the gloves comment below is about. Report it instead.
+        return None, None, "absent"
     if s in by_name:
         return by_name[s], None, "exact"
     # Weapon skin icons ship one per wear tier; they differ only in the amount
@@ -2026,7 +2163,7 @@ def resolve(stem):
 wanted = defaultdict(list)   # archive path -> [(out name, tint)]
 missing = []
 for entry in manifest:
-    path, tint, reason = resolve(entry["stem"])
+    path, tint, reason = resolve(entry["stem"], entry.get("kit"))
     if path is None:
         missing.append(dict(entry, reason=reason))
         continue
@@ -2225,7 +2362,7 @@ PYEOF
   RAW_PAINTS="$WORK/raw_paints"
   rm -rf "$RAW_PAINTS"
   CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_PAINTS="$RAW_PAINTS" \
-  CHARM_MATS="$WORK/charm-materials.json" \
+  CHARM_MATS="$WORK/charm-materials.json" STICKER_KITS="$STICKER_KITS" \
   ASSET_MANIFEST="$ASSET_MANIFEST" PAINT_DEST="$PAINT_DEST" python3 - <<'PYEOF'
 import glob, hashlib, json, os, re, shutil, subprocess, time
 from collections import defaultdict
@@ -2453,10 +2590,24 @@ def resolve_ref(ref):
 # cs2-lib's exact filename where it has one (the catalog's paintMaterial points
 # at it and must resolve); otherwise our own stable name. The short hash keeps
 # same-named assets in different trees apart.
+#
+# Sticker vmats are keyed by BASENAME in the archive index above, and sticker
+# basenames are not unique — `stickers/emskatowice2014/ibuypower.vmat_c` and
+# `stickers/cologne2014/ibuypower.vmat_c` are different art. This is the material
+# the viewer DRAWS on the weapon, so a basename match put the wrong event's
+# sticker on the gun. The kit's folder (§3f) makes it exact: 10,565/10,565.
+try:
+    kit_dirs = json.load(open(os.environ["STICKER_KITS"]))
+except Exception:
+    kit_dirs = {}
+
 wanted_name = {}
 unresolved = []
 for entry in manifest:
-    path = by_key.get(f"{entry['stem']}.{entry['kind']}".lower())
+    folder = kit_dirs.get(str(entry["kit"])) if entry.get("kit") is not None else None
+    path = by_path.get(f"{folder}/{entry['stem']}.{entry['kind']}_c".lower()) if folder else None
+    if path is None and not folder:
+        path = by_key.get(f"{entry['stem']}.{entry['kind']}".lower())
     if path:
         wanted_name[path] = entry["out"]
     else:

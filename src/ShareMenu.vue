@@ -99,10 +99,13 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
           class="flex w-full items-start gap-2.5 px-3 py-2 text-left transition-colors hover:bg-muted"
           @click="copy(l)"
         >
+          <!-- Success is the panel's --success, not the team accent: "Copied"
+               is a confirmation, and on CT the accent made it read as just
+               another blue element rather than as something having worked. -->
           <component
             :is="copied === l.key ? Check : Link2"
             class="mt-0.5 h-3.5 w-3.5 flex-none"
-            :class="copied === l.key ? 'text-[color:var(--acc)]' : 'text-muted-foreground'"
+            :class="copied === l.key ? 'text-[hsl(var(--success,142_70%_55%))]' : 'text-muted-foreground'"
           />
           <span class="min-w-0 flex-1">
             <span class="block text-f13">{{ copied === l.key ? "Copied" : l.label }}</span>

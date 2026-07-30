@@ -33,5 +33,8 @@ function onError(e: Event) {
 </script>
 
 <template>
-  <img v-if="src" :src="src" alt="" loading="lazy" @error="onError" />
+  <!-- decoding="async": this is the art in every card of every long grid, so a
+       fast scroll decodes dozens at once. Synchronous decode does that on the
+       main thread, inside the scroll frames. -->
+  <img v-if="src" :src="src" alt="" loading="lazy" decoding="async" @error="onError" />
 </template>

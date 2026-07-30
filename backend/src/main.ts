@@ -672,6 +672,37 @@ for (const route of ["/api/tests/img/:key", "/tests/:key"]) {
   });
 }
 
+/**
+ * The `/images/<file>.webp` key a caller means, or null if it isn't one.
+ *
+ * Every route that is asked ABOUT an item's artwork gets handed whatever the
+ * viewer is holding, and what the viewer holds is a fully-resolved URL —
+ * `https://<assets>/images/x.webp`, because api.ts absolutises every
+ * `/images/...` string in a response so the bundle (running on the PANEL's
+ * origin) can load it at all. It may now also carry `?v=<extract version>`.
+ *
+ * Both of those broke a bare `startsWith("/images/")` check, and broke it
+ * SILENTLY: the route answers `{art: null}`, which is a legitimate answer
+ * meaning "no texture on this mount", so the viewer quietly fell back to
+ * cropping the flat icon for EVERY sticker. It looked like a working feature.
+ * charm-model hit exactly this and was fixed there alone; this is that fix,
+ * shared, so the next such route can't reintroduce it.
+ */
+function imagePathParam(raw: string | undefined): string | null {
+  let image = raw ?? "";
+  if (!image) return null;
+  try {
+    // Absolute URL -> pathname (which excludes the query by definition).
+    if (/^https?:\/\//i.test(image)) image = new URL(image).pathname;
+  } catch {
+    return null;
+  }
+  // Bare path: drop a query/hash the URL parser never saw.
+  image = image.replace(/[?#].*$/, "");
+  if (!image.startsWith("/images/") || image.includes("..")) return null;
+  return image;
+}
+
 // Sticker placement envelope for a weapon model (drives the 3D drag editor).
 // Bounds AND the real per-slot UV anchors. Bounds alone can only rule a
 // placement out; the anchors are what let the viewer put a sticker where the
@@ -689,10 +720,26 @@ for (const route of ["/api/tests/img/:key", "/tests/:key"]) {
 // read per sticker and a viewer needs at most five. Answers null — never an
 // error — when the texture isn't on the mount, which is the case on any mount
 // extracted before v12; the viewer then falls back to the icon.
+//
+// Dropped whenever the mount is re-extracted, the same way stickerMarkup.ts
+// keys its caches on the source file's mtime. This is not hygiene, it is a bug
+// that shipped: an extraction can change WHICH texture a sticker's material
+// names — v18 repointed 6,410 sticker materials at the right event's art — and a
+// process that had answered for a sticker before the run kept handing out the
+// old texture path for its whole lifetime. The old file is still on the mount
+// (superseded textures are pruned a generation behind), so it resolved 200 and
+// the weapon kept wearing the wrong sticker with nothing in any log. Costs one
+// stat per request; the map itself is what makes that acceptable.
 const stickerArtCache = new Map<string, string | null>();
+let stickerArtStamp = -1;
 app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (request) => {
-  const image = request.query.image ?? "";
-  if (!image.startsWith("/images/") || image.includes("..")) return { art: null };
+  const image = imagePathParam(request.query.image);
+  if (!image) return { art: null };
+  const stamp = await fs.stat(EXTRACT_VERSION_FILE).then((s) => s.mtimeMs, () => -1);
+  if (stamp !== stickerArtStamp) {
+    stickerArtCache.clear();
+    stickerArtStamp = stamp;
+  }
   const hit = stickerArtCache.get(image);
   if (hit !== undefined) return { art: hit };
   let art: string | null = null;
@@ -726,18 +773,11 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
 // a mount that predates the charm-models step, and the viewer then falls back to
 // the charm's flat art — the behaviour every charm had before.
 app.get<{ Querystring: { image?: string } }>("/api/catalog/charm-model", async (request) => {
-  // Callers hold a fully-resolved image URL, not a path — the viewer's charm
-  // placement carries `https://<assets>/images/kc_*.webp`. Taking the pathname
-  // accepts both; requiring a bare path answered null for EVERY charm, which
-  // looks exactly like a mount that has no charm models at all.
-  const raw = request.query.image ?? "";
-  let image = raw;
-  try {
-    if (/^https?:\/\//i.test(raw)) image = new URL(raw).pathname;
-  } catch {
-    return { charm: null };
-  }
-  if (!image.startsWith("/images/") || image.includes("..")) return { charm: null };
+  // Callers hold a fully-resolved image URL, not a path — see imagePathParam,
+  // which is where this route's own hard-won handling of that now lives, and
+  // which also strips the ?v= the icons carry since they became versioned.
+  const image = imagePathParam(request.query.image);
+  if (!image) return { charm: null };
   // cs2-lib names assets `<game stem>_<hash8>.webp`; the stem is the econ name.
   const stem = path.basename(image).replace(/\.webp$/i, "").replace(/_[0-9a-f]{8}$/i, "");
   const charm = (await getCharmModels())[stem] ?? null;

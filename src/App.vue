@@ -77,7 +77,7 @@ import ViewerControls from "./ViewerControls.vue";
 import { SORT_DIR_ICON, type SortDir, type SortKind } from "./sortIcons";
 import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, STEAM_BLUE, stripName, wearTier } from "./itemVisuals";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
-import { revealInScroller } from "./dom";
+import { revealInScroller, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import "./style.css";
 
@@ -384,14 +384,17 @@ const ALL_SPECIALS = [...RAIL, ...EXTRAS];
 
 // ---- team accent ------------------------------------------------------------
 // T uses the panel's brand amber (--tac-amber + its CTA gradient endpoints) so
-// the plugin tracks the host's live branding; CT gets the CS2 blue.
+// the plugin tracks the host's live branding; CT uses the panel's CT blue, which
+// is not a global token — see --tac-ct in style.css for where it comes from and
+// why that value. Both halves now read the same way, and neither is a hex picked
+// here: CT was #4a8fe0, a colour the panel uses nowhere.
 const accent = computed(() =>
-  team.value === "T" ? "hsl(var(--tac-amber, 33 94% 58%))" : "#4a8fe0",
+  team.value === "T" ? "hsl(var(--tac-amber, 33 94% 58%))" : "hsl(var(--tac-ct, 198 100% 67%))",
 );
 const gradient = computed(() =>
   team.value === "T"
     ? "linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16))"
-    : "linear-gradient(135deg, #4a8fe0, #6fb3ff)",
+    : "linear-gradient(135deg, var(--tac-ct-cta-from, #7ad7ff), var(--tac-ct-cta-to, #35b4e8))",
 );
 // Built on var(--acc) rather than the computed hex so it rides the registered
 // property's crossfade when the team flips (see @property --acc in style.css).
@@ -562,7 +565,15 @@ const sheetSkins = ref<Skin[]>([]);
 // which is what keeps the extra controls off every other weapon sheet.
 const sheetFacets = ref<SheetFacets>({ groups: [], tints: [] });
 const sheetLoading = ref(false);
+/** How long a search box waits after the last keystroke before the grid filters.
+ *  Shared by the inventory and the sheet. Declared up here because the sheet's
+ *  watcher is thousands of lines above the inventory's — a `const` used before its
+ *  declaration is a TDZ waiting for someone to make it eager. */
+const SEARCH_DEBOUNCE_MS = 220;
 const sheetSearch = ref("");
+/** The sheet's debounced term — same reasoning as invSearchApplied, and the sheet
+ *  animates its tiles too, so a live filter churned just as visibly here. */
+const sheetSearchApplied = ref("");
 const activeRarity = ref<string>("");
 // Graffiti-shaped facets. Nothing here is slot-aware: each control shows only
 // when the loaded catalog actually has more than one value behind it.
@@ -681,7 +692,7 @@ const passTint = (s: Skin) => !sheetTint.value || s.tintName === sheetTint.value
 // Counts move with the SEARCH, the way the attachment picker's do: typing
 // "astralis" should leave the Team Logos tab reading 1, not 384.
 const sheetSearched = computed(() => {
-  const q = sheetSearch.value.trim().toLowerCase();
+  const q = sheetSearchApplied.value.trim().toLowerCase();
   return q ? sheetSkins.value.filter((s) => itemName(s).toLowerCase().includes(q)) : sheetSkins.value;
 });
 
@@ -689,13 +700,21 @@ const sheetSearched = computed(() => {
 // group, then collection, then colourway, then rarity. Counted with its own
 // filter on, a list would collapse to the single value you just picked and
 // there'd be no way to switch to another without clearing first.
+//
+// WHICH options exist is a property of the catalog (`sheetSkins`); HOW MANY match
+// is a property of the query (`sheetSearched`). Deriving both from the query made
+// the controls delete themselves the moment a search narrowed or missed —
+// the same failure the inventory rail had, and the reason a typo could leave the
+// sheet with no visible way back. Options persist; counts go to zero.
 const sheetGroupTabs = computed(() => {
   const counts = new Map<string, number>();
   for (const s of sheetSearched.value) if (s.group) counts.set(s.group, (counts.get(s.group) ?? 0) + 1);
+  const owned = new Set(sheetSkins.value.map((s) => s.group).filter(Boolean));
   const tabs = sheetFacets.value.groups
-    .map((g) => ({ ...g, count: counts.get(g.value) ?? 0 }))
-    .filter((g) => g.count > 0);
-  // One tab is not a split. "All" goes last, after the useful ones.
+    .filter((g) => owned.has(g.value))
+    .map((g) => ({ ...g, count: counts.get(g.value) ?? 0 }));
+  // One tab is not a split — judged on the CATALOG, so searching can't collapse
+  // the strip. "All" goes last, after the useful ones.
   return tabs.length > 1 ? [...tabs, { value: "", label: "All", count: sheetSearched.value.length }] : [];
 });
 const sheetCollectionOptions = computed(() => {
@@ -703,12 +722,20 @@ const sheetCollectionOptions = computed(() => {
   for (const s of sheetSearched.value) {
     if (s.collection && passGroup(s)) counts.set(s.collection, (counts.get(s.collection) ?? 0) + 1);
   }
-  if (counts.size < 2) return [];
   // Insertion order = catalog order ≈ release order, which reads far better for
   // capsules and events than alphabetical.
+  const all: string[] = [];
+  const seen = new Set<string>();
+  for (const s of sheetSkins.value) {
+    if (s.collection && passGroup(s) && !seen.has(s.collection)) {
+      seen.add(s.collection);
+      all.push(s.collection);
+    }
+  }
+  if (all.length < 2) return [];
   return [
     { value: "", label: `All collections (${fmtCount([...counts.values()].reduce((n, c) => n + c, 0))})` },
-    ...[...counts].map(([value, count]) => ({ value, label: `${value} (${count})` })),
+    ...all.map((value) => ({ value, label: `${value} (${counts.get(value) ?? 0})` })),
   ];
 });
 const sheetTintOptions = computed(() => {
@@ -716,36 +743,66 @@ const sheetTintOptions = computed(() => {
   for (const s of sheetSearched.value) {
     if (s.tintName && passGroup(s) && passCollection(s)) counts.set(s.tintName, (counts.get(s.tintName) ?? 0) + 1);
   }
-  if (counts.size < 2) return [];
+  const owned = new Set(
+    sheetSkins.value.filter((s) => s.tintName && passGroup(s) && passCollection(s)).map((s) => s.tintName),
+  );
+  if (owned.size < 2) return [];
   // Game order (red → white), not A→Z: that's how the colourways read as a set.
   return [
     { value: "", label: "All colors", color: null },
     ...sheetFacets.value.tints
-      .filter((t) => counts.has(t.value))
-      .map((t) => ({ value: t.value, label: `${t.label} (${counts.get(t.value)})`, color: t.color })),
+      .filter((t) => owned.has(t.value))
+      .map((t) => ({ value: t.value, label: `${t.label} (${counts.get(t.value) ?? 0})`, color: t.color })),
   ];
 });
 // Narrowing cascade, same as the attachment picker: a collection you picked
 // under Art means nothing under Team Logos.
+// Each is a no-op when the value is unchanged. Re-picking the active tab is not
+// a state change and must not clear the finer facets below it — nor, in the
+// picker's case, cost a refetch that visibly reloads the grid.
+//
+// A real change replaces the list, so the scroll offset (which belongs to the
+// old one) goes back to the top. The container is keyed on `sheetMode|sheetKey`,
+// so opening a different WEAPON remounts it and resets for free — but switching a
+// tab within one weapon does not, which is where you ended up part-way down a set
+// you had never scrolled.
 function setSheetGroup(v: string) {
+  if (sheetGroup.value === v) return;
   sheetGroup.value = v;
   sheetCollection.value = "";
   sheetTint.value = "";
   sheetDesign.value = null;
+  scrollPanelToTop(sheetScrollEl);
 }
 function setSheetCollection(v: string) {
+  if (sheetCollection.value === v) return;
   sheetCollection.value = v;
   sheetTint.value = "";
   sheetDesign.value = null;
+  scrollPanelToTop(sheetScrollEl);
 }
 function setSheetTint(v: string) {
+  if (sheetTint.value === v) return;
   sheetTint.value = v;
   sheetDesign.value = null;
+  scrollPanelToTop(sheetScrollEl);
 }
 // The two filters that aren't behind a setter (both are v-model). Searching
 // while inside a stack would otherwise show an empty grid whose cause — the
 // stack you're still in — isn't among the controls you just touched.
 watch([sheetSearch, activeRarity], () => (sheetDesign.value = null));
+// Debounce, mirroring invSearchApplied: clearing is instant, typing waits for you
+// to stop. A settled term means a new list, so the panel goes back to the top.
+let sheetSearchTimer: ReturnType<typeof setTimeout> | undefined;
+watch(sheetSearch, (v) => {
+  clearTimeout(sheetSearchTimer);
+  if (!v.trim()) {
+    sheetSearchApplied.value = "";
+    return;
+  }
+  sheetSearchTimer = setTimeout(() => (sheetSearchApplied.value = v), SEARCH_DEBOUNCE_MS);
+});
+onBeforeUnmount(() => clearTimeout(sheetSearchTimer));
 
 // Rarity facets for the Inventory grid — over what's OWNED, not a catalog.
 const invRarity = ref<string>("");
@@ -868,10 +925,30 @@ function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
  * — a render landing, an equip re-sorting — while changing a filter genuinely
  * should start over at page one.
  */
-function renderWindow<T>(source: ComputedRef<T[]>, reset: () => unknown, step = 60) {
-  const shown = ref(step);
+/** How many more items each scroll-triggered growth adds. */
+const WINDOW_STEP = 60;
+/**
+ * How many mount on the FIRST paint of a new list, and the cutoff for the
+ * entrance cascade — see invCellDelay (grids) and sheetCellClass (sheet).
+ *
+ * Smaller than the growth step, which is the point. Every list change replaces the
+ * cards rather than moving them (see invFilterSig), so the whole window is created
+ * in one synchronous task — and at 60 image-bearing cards that task is long enough
+ * to eat the frames the tab indicator and the cards' own entrance need, which read
+ * as both of them stalling. Roughly a viewport's worth mounts up front and the
+ * sentinel tops the rest up over later frames, where there is nothing to compete
+ * with.
+ */
+const WINDOW_FIRST = 24;
+function renderWindow<T>(
+  source: ComputedRef<T[]>,
+  reset: () => unknown,
+  step = WINDOW_STEP,
+  first = WINDOW_FIRST,
+) {
+  const shown = ref(first);
   watch(reset, () => {
-    shown.value = step;
+    shown.value = first;
   });
   return {
     items: computed(() => (shown.value >= source.value.length ? source.value : source.value.slice(0, shown.value))),
@@ -884,7 +961,7 @@ function renderWindow<T>(source: ComputedRef<T[]>, reset: () => unknown, step = 
 
 const teamOk = (teams?: Team[] | null) => !teams || teams.length === 0 || teams.includes(team.value);
 const matchesFilters = (name?: string, rarity?: string) => {
-  const q = sheetSearch.value.trim().toLowerCase();
+  const q = sheetSearchApplied.value.trim().toLowerCase();
   return (
     (!q || (name ?? "").toLowerCase().includes(q)) &&
     (!activeRarity.value || rarity === activeRarity.value)
@@ -943,6 +1020,11 @@ function stackByDesign<T>(
   list: T[],
   drill: number | null,
   of: (v: T) => { id: number; design?: number; tintName?: string } | null | undefined,
+  // The card's Vue key, and it has to identify the ROW, not the artwork: two
+  // owned copies of one skin share an item id, and a duplicate key inside a
+  // keyed v-for makes Vue's diff patch one node twice and orphan the other —
+  // an already-filtered-out card left sitting in the grid.
+  keyOf: (v: T) => string | number,
 ): Stack<T>[] {
   const out: Stack<T>[] = [];
   const byDesign = new Map<number, Stack<T>>();
@@ -950,11 +1032,11 @@ function stackByDesign<T>(
     const meta = of(v);
     const design = meta?.design;
     if (drill != null) {
-      if (design === drill) out.push({ key: meta?.id ?? out.length, face: v, behind: [], variants: [v] });
+      if (design === drill) out.push({ key: keyOf(v), face: v, behind: [], variants: [v] });
       continue;
     }
     if (design == null) {
-      out.push({ key: meta?.id ?? out.length, face: v, behind: [], variants: [v] });
+      out.push({ key: keyOf(v), face: v, behind: [], variants: [v] });
       continue;
     }
     const stack = byDesign.get(design);
@@ -984,7 +1066,9 @@ function stackByDesign<T>(
   return out;
 }
 
-const ownedStacks = computed(() => stackByDesign(ownedForSheet.value, sheetDesign.value, (i) => i.item));
+const ownedStacks = computed(() =>
+  stackByDesign(ownedForSheet.value, sheetDesign.value, (i) => i.item, (i) => i.id),
+);
 
 // Sheet: ALL catalog skins for the weapon (craft mode). The catalog facets only
 // live here — the Owned and Replace lists are inventory instances and weapons,
@@ -1008,7 +1092,7 @@ const craftList = computed(() =>
 /** Craft grid stacks, plus the name a deck shows: the face's, minus the
  *  "(Colour)" that only distinguishes it from its own siblings. */
 const craftStacks = computed(() =>
-  stackByDesign(craftList.value, sheetDesign.value, (s) => s).map((st) => ({
+  stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id).map((st) => ({
     ...st,
     card: st.variants.length > 1 ? { ...st.face, name: st.face.name.replace(TINT_SUFFIX, "") } : st.face,
   })),
@@ -1027,7 +1111,7 @@ const sheetResetKey = () =>
   [
     sheetKey.value,
     sheetMode.value,
-    sheetSearch.value,
+    sheetSearchApplied.value,
     activeRarity.value,
     sheetGroup.value,
     sheetCollection.value,
@@ -1665,6 +1749,7 @@ async function openCraftInspect() {
     const { inspect } = await fetchDraftInspectLink({ item_id: craft.value.skin.id, ...craftBody() });
     window.location.href = inspect;
     linkOpening.value = true;
+    notifyInspectSent();
     setTimeout(() => (linkOpening.value = false), 1600);
   } catch (e) {
     fail(e);
@@ -1996,6 +2081,15 @@ watch(craft, async (open) => {
   // After the flush, so the watcher jobs these assignments queued have run.
   await nextTick();
   modal3dResetting = false;
+  // The modal3d watcher mounts on an EDGE, and reassigning `craft` while 3D is
+  // already on doesn't produce one: the reset above writes true→false→true
+  // inside a single flush, which the watcher sees as no change at all. So the
+  // teardown at the top of this watcher would take the viewer away and nothing
+  // would bring it back — a blank stage on every view↔edit flip and every item
+  // switch made from the URL. `modalViewerAbort` is the "a mount has started
+  // since that teardown" flag (teardown is what clears it), so a genuine
+  // false→true edge, which HAS already mounted by now, doesn't mount twice.
+  if (modal3d.value && !modalViewerAbort) void mountModalViewer();
 });
 
 // ---- Deep links: the URL owns which modal is open ---------------------------
@@ -2322,9 +2416,25 @@ watch(viewOnly, (on) => modalViewerHandle?.setInteractive(!on));
 // Wear/seed changes retexture the model — debounced remount so slider drags
 // don't recomposite on every tick.
 let retexTimer: ReturnType<typeof setTimeout> | undefined;
+/** Which `craft` object the wear/seed this watcher last saw belonged to. */
+let retexCraft: object | null = null;
 watch(
   () => [craft.value?.wear, craft.value?.seed],
   () => {
+    // EDITS ONLY. Loading an item into the modal trips this watcher too — the
+    // values go null→(wear, seed) as `craft` is assigned — and that is not an
+    // edit: the mount the `craft` watcher started one line earlier was given
+    // those exact numbers. Acting on it built every weapon TWICE per open (two
+    // GLB loads, two paint composites), and the second mount aborted the first
+    // mid-download, which is where the orphaned canvas that rendered the gun
+    // below the pane came from. Identity, not a "first fire" flag: view↔edit
+    // and draft restores reassign `craft` too, and each one is the same
+    // not-an-edit.
+    const owner = craft.value ?? null;
+    if (owner !== retexCraft) {
+      retexCraft = owner;
+      return;
+    }
     if (!modal3d.value) return;
     clearTimeout(retexTimer);
     retexTimer = setTimeout(() => {
@@ -2527,6 +2637,8 @@ const pickerRarities = ref<AttachFacet[]>([]);
 const pickerResults = ref<Skin[]>([]);
 const pickerTotal = ref(0);
 const pickerQueryTotal = ref(0);
+/** The picker's grid, which is also its scroller — see pickerFetch. */
+const pickerScrollEl = ref<HTMLElement | null>(null);
 const pickerLoading = ref(false); // first page — the grid shows a spinner instead
 const pickerLoadingMore = ref(false); // a later page — the grid stays put
 let pickerTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2547,6 +2659,11 @@ async function pickerFetch(offset: number) {
     // stuck pickerLoadingMore would block loading forever.
     pickerLoadingMore.value = false;
     pickerLoading.value = true;
+    // The offset belongs to the list being replaced. Switching a tab left you
+    // part-way down a set you had never scrolled — or past the end of a shorter
+    // one, looking at nothing. Done on the way OUT, while the old results are
+    // still up and dimming, so the arriving page is never scrolled after paint.
+    scrollPanelToTop(pickerScrollEl.value);
   } else {
     pickerLoadingMore.value = true;
   }
@@ -2578,9 +2695,9 @@ async function pickerFetch(offset: number) {
     pickerResults.value = offset === 0 ? page.items : [...pickerResults.value, ...page.items];
     pickerTotal.value = page.total;
     pickerQueryTotal.value = page.queryTotal;
-    pickerGroups.value = page.groups;
-    pickerCollections.value = page.collections;
-    pickerRarities.value = page.rarities;
+    pickerGroups.value = keepFacets(pickerGroups.value, page.groups);
+    pickerCollections.value = keepFacets(pickerCollections.value, page.collections);
+    pickerRarities.value = keepFacets(pickerRarities.value, page.rarities);
   } catch (e) {
     fail(e);
   } finally {
@@ -2598,7 +2715,7 @@ function pickerMore() {
 }
 watch(pickerQuery, () => {
   clearTimeout(pickerTimer);
-  pickerTimer = setTimeout(pickerSearch, 250);
+  pickerTimer = setTimeout(pickerSearch, SEARCH_DEBOUNCE_MS);
 });
 // Facets are a click, not typing — refetch immediately, and cancel a debounced
 // search so a keystroke from a moment ago can't land after and undo the filter.
@@ -2618,6 +2735,14 @@ function setPickerDir(value: SortDir) {
   void pickerSearch();
 }
 function setPickerFacet(facet: "group" | "collection" | "rarity", value: string) {
+  // Re-picking what is already picked is not a state change, so it must not cost
+  // a round trip. It did: clicking the active tab re-ran the search, and because
+  // the grid remounts its tiles that read as the whole sticker list flickering
+  // and reloading for no reason. Note this has to come BEFORE the cascade below,
+  // which would otherwise clear the finer facets on a no-op click.
+  const currentValue =
+    facet === "group" ? pickerGroup.value : facet === "collection" ? pickerCollection.value : pickerRarity.value;
+  if (currentValue === value) return;
   clearTimeout(pickerTimer);
   // Narrowing cascade: a collection only exists within a group and a rarity
   // within a collection, so picking a coarser facet drops the finer ones. Kept
@@ -2673,6 +2798,23 @@ function clearPickerFacets() {
   pickerCollection.value = "";
   pickerRarity.value = "";
   void pickerSearch();
+}
+/**
+ * Facet lists survive a query that matches nothing.
+ *
+ * A zero-result search returns no facet entries at all — correctly, nothing
+ * matches — and every control in the bar is drawn `v-if="…length > 1"`. So
+ * typing a typo deleted the tabs, the collection dropdown and the rarity
+ * dropdown at the exact moment they were the only way out, leaving a bare CLEAR
+ * on an empty screen. It also reflowed the toolbar, which is the jerkiness.
+ *
+ * Keep the OPTIONS and zero the COUNTS: the options are a property of the
+ * catalog, which hasn't changed, while the counts belong to the query, which
+ * found nothing. Both halves stay honest and the bar stops moving.
+ */
+function keepFacets(prev: AttachFacet[], next: AttachFacet[]): AttachFacet[] {
+  if (next.length) return next;
+  return prev.map((f) => ({ ...f, count: 0 }));
 }
 const fmtCount = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 // "All" first, then the facet's own values with counts. The dropdowns show every
@@ -2832,6 +2974,20 @@ function onCacheCleared(_scope: "renders") {
 // before the entering tree is in the DOM and measure nothing — each pill
 // therefore re-measures via ResizeObserver whenever its tab list (re)mounts,
 // resizes (fonts, count badges) or flips hidden→visible.
+/**
+ * The sliding indicator's transition. TRANSFORM ONLY — the `width 0.2s ease` that
+ * used to ride along with it is gone on purpose.
+ *
+ * `transform` is composited: it keeps animating on its own thread even while the
+ * main thread is busy. `width` is layout, so every frame of it is main-thread
+ * work — and switching a tab is exactly when the main thread is busiest, rebuilding
+ * the grid underneath. The width animation stalled there, which is why the pill
+ * slid part way, hung, then snapped to the end. Width now applies instantly and
+ * only the travel animates, so nothing the grid does can block it.
+ */
+const pillTransition = (animated: boolean) =>
+  animated ? "transform 0.35s cubic-bezier(0.34,1.56,0.64,1)" : "none";
+
 function makePill() {
   const refs: Record<string, HTMLElement | null> = {};
   let listEl: HTMLElement | null = null;
@@ -2907,6 +3063,15 @@ watch([sheetGroup, sheetGroupTabs], () => nextTick(() => sheetGroupPill.sync(she
 });
 
 const linkOpening = ref(false);
+// The handoff is silent by design (see openInspectLink) — nothing in the page
+// changes and CS2 may take a while to surface, so without this the click reads
+// as having done nothing.
+function notifyInspectSent() {
+  notify(
+    tr("inventory.notify.inspect_sent", "Sent to your game client — CS2 will open the inspect view."),
+    "success",
+  );
+}
 // Hands a steam:// inspect link to the OS, which launches CS2 straight into
 // the inspect view for this craft — stickers and all — without the item ever
 // existing on Steam's backend. Nothing happens if Steam isn't installed to
@@ -2916,6 +3081,7 @@ async function openInspectLink(id: number) {
     const { inspect } = await fetchInspectLink(id);
     window.location.href = inspect;
     linkOpening.value = true;
+    notifyInspectSent();
     setTimeout(() => (linkOpening.value = false), 1600);
   } catch (e) {
     fail(e);
@@ -3702,6 +3868,11 @@ function setSheetScrollEl(el: unknown) {
   if (sheetScrollEl) requestAnimationFrame(() => measureSheetScroll(sheetScrollEl));
   else sheetHasMore.value = false;
 }
+// A settled search term means a new list, so the panel goes back to the top.
+// Lives HERE, beside sheetScrollEl, not next to the debounce that produces the
+// term: a watcher reading a `let` declared 3,000 lines below it works only because
+// the callback is deferred, and that is not a property to build on.
+watch(sheetSearchApplied, () => scrollPanelToTop(sheetScrollEl));
 // Opening a colour stack replaces the grid under a scroll position that meant
 // something in the OLD list — open one from the bottom of 93 stacks and the
 // nineteen colours land above the fold, off screen. Go to the top for the new
@@ -3771,12 +3942,41 @@ function scrollFade() {
       else more.value = false;
     },
     remeasure: () => requestAnimationFrame(measure),
+    /** Back to the top, for when the LIST is replaced rather than appended —
+     *  see scrollPanelToTop. The scroller is already resolved here, so callers
+     *  don't have to find it a second way. */
+    toTop: () => {
+      scrollPanelToTop(el);
+      requestAnimationFrame(measure);
+    },
   };
 }
 const invFade = scrollFade();
-// cardSize is watched separately, down where it's declared — it changes row
-// heights, so it changes whether there's more below.
-watch([() => inventoryWindow.items.value.length, () => inventoryStacks.value.length], invFade.remeasure);
+/**
+ * The cell's place in the entrance cascade (`--i`, read by animate-cell-in).
+ *
+ * The CLASS is not applied per item any more — TransitionGroup owns it, via
+ * `appear-active-class` and `enter-active-class`. That matters twice over.
+ * TransitionGroup does not animate the initial render at all unless told to
+ * `appear`, which is why the first paint used to arrive with no transition; and a
+ * class Vue adds is a class Vue REMOVES when the animation ends, so a card stops
+ * carrying a spent `animation-delay` around. That leftover delay was what made
+ * Vue retire leaving cards one at a time, in index order (see .inv-leave).
+ *
+ * Only the first window gets a stagger. cs2CellIn is `both`-filled, so a delayed
+ * cell sits at opacity 0 while the grid has already grown to fit it — the arrival
+ * wave, and equally the scroll jitter if it lands on rows appended under the fold.
+ * Past the first window the delay is 0: those cards still fade, they just do it
+ * immediately, because nothing about them needs announcing.
+ */
+const invCellDelay = (i: number) => (i < WINDOW_FIRST ? i : 0);
+/** Same rule for the sheet's two windowed grids (owned, craft), whose cascade is
+ *  `animate-sheet-in`. Both are infinite-scrolled, and both were staggering every
+ *  appended row — the `sheet-settled` gate only covers the options column. */
+const sheetCellClass = (i: number) => (i < WINDOW_FIRST ? "animate-sheet-in" : "");
+// The watch on the list lengths lives down beside inventoryWindow, NOT here —
+// see the note there. cardSize is watched separately too, where it's declared:
+// it changes row heights, so it changes whether there's more below.
 
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
 // pulls the rail to the category that actually contains it — otherwise the
@@ -3832,6 +4032,32 @@ async function ctxCopy() {
 
 // ---- inventory view ---------------------------------------------------------
 const invSearch = ref("");
+/**
+ * What the GRID filters by, a beat behind what the box holds.
+ *
+ * The input stays on `invSearch` so typing is never laggy, but the filter runs on
+ * this. Typing "p90" against a live filter renders three different inventories —
+ * "p", "p9", "p90" — and because the grid animates its reflow (`inv-move`, 280ms)
+ * you watch every weapon you own slide to a new home twice on the way to the
+ * answer, with the animations overlapping. Only the end state is interesting.
+ *
+ * Clearing is NOT debounced: emptying the box is a decision, not a keystroke on
+ * the way to one, and it should snap back instantly. Same reason the picker
+ * debounces its own search (see pickerTimer) — this is that treatment, which was
+ * missing here.
+ */
+const invSearchApplied = ref("");
+let invSearchTimer: ReturnType<typeof setTimeout> | undefined;
+watch(invSearch, (v) => {
+  clearTimeout(invSearchTimer);
+  if (!v.trim()) {
+    invSearchApplied.value = "";
+    return;
+  }
+  invSearchTimer = setTimeout(() => (invSearchApplied.value = v), SEARCH_DEBOUNCE_MS);
+});
+onBeforeUnmount(() => clearTimeout(invSearchTimer));
+watch(invSearchApplied, () => invFade.toTop());
 // Synced (steam) vs crafted filter + adjustable card size (persisted).
 const invOrigin = ref<OriginFilter>("all");
 // Multi-select, not one-of: toggling is the whole point of the rail, and
@@ -3839,15 +4065,20 @@ const invOrigin = ref<OriginFilter>("all");
 // shows if it matches ANY active toggle; nothing active means everything.
 const invModels = ref<string[]>([]); // specific weapon models, e.g. "ak47"
 const invTypes = ref<string[]>([]); // whole categories, e.g. "rifle" or "sticker"
+// Both replace the grid's contents (the render window resets with the filter),
+// so both send it back to the top — the old offset can easily be past the end of
+// the new, shorter list.
 function toggleModel(m: string) {
   invModels.value = invModels.value.includes(m)
     ? invModels.value.filter((x) => x !== m)
     : [...invModels.value, m];
+  invFade.toTop();
 }
 function toggleType(t: string) {
   invTypes.value = invTypes.value.includes(t)
     ? invTypes.value.filter((x) => x !== t)
     : [...invTypes.value, t];
+  invFade.toTop();
 }
 const matchesRail = (i: InventoryItem) => {
   if (!invModels.value.length && !invTypes.value.length) return true;
@@ -3858,24 +4089,34 @@ const matchesRail = (i: InventoryItem) => {
 // what clicking would actually give you rather than counting rows the search
 // box has already excluded.
 const railBase = computed(() => {
-  const q = invSearch.value.trim().toLowerCase();
+  const q = invSearchApplied.value.trim().toLowerCase();
   return inventory.value.filter(
     (i) => (!q || itemName(i.item).toLowerCase().includes(q)) && matchesOrigin(i, invOrigin.value),
   );
 });
+/**
+ * The rail's ROWS come from the whole inventory; only its COUNTS come from the
+ * filtered set.
+ *
+ * Both used to come from `railBase`, so a search that matched nothing emptied the
+ * maps and the entire left-hand weapon selection disappeared — the layout
+ * restructured itself at the exact moment you needed a way back, and the rail
+ * reflowed on every keystroke as groups dropped in and out. What you own does not
+ * change when you type; only how much of it currently matches does.
+ *
+ * So a row with `count: 0` is still drawn, disabled (see the template). Nothing
+ * about the rail's SHAPE depends on the filters any more.
+ */
 const invRail = computed(() => {
-  const models = new Map<string, { model: string; name: string; image: string | null; count: number; cat: string }>();
+  type RailModel = { model: string; name: string; image: string | null; count: number; cat: string };
+  const models = new Map<string, RailModel>();
   const types = new Map<string, number>();
-  for (const i of railBase.value) {
+  // Pass 1 — the shape, from everything owned. Counts start at zero.
+  for (const i of inventory.value) {
     const cat = categoryOf(i);
-    types.set(cat, (types.get(cat) ?? 0) + 1);
+    if (!types.has(cat)) types.set(cat, 0);
     const m = i.item?.model;
-    if (!m || !WEAPONISH.has(cat)) continue;
-    const hit = models.get(m);
-    if (hit) {
-      hit.count++;
-      continue;
-    }
+    if (!m || !WEAPONISH.has(cat) || models.has(m)) continue;
     const base = weapons.value.find((w) => w.model === m);
     models.set(m, {
       model: m,
@@ -3883,19 +4124,30 @@ const invRail = computed(() => {
       // The vanilla silhouette, not the first skin that happens to be owned —
       // a filter tile should say "AK-47", not "AK-47 | Redline".
       image: base?.image ?? i.item?.image ?? null,
-      count: 1,
+      count: 0,
       cat,
     });
   }
+  // Pass 2 — the counts, from what the search and origin filters left.
+  for (const i of railBase.value) {
+    const cat = categoryOf(i);
+    types.set(cat, (types.get(cat) ?? 0) + 1);
+    const m = i.item?.model;
+    const hit = m ? models.get(m) : undefined;
+    if (hit) hit.count++;
+  }
   return {
-    // Empty groups aren't drawn: the rail should be a picture of what you own.
+    // A group with no OWNED items is still dropped — the rail is a picture of
+    // what you own, and that is a fact about the inventory, not about the query.
     weapons: WEAPON_GROUPS.map(([key, label]) => ({
       key,
       label,
       count: types.get(key) ?? 0,
       items: [...models.values()].filter((e) => e.cat === key).sort((a, b) => a.name.localeCompare(b.name)),
     })).filter((g) => g.items.length),
-    gear: GEAR_TYPES.map(([key, label]) => ({ key, label, count: types.get(key) ?? 0 })).filter((r) => r.count),
+    gear: GEAR_TYPES.map(([key, label]) => ({ key, label, count: types.get(key) ?? 0 })).filter((r) =>
+      types.has(r.key),
+    ),
   };
 });
 // Whether the filter rail is drawn (it also needs `lg:` — see INV_TOOLBAR_PL).
@@ -3911,6 +4163,8 @@ const filtersActive = computed(
     !!invTypes.value.length,
 );
 function clearInvFilters() {
+  clearTimeout(invSearchTimer);
+  invSearchApplied.value = "";
   invSearch.value = "";
   invOrigin.value = "all";
   invRarity.value = "";
@@ -4047,7 +4301,14 @@ watch(
     const r = route.value.name;
     if (r !== "inventory" && r !== "item") return;
     const q = router.query.value.q ?? "";
-    if (q !== invSearch.value) invSearch.value = q;
+    if (q !== invSearch.value) {
+      invSearch.value = q;
+      // Applied straight away, bypassing the debounce: this is a whole query
+      // arriving at once (a deep link or a back/forward), not someone typing, so
+      // there are no intermediate states to hide and no reason to wait.
+      clearTimeout(invSearchTimer);
+      invSearchApplied.value = q;
+    }
     const o = router.query.value.origin;
     const nextOrigin: OriginFilter = o === "steam" || o === "crafted" ? o : "all";
     if (nextOrigin !== invOrigin.value) invOrigin.value = nextOrigin;
@@ -4066,7 +4327,7 @@ watch(
   { immediate: true },
 );
 const filteredInventory = computed(() => {
-  const q = invSearch.value.trim().toLowerCase();
+  const q = invSearchApplied.value.trim().toLowerCase();
   return sortInstances(
     inventory.value.filter(
       (i) =>
@@ -4084,7 +4345,9 @@ const filteredInventory = computed(() => {
 // Its own drill-in state, not the sheet's: the two grids are different screens
 // and being inside a stack on one says nothing about the other.
 const invDesign = ref<number | null>(null);
-const inventoryStacks = computed(() => stackByDesign(filteredInventory.value, invDesign.value, (i) => i.item));
+const inventoryStacks = computed(() =>
+  stackByDesign(filteredInventory.value, invDesign.value, (i) => i.item, (i) => i.id),
+);
 const invDesignName = computed(() =>
   invDesign.value == null
     ? ""
@@ -4095,10 +4358,44 @@ const invDesignName = computed(() =>
 // Any filter change drops you out of the stack — you can't stay inside a card
 // the filters just removed. (Entering select mode does too; that watch lives
 // with selectMode, which is declared further down.)
-watch([invSearch, invOrigin, invRarity, invTypes, invModels], () => (invDesign.value = null));
-const inventoryWindow = renderWindow(inventoryStacks, () =>
-  [invSearch.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
+//
+// The SETTLED search term, not the raw box: invDesign is part of invFilterSig, so
+// firing this on a keystroke rebuilt the grid one keystroke early and defeated the
+// debounce for anyone who happened to be inside a colour stack.
+watch([invSearchApplied, invOrigin, invRarity, invTypes, invModels], () => (invDesign.value = null));
+/**
+ * Everything that changes WHICH items the grid shows — one string.
+ *
+ * Two jobs. It resets the render window (a new list starts at page one), and it
+ * is folded into every card's `:key`, which is what stops the grid ANIMATING its
+ * way to the answer.
+ *
+ * TransitionGroup only animates a "move" for children whose keys survive. With
+ * stable keys, filtering to five P90s left ~55 survivors that each FLIPped from
+ * their old cell to their new one over 280ms — so you watched the grid sift
+ * itself, weapon by weapon, while the toolbar had already said 5/153. Worse, the
+ * cards carry `content-visibility: auto` (see style.css), so FLIP's before/after
+ * getBoundingClientRect on each one forces layout of a subtree the browser had
+ * deliberately skipped — dozens of image-bearing cards, spread over many frames.
+ * Changing the keys makes a filter a straight swap: every card is new, none
+ * moves, no offsets are read, and the result appears filtered and then waves in
+ * (animate-cell-in, first window only).
+ *
+ * `inv-move` still earns its keep for changes that AREN'T filters — crafting an
+ * item, deleting one — where the surviving cards genuinely should slide.
+ */
+const invFilterSig = computed(() =>
+  [invSearchApplied.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
 );
+const inventoryWindow = renderWindow(inventoryStacks, () => invFilterSig.value);
+// Down HERE, not up beside invFade where it reads more naturally, because `watch`
+// runs its source getters once at creation to seed the old value — it does that
+// with or without `immediate`. Sitting above these two consts, both getters threw
+// "Cannot access 'inventoryWindow' before initialization" into Vue's error
+// handler, which logs and continues: the watcher was never established, so the
+// "more below" fade silently stopped remeasuring when the list length changed.
+// A visible console error and a dead feature, from declaration order alone.
+watch([() => inventoryWindow.items.value.length, () => inventoryStacks.value.length], invFade.remeasure);
 function canEquipInstance(i: InventoryItem): boolean {
   if (!i.slot) return false;
   if (isShared(i.slot)) return true;
@@ -5134,7 +5431,7 @@ if (MDEBUG) {
             transform: `translateX(${teamPill.x.value}px)`,
             width: teamPill.w.value + 'px',
             background: gradient,
-            transition: teamPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+            transition: pillTransition(teamPill.animated.value),
           }"
         ></div>
         <button
@@ -5253,7 +5550,7 @@ if (MDEBUG) {
               border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
               background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
               boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-              transition: viewPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+              transition: pillTransition(viewPill.animated.value),
             }"
           ></div>
           <button
@@ -5433,7 +5730,7 @@ if (MDEBUG) {
                 border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                 background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                 boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: invOriginPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                transition: pillTransition(invOriginPill.animated.value),
               }"
             ></div>
             <button
@@ -5588,8 +5885,17 @@ if (MDEBUG) {
               <!-- The rail's facets. Groups toggle the whole category, the
                    tiles under them toggle one model — same additive rule as the
                    desktop rail, just laid out as chips. -->
+              <!-- Same rule as the desktop rail: empty means disabled, never
+                   removed. A sheet that reflows while you type is worse than the
+                   desktop rail doing it, because it can move the control under
+                   your thumb between the touch and the release. -->
               <section v-for="grp in invRail.weapons" :key="grp.key" class="flex flex-col gap-2">
-                <button class="flex items-center gap-2 text-left" @click="toggleType(grp.key)">
+                <button
+                  class="flex items-center gap-2 text-left transition-opacity duration-200"
+                  :class="!grp.count && !invTypes.includes(grp.key) ? 'pointer-events-none opacity-60' : ''"
+                  :disabled="!grp.count && !invTypes.includes(grp.key)"
+                  @click="toggleType(grp.key)"
+                >
                   <span class="text-f9 uppercase tracking-cs2" :class="invTypes.includes(grp.key) ? 'text-[color:var(--acc)]' : 'text-muted-foreground/60'">{{ grp.label }}</span>
                   <span class="font-mono text-f9 text-muted-foreground/50">{{ grp.count }}</span>
                 </button>
@@ -5597,7 +5903,13 @@ if (MDEBUG) {
                   <button
                     v-for="it in grp.items"
                     :key="it.model"
-                    :class="[INV_CHIP, 'gap-1.5', invModels.includes(it.model) ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    :class="[
+                      INV_CHIP,
+                      'gap-1.5 transition-opacity duration-200',
+                      invModels.includes(it.model) ? INV_CHIP_ON : INV_CHIP_OFF,
+                      !it.count && !invModels.includes(it.model) ? 'pointer-events-none opacity-30' : '',
+                    ]"
+                    :disabled="!it.count && !invModels.includes(it.model)"
                     @click="toggleModel(it.model)"
                   >
                     {{ it.name }}<span class="font-mono text-f8 text-muted-foreground/50">{{ it.count }}</span>
@@ -5611,7 +5923,13 @@ if (MDEBUG) {
                   <button
                     v-for="row in invRail.gear"
                     :key="row.key"
-                    :class="[INV_CHIP, 'gap-1.5', invTypes.includes(row.key) ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    :class="[
+                      INV_CHIP,
+                      'gap-1.5 transition-opacity duration-200',
+                      invTypes.includes(row.key) ? INV_CHIP_ON : INV_CHIP_OFF,
+                      !row.count && !invTypes.includes(row.key) ? 'pointer-events-none opacity-30' : '',
+                    ]"
+                    :disabled="!row.count && !invTypes.includes(row.key)"
                     @click="toggleType(row.key)"
                   >
                     {{ row.label }}<span class="font-mono text-f8 text-muted-foreground/50">{{ row.count }}</span>
@@ -5660,25 +5978,43 @@ if (MDEBUG) {
 
           <section v-for="grp in invRail.weapons" :key="grp.key" class="flex flex-none flex-col gap-1.5">
             <!-- The header is itself a toggle: "all rifles" is one click. -->
+            <!-- Dimmed less than the tiles when empty: this one is also the group's
+                 LABEL, and fading it out would take the rail's structure with it. -->
             <button
-              class="flex items-center justify-between px-0.5 text-f8 uppercase tracking-cs3 transition-colors"
-              :class="invTypes.includes(grp.key) ? 'text-[color:var(--acc)]' : 'text-muted-foreground/60 hover:text-foreground'"
-              :title="`Show all ${grp.label.toLowerCase()}`"
+              class="flex items-center justify-between px-0.5 text-f8 uppercase tracking-cs3 transition-[color,opacity] duration-200"
+              :class="[
+                invTypes.includes(grp.key) ? 'text-[color:var(--acc)]' : 'text-muted-foreground/60',
+                !grp.count && !invTypes.includes(grp.key) ? 'pointer-events-none opacity-60' : 'hover:text-foreground',
+              ]"
+              :disabled="!grp.count && !invTypes.includes(grp.key)"
+              :title="grp.count ? `Show all ${grp.label.toLowerCase()}` : `No ${grp.label.toLowerCase()} match the current filters`"
               @click="toggleType(grp.key)"
             >
               <span>{{ grp.label }}</span>
               <span class="font-mono">{{ grp.count }}</span>
             </button>
+            <!-- A model with nothing left after the search is DISABLED, not
+                 removed: the rail keeps its geometry, so typing never restructures
+                 the page out from under you. `disabled` keeps it off the tab order
+                 too. Still drawn when it is the ACTIVE filter, and still clickable
+                 then, or turning a filter on could strand you with no way to turn
+                 it back off. -->
             <div class="grid grid-cols-2 gap-1.5">
               <button
                 v-for="it in grp.items"
                 :key="it.model"
-                class="group relative grid aspect-square place-items-center overflow-hidden rounded-md border transition-colors"
-                :class="invModels.includes(it.model)
-                  ? 'border-[color:var(--acc)] bg-secondary/70'
-                  : 'border-border/60 bg-secondary/30 hover:border-muted-foreground/40 hover:bg-secondary/60'"
+                class="group relative grid aspect-square place-items-center overflow-hidden rounded-md border transition-[color,background-color,border-color,opacity] duration-200"
+                :class="[
+                  invModels.includes(it.model)
+                    ? 'border-[color:var(--acc)] bg-secondary/70'
+                    : 'border-border/60 bg-secondary/30',
+                  !it.count && !invModels.includes(it.model)
+                    ? 'pointer-events-none opacity-30'
+                    : 'hover:border-muted-foreground/40 hover:bg-secondary/60',
+                ]"
+                :disabled="!it.count && !invModels.includes(it.model)"
                 :style="selRing(invModels.includes(it.model))"
-                :title="`${it.name} · ${it.count}`"
+                :title="it.count ? `${it.name} · ${it.count}` : `${it.name} — none match the current filters`"
                 @click="toggleModel(it.model)"
               >
                 <img
@@ -5703,10 +6039,16 @@ if (MDEBUG) {
             <button
               v-for="row in invRail.gear"
               :key="row.key"
-              class="flex items-center justify-between rounded-md border px-2 py-1.5 text-f9 uppercase tracking-wider transition-colors"
-              :class="invTypes.includes(row.key)
-                ? 'border-[color:var(--acc)] bg-secondary/70 text-foreground'
-                : 'border-border/60 bg-secondary/30 text-muted-foreground hover:border-muted-foreground/40 hover:text-foreground'"
+              class="flex items-center justify-between rounded-md border px-2 py-1.5 text-f9 uppercase tracking-wider transition-[color,background-color,border-color,opacity] duration-200"
+              :class="[
+                invTypes.includes(row.key)
+                  ? 'border-[color:var(--acc)] bg-secondary/70 text-foreground'
+                  : 'border-border/60 bg-secondary/30 text-muted-foreground',
+                !row.count && !invTypes.includes(row.key)
+                  ? 'pointer-events-none opacity-30'
+                  : 'hover:border-muted-foreground/40 hover:text-foreground',
+              ]"
+              :disabled="!row.count && !invTypes.includes(row.key)"
               @click="toggleType(row.key)"
             >
               <span>{{ row.label }}</span>
@@ -5752,7 +6094,12 @@ if (MDEBUG) {
           class="min-h-0 min-w-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto p-6"
           :style="invGridStyle"
           move-class="inv-move"
-          enter-active-class="animate-fade-in"
+          appear
+          appear-active-class="animate-cell-in"
+          enter-active-class="animate-cell-in"
+          leave-active-class="inv-leave"
+          leave-from-class="inv-leave"
+          leave-to-class="inv-leave"
           @scroll.passive="invFade.onScroll"
         >
           <div v-if="!inventory.length" key="empty" class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground">
@@ -5776,15 +6123,18 @@ if (MDEBUG) {
             </button>
           </div>
           <!-- A click OPENS the item (see it big, then decide). Equipping moved
-               into the detail modal so a stray click can't re-equip a slot. -->
-          <template v-for="st in inventoryWindow.items.value" :key="st.key">
+               into the detail modal so a stray click can't re-equip a slot.
+               The entrance is TransitionGroup's (`appear` + enter classes above);
+               each card only contributes its place in the cascade via `--i`. See
+               invCellDelay for why the class is not applied per item. -->
+          <template v-for="(st, i) in inventoryWindow.items.value" :key="st.key + '|' + invFilterSig">
             <!-- A deck is not an item: no single instance to open, select or
                  act on, so its only verb is "open me". Selecting is done inside
                  it, where the instances are. -->
-            <div v-if="st.variants.length > 1" class="relative h-full">
+            <div v-if="st.variants.length > 1" class="cv-tile relative h-full" :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }">
               <span
                 v-for="(hex, n) in st.behind"
-                :key="hex"
+                :key="n"
                 class="pointer-events-none absolute inset-0 rounded-lg border"
                 :style="{
                   transform: `rotate(${n === 0 ? -5 : 5}deg) scale(0.88)`,
@@ -5808,7 +6158,7 @@ if (MDEBUG) {
                   <img
                     :src="st.face.item?.image ?? undefined"
                     alt=""
-                    loading="lazy"
+                    loading="lazy" decoding="async"
                     class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
                   />
                 </div>
@@ -5821,6 +6171,8 @@ if (MDEBUG) {
             </div>
             <ItemTile
               v-else
+              class="cv-tile"
+              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
               :inst="st.face"
               show-header
               :selected="selectMode && selectedIds.has(st.face.id)"
@@ -6383,7 +6735,7 @@ if (MDEBUG) {
                       border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                       background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                       boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                      transition: focus3dPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                      transition: pillTransition(focus3dPill.animated.value),
                     }"
                   ></div>
                   <button
@@ -6579,7 +6931,7 @@ if (MDEBUG) {
                 border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                 background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                 boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: sheetPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                transition: pillTransition(sheetPill.animated.value),
               }"
             ></div>
             <button
@@ -6636,7 +6988,7 @@ if (MDEBUG) {
                 border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                 background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                 boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: sheetGroupPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                transition: pillTransition(sheetGroupPill.animated.value),
               }"
             ></div>
             <button
@@ -6648,7 +7000,10 @@ if (MDEBUG) {
               @click="setSheetGroup(g.value)"
             >
               {{ g.label }}
-              <span class="ml-1.5 inline-flex h-[15px] min-w-[20px] items-center justify-center rounded border border-border bg-background/70 px-1.5 font-mono text-f9 leading-none">{{ fmtCount(g.count) }}</span>
+              <!-- Fixed width + tabular figures — see the picker's tab strip: a
+                   self-sizing count resizes the tab and drags the sliding pill on
+                   every keystroke. -->
+              <span class="ml-1.5 inline-flex h-[15px] w-[34px] flex-none items-center justify-center rounded border border-border bg-background/70 px-1 font-mono text-f9 leading-none tabular-nums">{{ fmtCount(g.count) }}</span>
             </button>
           </div>
           <FilterDropdown
@@ -6704,7 +7059,7 @@ if (MDEBUG) {
                 border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                 background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                 boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                transition: sheetOriginPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                transition: pillTransition(sheetOriginPill.animated.value),
               }"
             ></div>
             <button
@@ -7104,10 +7459,10 @@ if (MDEBUG) {
                    no single instance to equip, so it gets a plain card whose only
                    verb is "open me" rather than an ItemTile with actions that
                    would each need an owner. -->
-              <div v-if="st.variants.length > 1" class="animate-sheet-in relative h-full" :style="{ '--i': idx + 2 }">
+              <div v-if="st.variants.length > 1" class="relative h-full" :class="sheetCellClass(idx)" :style="{ '--i': idx + 2 }">
                 <span
                   v-for="(hex, i) in st.behind"
-                  :key="hex"
+                  :key="i"
                   class="pointer-events-none absolute inset-0 rounded-lg border"
                   :style="{
                     transform: `rotate(${i === 0 ? -5 : 5}deg) scale(0.88)`,
@@ -7130,7 +7485,7 @@ if (MDEBUG) {
                     <img
                       :src="st.face.item?.image ?? undefined"
                       alt=""
-                      loading="lazy"
+                      loading="lazy" decoding="async"
                       class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
                     />
                   </div>
@@ -7144,7 +7499,7 @@ if (MDEBUG) {
               <ItemTile
                 v-else
                 :inst="st.face"
-                class="animate-sheet-in"
+                :class="sheetCellClass(idx)"
                 :style="{ '--i': idx + 2 }"
                 draggable="true"
                 @dragstart="onTileDragStart(st.face, $event)"
@@ -7172,7 +7527,12 @@ if (MDEBUG) {
 
           <!-- CRAFT: full catalog for the slot's weapon -->
           <template v-else-if="sheetMode === 'craft'">
-            <div v-if="sheetLoading" class="col-span-full flex items-center justify-center gap-2 py-8 text-muted-foreground">
+            <!-- Fixed height, and it does not take the grid's place: this used to
+                 be `v-if="sheetLoading"` against a `v-else` holding the whole
+                 catalog, so switching weapons collapsed the grid to one centred
+                 line and then re-expanded it. Reserving the row instead means the
+                 spinner costs the layout nothing. -->
+            <div v-if="sheetLoading" class="col-span-full flex h-11 items-center justify-center gap-2 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" /> Loading finishes…
             </div>
             <template v-else>
@@ -7182,7 +7542,8 @@ if (MDEBUG) {
               <div
                 v-for="(st, idx) in craftWindow.items.value"
                 :key="st.key"
-                class="animate-sheet-in relative h-full"
+                class="relative h-full"
+                :class="sheetCellClass(idx)"
                 :style="{ '--i': idx }"
               >
                 <!-- Fanned out from the bottom edge and wearing two of the
@@ -7195,7 +7556,7 @@ if (MDEBUG) {
                      because 5px of a wash is 5px of nothing. -->
                 <span
                   v-for="(hex, i) in st.behind"
-                  :key="hex"
+                  :key="i"
                   class="pointer-events-none absolute inset-0 rounded-lg border"
                   :style="{
                     transform: `rotate(${i === 0 ? -5 : 5}deg) scale(0.88)`,
@@ -7229,7 +7590,7 @@ if (MDEBUG) {
                     <img
                       :src="st.card.image ?? undefined"
                       alt=""
-                      loading="lazy"
+                      loading="lazy" decoding="async"
                       class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
                       :class="sheetKey === 'agent' && ART_FADE_B"
                     />
@@ -7260,7 +7621,7 @@ if (MDEBUG) {
               @click="equipDefaultAt(w, selected)"
             >
               <div :class="SHEET_ART">
-                <img :src="w.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain" />
+                <img :src="w.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain" />
               </div>
               <div :class="SHEET_LABEL">
                 <div class="truncate text-f13 font-medium">{{ w.name }}</div>
@@ -7282,7 +7643,7 @@ if (MDEBUG) {
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(i.item?.rarity, 0.22)"></span>
               <div :class="[SHEET_ART, 'relative z-[2]']">
-                <img :src="i.item?.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain" />
+                <img :src="i.item?.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain" />
               </div>
               <div :class="[SHEET_LABEL, 'relative z-[2] flex items-center gap-1.5']">
                 <span class="truncate text-f13 font-medium">{{ itemName(i.item) }}</span>
@@ -7521,7 +7882,7 @@ if (MDEBUG) {
                     border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                     background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                     boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                    transition: modal3dPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                    transition: pillTransition(modal3dPill.animated.value),
                   }"
                 ></div>
                 <button
@@ -7932,7 +8293,7 @@ if (MDEBUG) {
                   border: '1px solid hsl(var(--tac-amber, 33 94% 58%) / 0.45)',
                   background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
                   boxShadow: '0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                  transition: pickerGroupPill.animated.value ? 'transform 0.35s cubic-bezier(0.34,1.56,0.64,1), width 0.2s ease' : 'none',
+                  transition: pillTransition(pickerGroupPill.animated.value),
                 }"
               ></div>
               <button
@@ -7946,8 +8307,13 @@ if (MDEBUG) {
                 {{ g.label }}
                 <!-- Wider than the other count badges and square-cornered, not a
                      circle: these read "10.6k", where a pill sized for "12" put
-                     the text against its own border. -->
-                <span class="ml-1.5 inline-flex h-[15px] min-w-[20px] items-center justify-center rounded border border-border bg-background/70 px-1.5 font-mono text-f9 leading-none">{{ fmtCount(g.count) }}</span>
+                     the text against its own border.
+                     FIXED width, not min-width, and tabular figures: the count is
+                     the one thing here that changes while you type, and letting it
+                     size itself resized the TAB — which moved every tab after it
+                     and dragged the sliding indicator along, on every keystroke.
+                     Sized for "10.6k", the widest value the formatter emits. -->
+                <span class="ml-1.5 inline-flex h-[15px] w-[34px] flex-none items-center justify-center rounded border border-border bg-background/70 px-1 font-mono text-f9 leading-none tabular-nums">{{ fmtCount(g.count) }}</span>
               </button>
             </div>
             <FilterDropdown
@@ -7988,50 +8354,84 @@ if (MDEBUG) {
             />
           </div>
 
+          <!-- The results are NOT unmounted while the next set loads. They used to
+               be — `v-if="pickerLoading"` swapped the whole grid for a centred
+               "Searching…" — so every keystroke collapsed the grid to one line,
+               jumped the scroll height and popped it back. Now the outgoing set
+               dims in place and the incoming one waves in over it, which is the
+               same treatment the inventory grid gives a filter change. -->
           <div
-            class="flex-1 content-start gap-2 overflow-y-auto"
+            ref="pickerScrollEl"
+            data-scroller
+            class="flex-1 content-start gap-2 overflow-y-auto transition-opacity duration-200 ease-out"
+            :class="pickerLoading ? 'opacity-45' : 'opacity-100'"
             :style="attachGridStyle"
           >
-            <div v-if="pickerLoading" class="col-span-full flex items-center justify-center gap-2 py-8 text-muted-foreground">
-              <Loader2 class="h-4 w-4 animate-spin" /> Searching…
-            </div>
             <!-- Rarity is read the same way as on a weapon card: the tier's colour
                  as a bottom rule plus a soft glow behind the art. Without it the
                  grid is a wall of identical grey boxes and the one attribute that
                  sorts them is invisible. -->
+            <!-- animate-cell-in is the loadout grid's stagger, reused — but ONLY
+                 for the first page. cs2CellIn is `both`-filled with a delay, so an
+                 appended tile holds opacity 0 for up to 420ms while the grid has
+                 ALREADY grown to fit it: you scroll, the layout jumps down, and
+                 the stickers fade in afterwards. That is the infinite-scroll jank.
+                 Pages after the first appear immediately; there is nothing to
+                 announce, they were prefetched below the fold on purpose.
+                 Honours prefers-reduced-motion via the global animate-* rule. -->
             <button
-              v-for="it in pickerResults"
+              v-for="(it, i) in pickerResults"
               :key="it.id"
-              class="group relative flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
-              :style="it.rarity ? { borderBottom: `3px solid ${it.rarity}` } : {}"
+              class="cv-tile group relative flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
+              :class="i < PICKER_PAGE ? 'animate-cell-in' : ''"
+              :style="{ ...(it.rarity ? { borderBottom: `3px solid ${it.rarity}` } : {}), '--i': i, '--cis': attachCardSize + 12 + 'px' }"
               :title="it.name"
               @click="pickAttachment(it)"
             >
               <span class="pointer-events-none absolute inset-0" :style="glowStyle(it.rarity, 0.22)"></span>
               <div :class="CARD_ART" class="relative z-[2]">
-                <img :src="it.image ?? undefined" alt="" loading="lazy" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
+                <!-- decoding="async" keeps the decode off the main thread. With
+                     `lazy`, a fast scroll brings dozens of images into view at
+                     once and the default synchronous decode lands all of them in
+                     the scroll frames — the "logos rendering in" stutter. -->
+                <img :src="it.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
               </div>
               <span class="relative z-[2] w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm|Sticker Slab) \| /, '') }}</span>
             </button>
-            <div v-if="!pickerLoading && !pickerResults.length" class="col-span-full py-8 text-center text-f13 text-muted-foreground">
+            <div v-if="!pickerLoading && !pickerResults.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
               No results — try a different search.
             </div>
             <!-- Scrolling to the bottom pulls the next page. `done` also carries
                  the first-page spinner: without it the sentinel is on screen
-                 under an empty grid and would fire a second, duplicate page. -->
+                 under an empty grid and would fire a second, duplicate page.
+                 A deeper rootMargin than the 500px default: one page is 120 tiles,
+                 which at any card size is several screens, so firing further ahead
+                 costs one request that was coming anyway and buys the page landing
+                 before you reach the end — the difference between infinite scroll
+                 and scroll-then-wait. -->
             <InfiniteSentinel
               :count="pickerResults.length"
               :done="pickerDone || pickerLoading"
+              root-margin="1200px"
               @hit="pickerMore"
             />
-            <div
-              v-if="!pickerLoading && pickerResults.length"
-              class="col-span-full flex items-center justify-center gap-2 py-4 text-f10 uppercase tracking-cs1 text-muted-foreground"
-            >
-              <template v-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
-              <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
-              <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
-            </div>
+          </div>
+          <!-- OUTSIDE the scroller, and a fixed height that is always present.
+               This row used to be the last cell of the grid, so it was pushed down
+               by every appended page and its own content swaps ("Loading more…"
+               has a spinner, "1200 of 10565" does not) resized it mid-scroll. A
+               loading state must not be able to move anything: as a sibling of the
+               scroll area it is outside the grid's layout entirely, it reserves
+               its space whether or not there is anything to say, and the status
+               text now stays visible instead of scrolling away. -->
+          <div class="flex h-11 flex-none items-center justify-center gap-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
+            <template v-if="pickerLoading"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Searching…</template>
+            <template v-else-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
+            <!-- Nothing to say on an empty result set; `h-11` holds the space
+                 regardless, so the grid above never resizes either way. -->
+            <template v-else-if="!pickerResults.length"></template>
+            <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
+            <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
           </div>
         </div>
         </Transition>

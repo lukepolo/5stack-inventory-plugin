@@ -5,6 +5,7 @@
       "sign_in_to_save": "Sign in to save this to your inventory.",
       "crafted": "Crafted — it's in your inventory.",
       "copy_created": "Editable copy created in your inventory.",
+      "inspect_sent": "Sent to your game client — CS2 will open the inspect view.",
       "synced": "Synced with Steam — {summary}.",
       "synced_partial": "Synced with Steam — {summary}. Inventory too large to read fully.",
       "synced_no_changes": "Synced with Steam — everything was already up to date.",

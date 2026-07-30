@@ -1440,6 +1440,8 @@ export interface ViewerHandle {
   paintIncomplete: () => boolean;
   /** Measured placement frame, for tools/shadertest. See the impl for why. */
   probePlacement: () => PlacementProbe;
+  /** Where the name plate landed, measured against the weapon. See NameplateProbe. */
+  probeNameplate: () => NameplateProbe;
 }
 
 export interface PlacementProbe {
@@ -1454,6 +1456,29 @@ export interface PlacementProbe {
   roundTripErr: number | null;
   posed: boolean;
   offsetBox: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } };
+}
+
+/** What tools/shadertest/nameplate.ts measures. Every field is relative to the
+ *  WEAPON, so a pass/fail here does not depend on any of our own conventions. */
+export interface NameplateProbe {
+  model: string;
+  mounted: boolean;
+  /** Anchor angles as authored, degrees, [pitch, yaw, roll]. */
+  angles: number[] | null;
+  /** Which bone carries the attachment, when it is not the body's. */
+  bone: string | null;
+  /** Object-local position of the plate's centre. */
+  pos: number[] | null;
+  /** Unit axes of the plate in object space. */
+  thin: number[] | null;
+  long: number[] | null;
+  /** Surface normal measured at the anchor by raycast, object space. */
+  normal: number[] | null;
+  /** |thin . normal| — 1 means the plate lies flat on the body. */
+  flat: number | null;
+  /** Gap from the plate's inner face to that surface, millimetres. Negative
+   *  means it is buried. */
+  gapMm: number | null;
 }
 
 export interface ViewerOpts {
@@ -1545,9 +1570,26 @@ export async function mountViewer(
   // leaked — and leaked contexts are what eventually get a tab killed. Builds no
   // longer create a context: they borrow the shared one (getSharedGL), which
   // outlives every mount, so a failed build has nothing to reclaim.
-  return queueBuild(opts?.priority ?? "interactive", opts?.signal, (signal) =>
-    buildViewer(container, model, opts, signal),
-  );
+  //
+  // The CANVAS is a different story, and it does need reclaiming. buildViewer
+  // puts it in the DOM early (sizing, controls and pointer events all want it
+  // there) and then keeps awaiting — GLB, paint composite, decal art. A throw
+  // past that point returns no handle, so there is no dispose() to remove it,
+  // and the orphan is a `display:block; height:100%` sibling: the NEXT viewer's
+  // canvas is laid out BELOW it and the weapon draws outside the pane, usually
+  // clipped away by the modal entirely. Aborts are the common case rather than
+  // the exotic one — every remount (2D/3D flip, wear/seed edit, model switch)
+  // cancels the build in flight, and on a cold cache that lands mid-load, long
+  // after the canvas went in.
+  const mounted: { view?: HTMLCanvasElement } = {};
+  try {
+    return await queueBuild(opts?.priority ?? "interactive", opts?.signal, (signal) =>
+      buildViewer(container, model, opts, signal, mounted),
+    );
+  } catch (e) {
+    mounted.view?.remove();
+    throw e;
+  }
 }
 
 async function buildViewer(
@@ -1557,6 +1599,9 @@ async function buildViewer(
   // NOT opts.signal: the scheduler hands down a combined signal that also fires
   // when a background build is preempted by an interactive one.
   signal: AbortSignal,
+  // Write-only channel back to mountViewer, so a build that dies after its
+  // canvas is in the DOM can still have that canvas taken out again.
+  mounted: { view?: HTMLCanvasElement } = {},
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
   const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton } = await loadThree();
@@ -1621,7 +1666,15 @@ async function buildViewer(
     target.style.setProperty("-webkit-user-select", "none");
     target.style.setProperty("-webkit-touch-callout", "none");
   }
+  // Belt and braces to the reclaim in mountViewer: the pane belongs to one
+  // viewer at a time, so anything canvas-shaped still sitting in it is a corpse.
+  // Leaving one costs the whole pane — this canvas is block-level at
+  // `height:100%`, so a sibling before it pushes it a full pane down and the
+  // weapon renders under the frame instead of in it. (The cursor layer and the
+  // perf HUD also live in here, but both are absolutely positioned divs.)
+  for (const stale of container.querySelectorAll("canvas")) stale.remove();
   container.appendChild(view);
+  mounted.view = view;
 
   const scene = new THREE.Scene();
   // Prefiltered once for the whole app — see getSharedGL. Ambient stays tiny;
@@ -5101,21 +5154,63 @@ vec3 csCharmAdjust( vec3 linear ) {
     anchor: import("./stattrakModule").StatTrakAnchor,
     bone?: string,
     /**
-     * Cast the seating ray from where the module ACTUALLY ended up rather than
-     * from `anchor.pos`.
+     * Compose the attachment's angles as a real Source QAngle rather than with
+     * the hand-rolled swizzle below.
      *
-     * `pos` is the pre-swizzled fallback for a skeleton-less model, and on a
-     * real weapon it does not agree with the posed position — measured on the
-     * AK, StatTrak's stored pos is [0.013, 0.034, 0.213] against a posed
-     * [0.013, 0.051, 0.028]. Only x lines up. StatTrak survives that because
-     * the ray simply misses from there and seating no-ops, but the name plate's
-     * ray either misses (leaving it floating proud of the receiver) or hits
-     * unrelated geometry and drags the plate off the gun.
+     * Source QAngle is [pitch, yaw, roll] about Source's [Y, Z, X], composed
+     * Rz(yaw)*Ry(pitch)*Rx(roll). The glTF node maps Source X->Z, Y->X, Z->Y, so
+     * under that basis roll turns about GLB Z, pitch about GLB X and yaw about
+     * GLB Y — which is three's Euler order "YXZ" over (pitch, yaw, roll).
      *
-     * Opt-in so StatTrak's placement stays byte-identical — it is known good
-     * and this is not the change to perturb it with.
+     * StatTrak never needed this: every gun anchor it uses is unrotated, so any
+     * composition looked correct. The name plate does — 36 of 37 anchors are
+     * rotated and the pistols hard (Deagle [80.3, -179.2, -179.0]), which is
+     * exactly why their plates lay at the wrong angle across the grip.
+     *
+     * Opt-in, so StatTrak's placement stays byte-identical.
      */
-    seatFromPosed = false,
+    sourceAngles = false,
+    /**
+     * Skip the rotation entirely — the module keeps the identity orientation.
+     *
+     * Measured, not assumed. On the Deagle the correct orientation solves to
+     * identity: the plate's thin axis then matches the frame's surface normal to
+     * 0.994 and its long axis runs along the gun to 1.000. Neither term belongs
+     * there — the attachment QAngle is [80.3, -179.2, -179.0] and the clip
+     * residual is a further [130, 75, 135] on a pistol (guns are 0.05 degrees),
+     * and applying either lays the plate flat across the grip. A sweep of all
+     * six Euler orders x six axis permutations x both signs never got past 0.228
+     * alignment, which is what ruled the angle convention out as the cause.
+     *
+     * The plate carries its orientation in its own mesh basis, so the anchor
+     * only has to say WHERE.
+     */
+    noRotation = false,
+    /**
+     * How hard to push the module onto the body once it is positioned.
+     *
+     * "posed" slides the module's inner face onto the first surface under it,
+     * with the ray fired from where the module ACTUALLY landed. The name plate
+     * needs that: it is a flat plate glued to the receiver, and left on its
+     * anchor alone it either floats proud or lies at the wrong depth.
+     *
+     * "none" leaves the authored depth alone, which is what the StatTrak module
+     * wants. Valve does not seat it either — the game just parents the model to
+     * the attachment — and the authoring is deliberate: measured across six
+     * weapons, the body surface sits +3.3 to +4.6mm outside the attachment
+     * origin while the display glass sits at +4.6 to +5.1mm. The housing is
+     * MEANT to be sunk into the receiver with only the readout proud. Seating
+     * its back face onto the surface stands all 35 modules ~10mm off the gun,
+     * which reads as a brick glued on; that was tried on 2026-07-30 and undone.
+     *
+     * The old third mode fired the ray from `anchor.pos` — the pre-swizzled
+     * fallback for a skeleton-less model, which on a posed weapon is nowhere
+     * near the module (the M4's is [0.015, 0.309, 0.525] against a posed
+     * [0.015, 0.051, 0.042], i.e. off the gun entirely). It survived only
+     * because the ray usually missed and the correction no-oped. It is gone:
+     * where it happened to HIT it moved the module by an arbitrary amount.
+     */
+    seating: "posed" | "none" = "posed",
   ): boolean {
     const xform = stattrakTransform(anchor);
     if (!xform) return false;
@@ -5162,9 +5257,16 @@ vec3 csCharmAdjust( vec3 linear ) {
     // unconstrained by guns — which is exactly why knives (karambit
     // [-54.1, 0, -170.4]) do not work yet and stay gated above.
     const clipQuat = clipRotation(THREE, bonePose, poseBones.modelQuat) ?? new THREE.Quaternion();
-    mod.quaternion
+    if (noRotation) mod.quaternion.identity();
+    else mod.quaternion
       .copy(clipQuat)
-      .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(euler[1], euler[2], euler[0], "ZYX")));
+      .multiply(
+        new THREE.Quaternion().setFromEuler(
+          sourceAngles
+            ? new THREE.Euler(euler[0], euler[1], euler[2], "YXZ")
+            : new THREE.Euler(euler[1], euler[2], euler[0], "ZYX"),
+        ),
+      );
 
     // ---- Seat it against the body -------------------------------------------
     // The anchor is validated (muzzle_flash lands 2cm past the barrel on a 90cm
@@ -5176,23 +5278,51 @@ vec3 csCharmAdjust( vec3 linear ) {
     // So cast inward along the side axis and slide the module's inner face onto
     // whatever it hits. Render-only, exactly like liftOutOfBody: no stored
     // value is touched, so this cannot desync from what the game is sent.
-    {
-      const ref = seatFromPosed
-        ? [mod.position.x, mod.position.y, mod.position.z]
-        : pos;
+    //
+    // Skipped for modules Valve already seats itself — see `seating`.
+    if (seating === "posed") {
+      const ref = [mod.position.x, mod.position.y, mod.position.z];
       const outward = ref[0] >= 0 ? 1 : -1;
       // Extent about the module's OWN origin, with its tilt already applied.
       const self = new THREE.Box3().setFromObject(mod).translate(mod.position.clone().negate());
       const innerFace = outward > 0 ? self.min.x : self.max.x;
       const probe = 0.06;
       const dirWorld = new THREE.Vector3(-outward, 0, 0).transformDirection(object.matrixWorld).normalize();
-      const start = object.localToWorld(new THREE.Vector3(ref[0] + outward * probe, ref[1], ref[2]));
-      raycaster.set(start, dirWorld);
-      raycaster.far = probe * 2;
-      const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+      /**
+       * Sample the surface ACROSS the module's whole footprint and keep the
+       * OUTERMOST hit, rather than firing one ray at its centre.
+       *
+       * A receiver is not flat. Measured on the AK, the surface directly under
+       * the plate's centre sits at x=0.0173 while the panel around it bulges to
+       * 0.0181 — and the plate is only 1.5mm thick, so seating it to the centre
+       * reading buries all but 0.7mm of it in the gun. That is the "plate is
+       * behind the model" symptom: not floating, sunk.
+       *
+       * Sampling only widens the search, so it can never seat DEEPER than the
+       * single ray did.
+       */
+      const cast = (y: number, z: number) => {
+        raycaster.set(object.localToWorld(new THREE.Vector3(ref[0] + outward * probe, y, z)), dirWorld);
+        raycaster.far = probe * 2;
+        const h = raycaster.intersectObjects(weaponMeshes, false)[0];
+        return h ? object.worldToLocal(h.point.clone()).x : null;
+      };
+      let best: number | null = null;
+      const samples: [number, number][] = [[0, 0]];
+      // Inset from the edges: a sample exactly on the rim can slide off the
+      // panel onto whatever is behind it.
+      for (const fy of [-0.3, 0, 0.3]) {
+        for (const fz of [-0.35, 0, 0.35]) samples.push([self.min.y + (self.max.y - self.min.y) * (0.5 + fy), self.min.z + (self.max.z - self.min.z) * (0.5 + fz)]);
+      }
+      for (const [dy, dz] of samples) {
+        const x = cast(ref[1] + dy, ref[2] + dz);
+        if (x == null) continue;
+        if (best == null || (outward > 0 ? x > best : x < best)) best = x;
+      }
+      const hit = best == null ? null : { point: null as unknown as import("three").Vector3 };
       if (!hit) mod.userData.seating = { ref: [...ref], outward, missed: true };
       if (hit) {
-        const surfaceX = object.worldToLocal(hit.point.clone()).x;
+        const surfaceX = best as number;
         // The knife module is a FLAT plate (measured: y extent exactly 0), so
         // its inner face IS its outer face. Seating that dead on the surface
         // z-fights; lift it by a fraction of a millimetre.
@@ -5210,6 +5340,106 @@ vec3 csCharmAdjust( vec3 linear ) {
       }
     }
     return true;
+  }
+
+  /**
+   * Guarantee the READOUT clears the body, and push the module out if it does
+   * not. Never pulls it in.
+   *
+   * Valve's placement leaves almost no margin on purpose: the housing is sunk
+   * into the receiver and only the display glass stands proud, measured at
+   * +4.64mm from the attachment origin against a body surface at +3.3 to
+   * +4.6mm. A body that bulges a fraction of a millimetre under one end of the
+   * plate is therefore enough to swallow the digits — which is exactly what the
+   * legacy AUG does. Measured on it, the stock crosses the glass by 1.26mm at
+   * the rear end and the finish renders straight through the counter; the HD
+   * AUG body clears the same plate by +0.90mm and looks correct. Same anchor,
+   * same module, different body mesh, so this cannot be fixed in the anchors.
+   *
+   * Sampled on a 13x5 grid over the GLASS, not the housing. The margin at stake
+   * is smaller than the spacing of the 3x3 the seating pass uses, and the
+   * failure is at the plate's very end, which a coarse inset grid steps over.
+   *
+   * Render-only, like the seating pass: nothing stored is touched, so this
+   * cannot desync from what the game is sent.
+   */
+  function clearReadout(mod: import("three").Object3D) {
+    // In OBJECT-local space, offset to the module's own origin. Taking a world
+    // AABB and subtracting the local position (the way the seating pass does)
+    // only agrees while `object` is unrotated at unit scale, and the framing
+    // transform is neither — it read the AUG's glass at -4.8mm, on the wrong
+    // side of the plate entirely.
+    const toObject = new THREE.Matrix4().copy(object.matrixWorld).invert();
+    let display: import("three").Box3 | null = null;
+    mod.traverse((c) => {
+      const m = c as import("three").Mesh;
+      const mat = m.material as import("three").Material | undefined;
+      if (!m.isMesh || !isDisplayMaterial(mat?.name)) return;
+      m.geometry.computeBoundingBox();
+      display = new THREE.Box3()
+        .copy(m.geometry.boundingBox!)
+        .applyMatrix4(new THREE.Matrix4().multiplyMatrices(toObject, m.matrixWorld))
+        .translate(mod.position.clone().negate());
+    });
+    const glassBox = display as import("three").Box3 | null;
+    if (!glassBox) return null;
+    const outward = mod.position.x >= 0 ? 1 : -1;
+    // The plane that has to stay outside the body is the glass's INNER face.
+    const glass = outward > 0 ? glassBox.min.x : glassBox.max.x;
+    const probe = 0.06;
+    const dir = new THREE.Vector3(-outward, 0, 0).transformDirection(object.matrixWorld).normalize();
+    let worst = Infinity;
+    let at = "-";
+    for (let i = 0; i <= 12; i++) {
+      for (let k = 0; k <= 4; k++) {
+        const z = glassBox.min.z + (glassBox.max.z - glassBox.min.z) * (i / 12);
+        const y = glassBox.min.y + (glassBox.max.y - glassBox.min.y) * (k / 4);
+        raycaster.set(
+          object.localToWorld(new THREE.Vector3(mod.position.x + outward * probe, mod.position.y + y, mod.position.z + z)),
+          dir,
+        );
+        raycaster.far = probe * 2;
+        const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+        if (!hit) continue; // nothing under this corner — the plate overhangs
+        const surface = object.worldToLocal(hit.point.clone()).x - mod.position.x;
+        const clear = outward > 0 ? glass - surface : surface - glass;
+        if (clear < worst) {
+          worst = clear;
+          at = `z${(i / 12).toFixed(2)} y${(k / 4).toFixed(2)}`;
+        }
+      }
+    }
+    // A plate hanging entirely off the geometry has nothing to clear.
+    if (!Number.isFinite(worst)) return null;
+    // Enough to beat depth precision at this scale without visibly lifting the
+    // module: half a millimetre on a housing 12mm thick.
+    const MARGIN = 0.0005;
+    /**
+     * Correct the sub-millimetre class of error ONLY, and abandon anything
+     * bigger rather than capping it.
+     *
+     * What this is for is our extraction disagreeing with the game by a hair.
+     * Measured over all 35 guns, that is what it looks like: 29 already clear,
+     * and the six that do not need 0.02 to 0.93mm. A deeper intersection is a
+     * different animal and a nudge is the wrong tool for it either way —
+     *
+     *   - sg556 reads -3.93mm, but only at the plate's far corner, where the
+     *     receiver has a raised feature. CS2 does no correction at all, so the
+     *     module overlaps it in game too; lifting the whole housing 4mm to free
+     *     one corner invents a gap the real weapon does not have.
+     *   - elite reads -26.61mm because the ray leaves the right pistol and hits
+     *     the LEFT one — the pair is rendered side by side (see the dual-wield
+     *     note) and there is no body under that part of the plate at all.
+     *
+     * Capping and applying anyway was the first cut, and it moved both of these
+     * by the full cap for no reason. Skipping leaves them exactly as authored,
+     * which is also exactly what the game draws.
+     */
+    const MAX_PUSH = 0.0015;
+    const want = worst >= MARGIN ? 0 : MARGIN - worst;
+    const push = want > MAX_PUSH ? 0 : want;
+    if (push > 0) mod.position.x += outward * push;
+    return { glass, worst, at, pushed: push, skipped: want > MAX_PUSH };
   }
 
   const stattrakDisposables: { dispose: () => void }[] = [];
@@ -5305,10 +5535,15 @@ vec3 csCharmAdjust( vec3 linear ) {
       }
       display.needsUpdate = true;
     });
-    if (!placeAttachedModule(mod, anchor, bone)) return;
+    // seating="none" — Valve authors this attachment already seated, with the
+    // housing sunk into the receiver and only the readout proud. All this pass
+    // has to do afterwards is guarantee the readout actually clears.
+    if (!placeAttachedModule(mod, anchor, bone, false, false, "none")) return;
     object.add(mod);
     stattrakMod = mod;
     object.updateMatrixWorld(true);
+    const clearance = clearReadout(mod);
+    if (clearance?.pushed) object.updateMatrixWorld(true);
     // Placement introspection for tools/shadertest/stattrak.html. Off unless
     // the rig sets the flag, so production pays nothing — and measuring these
     // boxes is what finally settled placement after several wrong theories.
@@ -5320,9 +5555,15 @@ vec3 csCharmAdjust( vec3 linear ) {
         const m = c as import("three").Mesh;
         if (m.isMesh && !mod.getObjectById(m.id)) wb.expandByObject(m);
       });
-      const line = `${model} local=[${mod.position.toArray().map((v) => v.toFixed(4))}] mod=${f(new THREE.Box3().setFromObject(mod))} weapon=${f(wb)}`;
+      const line = `${model} local=[${mod.position.toArray().map((v) => v.toFixed(4))}] mod=${f(new THREE.Box3().setFromObject(mod))} weapon=${f(wb)} seating=${JSON.stringify(mod.userData.seating ?? null)}`;
       (globalThis as { __stBox?: string }).__stBox = line;
       console.log(`[st] ${line}`);
+      if (clearance) {
+        const mm = (v: number) => (v * 1000).toFixed(2);
+        const clr = `${model} glass=${mm(clearance.glass)}mm worstClearance=${mm(clearance.worst)}mm at ${clearance.at} push=${mm(clearance.pushed)}mm${clearance.skipped ? " SKIPPED" : ""}`;
+        (globalThis as { __stClearance?: string }).__stClearance = clr;
+        console.log(`[st-clear] ${clr}`);
+      }
     }
   }
 
@@ -5354,11 +5595,18 @@ vec3 csCharmAdjust( vec3 linear ) {
   /**
    * The plate's colour map with the serial line replaced by the custom name.
    *
-   * The shipped texture is an atlas — a black label strip reading
-   * "PARKER / INVENTORY UID DATAPLATE SERIAL NO / barcode", a plain metal back
-   * face, and two rivets. Measured on the 512x512 map, the serial line occupies
-   * x 111..297, y 74..95; the logo sits to its left and the barcode to its
-   * right, so the name goes exactly there and nothing else is disturbed.
+   * The shipped texture is an atlas: a black label strip, a plain metal back
+   * face, and two rivets. The strip has TWO bands, and the name goes in the
+   * upper one — profiling the 512x512 map by row:
+   *
+   *   y  6..11   plate border highlight
+   *   y 12..69   EMPTY (only the side borders light up) — the NAME band
+   *   y 70..71   divider rule
+   *   y 72..99   PARKER / INVENTORY UID DATAPLATE SERIAL NO / barcode
+   *
+   * The first version wrote the name over the serial line instead, which both
+   * put it in the wrong place and destroyed artwork the game keeps. Nothing is
+   * painted out now — the name simply fills the space left for it.
    *
    * Sampler settings are copied off the texture being replaced rather than set
    * by hand — flipY in particular, which differs between a glTF texture and a
@@ -5375,24 +5623,25 @@ vec3 csCharmAdjust( vec3 linear ) {
     ctx.drawImage(img, 0, 0);
     // Box in the 512-wide authored space, scaled to whatever the mount ships.
     const k = img.width / 512;
-    const box = { x: 111 * k, y: 74 * k, w: (297 - 111) * k, h: (95 - 74) * k };
-    // Paint out the serial with the label's own background, sampled from just
-    // under the line rather than assumed black — the strip is not flat.
-    const bg = ctx.getImageData(Math.round(box.x + box.w * 0.5), Math.round(box.y + box.h + 4 * k), 1, 1).data;
-    ctx.fillStyle = `rgb(${bg[0]},${bg[1]},${bg[2]})`;
-    ctx.fillRect(box.x - 2 * k, box.y - 2 * k, box.w + 4 * k, box.h + 4 * k);
-    // Fit to the box: names run to 24 characters and the plate is narrow, so
-    // size is driven by what fits rather than by a fixed point size.
-    const label = text.toUpperCase();
-    let size = box.h;
-    ctx.textAlign = "center";
+    const box = { x: 22 * k, y: 14 * k, w: (492 - 22) * k, h: (68 - 14) * k };
+    // Fit to the band. Names run to 24 characters and the plate is wide but
+    // short, so the size is driven by what fits rather than a fixed point size.
+    // Start from a FIXED size and only shrink to fit. Sizing purely to width
+    // makes a short name balloon to the full band height while a long one sits
+    // small, which is not what the game does — it prints at one size and only
+    // compresses when the name is too long for the plate.
+    let size = box.h * 0.72;
+    // LEFT aligned, lining up with the PARKER logo below it — that is how the
+    // game sets it, and a centred name drifts away from the logo as it shortens.
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     for (; size > 4; size -= 0.5) {
       ctx.font = `${size}px "Arial Narrow", "Roboto Condensed", "DejaVu Sans Condensed", sans-serif`;
-      if (ctx.measureText(label).width <= box.w) break;
+      if (ctx.measureText(text).width <= box.w) break;
     }
-    ctx.fillStyle = "#d8d5cd"; // the serial line's own ink, not pure white
-    ctx.fillText(label, box.x + box.w / 2, box.y + box.h / 2, box.w);
+    // NOT upper-cased: the game prints the name exactly as it was bought.
+    ctx.fillStyle = "#f0efec";
+    ctx.fillText(text, box.x, box.y + box.h / 2, box.w);
     const tex = new THREE.CanvasTexture(cv);
     tex.flipY = src!.flipY;
     tex.colorSpace = src!.colorSpace;
@@ -5402,8 +5651,53 @@ vec3 csCharmAdjust( vec3 linear ) {
     return tex;
   }
 
+  /** Nearest body surface to a point, and its outward normal — both in object
+   *  space. Used to lie the name plate on the weapon rather than assume which
+   *  way its flank faces. */
+  function surfaceHitAt(p: import("three").Vector3, maxDist = 0.03) {
+    let best: { point: import("three").Vector3; normal: import("three").Vector3; dist: number } | null = null;
+    for (const d of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      const dir = new THREE.Vector3(d[0], d[1], d[2]);
+      raycaster.set(
+        object.localToWorld(p.clone().addScaledVector(dir, 0.08)),
+        dir.clone().negate().transformDirection(object.matrixWorld).normalize(),
+      );
+      raycaster.far = 0.16;
+      const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+      if (!hit?.face) continue;
+      const at = object.worldToLocal(hit.point.clone());
+      // Rank by distance from the PLATE and reject anything far away. The ray
+      // starts 8cm out, so without this a face on the OPPOSITE side of the
+      // weapon can win — which is how the plate ended up relocated inside the
+      // body and invisible.
+      const fromPlate = at.distanceTo(p);
+      if (fromPlate > maxDist || (best && fromPlate >= best.dist)) continue;
+      const nWorld = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+      best = { point: at, normal: object.worldToLocal(hit.point.clone().add(nWorld)).sub(at).normalize(), dist: fromPlate };
+    }
+    raycaster.far = Infinity;
+    return best;
+  }
+  const surfaceNormalAt = (p: import("three").Vector3) => surfaceHitAt(p)?.normal ?? null;
+
+  /** Half the plate's thickness, in metres, taken from the mesh's own geometry
+   *  along its local thin axis (geometry Y) — independent of how it is rotated. */
+  function nameplateHalfThickness() {
+    let half = 0;
+    nametagMod?.traverse((n) => {
+      const m = n as import("three").Mesh;
+      if (!(m as unknown as { isMesh?: boolean }).isMesh || half) return;
+      m.geometry.computeBoundingBox();
+      const b = m.geometry.boundingBox;
+      if (b) half = ((b.max.y - b.min.y) * m.scale.y) / 2;
+    });
+    return half;
+  }
+
   const nametagDisposables: { dispose: () => void }[] = [];
   let nametagMod: import("three").Object3D | null = null;
+  /** The anchor the plate was mounted from — probeNameplate reports it. */
+  let nametagPicked: { anchor: import("./stattrakModule").StatTrakAnchor; bone?: string } | null = null;
   async function mountNameTag(text: string) {
     const picked = pickAnchor(
       NAMETAG_ANCHORS as Record<string, import("./stattrakModule").StatTrakAnchorSet | undefined>,
@@ -5417,33 +5711,138 @@ vec3 csCharmAdjust( vec3 linear ) {
     } catch {
       return; // plate art missing from the mount — render the weapon regardless
     }
-    const mod = modGltf.scene.clone(true);
-    // The engraved face is drawn per item, so its material can never be the
-    // shared one out of the glTF cache.
-    mod.traverse((child) => {
-      const mesh = child as import("three").Mesh;
-      if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
-      const mat = (mesh.material as import("three").MeshStandardMaterial)?.clone();
-      if (!mat) return;
-      const label = nameplateTexture(text, mat.map);
-      if (label) {
-        mat.map = label;
-        nametagDisposables.push(label);
-      }
-      mat.needsUpdate = true;
-      mesh.material = mat;
-      nametagDisposables.push(mat);
+    /**
+     * Built from the MESH, not from the glTF scene.
+     *
+     * The scene is unusable as a mount point: the plate's mesh is a sibling ROOT
+     * node (node 2) sitting OUTSIDE node 0's transform chain, so it inherits
+     * neither node 0's swizzle+scale matrix nor node 1's rotation, and it does
+     * not sit at the scene origin. Positioning the scene therefore moves a point
+     * with no fixed relationship to where the plate actually draws — which is
+     * why every anchor correction failed, and why measuring the node said "on
+     * target" while the render plainly disagreed.
+     *
+     * So take the mesh, centre its geometry on its own origin, apply the inch
+     * scale and the axis permutation node 0 encodes, and hang it in a group of
+     * our own. Every transform is then one we set, and the plate's centre IS the
+     * group's position.
+     */
+    let srcMesh: import("three").Mesh | null = null;
+    modGltf.scene.traverse((c) => {
+      const m = c as import("three").Mesh;
+      if (!srcMesh && (m as unknown as { isMesh?: boolean }).isMesh) srcMesh = m;
     });
-    if (!placeAttachedModule(mod, picked.anchor, picked.bone, true)) return;
+    if (!srcMesh) return;
+    const found = srcMesh as import("three").Mesh;
+    const mesh = new THREE.Mesh(found.geometry.clone(), (found.material as import("three").Material).clone());
+    mesh.geometry.center();
+    // Geometry ships in Source INCHES; that scale normally lives on node 0.
+    mesh.scale.setScalar(0.0254);
+    // node 0's basis: local X -> world Z, Y -> X, Z -> Y. Long axis along the
+    // barrel, thin axis out through the flank, short axis vertical.
+    mesh.quaternion.setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(
+        new THREE.Vector3(0, 0, 1),
+        new THREE.Vector3(1, 0, 0),
+        new THREE.Vector3(0, 1, 0),
+      ),
+    );
+    const plateMat = mesh.material as import("three").MeshStandardMaterial;
+    const label = nameplateTexture(text, plateMat.map);
+    if (label) {
+      plateMat.map = label;
+      nametagDisposables.push(label);
+    }
+    plateMat.needsUpdate = true;
+    nametagDisposables.push(plateMat, mesh.geometry);
+    const mod = new THREE.Group();
+    mod.add(mesh);
+    // sourceAngles=false, noRotation=true — the orientation is solved below
+    // instead, so placeAttachedModule only has to supply the POSITION.
+    // seating="posed" — the plate, unlike the StatTrak module, is a bare sticker
+    // of a thing that has to end up ON the surface, so it does get seated.
+    if (!placeAttachedModule(mod, picked.anchor, picked.bone, false, true, "posed")) return;
     object.add(mod);
+    /**
+     * Orient the plate: flatness from the BODY, direction from the GAME DATA.
+     *
+     * Applying the attachment's QAngle wholesale stands the plate on edge (all
+     * six Euler orders x six permutations x both signs peak at 0.228 alignment),
+     * and dropping it entirely lays every plate along the barrel — right on a
+     * rifle, wrong on a pistol, where it belongs down the grip.
+     *
+     * Both halves are needed, and they come from different places. Which way is
+     * OUT is a fact about the weapon, so it is measured off the surface. Which
+     * way the text READS is authored, so it comes from the angles: their frame's
+     * forward axis, projected into that surface. Measured on the two ends of the
+     * range this must satisfy at once — Deagle 0.986 vertical (down the grip),
+     * AK 0.999 along the barrel.
+     */
+    const anchorAngles = picked.anchor.angles;
+    const normal = surfaceNormalAt(mod.position);
+    if (normal && anchorAngles.length === 3) {
+      const rad = Math.PI / 180;
+      // Negated XYZ — settled by sweeping every order/permutation/sign against
+      // those two weapons rather than derived from a convention we cannot check.
+      const authored = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(-anchorAngles[0] * rad, -anchorAngles[1] * rad, -anchorAngles[2] * rad, "XYZ"),
+      );
+      const wanted = new THREE.Vector3(0, 0, 1).applyQuaternion(authored);
+      const long = wanted.sub(normal.clone().multiplyScalar(wanted.dot(normal)));
+      // Degenerate only if the plate reads straight out of the surface, which no
+      // shipped anchor does — fall back to the flat-along-the-body orientation.
+      if (long.lengthSq() > 1e-6) {
+        long.normalize();
+        // long x normal, NOT normal x long. makeBasis wants a RIGHT-handed frame
+        // (X cross Y = Z); the other order gives normal x tall = -long, i.e. a
+        // reflection, and setFromRotationMatrix on that returns something that
+        // is not the rotation asked for — the plate came out flat but still
+        // reading along the barrel instead of down the grip.
+        const tall = new THREE.Vector3().crossVectors(long, normal).normalize();
+        // ORIENTATION ONLY. The position is placeAttachedModule's and is known
+        // good — an earlier version also moved the plate onto the probed surface
+        // and that is what made every plate vanish, because a probe that finds
+        // the far face relocates it into the weapon.
+        mod.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(normal, tall, long));
+        mod.updateMatrixWorld(true);
+      }
+    }
     nametagMod = mod;
+    nametagPicked = picked;
+    // Probes, in the CODE so they survive a reload: ?nameplateprobe=1
+    if (debugFlag("nameplateprobe")) {
+      const S = 0.0254;
+      const swz = (v: number[]) => new THREE.Vector3(v[1] * S, v[2] * S, v[0] * S);
+      const probes: [number, import("three").Vector3][] = [
+        [0xff0000, mod.position.clone()],
+        [0xffff00, swz(picked.anchor.src)],
+      ];
+      for (const [color, p] of probes) {
+        const box = new THREE.Mesh(
+          new THREE.BoxGeometry(0.003, 0.012, 0.07),
+          new THREE.MeshBasicMaterial({ color, depthTest: false }),
+        );
+        box.renderOrder = 999;
+        box.name = "__nameplateProbe";
+        box.position.copy(p);
+        object.add(box);
+        nametagDisposables.push(box.geometry, box.material as import("three").Material);
+      }
+    }
   }
 
   function removeNameTag() {
     if (nametagMod) {
       object.remove(nametagMod);
       nametagMod = null;
+      nametagPicked = null;
     }
+    // Probes hang off `object`, not off the module — clear them too or they pile
+    // up one set per keystroke.
+    for (const p of object.children.filter((c) => c.name === "__nameplateProbe")) object.remove(p);
+    // Probes hang off `object`, not off the module — clear them too or they pile
+    // up one set per keystroke.
+    for (const p of object.children.filter((c) => c.name === "__nameplateProbe")) object.remove(p);
     for (const d of nametagDisposables) d.dispose();
     nametagDisposables.length = 0;
   }
@@ -5762,6 +6161,65 @@ vec3 csCharmAdjust( vec3 linear ) {
     // share the constant, so drags round-trip perfectly against themselves) and
     // only shows up on the item the game renders. Nothing here may be derived
     // from a constant the caller already has, or the check proves nothing.
+    probeNameplate(): NameplateProbe {
+      const base: NameplateProbe = {
+        model, mounted: false, angles: null, bone: null, pos: null,
+        thin: null, long: null, normal: null, flat: null, gapMm: null,
+      };
+      if (!nametagMod || !nametagPicked) return base;
+      nametagMod.updateMatrixWorld(true);
+      const q = nametagMod.quaternion;
+      // The mesh basis maps geometry (long, thin, tall) onto group (Z, X, Y),
+      // so these are the plate's own axes expressed in object space.
+      const thin = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+      const long = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+      const pos = nametagMod.position.clone();
+      // Surface under the plate: probe from outside along each axis and keep the
+      // nearest hit, so this does not assume which way the body faces.
+      let normal: import("three").Vector3 | null = null;
+      let gap: number | null = null;
+      let bestDist = Infinity;
+      for (const d of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+        const dir = new THREE.Vector3(d[0], d[1], d[2]);
+        const start = object.localToWorld(pos.clone().addScaledVector(dir, 0.08));
+        raycaster.set(start, dir.clone().negate().transformDirection(object.matrixWorld).normalize());
+        raycaster.far = 0.16;
+        const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+        if (!hit?.face) continue;
+        // Distance from the PLATE, not from the ray origin — the origin is 8cm
+        // out along an arbitrary axis and ranking by it picks the wrong face.
+        const fromPlate = object.worldToLocal(hit.point.clone()).distanceTo(pos);
+        if (fromPlate >= bestDist) continue;
+        bestDist = fromPlate;
+        const nWorld = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+        const at = object.worldToLocal(hit.point.clone());
+        normal = object.worldToLocal(hit.point.clone().add(nWorld)).sub(at).normalize();
+        // Signed distance from the plate's inner face to that surface, measured
+        // ALONG THE NORMAL. Straight-line distance is wrong: the ray starts 8cm
+        // out, so a hit on the far side of the weapon can be "nearest" and the
+        // gap then reports the body's own thickness.
+        //
+        // Half-thickness comes from the plate's OWN geometry, never from its
+        // world bounding box. Dotting that box with the thin direction happens
+        // to give the thickness when the plate lies on a flank (thin along world
+        // X) and gives the plate's LENGTH once it is rotated — which is how every
+        // knife reported a ~30mm burial that was pure measurement error.
+        gap = (pos.clone().sub(at).dot(normal) - nameplateHalfThickness()) * 1000;
+      }
+      raycaster.far = Infinity;
+      return {
+        ...base,
+        mounted: true,
+        angles: [...nametagPicked.anchor.angles],
+        bone: nametagPicked.bone ?? null,
+        pos: pos.toArray(),
+        thin: thin.toArray(),
+        long: long.toArray(),
+        normal: normal ? normal.toArray() : null,
+        flat: normal ? Math.abs(thin.dot(normal)) : null,
+        gapMm: gap,
+      };
+    },
     probePlacement() {
       const anchorJson = (CHARM_ANCHORS as Record<string, { keychain: number[] } | undefined>)[model];
       return {

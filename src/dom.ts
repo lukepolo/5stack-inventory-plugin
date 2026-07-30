@@ -48,3 +48,24 @@ export function revealInScroller(el: HTMLElement, bottomInset = 0, smooth = true
 
   sc.scrollBy({ top: dy, behavior: smooth ? "smooth" : "auto" });
 }
+
+/**
+ * Send a results panel back to the top, for when its CONTENT is replaced.
+ *
+ * Switching a tab or a filter builds a different list, and the scroll offset
+ * belongs to the old one — so you landed part-way down a set you had never
+ * looked at, or past the end of a shorter one and staring at blank space. This is
+ * only ever right when the list is REPLACED; appending a page must leave the
+ * offset alone.
+ *
+ * `auto`, never smooth: the new list is arriving in the same frames, and animating
+ * the offset across a content swap is the jitter it looks like.
+ *
+ * Takes the scroller itself, or any element inside it (the grids mark theirs with
+ * `[data-scroller]`, but several ARE the scroller).
+ */
+export function scrollPanelToTop(el: HTMLElement | null | undefined): void {
+  if (!el) return;
+  const sc = el.matches("[data-scroller]") || el.scrollHeight > el.clientHeight ? el : scrollRoot(el);
+  (sc ?? el).scrollTo({ top: 0, behavior: "auto" });
+}

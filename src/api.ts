@@ -171,7 +171,16 @@ export interface InventoryItem {
 let assetOrigin = API_ORIGIN;
 export const ASSET_ORIGIN = API_ORIGIN;
 export const getAssetOrigin = () => assetOrigin;
-export const assetUrl = (path: string) => `${assetOrigin}${path}`;
+// Versioned, for the same reason the paint materials are (see withAssetVersion):
+// an icon's filename is cs2-lib's content hash, not ours, so it does NOT change
+// when the artwork behind it does — and /images is served `immutable, max-age=1y`.
+//
+// That combination cached wrong art for a YEAR. Extraction v18 repointed 13,102
+// icons at the right event's asset, and every browser and Cloudflare edge kept
+// serving the old bytes off an identical URL: `cf-cache-status: HIT` on a
+// nine-hour-old copy, with no reload able to touch it. Only the URL changing can
+// fix that, and the extraction version is exactly the thing that should change it.
+export const assetUrl = (path: string) => withAssetVersion(`${assetOrigin}${path}`);
 
 /** Rewrite every "/images/..." string in a decoded response body in place.
  *  Item art appears under a dozen different keys (item, skin, stickers[],
@@ -193,6 +202,16 @@ function resolveAssetPaths(node: unknown): unknown {
   return node;
 }
 
+/** Runtime bits the catalog carries. Applied BEFORE the asset walk below — see
+ *  the call in `request`. */
+function applyCatalogRuntime(c: Partial<Catalog>) {
+  if (c.assetVersion) assetVersion = c.assetVersion;
+  if (typeof c.renderVersion === "number") renderVersion = c.renderVersion;
+  // Empty string is meaningful — "serve from this host" — so only a non-empty
+  // value overrides the default.
+  if (c.assetOrigin) assetOrigin = c.assetOrigin;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}/api${path}`, {
     credentials: "include",
@@ -212,7 +231,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message);
   }
-  return resolveAssetPaths(await response.json()) as T;
+  const body = await response.json();
+  // The catalog's OWN images are rewritten by the walk below, so the origin and
+  // version it carries have to be in place before that runs — applying them in
+  // fetchCatalog afterwards left the first response's URLs unstamped (stale art
+  // that no later reload could dislodge) and, on any deployment that sets
+  // assetOrigin, pointed them at the wrong host entirely.
+  if (path === "/catalog") applyCatalogRuntime(body as Partial<Catalog>);
+  return resolveAssetPaths(body) as T;
 }
 
 // Cache-buster for paint MATERIALS. Their filenames come from cs2-lib and are
@@ -229,15 +255,8 @@ export const getAssetVersion = () => assetVersion;
 export const withAssetVersion = (url: string) =>
   assetVersion ? `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(assetVersion)}` : url;
 
-export const fetchCatalog = async () => {
-  const c = await request<Catalog>("/catalog");
-  if (c.assetVersion) assetVersion = c.assetVersion;
-  if (typeof c.renderVersion === "number") renderVersion = c.renderVersion;
-  // Empty string is meaningful — "serve from this host" — so only a non-empty
-  // value overrides the default.
-  if (c.assetOrigin) assetOrigin = c.assetOrigin;
-  return c;
-};
+// The runtime bits are applied inside `request`, before it rewrites asset paths.
+export const fetchCatalog = () => request<Catalog>("/catalog");
 
 // Cached true-render card images (client 3D snapshots stored on the mount).
 // Number() guards: pg numerics can arrive as strings — .toFixed on a string throws.
