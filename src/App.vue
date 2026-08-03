@@ -1434,23 +1434,45 @@ const craftTarget = ref<ViewerTarget | null>(null);
 // further down the file throws on the temporal dead zone — which blanked the
 // whole plugin, since a setup that throws mounts nothing at all.
 watch(
-  () => [craft.value?.skin.paintMaterial ?? null, craftTarget.value?.kind ?? null] as const,
-  async ([pm, kind]) => {
+  // The type is read off the SKIN rather than through craftType, which is the
+  // same temporal-dead-zone rule as the note above: craftType reaches for
+  // craftInst, declared far below, and `immediate` runs this getter during
+  // setup. The skin's own type is what a glove always carries anyway.
+  () => [craft.value?.skin.paintMaterial ?? null, craftTarget.value?.kind ?? null, craft.value?.skin.type ?? null] as const,
+  async ([pm, kind, type]) => {
     patternMoves.value = null;
     // A GLOVE carries a pattern and is rendered by a different compositor —
     // gloveComposite, which never reads the seed. Asking the weapon paint def
     // about it would answer a question about a shader that is not the one
     // drawing this. The pattern is still a real tradeable attribute, so the
     // field stays; there is simply no look to browse.
-    if (kind === "glove") {
+    //
+    // Asked of the ECONOMY TYPE as well as the viewer kind, because the two
+    // become known at different moments and only one of them is synchronous.
+    // `craftTarget` is resolved a tick after `craft` is assigned, so the first
+    // run of this watcher always sees kind null — the type is already 'glove'
+    // by then and settles it without waiting for anything.
+    if (kind === "glove" || type === "glove") {
       patternMoves.value = false;
       return;
     }
     if (!pm) return;
     const def = await loadPaintDef(pm);
-    // Still the same finish? The fetch is cached, but a fast click through two
+    // Still the same subject? The fetch is cached, but a fast click through two
     // skins can still land these out of order.
-    if ((craft.value?.skin.paintMaterial ?? null) !== pm) return;
+    //
+    // The KIND is re-checked here, not just the finish, and that is the whole
+    // bug: the first run — the one that sees kind null — went off to fetch, and
+    // came back to overwrite the `false` the glove gate had set in the meantime.
+    // Every glove therefore got a 1..1000 pattern rail, on a compositor with no
+    // seed input at all, so dragging it moved the needle and nothing else.
+    if (
+      (craft.value?.skin.paintMaterial ?? null) !== pm ||
+      (craftTarget.value?.kind ?? null) !== kind ||
+      (craft.value?.skin.type ?? null) !== type
+    ) {
+      return;
+    }
     patternMoves.value = def ? seedMovesPattern(def) : null;
   },
   { immediate: true },
