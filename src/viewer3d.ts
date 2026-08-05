@@ -17,7 +17,7 @@
 import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
 import { FLAGS, flagValue, setFlag } from "./devFlags";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
-import { type CharmShading, dressCharm, tuneCharmShading } from "./charmMaterial";
+import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
 import {
   buildCharmSim,
   charmMotion,
@@ -1741,6 +1741,17 @@ export interface ViewerHandle {
    *  read something off it (charmAlbedoTile) has to know when it landed. */
   setCharm: (charm: CharmPlacement | null) => Promise<void>;
   /**
+   * The same promise for the charm the MOUNT was given, which nothing else can
+   * await.
+   *
+   * The mount deliberately does not block on the charm — a weapon should not
+   * wait on the trinket hanging off it — so at the moment a caller is handed the
+   * handle, `charmAlbedoTile` still answers null. The pattern rail read exactly
+   * then, found nothing, and stayed blank until an edit happened to re-sample
+   * it: the charm looked like it had no pattern until you dragged the slider.
+   */
+  charmReady: () => Promise<void>;
+  /**
    * Re-shade the charm at a new PATTERN without remounting.
    *
    * Covers the standalone mount, where the charm IS the model and so never goes
@@ -1793,6 +1804,14 @@ export interface ViewerHandle {
      * GLB — and then predicts colours the render never shows.
      */
     material: string | null;
+    /**
+     * That material's TINT MASK at the same size, or null where it has none.
+     *
+     * Sampled from the very texture the shader is reading, so a caller
+     * predicting a pattern's colour masks it exactly as the render does. Without
+     * it a prediction covers the whole charm while the render covers a badge.
+     */
+    mask: Uint8ClampedArray | null;
   } | null;
   /** Attach/detach the StatTrak module without remounting (keeps the camera). */
   setStatTrak: (spec: { count: number | null } | null) => void;
@@ -2732,6 +2751,15 @@ async function buildViewer(
   // Frees the glove composite's render targets on dispose — see below.
   let gloveRelease: (() => void) | null = null;
   /**
+   * The tint masks of a charm that IS the mounted model.
+   *
+   * Kept so a later re-shade can hand them back. The re-shade normally reaches
+   * a material this viewer already cloned and only writes uniforms, but a mount
+   * whose shading map arrived empty has nothing cloned yet, and passing them
+   * every time costs a map lookup.
+   */
+  let standaloneCharmMasks: Map<string, import("three").Texture> | null = null;
+  /**
    * Only the three maps and the disposer are used here; the two generations'
    * composites differ solely in the resolve targets they expose for the flat-map
    * debug view. Declared out here so the re-composite path below can name it.
@@ -2851,7 +2879,10 @@ async function buildViewer(
     if (material && !(await dressCharm(THREE, loadTexture, object, material))) {
       throw new Error(`[viewer3d] charm ${model} could not be dressed with ${material}`);
     }
-    tuneCharmShading(THREE, object, shading, opts?.seed ?? 0);
+    // Masks first, then the tune: the tune clones the material and compiles its
+    // program, so a mask arriving after it would have nothing to bind to.
+    standaloneCharmMasks = await loadCharmTintMasks(THREE, loadTexture, object, shading);
+    tuneCharmShading(THREE, object, shading, opts?.seed ?? 0, standaloneCharmMasks);
   }
   scene.add(object);
 
@@ -4918,7 +4949,10 @@ async function buildViewer(
       // undressed, every community charm is the same grey shape, which is less
       // use than the flat art it would otherwise fall back to.
       if (spec?.material && !(await dressCharm(THREE, loadTexture, model, spec.material))) return null;
-      tuneCharmShading(THREE, model, shading, seed);
+      // Masks before the tune — the tune clones the material and compiles the
+      // program, and a mask handed over afterwards would bind to nothing.
+      const masks = await loadCharmTintMasks(THREE, loadTexture, model, shading);
+      tuneCharmShading(THREE, model, shading, seed, masks);
       // The stem comes back with the model because the cloth sidecar is keyed on
       // it, and re-deriving it at the call site would mean repeating the econ
       // lookup above — including its fallback, which is the part that would
@@ -4926,8 +4960,9 @@ async function buildViewer(
       //
       // The shading map rides along for the same reason: a pattern change
       // re-shades this model in place, and refetching the map per tick of a
-      // rail drag would put the econ lookup back in the scrub's way.
-      return { model, stem, shading };
+      // rail drag would put the econ lookup back in the scrub's way. The masks
+      // ride for the same reason and are far more expensive to refetch.
+      return { model, stem, shading, masks };
     } catch {
       return null;
     }
@@ -5024,8 +5059,17 @@ async function buildViewer(
      * so there is nothing for a re-shade to do.
      */
     shading: Record<string, CharmShading> | null;
+    /** The tint masks loaded for those materials — see loadCharmTintMasks. */
+    masks: Map<string, import("three").Texture> | null;
   };
   let charm: Charm | null = null;
+  /**
+   * The charm attach in flight, if any — see ViewerHandle.charmReady.
+   *
+   * Every path that changes the charm assigns it, so awaiting it always means
+   * "whatever the charm is meant to be right now, it is".
+   */
+  let charmWork: Promise<void> = Promise.resolve();
 
   // The charm is on a CORD_LEN leash from a pivot that only moves when the user
   // drags it, and probes a small radius around itself — so every triangle it
@@ -6107,7 +6151,7 @@ async function buildViewer(
     // nothing and silently keep the old colour — the exact bug the seed was put
     // in the identity key to prevent.
     if (charm && prev && prev[0] === c.image && prev[4] !== (c.seed ?? null)) {
-      if (charm.shading) tuneCharmShading(THREE, charm.sprite, charm.shading, c.seed ?? 0);
+      if (charm.shading) tuneCharmShading(THREE, charm.sprite, charm.shading, c.seed ?? 0, charm.masks);
       // A rail drag changes only the pattern, but a draft restore can change
       // both at once — so the anchor still has to follow when it moved.
       if (movedAnchor) reanchor(c);
@@ -6300,7 +6344,7 @@ async function buildViewer(
     );
     line.visible = false;
     scene.add(line);
-    charm = { sprite, line, pivot, pos, prev: pos.clone(), key, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd, off: cOff, sim, shading: found?.shading ?? null };
+    charm = { sprite, line, pivot, pos, prev: pos.clone(), key, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd, off: cOff, sim, shading: found?.shading ?? null, masks: found?.masks ?? null };
     if (sim) {
       // Settle it before the first frame. A charm that popped into view mid-swing
       // read as a glitch rather than as physics, and a still viewer (a card bake)
@@ -8014,7 +8058,12 @@ async function buildViewer(
   // has no such space. A silent no-op is the only sane answer.
   if (pres.attachments) {
     setStickers(opts?.stickers ?? []);
-    void setCharm(opts?.charm ?? null);
+    // NOT awaited — the charm's GLB, its cloth sidecar and its tint masks are
+    // several fetches, and a weapon should appear without waiting on the thing
+    // hanging off it. Kept as a PROMISE though: a caller that needs the charm
+    // (the pattern rail, which grades its albedo) otherwise has no way to know
+    // when it landed and paints an empty rail until the first drag pokes it.
+    charmWork = setCharm(opts?.charm ?? null);
   }
   // AWAITED, unlike the charm: snapshots fire on a fixed timer after mount, so
   // a module still loading when the shutter drops would bake a card with no
@@ -8291,7 +8340,8 @@ async function buildViewer(
     agentPose: () => agentPose,
     setStickers,
     flashSticker,
-    setCharm: (c) => setCharm(c),
+    setCharm: (c) => (charmWork = setCharm(c)),
+    charmReady: () => charmWork,
     setPaintVariant: (wear, seed, proxy) => setPaintVariant(wear, seed, proxy),
     paintUvWeights: (size) => paintUvWeights(size),
     setCharmSeed(seed) {
@@ -8300,13 +8350,13 @@ async function buildViewer(
       // and never passes through setCharm. Its shading map came in with the
       // mount options, which is the only place it exists on this path.
       if (kind === "charm" && opts?.charmSpec) {
-        tuneCharmShading(THREE, object, opts.charmSpec.shading, seed);
+        tuneCharmShading(THREE, object, opts.charmSpec.shading, seed, standaloneCharmMasks);
       }
       // The attached mount. Deliberately not `else` — a charm viewer showing a
       // charm that itself hangs a charm is not a thing today, but neither
       // branch costs anything when its side is absent, and an `else` here would
       // be a silent choice about which one wins if it ever were.
-      if (charm?.shading) tuneCharmShading(THREE, charm.sprite, charm.shading, seed);
+      if (charm?.shading) tuneCharmShading(THREE, charm.sprite, charm.shading, seed, charm.masks);
     },
     charmAlbedoTile(size = 16) {
       if (disposed) return null;
@@ -8315,6 +8365,7 @@ async function buildViewer(
       if (!root || (kind !== "charm" && !charm?.shading)) return null;
       let img: CanvasImageSource | null = null;
       let material: string | null = null;
+      let maskImg: CanvasImageSource | null = null;
       /** Fallback albedo, used only when nothing on this charm was tuned. */
       let plain: CanvasImageSource | null = null;
       root.traverse((n) => {
@@ -8331,6 +8382,13 @@ async function buildViewer(
         if (mesh.userData.charmTuned === mat) {
           img = src;
           material = mat.name || null;
+          // Its tint mask, taken off the same material rather than refetched, so
+          // a caller predicting the grade masks it with the very texels the
+          // shader samples. The white stand-in is skipped on the flag, not on
+          // its pixels — see tuneCharmShading.
+          const flag = mat.userData.charmMask as { x: number } | undefined;
+          const tint = mat.userData.tintMask as import("three").Texture | undefined;
+          if (flag?.x === 1 && tint?.image) maskImg = tint.image as CanvasImageSource;
           return;
         }
         // Nothing tuned yet. Keep the first body texture anyway so a caller
@@ -8347,7 +8405,14 @@ async function buildViewer(
         const ctx = cv.getContext("2d", { willReadFrequently: true });
         if (!ctx) return null;
         ctx.drawImage(source, 0, 0, size, size);
-        return { data: ctx.getImageData(0, 0, size, size).data, size, material };
+        const data = ctx.getImageData(0, 0, size, size).data;
+        let mask: Uint8ClampedArray | null = null;
+        if (maskImg) {
+          ctx.clearRect(0, 0, size, size);
+          ctx.drawImage(maskImg, 0, 0, size, size);
+          mask = ctx.getImageData(0, 0, size, size).data;
+        }
+        return { data, size, material, mask };
       } catch {
         // A texture three decoded through a path the 2D context will not accept
         // (or a tainted canvas) is not worth failing a mount over.

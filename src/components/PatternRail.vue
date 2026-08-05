@@ -26,6 +26,7 @@ import {
   charmColorTextureUrl,
   charmSeedAdjust,
   charmMaterialName,
+  charmTintMaskUrl,
   seedDrivenShading,
   type CharmShading,
 } from "../charmMaterial";
@@ -40,14 +41,27 @@ const props = withDefaults(
      * that keep their textures inside the GLB and so have no material to fetch.
      * See ViewerHandle.charmAlbedoTile.
      */
-    albedo?: { data: Uint8ClampedArray; size: number; material: string | null } | null;
+    albedo?: {
+      data: Uint8ClampedArray;
+      size: number;
+      material: string | null;
+      mask?: Uint8ClampedArray | null;
+    } | null;
+    /**
+     * The model this charm's colours have to be read off is still loading.
+     *
+     * The rail cannot paint without it, and — more to the point — a drag that
+     * lands before the charm does changes a number nothing is listening to, so
+     * the pattern silently does not take. Held as a skeleton instead.
+     */
+    loading?: boolean;
     min?: number;
     max?: number;
     /** Chunk width. 1000 over a 100000 space is 100 bands, which is as many
      *  ticks as a rail this size can show without becoming a hatch pattern. */
     chunk?: number;
   }>(),
-  { modelValue: null, image: null, albedo: null, min: 1, max: 100000, chunk: 1000 },
+  { modelValue: null, image: null, albedo: null, loading: false, min: 1, max: 100000, chunk: 1000 },
 );
 
 const emit = defineEmits<{
@@ -80,6 +94,20 @@ const canvas = ref<HTMLCanvasElement | null>(null);
 const editEl = ref<HTMLInputElement | null>(null);
 const tune = shallowRef<CharmShading | null>(null);
 const tile = shallowRef<Uint8ClampedArray | null>(null);
+/**
+ * The graded material's tint mask at TILE², or null where it grades whole.
+ *
+ * Without this the rail paints a band for a colour change the render only makes
+ * on part of the charm — and on something like Charm | Lil' Vino, where the
+ * mask is the wine and nothing else, the rail's ramp and the render agreed on
+ * nothing.
+ */
+const mask = shallowRef<Uint8ClampedArray | null>(null);
+/** The mask fetched from the material, for the charms with no viewer beside. */
+const fetchedMask = shallowRef<Uint8ClampedArray | null>(null);
+/** Which URL `fetchedMask` holds — plain, not reactive: it exists to stop the
+ *  same mask being fetched twice, not to drive anything. */
+let fetchedMaskUrl: string | null = null;
 /** The econ lookup's answer, kept so resolve() can re-run against it. */
 const econ = shallowRef<{ shading: Record<string, CharmShading>; spec: Spec } | null>(null);
 /** The albedo fetched from a community charm's own material, if it had one. */
@@ -107,7 +135,9 @@ const inBand = computed(() => seed.value >= lo.value && seed.value <= hi.value);
 const hoverSeed = computed(() =>
   hover.value == null ? null : Math.round(lo.value + hover.value * (hi.value - lo.value)),
 );
-const canBrowse = computed(() => state.value === "ready" || state.value === "unavailable");
+const canBrowse = computed(() => !props.loading && (state.value === "ready" || state.value === "unavailable"));
+/** What the template renders: the caller's load outranks our own. */
+const shown = computed(() => (props.loading && state.value !== "inert" ? "loading" : state.value));
 
 /** The exact colour at one pattern, as a CSS rgb() — the swatch and the
  *  needle's glow both read from this, so the marker is tinted by the very
@@ -117,19 +147,43 @@ function colorAt(s: number): string | null {
   const t = tune.value;
   if (!src || !t) return null;
   const work = new Uint8ClampedArray(src);
-  charmAdjustSrgb(work, charmSeedAdjust(t, s));
+  charmAdjustSrgb(work, charmSeedAdjust(t, s), mask.value);
+  return average(work, src, mask.value);
+}
+
+/**
+ * The tile's colour, WEIGHTED BY THE MASK where there is one.
+ *
+ * A masked charm only recolours where the mask lets it, so a flat average is
+ * mostly texels the pattern cannot touch — on a charm whose mask is one small
+ * badge that reads as a rail that barely moves, which is a worse lie than the
+ * unmasked rail was. Weighting answers the question the rail is actually asked:
+ * what colour is the part that changes.
+ *
+ * Falls back to the flat average if the mask sums to nothing. Downsampling
+ * averages a mask rather than dropping it, so that means a mask that is black
+ * everywhere, not a small one.
+ */
+function average(work: Uint8ClampedArray, src: Uint8ClampedArray, m: Uint8ClampedArray | null): string | null {
+  const weighted = !!m && m.length === src.length;
   let r = 0;
   let g = 0;
   let b = 0;
   let n = 0;
-  for (let i = 0; i < work.length; i += 4) {
-    if (src[i + 3] < 8) continue;
-    r += work[i];
-    g += work[i + 1];
-    b += work[i + 2];
-    n++;
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 0; i < work.length; i += 4) {
+      if (src[i + 3] < 8) continue; // padding, not colour — see sampleAlbedo
+      const w = pass === 0 && weighted ? m![i] / 255 : 1;
+      if (w <= 0) continue;
+      r += work[i] * w;
+      g += work[i + 1] * w;
+      b += work[i + 2] * w;
+      n += w;
+    }
+    if (n > 0.01) break;
+    r = g = b = n = 0;
   }
-  return n ? `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})` : null;
+  return n > 0 ? `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})` : null;
 }
 const swatch = computed(() => colorAt(seed.value));
 
@@ -146,7 +200,10 @@ async function load(image: string) {
   state.value = "loading";
   tune.value = null;
   tile.value = null;
+  mask.value = null;
   fetched.value = null;
+  fetchedMask.value = null;
+  fetchedMaskUrl = null;
   const answer = await fetch(`${API_ORIGIN}/api/catalog/charm-model?image=${encodeURIComponent(image)}`)
     .then((r) => (r.ok ? r.json() : null))
     .catch(() => null);
@@ -218,6 +275,7 @@ function resolve(image: string) {
     state.value = "inert";
     tune.value = null;
     tile.value = null;
+    mask.value = null;
     emit("update:inert", true);
     return;
   }
@@ -225,6 +283,10 @@ function resolve(image: string) {
   // The mounted model wins here too when it named its material: that texture is
   // the one being graded on screen, where a fetched one is only probably it.
   tile.value = (named ? fromProp() : null) ?? fetched.value ?? fromProp();
+  // The mask comes from whichever source the tile did. When the RENDERER named
+  // the material, its answer is complete — a null mask there means that material
+  // has none, not that one has yet to arrive, so a fetched one must not stand in.
+  mask.value = named ? maskFromProp() : (fetchedMask.value ?? maskFromProp());
   if (PATTERN_LOG) {
     console.log("[patternrail]", {
       image,
@@ -234,22 +296,54 @@ function resolve(image: string) {
       dynamic: tune.value?.dynamic ? Object.keys(tune.value.dynamic) : null,
       atSeed: tune.value ? charmSeedAdjust(tune.value, seed.value) : null,
       shadingKeys: Object.keys(shading).length,
+      tintMask: tune.value?.tintMask ?? null,
+      maskFrom: mask.value ? (named ? "renderer" : "fetched") : "none",
     });
   }
   settle();
+  // Idempotent — it returns immediately once the current material's mask is the
+  // one already fetched, which is what keeps the resolve() it calls on arrival
+  // from looping.
+  void ensureMask(image);
+}
+
+/**
+ * Fetch the graded material's tint mask, for a rail with no viewer beside it.
+ *
+ * Only that case: when a model is mounted its mask arrives with the albedo, off
+ * the very texture the shader samples. This path covers the rail painting before
+ * the GLB lands, and the preview panels that never mount one at all.
+ */
+async function ensureMask(image: string) {
+  const url = charmTintMaskUrl(tune.value);
+  if (!url || url === fetchedMaskUrl) return;
+  fetchedMaskUrl = url;
+  const sampled = await sampleAlbedo(url);
+  // The charm — or the material within it — may have changed under us.
+  if (props.image !== image || charmTintMaskUrl(tune.value) !== url) return;
+  fetchedMask.value = sampled;
+  resolve(image);
 }
 
 /** The mounted model's albedo, resized to TILE² if it came in at another size. */
 function fromProp(): Uint8ClampedArray | null {
-  const a = props.albedo;
-  if (!a?.data?.length) return null;
-  if (a.size === TILE) return a.data;
+  return resizeTile(props.albedo?.data ?? null, props.albedo?.size ?? 0);
+}
+
+/** …and its tint mask, which arrives at the same size or not at all. */
+function maskFromProp(): Uint8ClampedArray | null {
+  return resizeTile(props.albedo?.mask ?? null, props.albedo?.size ?? 0);
+}
+
+function resizeTile(data: Uint8ClampedArray | null, size: number): Uint8ClampedArray | null {
+  if (!data?.length || !size) return null;
+  if (size === TILE) return data;
   const out = new Uint8ClampedArray(TILE * TILE * 4);
   for (let y = 0; y < TILE; y++) {
     for (let x = 0; x < TILE; x++) {
-      const sx = Math.min(a.size - 1, Math.floor((x * a.size) / TILE));
-      const sy = Math.min(a.size - 1, Math.floor((y * a.size) / TILE));
-      out.set(a.data.subarray((sy * a.size + sx) * 4, (sy * a.size + sx) * 4 + 4), (y * TILE + x) * 4);
+      const sx = Math.min(size - 1, Math.floor((x * size) / TILE));
+      const sy = Math.min(size - 1, Math.floor((y * size) / TILE));
+      out.set(data.subarray((sy * size + sx) * 4, (sy * size + sx) * 4 + 4), (y * TILE + x) * 4);
     }
   }
   return out;
@@ -303,22 +397,13 @@ function draw() {
   if (!ctx) return;
   const span = hi.value - lo.value;
   const work = new Uint8ClampedArray(src.length);
+  const m = mask.value;
   for (let x = 0; x < w; x++) {
     work.set(src);
-    charmAdjustSrgb(work, charmSeedAdjust(t, lo.value + (span * x) / Math.max(1, w - 1)));
-    let r = 0;
-    let g = 0;
-    let b = 0;
-    let n = 0;
-    for (let i = 0; i < work.length; i += 4) {
-      if (src[i + 3] < 8) continue;
-      r += work[i];
-      g += work[i + 1];
-      b += work[i + 2];
-      n++;
-    }
-    if (!n) continue;
-    ctx.fillStyle = `rgb(${Math.round(r / n)},${Math.round(g / n)},${Math.round(b / n)})`;
+    charmAdjustSrgb(work, charmSeedAdjust(t, lo.value + (span * x) / Math.max(1, w - 1)), m);
+    const col = average(work, src, m);
+    if (!col) continue;
+    ctx.fillStyle = col;
     ctx.fillRect(x * dpr, 0, Math.ceil(dpr), cv.height);
   }
 }
@@ -496,11 +581,11 @@ watch(
        `rounded-md bg-secondary/40 p-2.5` row, so carrying the same card here
        drew a box inside an identical box. A control should not assume it is a
        card; the surface it sits on is the caller's decision. -->
-  <div v-if="state !== 'inert'">
+  <div v-if="shown !== 'inert'">
     <!-- Holds the row's height while the econ lookup lands. Collapsing to
          nothing and springing back is the jump the charm slot above already
          avoids, and this control is taller than that one. -->
-    <div v-if="state === 'loading'">
+    <div v-if="shown === 'loading'">
       <div class="mb-2 flex items-center gap-2">
         <span class="animate-skeleton h-5 w-5 flex-none rounded-sm bg-muted-foreground/20"></span>
         <span class="animate-skeleton h-2 w-24 rounded-full bg-muted-foreground/20" :style="{ '--i': 1 }"></span>
@@ -611,7 +696,7 @@ watch(
              bar that reads as a charm with no colours — the band picker and the
              scrub both still work. -->
         <div
-          v-if="state === 'unavailable'"
+          v-if="shown === 'unavailable'"
           class="absolute inset-0 grid place-items-center bg-secondary/70 text-f8 uppercase tracking-cs1 text-muted-foreground/70"
         >
           Drag to browse

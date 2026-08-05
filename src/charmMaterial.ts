@@ -23,6 +23,17 @@ export interface CharmShading {
   metalness?: number;
   roughness?: number;
   roughnessOffset?: number;
+  /**
+   * `/textures/…webp` — WHICH TEXELS the pattern grade applies to.
+   *
+   * `g_tTintMask`, on 53 of the 82 corrected materials. Without it the grade
+   * covers the whole charm, which is wrong for most of them: a pattern that
+   * should sweep the shell of a charm was sweeping its face and its metal too.
+   * See CHARM_ADJUST_GLSL for the blend the game ends on.
+   */
+  tintMask?: string;
+  /** The roughness adjust is faded by the mask as well — see charmTune. */
+  maskRoughness?: boolean;
   /** Seed-driven shader params as decoded expression trees — see evalVfx. */
   dynamic?: Record<string, VfxNode>;
 }
@@ -62,6 +73,18 @@ export function evalVfx(node: VfxNode, t: number): number[] {
     case "sin": return [Math.sin(s(0))];
     case "cos": return [Math.cos(s(0))];
     case "step": return [s(1) >= s(0) ? 1 : 0];
+    // Comparisons are 1.0/0.0 and get MULTIPLIED, not branched on — Source 2
+    // compiles `a * (seed <= 0.5) + b * (seed > 0.5)` rather than an if. Charm |
+    // That's Bananas splits its ramp at the halfway pattern this way.
+    case "==": return [s(0) === s(1) ? 1 : 0];
+    case "!=": return [s(0) !== s(1) ? 1 : 0];
+    case ">": return [s(0) > s(1) ? 1 : 0];
+    case ">=": return [s(0) >= s(1) ? 1 : 0];
+    case "<": return [s(0) < s(1) ? 1 : 0];
+    case "<=": return [s(0) <= s(1) ? 1 : 0];
+    case "&&": return [s(0) && s(1) ? 1 : 0];
+    case "||": return [s(0) || s(1) ? 1 : 0];
+    case "!": return [s(0) ? 0 : 1];
     case "float2": return [s(0), s(1)];
     case "float3": return [s(0), s(1), s(2)];
     case "float4": return [s(0), s(1), s(2), s(3)];
@@ -131,8 +154,11 @@ export interface CharmAdjust {
 }
 
 interface CharmTune extends CharmAdjust {
-  roughScale: number;
-  roughOffset: number;
+  /** `g_fTextureRoughnessContrast` / `Brightness`, UNFOLDED — the shader applies
+   *  `((r - 0.5) * contrast + 0.5) * brightness`. Kept as the two knobs rather
+   *  than the affine pair the map ships because a mask lerps each toward 1. */
+  roughContrast: number;
+  roughBright: number;
   metalness?: number;
   /** True when any colour knob is off identity at THIS pattern. */
   graded: boolean;
@@ -161,23 +187,32 @@ function charmTune(tune: CharmShading, seed: number): CharmTune {
     const range = evalVfx(dyn.g_vMetalnessRemapRange, t);
     if (range.length >= 2) metalness = range[1];
   }
-  // Roughness: the game's own adjust is affine, and a seed-driven contrast
-  // folds into it the same way the baked one does.
-  let roughScale = tune.roughness ?? 1;
-  let roughOffset = tune.roughnessOffset ?? 0;
+  // Roughness. The map ships the two knobs already folded into `scale`/`offset`
+  // (scale = c*b, offset = b*0.5*(1-c)), which is exact — but only at full mask.
+  // Where the mask fades the adjust the game lerps each KNOB toward 1, so unfold
+  // it back: b = scale + 2*offset, c = scale/b, both exactly recoverable.
+  let roughContrast = 1;
+  let roughBright = 1;
+  if (tune.roughness !== undefined || tune.roughnessOffset !== undefined) {
+    const scale = tune.roughness ?? 1;
+    const offset = tune.roughnessOffset ?? 0;
+    const b = scale + 2 * offset;
+    if (Math.abs(b) > 1e-6) {
+      roughBright = b;
+      roughContrast = scale / b;
+    }
+  }
   if (dyn.g_fTextureRoughnessContrast || dyn.g_fTextureRoughnessBrightness) {
-    const rc = one("g_fTextureRoughnessContrast", 1);
-    const rb = one("g_fTextureRoughnessBrightness", 1);
-    roughScale = rc * rb;
-    roughOffset = rb * 0.5 * (1 - rc);
+    roughContrast = one("g_fTextureRoughnessContrast", 1);
+    roughBright = one("g_fTextureRoughnessBrightness", 1);
   }
   return {
     hueRad: (hueDeg * Math.PI) / 180,
     sat,
     contrast,
     bright,
-    roughScale,
-    roughOffset,
+    roughContrast,
+    roughBright,
     metalness,
     graded: hueDeg !== 0 || sat !== 1 || bright !== 1 || contrast !== 1,
   };
@@ -199,16 +234,22 @@ const GREY_AXIS = 0.57735027;
  * Transcribed from CHARM_ADJUST_GLSL below rather than approximated with a CSS
  * hue-rotate filter, because the two disagree exactly where it matters: CSS
  * rotates every pixel equally, while the game fades the rotation out on
- * near-grey pixels by `pow(hsvSaturation, 0.125)`. That fade is what stops a
- * charm's metal parts smearing colour as the pattern sweeps, so a rail drawn
- * without it would promise colours on chrome that the render never shows.
+ * near-grey pixels by `pow(hsvSaturation, 0.125)`. That fade is the shader's own
+ * near-grey fallback, so a rail drawn without it would promise colours on chrome
+ * the render never shows.
+ *
+ * `mask`, when given, is the authored answer to the same question and outranks
+ * that fallback: an RGBA tile of the material's `g_tTintMask` at the same size,
+ * read on .r, blended exactly as the shader blends it. Without one every texel
+ * grades, which is what the game does for a material with no mask.
  *
  * Mutates RGBA in place. The GLSL's sRGB encode/decode wrapper is deliberately
  * absent: canvas bytes are already sRGB, which is the space the game grades in.
- * The final clamp is left to Uint8ClampedArray — unlike the contrast clamp,
- * which feeds the rest of the math and so has to be explicit.
+ * Both clamps ARE explicit: the contrast one feeds the rest of the math, and the
+ * final one feeds the mask blend — leaving either to Uint8ClampedArray would
+ * clamp after the mix instead of before it, which is a different colour.
  */
-export function charmAdjustSrgb(px: Uint8ClampedArray, adj: CharmAdjust): void {
+export function charmAdjustSrgb(px: Uint8ClampedArray, adj: CharmAdjust, mask?: Uint8ClampedArray | null): void {
   const ca = Math.cos(adj.hueRad);
   const sa = Math.sin(adj.hueRad);
   const k = GREY_AXIS;
@@ -231,30 +272,56 @@ export function charmAdjustSrgb(px: Uint8ClampedArray, adj: CharmAdjust): void {
     const hueG = lum + (rotG - lum) * fade;
     const hueB = lum + (rotB - lum) * fade;
     const hueLum = hueR * LUM[0] + hueG * LUM[1] + hueB * LUM[2];
-    px[i] = 255 * (hueLum + (hueR - hueLum) * adj.sat);
-    px[i + 1] = 255 * (hueLum + (hueG - hueLum) * adj.sat);
-    px[i + 2] = 255 * (hueLum + (hueB - hueLum) * adj.sat);
+    // The mask blends against the ORIGINAL texel, not the contrasted one — the
+    // shader's mix takes the untouched albedo as its first argument, so contrast
+    // and brightness are masked off with everything else.
+    const m = mask && mask.length === px.length ? mask[i] / 255 : 1;
+    const outR = hueLum + (hueR - hueLum) * adj.sat;
+    const outG = hueLum + (hueG - hueLum) * adj.sat;
+    const outB = hueLum + (hueB - hueLum) * adj.sat;
+    px[i] = px[i] + (255 * Math.min(1, Math.max(0, outR)) - px[i]) * m;
+    px[i + 1] = px[i + 1] + (255 * Math.min(1, Math.max(0, outG)) - px[i + 1]) * m;
+    px[i + 2] = px[i + 2] + (255 * Math.min(1, Math.max(0, outB)) - px[i + 2]) * m;
   }
 }
 
 /**
  * csgo_weapon.vfx's colour adjustment, transcribed from the decompiled shader
- * (static combo 225 of csgo_weapon_vulkan_50_ps.vcs) rather than reinvented.
+ * rather than reinvented — see tools/shadertest/groundtruth/weapon_tintmask.glsl,
+ * which is static combo 33 (S_ENABLE_ADJUSTMENTS + S_TINT_MASK) of
+ * csgo_weapon_vulkan_50_ps.vcs.
  *
  * Order matters and is not the obvious one: CONTRAST and BRIGHTNESS first, then
  * the hue rotation, then saturation. The hue rotation is Rodrigues about the
  * RGB grey axis — not an HSV round trip — and it is faded out on near-grey
- * pixels by `pow(hsvSaturation, 0.125)`, which is what stops the metal parts of
- * a charm smearing colour as the pattern sweeps.
+ * pixels by `pow(hsvSaturation, 0.125)`.
+ *
+ * THEN THE WHOLE THING IS MASKED. The shader's last step is
+ * `mix(albedo, graded, g_tTintMask.r)`, and 53 of the 82 charm materials bind a
+ * mask — so the grade is not a property of the material, it is a property of
+ * each texel. Missing that made every pattern recolour the entire charm: Lil'
+ * Vino's wine changed hue and so did the bottle, the cork and the label.
+ * The near-grey fade above is the fallback for materials with no mask, not the
+ * mechanism; it was doing a job it was never meant to do alone.
  *
  * Applied in sRGB: the game grades the texture as authored, so the linear
  * sample three hands us has to be encoded, adjusted and decoded again.
  * Verified against Valve's own ramp — Semi-Precious at pattern 25000 lands on
  * hue 172 (teal), matching the published pattern guide band for band.
  */
-const CHARM_ADJUST_GLSL = `
+const charmAdjustGlsl = (hasMapUv: boolean) => `
 uniform vec2 uRoughAdjust;
 uniform vec4 uColorAdjust;
+uniform vec2 uCharmMask;
+uniform sampler2D uTintMask;
+float csCharmMask() {
+  ${
+    // `vMapUv` is only declared when the material HAS a map, and a charm
+    // material without one has no albedo for a mask to be in register with
+    // either — so that case grades whole rather than failing to compile.
+    hasMapUv ? "return uCharmMask.x > 0.5 ? texture2D( uTintMask, vMapUv ).r : 1.0;" : "return 1.0;"
+  }
+}
 vec3 csToSrgb( vec3 c ) {
   c = max( c, vec3( 0.0 ) );
   return mix( c * 12.92, 1.055 * pow( c, vec3( 1.0 / 2.4 ) ) - 0.055, step( vec3( 0.0031308 ), c ) );
@@ -266,6 +333,7 @@ vec3 csToLinear( vec3 c ) {
 vec3 csCharmAdjust( vec3 linear ) {
   const vec3 W = vec3( 0.2125, 0.7154, 0.0721 );
   vec3 c = csToSrgb( linear );
+  vec3 authored = c;
   c = clamp( mix( vec3( 0.5 ), c, uColorAdjust.z ) * uColorAdjust.w, 0.0, 1.0 );
   float mx = max( c.r, max( c.g, c.b ) );
   float hsvSat = mx == 0.0 ? 0.0 : ( mx - min( c.r, min( c.g, c.b ) ) ) / mx;
@@ -274,7 +342,7 @@ vec3 csCharmAdjust( vec3 linear ) {
   vec3 rot = c * ca + cross( K, c ) * sa + K * dot( K, c ) * ( 1.0 - ca );
   vec3 hued = mix( vec3( dot( c, W ) ), rot, pow( hsvSat, 0.125 ) );
   vec3 outC = clamp( mix( vec3( dot( hued, W ) ), hued, uColorAdjust.y ), 0.0, 1.0 );
-  return csToLinear( outC );
+  return csToLinear( mix( authored, outC, csCharmMask() ) );
 }`;
 
 /**
@@ -296,12 +364,17 @@ vec3 csCharmAdjust( vec3 linear ) {
  * owns and writes the new numbers into the very Vector2/Vector4 the uniforms
  * are bound to. No clone, no program recompile, no `needsUpdate` — so dragging
  * the rail recolours at frame rate instead of rebuilding the charm per tick.
+ *
+ * `masks` is the tint masks already loaded — see loadCharmTintMasks, which the
+ * caller awaits first. Kept out of here so this stays SYNCHRONOUS: it is called
+ * per tick of a pattern drag, and a mask does not change with the pattern.
  */
 export function tuneCharmShading(
   THREE: Three,
   model: ThreeNS.Object3D,
   shading: Record<string, CharmShading>,
   seed: number,
+  masks?: Map<string, ThreeNS.Texture> | null,
 ) {
   if (!shading || !Object.keys(shading).length) return;
   model.traverse((n) => {
@@ -317,7 +390,7 @@ export function tuneCharmShading(
     // on a re-cloned mesh would have us writing into a Vector4 no program reads.
     if (mesh.userData.charmTuned === mat) {
       (mat.userData.colorAdjust as ThreeNS.Vector4).set(v.hueRad, v.sat, v.contrast, v.bright);
-      (mat.userData.roughAdjust as ThreeNS.Vector2).set(v.roughScale, v.roughOffset);
+      (mat.userData.roughAdjust as ThreeNS.Vector2).set(v.roughContrast, v.roughBright);
       if (v.metalness !== undefined) mat.metalness = v.metalness;
       return;
     }
@@ -329,7 +402,7 @@ export function tuneCharmShading(
     // A material the seed cannot touch still takes the old early exit, so an
     // untouched charm keeps sharing the cached material and its program.
     const seedDriven = seedDrivenShading(tune);
-    if (!seedDriven && v.roughScale === 1 && v.roughOffset === 0 && !v.graded && v.metalness === undefined) return;
+    if (!seedDriven && v.roughContrast === 1 && v.roughBright === 1 && !v.graded && v.metalness === undefined) return;
     // CLONED, not mutated in place: the gltf comes out of a shared LRU and the
     // tuning is seed-dependent, so two viewers showing the same charm at
     // different patterns would otherwise overwrite each other's colour. (It
@@ -339,20 +412,39 @@ export function tuneCharmShading(
     mesh.material = owned;
     mesh.userData.charmTuned = owned;
     if (v.metalness !== undefined) owned.metalness = v.metalness;
-    // `roughness` is a plain multiplier on the map, so the scale rides there;
-    // the offset has no equivalent knob and needs the one line of shader. Both
-    // go through the uniform so every tuned charm still shares one program.
+    // Roughness rides the uniform whole — `roughness` stays 1 — because the
+    // game's adjust is `((r - 0.5) * contrast + 0.5) * brightness` and neither
+    // knob is a plain multiplier three can carry. One uniform, so every tuned
+    // charm still shares one program.
     owned.roughness = 1;
-    owned.userData.roughAdjust = new THREE.Vector2(v.roughScale, v.roughOffset);
+    owned.userData.roughAdjust = new THREE.Vector2(v.roughContrast, v.roughBright);
     owned.userData.colorAdjust = new THREE.Vector4(v.hueRad, v.sat, v.contrast, v.bright);
+    // The sampler is declared and BOUND on every tuned charm, masked or not —
+    // a 1x1 white stands in where there is no mask. Branching the source
+    // instead would compile a second program and cost a hitch mid-scrub, and
+    // one extra texture unit is nothing on a material with four.
+    const mask = masks?.get(mat.name) ?? null;
+    owned.userData.tintMask = mask ?? whiteTexture(THREE);
+    owned.userData.charmMask = new THREE.Vector2(mask ? 1 : 0, mask && tune.maskRoughness ? 1 : 0);
     owned.onBeforeCompile = (shader) => {
       shader.uniforms.uRoughAdjust = { value: owned.userData.roughAdjust };
       shader.uniforms.uColorAdjust = { value: owned.userData.colorAdjust };
+      shader.uniforms.uCharmMask = { value: owned.userData.charmMask };
+      shader.uniforms.uTintMask = { value: owned.userData.tintMask };
       shader.fragmentShader = shader.fragmentShader
-        .replace("void main() {", `${CHARM_ADJUST_GLSL}\nvoid main() {`)
+        .replace("void main() {", `${charmAdjustGlsl(!!owned.map)}\nvoid main() {`)
+        // Three materials fade the roughness adjust by the mask too, and the
+        // game fades each KNOB toward identity rather than the result — which
+        // is why the pair arrives unfolded. See charmTune.
         .replace(
           "#include <roughnessmap_fragment>",
-          "#include <roughnessmap_fragment>\n\troughnessFactor = clamp( roughnessFactor * uRoughAdjust.x + uRoughAdjust.y, 0.0, 1.0 );",
+          [
+            "#include <roughnessmap_fragment>",
+            "\tfloat csRoughMask = uCharmMask.y > 0.5 ? csCharmMask() : 1.0;",
+            "\tfloat csRoughC = mix( 1.0, uRoughAdjust.x, csRoughMask );",
+            "\tfloat csRoughB = mix( 1.0, uRoughAdjust.y, csRoughMask );",
+            "\troughnessFactor = clamp( ( ( roughnessFactor - 0.5 ) * csRoughC + 0.5 ) * csRoughB, 0.0, 1.0 );",
+          ].join("\n"),
         )
         .replace(
           "#include <map_fragment>",
@@ -361,6 +453,93 @@ export function tuneCharmShading(
     };
     owned.needsUpdate = true;
   });
+}
+
+/**
+ * The stand-in bound where a material has no tint mask.
+ *
+ * One per three module, not per material: it exists only so the sampler is
+ * never left unbound (which is undefined behaviour, and in practice a black
+ * charm), and `uCharmMask.x` is what actually decides whether it is read.
+ */
+let white: ThreeNS.DataTexture | null = null;
+function whiteTexture(THREE: Three): ThreeNS.DataTexture {
+  if (!white) {
+    white = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    white.needsUpdate = true;
+  }
+  return white;
+}
+
+/**
+ * Load the tint masks a model's materials name, before anything is tuned.
+ *
+ * Separate from tuneCharmShading because that has to stay synchronous — it runs
+ * per tick of a pattern drag — and because a mask is per MATERIAL, so a model
+ * whose body and clasp are both masked loads two, and one whose two meshes
+ * share a material loads one.
+ *
+ * A mask that fails to load comes back absent rather than throwing: the charm
+ * then grades whole, which is what it did before any of this existed, and is a
+ * far better outcome than a charm that does not render.
+ */
+export async function loadCharmTintMasks(
+  THREE: Three,
+  loadTexture: (url: string) => Promise<ThreeNS.Texture>,
+  model: ThreeNS.Object3D,
+  shading: Record<string, CharmShading>,
+): Promise<Map<string, ThreeNS.Texture>> {
+  const out = new Map<string, ThreeNS.Texture>();
+  if (!shading || !Object.keys(shading).length) return out;
+  const wanted = new Map<string, { path: string; flipY: boolean }>();
+  model.traverse((n) => {
+    const mesh = n as ThreeNS.Mesh;
+    if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
+    const mat = mesh.material as ThreeNS.MeshStandardMaterial;
+    const name = mat?.name;
+    const url = name ? shading[name]?.tintMask : null;
+    // The ALBEDO's orientation, carried along, because the mask has to be read
+    // in the same one — see the flipY note below.
+    if (url) wanted.set(name, { path: url, flipY: mat.map?.flipY ?? true });
+  });
+  await Promise.all(
+    [...wanted].map(async ([name, { path, flipY }]) => {
+      const tex = await loadTexture(paintTextureUrl(path)).catch(() => null);
+      if (!tex) return;
+      // MATCH THE ALBEDO'S FLIP. A charm's art reaches us two ways and they do
+      // not agree: the 23 blank-mesh charms fetch theirs as a texture file
+      // (TextureLoader, flipY true), while the other 58 carry theirs inside the
+      // GLB (GLTFLoader, flipY FALSE — glTF's UV origin is top-left). The mask
+      // always arrives by the first route, so on a model-owning charm it was
+      // sampled upside down: Charm | Lil' Squatch tinted its fur and face and
+      // left the shorts the mask actually covers alone.
+      //
+      // Set on the CACHED texture, not a clone, so the second mount of a charm
+      // re-uploads nothing. That is safe while a mask belongs to one KIND of
+      // charm — the four sam_* materials share one and are all model-owning. A
+      // mask shared across both kinds would need the clone.
+      if (tex.flipY !== flipY) {
+        tex.flipY = flipY;
+        tex.needsUpdate = true;
+      }
+      // A MASK, not a picture: the shared loader marks everything sRGB, which
+      // three honours by uploading as SRGB8_ALPHA8 and having the GPU decode on
+      // every sample. That would pull each midtone down — a half-strength mask
+      // edge would read as a quarter — so it has to be raw. Re-flagged only when
+      // it actually changed, because that is a re-upload of a 1024² texture.
+      if (tex.colorSpace !== THREE.NoColorSpace) {
+        tex.colorSpace = THREE.NoColorSpace;
+        tex.needsUpdate = true;
+      }
+      out.set(name, tex);
+    }),
+  );
+  return out;
+}
+
+/** A material's tint mask as a fetchable URL, for callers with no renderer. */
+export function charmTintMaskUrl(tune?: CharmShading | null): string | null {
+  return tune?.tintMask ? paintTextureUrl(tune.tintMask) : null;
 }
 
 /**

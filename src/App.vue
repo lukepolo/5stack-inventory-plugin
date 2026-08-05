@@ -2169,10 +2169,14 @@ const modalViewer = useViewerMount({
   host: () => modalViewerEl.value,
   onError: (e) => {
     modal3d.value = false;
+    charmPending.value = false; // nothing is coming — don't strand the rail
     fail(e);
   },
 });
-const teardownModalViewer = modalViewer.teardown;
+const teardownModalViewer = () => {
+  charmPending.value = false;
+  modalViewer.teardown();
+};
 // Loading an item into the modal drives `modal3d` as BOOKKEEPING (off, then
 // back on once we know the model exists), not as a 2D/3D toggle. Its URL
 // watcher below must sit those out: view→edit reassigns `craft`, so the reset
@@ -2493,6 +2497,10 @@ async function mountModalViewer() {
   const target = craftTarget.value;
   if (!target) return;
   const model = target.model;
+  // Only a weapon hangs a charm the mount does not wait for. On the standalone
+  // charm the charm IS the model, so `busy` already covers it and claiming a
+  // pending charm here would leave the rail a skeleton forever.
+  charmPending.value = target.kind === "weapon" && !!craft.value?.charm;
   await modalViewer.mount(
     model,
     async () => {
@@ -2571,7 +2579,17 @@ async function mountModalViewer() {
       // off the model because for most charms that is the only place it exists
       // — see ViewerHandle.charmAlbedoTile. Taken here rather than in the rail
       // so the rail never has to know a viewer exists.
+      //
+      // TWICE, and the second one is the one that usually lands: the mount does
+      // not wait on the charm, so at this instant an attached charm is still
+      // fetching and answers null. Sampling only here is what left the rail grey
+      // until the first drag re-sampled it as a side effect.
       charmAlbedo.value = handle.charmAlbedoTile();
+      void handle.charmReady().then(() => {
+        if (modalViewer.current() !== handle) return; // superseded mid-load
+        charmAlbedo.value = handle.charmAlbedoTile();
+        charmPending.value = false;
+      });
       // The options above are a snapshot taken before the GLB loaded, and
       // pressing Edit during that load flips viewOnly while there is no handle
       // for the watcher below to talk to. Reconcile here so a mode change can't
@@ -2605,9 +2623,26 @@ watch(viewOnly, (on) => modalViewer.current()?.setInteractive(!on));
  * the mounted model is the only cheap source. Held here rather than inside the
  * rail so the rail stays a control that knows nothing about renderers.
  */
-type CharmAlbedo = { data: Uint8ClampedArray; size: number; material: string | null };
+type CharmAlbedo = {
+  data: Uint8ClampedArray;
+  size: number;
+  material: string | null;
+  /** That material's tint mask — which texels the pattern may recolour at all. */
+  mask: Uint8ClampedArray | null;
+};
 const charmAlbedo = ref<CharmAlbedo | null>(null);
 const previewAlbedo = ref<CharmAlbedo | null>(null);
+/**
+ * The charm has not landed on the mounted model yet.
+ *
+ * Separate from the mount's own `busy`, because the mount deliberately finishes
+ * without the charm (see ViewerHandle.charmReady) — so `busy` going false is not
+ * the moment the rail has something to paint. The rail takes both and stays a
+ * skeleton until neither is true: dragging before then moves a number nothing is
+ * listening to, which reads as a broken control.
+ */
+const charmPending = ref(false);
+const charmRailLoading = computed(() => modalViewer.busy.value || charmPending.value);
 /**
  * Charms whose pattern provably changes nothing, reported by their own rail.
  *
@@ -2801,8 +2836,21 @@ watch(
     // previous one. Guarded on the handle still being the live one: a remount
     // mid-swap would otherwise publish a torn-down viewer's colours.
     void handle.setCharm(craftCharmPlacement()).then(() => {
-      if (modalViewer.current() === handle) charmAlbedo.value = handle.charmAlbedoTile();
+      if (modalViewer.current() !== handle) return;
+      charmAlbedo.value = handle.charmAlbedoTile();
+      charmPending.value = false;
     });
+  },
+);
+// A SWAPPED charm is a fresh load, so the rail goes back to its skeleton until
+// the new one lands. Keyed on the image alone: the watcher above also fires on
+// every tick of a pattern drag, and flipping this there would disable the rail
+// under the pointer that is using it.
+watch(
+  () => craft.value?.charm?.image ?? null,
+  (img, was) => {
+    if (img === was) return;
+    charmPending.value = !!img && craftTarget.value?.kind === "weapon";
   },
 );
 // Patches → re-composite the agent's body texture on the live viewer. Its own
@@ -8602,6 +8650,7 @@ if (MDEBUG) {
                 :model-value="craft.charm.seed ?? 0"
                 :image="craft.charm.image"
                 :albedo="charmAlbedo"
+                :loading="charmRailLoading"
                 @update:model-value="craft!.charm!.seed = $event"
               />
               <div v-if="craft.charm && advancedPlacement" class="mt-1.5 flex items-center gap-1.5">
@@ -8638,6 +8687,7 @@ if (MDEBUG) {
                 :model-value="craft.seed ?? 0"
                 :image="craft.skin.image"
                 :albedo="charmAlbedo"
+                :loading="charmRailLoading"
                 @update:model-value="craft!.seed = $event"
                 @update:inert="craftCharmInert = $event"
               />
@@ -9288,6 +9338,7 @@ if (MDEBUG) {
               :model-value="preview3dSeed"
               :image="preview3d?.image ?? null"
               :albedo="previewAlbedo"
+              :loading="preview3dViewer.busy.value"
               @update:model-value="preview3dSeed = $event"
               @update:inert="previewCharmInert = $event"
             />

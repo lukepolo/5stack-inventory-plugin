@@ -172,6 +172,23 @@ export interface CharmShading {
   roughness?: number;
   roughnessOffset?: number;
   /**
+   * `/textures/<file>.webp` — WHICH TEXELS the pattern grade applies to.
+   *
+   * `F_TINT_MASK` + `g_tTintMask`, set by 53 of the 82 corrected materials. The
+   * game ends the grade with `mix(albedo, graded, mask.r)`, so a charm whose
+   * pattern should only sweep its shell keeps its face, metal and trim as
+   * authored. Absent means the whole material grades, which is also what the
+   * game does without the flag.
+   *
+   * Delivered HERE rather than in the material JSON because only 23 charms have
+   * a material file to fetch; the other 58 keep their textures inside the GLB,
+   * and this map — keyed by material stem — is the only thing that reaches them.
+   */
+  tintMask?: string;
+  /** `g_bMaskRoughnessAdjustmentsByTintMask`: the roughness adjust is lerped
+   *  toward identity by the mask too. Three materials. */
+  maskRoughness?: boolean;
+  /**
    * SEED-DRIVEN params, as decoded expression trees keyed by shader param name.
    *
    * A charm's pattern drives real shader params on 36 of the 89 keychain
@@ -207,6 +224,11 @@ export async function getCharmShading(): Promise<Record<string, CharmShading>> {
         const v = Number(e[key]);
         if (Number.isFinite(v)) out[key] = v;
       }
+      // Path-checked like the patch materials are: this becomes a fetch URL in
+      // the client, and the one thing worth refusing is a value that is not a
+      // texture we wrote.
+      if (typeof e.tintMask === "string" && e.tintMask.startsWith("/textures/")) out.tintMask = e.tintMask;
+      if (e.maskRoughness === true) out.maskRoughness = true;
       if (e.dynamic && typeof e.dynamic === "object" && !Array.isArray(e.dynamic)) {
         out.dynamic = e.dynamic as Record<string, unknown>;
       }

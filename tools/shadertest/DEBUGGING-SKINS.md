@@ -43,8 +43,18 @@ Combos already mined (re-dump these rather than rediscovering):
 | 1447 | style 7 + CASE_HARDENING + SEPARATE_CHANNEL_INPUTS | Heat Treated, patina |
 | 293  | style 5 + SEPARATE_CHANNEL_INPUTS | Blaze, spray/airbrush projection |
 | weapon 192 | S_GLITTER + S_ENABLE_SFX_MASK (the RUNTIME weapon shader, a different 27MB .vcs) | glitter, pearlescence, iridescence |
+| weapon 33 | S_ENABLE_ADJUSTMENTS + S_TINT_MASK (same 27MB .vcs) | the CHARM pattern grade, and which texels it touches |
 
 Saved decompiles live in `tools/shadertest/groundtruth/`.
+
+`csgo_weapon_vulkan_50_ps.vcs` is not in the dedicated-server install — the
+game-server pod's `shaders_vulkan_dir.vpk` does not list it. Use the full CS2
+tree the extraction mounts (`/cs2-game/game/csgo/`), where it is archive 1,
+offset 80904864, length 27333852. Its 12 features are S_ENABLE_ADJUSTMENTS(1),
+S_MODE_TOOLS_VIS(2), S_ALPHA_TEST(4), S_TRANSLUCENT(8), S_ADDITIVE_BLEND(16),
+S_TINT_MASK(32), S_GLITTER(64), S_ENABLE_SFX_MASK(128), S_SELF_ILLUM(256),
+S_STICKERS(512), S_MODE_DEPTH(1024), S_OPAQUE_REFRACT(2048) — add the
+multipliers to get a combo id.
 
 > **A combo tells you the math for ITS feature set.** A skin with extra features
 > routes a different value into the same slot. This bit us: combo 1529 has no
@@ -332,6 +342,24 @@ with V flipped; the control (surface.png, ordinary TextureLoader) was 0.75 vs
 to read a projection off a shaded 3D render, the lighting and sRGB-on-write
 corrupt every value (an emissiveMap hack to force it unlit still left it
 unreadable).
+
+**A pattern that recolours TOO MUCH is a missing mask, not wrong math.**
+Charms grade their albedo through `csgo_weapon.vfx`'s hue/saturation/brightness/
+contrast block, and 53 of the 82 corrected keychain materials end that block
+with `mix(albedo, graded, g_tTintMask.r)` — the mask is the whole answer to
+"which part of this charm is the pattern for". We had the grade transcribed
+correctly and no mask at all, so every pattern swept the entire charm: Lil'
+Vino's wine, bottle, cork and label all moved together. Two things made it hard
+to see. The grade already had a *plausible* region limiter in it — the
+`pow(hsvSaturation, 0.125)` fade that leaves near-grey texels alone — so the
+render looked deliberate rather than broken. And most of the masked charms were
+not grading at all, because the extractor's dynamic-expression regex only
+matched VRF's inline `m_value = #[ … ]` and silently dropped the 45 materials
+whose bytecode was long enough to wrap onto its own line. Two bugs, one
+symptom-free until you compare against the game. When an authored mask exists,
+prefer it over any inferred limiter — and check the vmat's `F_*` flags for
+maskings you have not modelled (`g_bMaskRoughnessAdjustmentsByTintMask` lerps
+each roughness KNOB toward identity, not the result).
 
 ---
 

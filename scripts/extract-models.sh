@@ -92,6 +92,19 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v21 (2026-08-05): charm-shading.json gains `tintMask` (and `maskRoughness`),
+# and the pattern grade stops applying to the whole charm. CS2 ends the grade
+# with `mix(albedo, graded, g_tTintMask.r)` — decompiled and saved at
+# tools/shadertest/groundtruth/weapon_tintmask.glsl — and 52 of the 81
+# seed-driven keychain materials set it, so a pattern that should sweep a
+# charm's shell was sweeping its face, its metal and its trim too. The masks
+# themselves join the paint chain as bare textures (charm-textures.json): 58 of
+# the 81 charms keep their art inside the GLB, which has no mask channel, so
+# nothing on the chain reached them.
+# Also fixes the dynamic-expression blob regex, which only matched VRF's INLINE
+# `m_value = #[ … ]` and not the indented form it wraps longer expressions onto.
+# 45 of 81 seed-driven materials were being dropped by that — every kc_db_*
+# charm — so those charms looked identical at every pattern.
 # v20 (2026-07-30): charm CLOTH SIMULATION (new step 3g -> <stem>.phys.json).
 # A CS2 charm is a cloth softbody, not a pendulum. Every kc_*.vmdl_c has always
 # carried a PHYS block whose m_pFeModel is a complete PhysFeModelDesc — Valve's
@@ -173,7 +186,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=20
+EXTRACT_VERSION=21
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -1835,7 +1848,8 @@ echo "--- Reading charm models…"
 # outright with "Argument list too long".
 "$CLI" -i "$VPK" -f "weapons/keychains/" -e vmat_c -b DATA >"$WORK/charm-vmats.txt" 2>/dev/null || true
 CHARM_SHADING="$WORK/charm-vmats.txt" \
-ITEMS_GAME="$ITEMS_GAME" DEST="$DEST" CHARM_MATS="$WORK/charm-materials.json" python3 - <<'PYEOF'
+ITEMS_GAME="$ITEMS_GAME" DEST="$DEST" CHARM_MATS="$WORK/charm-materials.json" \
+CHARM_TEXTURES="$WORK/charm-textures.json" python3 - <<'PYEOF'
 import hashlib, json, os, re, struct
 
 src, dest = os.environ.get("ITEMS_GAME", ""), os.environ["DEST"]
@@ -1885,6 +1899,16 @@ def mat_out_name(path):
     stem = os.path.basename(path)
     stem = stem[: stem.index(".")]
     return f"{stem}_{hashlib.sha1((path + '_c').encode()).hexdigest()[:8]}.vmat.json"
+
+
+# The same rule for a TEXTURE, so the shading map below can name a file the
+# paint chain has not written yet. Predicted rather than reported back because
+# §3e runs first and can run alone; §5 re-derives it from the archive path and
+# shouts if the two ever disagree.
+def tex_out_name(path):
+    stem = os.path.basename(path)
+    stem = stem[: stem.index(".")]
+    return f"{stem}_{hashlib.sha1((path + '_c').encode()).hexdigest()[:8]}.webp"
 
 
 charms, mats = {}, []
@@ -1942,7 +1966,12 @@ _VFX_FUNCS = [("sin",1),("cos",1),("tan",1),("frac",1),("floor",1),("ceil",1),
               ("SrgbLinearToGamma",1),("SrgbGammaToLinear",1),("random",2),
               ("normalize",1),("length",1),("sqr",1),("rotation2d",1),("rotate2d",2),
               ("sincos",1),("TextureSize",1),("TextureAverageColor",1)]
-_VFX_BINOPS = {0x13:"+",0x14:"-",0x15:"*",0x16:"/",0x17:"%"}
+_VFX_BINOPS = {0x13:"+",0x14:"-",0x15:"*",0x16:"/",0x17:"%",
+               # Comparisons yield 1.0/0.0 and are used as BRANCHLESS SELECTS —
+               # `a * (seed <= 0.5) + b * (seed > 0.5)` — not as control flow, so
+               # they need no jump handling. Charm | That's Bananas splits its
+               # ramp in half this way.
+               0x0A:"||",0x0B:"&&",0x0D:"==",0x0E:"!=",0x0F:">",0x10:">=",0x11:"<",0x12:"<="}
 # Murmur token for the one render attribute charms use.
 _VFX_KEYCHAIN_SEED = 0x8BEF1EF6
 
@@ -1950,6 +1979,12 @@ _VFX_KEYCHAIN_SEED = 0x8BEF1EF6
 def vfx_decode(code):
     """Bytecode -> JSON AST. Numbers stay numbers; nodes are {"f": name, "a": [...]}."""
     stack = []
+    # STORE/LOAD locals. The expressions are pure, so a LOAD can simply paste the
+    # stored SUBTREE back in — no let-binding to represent, and the AST the
+    # renderer walks stays a plain tree. Charm | That's Bananas needs this: all
+    # four of its colour params (hue, saturation, brightness, contrast) compute
+    # one ramp into a local and read it back.
+    local = {}
     i = 0
     while i < len(code):
         op = code[i]
@@ -1959,9 +1994,19 @@ def vfx_decode(code):
         if op == 0x07:  # FLOAT literal
             stack.append(round(struct.unpack_from("<f", code, i)[0], 6))
             i += 4
+        elif op == 0x08:  # STORE — a statement, so it takes its value off the stack
+            local[code[i]] = stack.pop()
+            i += 1
+        elif op == 0x09:  # LOAD
+            if code[i] not in local:
+                raise ValueError(f"load of unset local {code[i]}")
+            stack.append(local[code[i]])
+            i += 1
         elif op == 0x18:  # NEGATE
             v = stack.pop()
             stack.append(-v if isinstance(v, (int, float)) else {"f": "neg", "a": [v]})
+        elif op == 0x0C:  # NOT
+            stack.append({"f": "!", "a": [stack.pop()]})
         elif op == 0x19:  # ATTRIBUTE
             tok = struct.unpack_from("<I", code, i)[0]
             i += 4
@@ -1986,13 +2031,35 @@ def vfx_decode(code):
     return stack[-1]
 
 
-shading = {}
+shading, mask_textures = {}, {}
 for block in BLOCKS:
     named = re.search(r'm_materialName = "([^"]+)"', block)
     if not named:
         continue
     stem = os.path.basename(named.group(1)).split(".")[0]
     entry = {}
+    # ---- WHICH PART of the charm the pattern recolours ----------------------
+    #
+    # Not all of it, on 52 of the 81 seed-driven materials. `F_TINT_MASK` binds
+    # a greyscale `g_tTintMask` in the albedo's UV space and the shader ends the
+    # grade with `mix(albedo, graded, mask.r)` — see the decompile saved at
+    # tools/shadertest/groundtruth/weapon_tintmask.glsl (combo 33). Ungated, a
+    # charm whose pattern should only sweep its shell sweeps end to end.
+    #
+    # The mask rides the SHADING map rather than the material JSON because it
+    # has to reach both kinds of charm: 23 wear a standalone material the client
+    # can fetch, the other 58 keep their textures inside the GLB and this map,
+    # keyed by material stem, is the only channel that reaches them.
+    if num(block, "F_TINT_MASK", "m_nValue"):
+        mask = re.search(r'm_name = "g_tTintMask"\s*\n\s*m_pValue = resource:"([^"]+)"', block)
+        if mask:
+            entry["tintMask"] = f"/textures/{tex_out_name(mask.group(1))}"
+            mask_textures[mask.group(1) + "_c"] = tex_out_name(mask.group(1))
+        # The mask also lerps the ROUGHNESS adjust toward identity, per material.
+        # Its two knobs are folded into scale/offset below, and folding is exact
+        # only at mask=1 — so the flag rides along and the renderer unfolds.
+        if num(block, "g_bMaskRoughnessAdjustmentsByTintMask", "m_nValue"):
+            entry["maskRoughness"] = True
     remap = re.search(r'm_name = "g_vMetalnessRemapRange"\s*\n\s*m_value = \[ ([^\]]+) \]', block)
     if remap:
         lo, hi = [float(x) for x in remap.group(1).split(",")[:2]]
@@ -2030,10 +2097,17 @@ for block in BLOCKS:
     # tiny AST rather than special-cased per charm — the whole language in use is
     # lerp/frac/float2, four arithmetic ops and negate, so one decoder covers
     # every charm that exists now and any Valve ships later.
+    #
+    # The blob is written two ways and BOTH have to be read. VRF prints a short
+    # expression inline (`m_value = #[ 07 00 … ]`) and wraps anything longer onto
+    # its own line, indented. Matching only the inline form silently dropped 45
+    # of the 81 seed-driven materials — every kc_db_* charm and most of the
+    # tint-masked ones — so those charms held one colour at every pattern and
+    # nothing said why.
     dyn = re.search(r"m_dynamicParams\s*=\s*\[(.*?)\n\t\]", block, re.S)
     if dyn:
         exprs = {}
-        for pm in re.finditer(r'm_name = "([^"]+)"\s*\n\s*m_value = #\[([0-9A-Fa-f\s]*)\]', dyn.group(1)):
+        for pm in re.finditer(r'm_name = "([^"]+)"\s*\n\s*m_value =\s*#\[([0-9A-Fa-f\s]*)\]', dyn.group(1)):
             try:
                 exprs[pm.group(1)] = vfx_decode(bytes.fromhex("".join(pm.group(2).split())))
             except Exception as exc:  # a param we cannot read must not kill the run
@@ -2048,10 +2122,20 @@ with open(os.path.join(dest, "charm-shading.json"), "w") as fh:
 # Handed to the paint chain, which owns extracting materials and their textures.
 with open(os.environ["CHARM_MATS"], "w") as fh:
     json.dump(sorted(set(mats)), fh)
+# Tint masks, likewise — but as TEXTURES, not entry points. Only the 23 charms
+# that name a material in the econ schema ride the chain as materials; the rest
+# keep their textures in the GLB, which carries no mask channel, so their mask
+# would never be extracted and the URL above would 404. A map, not a list, so
+# the chain can check its own naming against what was written here.
+with open(os.environ["CHARM_TEXTURES"], "w") as fh:
+    json.dump(mask_textures, fh, indent=1, sort_keys=True)
 
 shared = len([c for c in charms.values() if "material" in c])
+seeded = len([e for e in shading.values() if "dynamic" in e])
+masked = len([e for e in shading.values() if "tintMask" in e])
 print(f"--- Charm models: {len(charms)} charms, {shared} sharing a blank mesh with their own material")
-print(f"--- Charm shading: {len(shading)} of {len(BLOCKS)} materials need a metalness/roughness correction")
+print(f"--- Charm shading: {len(shading)} of {len(BLOCKS)} materials corrected, "
+      f"{seeded} pattern-driven, {masked} tint-masked ({len(mask_textures)} mask textures)")
 if not charms:
     print("!!! No charm definitions recovered — charms will fall back to their "
           "flat art. Check that scripts/items/items_game.txt extracted.")
@@ -3081,7 +3165,8 @@ PYEOF
   RAW_PAINTS="$WORK/raw_paints"
   rm -rf "$RAW_PAINTS"
   CLI="$CLI" VPK="$VPK" VPK_LIST="$VPK_LIST" RAW_PAINTS="$RAW_PAINTS" \
-  CHARM_MATS="$WORK/charm-materials.json" PATCH_MATS="$WORK/patch-materials.json" STICKER_KITS="$STICKER_KITS" \
+  CHARM_MATS="$WORK/charm-materials.json" CHARM_TEXTURES="$WORK/charm-textures.json" \
+  PATCH_MATS="$WORK/patch-materials.json" STICKER_KITS="$STICKER_KITS" \
   ASSET_MANIFEST="$ASSET_MANIFEST" PAINT_DEST="$PAINT_DEST" python3 - <<'PYEOF'
 import glob, hashlib, json, os, re, shutil, subprocess, time
 from collections import defaultdict
@@ -3102,6 +3187,17 @@ CHARM_MATS = []
 try:
     with open(os.environ.get("CHARM_MATS") or "") as fh:
         CHARM_MATS = [p for p in json.load(fh) if isinstance(p, str)]
+except Exception:
+    pass
+# Charm TINT MASKS, from the same step: {archive path -> the filename §3e told
+# charm-shading.json to expect}. These are textures with no material to reach
+# them by — 58 of the 81 charms keep their art inside the GLB, so their mask has
+# no entry point on the chain at all — and without them the shading map's
+# tintMask URL points at a file nobody wrote and the whole charm recolours.
+CHARM_TEXTURES = {}
+try:
+    with open(os.environ.get("CHARM_TEXTURES") or "") as fh:
+        CHARM_TEXTURES = {k: v for k, v in json.load(fh).items() if isinstance(v, str)}
 except Exception:
     pass
 # Patch materials, handed over by step 3f, and for the SAME reason the charms
@@ -3547,6 +3643,19 @@ while queue:
                 visit(v)
 
     visit(doc)
+
+# Charm tint masks join the texture set directly — nothing in the graph walk
+# reaches them. Their names are also CHECKED here rather than trusted: §3e wrote
+# the URL into charm-shading.json from the same hash rule, and a silent
+# disagreement between the two is a 404 that reads as "this charm has no mask",
+# which is exactly the bug the mask exists to fix.
+for path, expected in CHARM_TEXTURES.items():
+    textures.add(path)
+    actual = out_name(path, "vtex")
+    if actual != expected:
+        print(f"!!! charm tint mask naming disagrees: {path} -> {actual}, shading map says {expected}")
+if CHARM_TEXTURES:
+    print(f"---   {len(CHARM_TEXTURES)} charm tint masks added directly")
 
 print(f"---   {len(docs)} materials reachable, {len(textures)} textures referenced")
 
