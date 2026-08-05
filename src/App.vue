@@ -1825,23 +1825,17 @@ function craftBody() {
 // Inspect the DRAFT — works before the craft has ever been saved.
 async function openCraftInspect() {
   if (!craft.value) return;
-  try {
-    const { inspect } = await fetchDraftInspectLink({
-      item_id: craft.value.skin.id,
+  await sendInspect(() =>
+    fetchDraftInspectLink({
+      item_id: craft.value!.skin.id,
       ...craftBody(),
       // Kills are NOT part of craftBody(): they live on the owned row, not in
       // the form, and craftBody() is also what save sends. Same number the 3D
       // stage puts on the module, so inspecting an edit of a StatTrak item
       // opens CS2 on its real count instead of a fresh 0.
-      stattrak_count: craft.value.stattrak ? craftInst.value?.stattrak_count ?? 0 : 0,
-    });
-    window.location.href = inspect;
-    linkOpening.value = true;
-    notifyInspectSent();
-    setTimeout(() => (linkOpening.value = false), 1600);
-  } catch (e) {
-    fail(e);
-  }
+      stattrak_count: craft.value!.stattrak ? craftInst.value?.stattrak_count ?? 0 : 0,
+    }),
+  );
 }
 /**
  * Commit the current editor state as a NEW item instead of overwriting the one
@@ -3339,6 +3333,12 @@ const preview3d = ref<{
   image: string;
   name: string;
   kind: string;
+  /** The economy item itself, for the inspect link — a sticker and a charm are
+   *  each an inspectable item in their own right, and this panel is the only
+   *  place either one is ever the subject rather than something stuck to a gun.
+   *  Nullable because the picker's rows are the one source that might not carry
+   *  an id back. */
+  id: number | null;
   /**
    * The slot on the weapon this was opened FROM, or null when it came from the
    * picker. What it decides is where the panel's wear/seed write to — see
@@ -3430,7 +3430,7 @@ const ATTACH_TYPE: Record<string, string> = { sticker: "sticker", patch: "patch"
  * nothing is attached yet and they drive a scratch value instead.
  */
 async function openPreview3d(
-  item: { image?: string | null; name?: string | null; type?: string | null },
+  item: { id?: number | null; image?: string | null; name?: string | null; type?: string | null },
   kind: string,
   applied?: { slot: number },
 ) {
@@ -3445,7 +3445,7 @@ async function openPreview3d(
     seed: (applied && kind === "charm" ? craft.value?.charm?.seed : null) ?? 0,
   };
   preview3dTarget = target;
-  preview3d.value = { image: item.image, name: item.name ?? "", kind, slot: applied?.slot ?? null };
+  preview3d.value = { id: item.id ?? null, image: item.image, name: item.name ?? "", kind, slot: applied?.slot ?? null };
   await mountPreview3d();
 }
 /**
@@ -3691,9 +3691,26 @@ function notifyInspectSent() {
 // the inspect view for this craft — stickers and all — without the item ever
 // existing on Steam's backend. Nothing happens if Steam isn't installed to
 // claim the protocol, so this stays a no-op rather than an error.
-async function openInspectLink(id: number) {
+//
+// EVERY inspect entry point funnels through here: the item modal, the focus
+// stage, both context menus, the tile clusters, the default-weapon stage and
+// the attachment preview. ONE RULE — a surface that is showing you an item
+// offers to open it in game — and the only way that rule holds is if the
+// surfaces share this. Each one used to carry its own copy of the handoff plus
+// its own idea of when to bother, which is how the button ended up present on
+// some screens, absent on others, and gone the moment you touched Edit.
+async function sendInspect(link: () => Promise<{ inspect: string }>) {
+  // Both link endpoints are authenticated, so signed out there is genuinely
+  // nothing to hand the OS. SAID, not hidden: this app is a public sandbox —
+  // an anonymous visitor can build a whole craft and open it in 3D — and a
+  // button that quietly isn't there reads as a missing feature, where "sign in"
+  // reads as a door. Same call the Save row makes two boxes down.
+  if (!signedIn.value) {
+    notify(tr("inventory.notify.sign_in_to_inspect", "Sign in to open this in game."), "error");
+    return;
+  }
   try {
-    const { inspect } = await fetchInspectLink(id);
+    const { inspect } = await link();
     window.location.href = inspect;
     linkOpening.value = true;
     notifyInspectSent();
@@ -3701,6 +3718,51 @@ async function openInspectLink(id: number) {
   } catch (e) {
     fail(e);
   }
+}
+/**
+ * An owned row re-expressed as a DRAFT — the same shape the craft editor posts.
+ *
+ * What it's for: /inventory/<id>/inspect only ever answers for the caller's own
+ * rows, so it can't build a link for the loadout you are VISITING. The row we
+ * were handed carries the whole spec (it's what the viewer on screen is already
+ * rendering), and the draft endpoint turns a spec into a link without caring
+ * whose it is.
+ */
+function inspectDraftBody(inst: InventoryItem) {
+  const spec = (p: { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null } | null): AttachSpec =>
+    p ? { id: p.id, x: p.x ?? null, y: p.y ?? null, r: p.r ?? null, w: p.w ?? null } : null;
+  return {
+    item_id: inst.item_id,
+    wear: inst.wear,
+    seed: inst.seed,
+    stattrak: inst.stattrak,
+    stattrak_count: inst.stattrak_count,
+    nametag: inst.nametag,
+    stickers: (inst.stickers ?? []).map(spec),
+    patches: (inst.patches ?? []).map(spec),
+    charm_id: inst.charm?.id ?? null,
+    charm_offset: inst.charm
+      ? { x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null }
+      : null,
+  };
+}
+async function openInspectLink(id: number) {
+  // Yours goes through the SAVED route: it re-reads each attachment's own row
+  // server-side, which is where a linked sticker's scratch actually lives.
+  // Someone else's can't — that route is scoped to the caller's steam_id and
+  // 404s on a row they don't own — so it goes out as a draft instead.
+  const theirs = viewerId.value ? instanceById(id) : null;
+  await sendInspect(() => (theirs ? fetchDraftInspectLink(inspectDraftBody(theirs)) : fetchInspectLink(id)));
+}
+/**
+ * Inspect a bare CATALOG item — one nobody owns and no editor is holding: the
+ * default weapon on the loadout's 3D stage, the sticker or charm in the
+ * attachment preview. Vanilla is just paintindex 0 to the link builder, so the
+ * id is the whole input.
+ */
+async function openItemInspect(itemId?: number | null) {
+  if (itemId == null) return;
+  await sendInspect(() => fetchDraftInspectLink({ item_id: itemId }));
 }
 async function toggleStatTrak() {
   const inst = equippedInstance(selected.value);
@@ -5202,9 +5264,15 @@ async function mount3d() {
 // ---- 3D overlay for a DEFAULT weapon (ctx menu → View in 3D) ----------------
 // Owned items don't come here — they open the craft modal in view mode, which
 // can show their spec and hand off to Edit. This overlay is what's left for a
-// model with no instance behind it: no wear, no attachments, nothing to inspect
-// or edit, so it's a bare stage with a name and a close button.
-const loadout3d = ref<{ pos: string; model: string; name: string } | null>(null);
+// model with no instance behind it: no wear and no attachments, so it's a bare
+// stage with a name, an inspect link and a close button.
+//
+// `id` is the base weapon's own economy item id. It's here because "no instance
+// behind it" was read as "nothing to inspect", and that's wrong: a vanilla
+// weapon is paintindex 0 to the link builder like any other item, so this stage
+// can offer the link the same way every other stage does. It just can't ask the
+// saved route for it — there is no owned row — so it goes out as a bare draft.
+const loadout3d = ref<{ pos: string; model: string; name: string; id: number | null } | null>(null);
 const loadout3dEl = ref<HTMLElement | null>(null);
 // Mounting downloads a GLB and composites the paint — seconds on a cold cache,
 // during which the canvas is just empty black. Covered by a spinner instead
@@ -5239,8 +5307,15 @@ function dismissLoadout3d() {
  * that have no sticker slots — the other three mounts gate that on being a
  * weapon.
  */
-async function openViewer3d(model: string, name: string, paint: string | null, legacyPaint = false, kind: ViewerKind = "weapon") {
-  loadout3d.value = { pos: "", model, name };
+async function openViewer3d(
+  model: string,
+  name: string,
+  paint: string | null,
+  legacyPaint = false,
+  kind: ViewerKind = "weapon",
+  id: number | null = null,
+) {
+  loadout3d.value = { pos: "", model, name, id };
   await loadout3dViewer.mount(model, async () => ({
     kind,
     paintMaterial: paint,
@@ -5265,7 +5340,17 @@ async function ctxView3d() {
   const name = skinLabel(pos) === "Default" ? occupantWeapon(pos)?.name ?? model : `${occupantWeapon(pos)?.name} | ${skinLabel(pos)}`;
   // A default has no instance to resolve a kind from, so it comes from the SLOT.
   const kind: ViewerKind = pos === "gloves" ? "glove" : pos === "agent" ? "agent" : "weapon";
-  await openViewer3d(model, name, isSkinned(row) ? row?.item?.paintMaterial ?? null : null, isSkinned(row) && !!row?.item?.legacyPaint, kind);
+  // The row's own item first — a slot can hold a free default WEAPON equip
+  // (an item_id with no instance), and that item is what the stage is showing.
+  // The catalog weapon is the fallback for a slot sitting on true vanilla.
+  await openViewer3d(
+    model,
+    name,
+    isSkinned(row) ? row?.item?.paintMaterial ?? null : null,
+    isSkinned(row) && !!row?.item?.legacyPaint,
+    kind,
+    row?.item?.id ?? occupantWeapon(pos)?.id ?? null,
+  );
 }
 /**
  * UI entry point for 3D on an owned item — navigates; the route watcher mounts.
@@ -7163,8 +7248,13 @@ if (MDEBUG) {
                 >
                   <Pencil class="h-3.5 w-3.5" /> Edit
                 </button>
+                <!-- Same rule as the item modal: a stage showing the item
+                     offers to open it in game. Not `canEdit` — inspecting is
+                     not editing, and a loadout you are VISITING is exactly the
+                     one you most want to look at in game (openInspectLink
+                     sends someone else's item as a draft for that reason). -->
                 <button
-                  v-if="isSkinned(focusRow) && canEdit && focusInstance && !isCoarse && canInspect(focusRow?.item)"
+                  v-if="isSkinned(focusRow) && focusInstance && canInspect(focusRow?.item)"
                   :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
                   title="Launch CS2 and inspect this item in-game"
                   @click="openInspectLink(focusInstance.id)"
@@ -8043,21 +8133,31 @@ if (MDEBUG) {
             <RefreshCw class="h-3 w-3" /> synced items are read-only — saving crafts your own copy
           </span>
           <div class="flex flex-none items-center gap-3">
-            <!-- Needs auth: the inspect-link endpoints are the one part of the
-                 craft editor that isn't client-side, so signed out it would
-                 just 401 into a toast.
+            <!-- UNCONDITIONAL, bar the one thing that makes a link impossible.
+                 This modal IS the item — 2D or 3D, view or edit — so it always
+                 offers to open it in game. Every previous gate here was a
+                 different reason the button vanished on a screen showing a
+                 perfectly inspectable gun: `signedIn` (now a message from
+                 sendInspect, not an absence), `isCoarse` (a phone can't launch
+                 CS2, but it can be a Steam Deck or a touchscreen desktop, and
+                 hiding it on every touch device to spare the minority the
+                 no-op was the wrong trade), and asking only the current mode's
+                 copy of the item for its defindex.
 
-                 View and edit are the SAME item, so they get the same button —
-                 either source answering "this has a defindex" is enough. Asking
-                 only the mode's own copy is what let a dropped field on one of
-                 them take the button away on Edit. -->
+                 View and edit are the SAME item, so either source answering
+                 "this has a defindex" is enough. -->
             <button
-              v-if="!isCoarse && signedIn && (canInspect(craft.skin) || canInspect(craftInst?.item))"
-              class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              v-if="canInspect(craft.skin) || canInspect(craftInst?.item)"
+              class="flex flex-none items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              :class="isCompact ? 'h-10 w-10' : 'px-2.5 py-1 text-f10'"
               :title="viewOnly ? 'Launch CS2 and inspect this item in-game' : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
               @click="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"
             >
-              <ExternalLink class="h-3 w-3" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
+              <!-- Icon-only on compact: the header already carries share, edit,
+                   delete and close at 40px each, and the label is what pushed
+                   that row past a phone's width. -->
+              <ExternalLink :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3 w-3'" />
+              <template v-if="!isCompact">{{ linkOpening ? 'Opening…' : 'Inspect in game' }}</template>
             </button>
             <ShareMenu
               :links="craftShareLinks"
@@ -8809,8 +8909,11 @@ if (MDEBUG) {
         >
           <Replace class="h-3.5 w-3.5" /> Replace weapon…
         </button>
+        <!-- The touch path's ONLY way to this action: the tile clusters are
+             hover chrome and stay desktop-only, so hiding it here too left a
+             phone with no inspect at all. -->
         <button
-          v-if="ctx && equippedInstance(ctx.pos) && !isCoarse && canInspect(equippedInstance(ctx.pos)?.item)"
+          v-if="ctx && equippedInstance(ctx.pos) && canInspect(equippedInstance(ctx.pos)?.item)"
           :class="MENU_ROW"
           @click="ctxInspect"
         >
@@ -8863,11 +8966,26 @@ if (MDEBUG) {
             : 'h-[min(88vh,900px)] w-[min(96vw,1400px)] rounded-lg border border-border'"
           @click.stop
         >
-          <div class="flex items-center justify-between border-b border-border px-4 py-2.5">
+          <div class="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
             <span class="truncate text-f11 uppercase tracking-cs3 text-muted-foreground">{{ loadout3d.name }}</span>
-            <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="Close" aria-label="Close" @click="dismissLoadout3d">
-              <X class="h-4 w-4" />
-            </button>
+            <div class="flex flex-none items-center gap-2">
+              <!-- Same corner, same rule as every other stage. A default weapon
+                   has no owned row, so this is the bare-item link — see
+                   openItemInspect. -->
+              <button
+                v-if="loadout3d.id != null"
+                class="flex items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+                :class="isCompact ? 'h-10 w-10' : 'px-2.5 py-1 text-f10'"
+                title="Launch CS2 and inspect this weapon in-game"
+                @click="openItemInspect(loadout3d.id)"
+              >
+                <ExternalLink :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3 w-3'" />
+                <template v-if="!isCompact">{{ linkOpening ? 'Opening…' : 'Inspect in game' }}</template>
+              </button>
+              <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="Close" aria-label="Close" @click="dismissLoadout3d">
+                <X class="h-4 w-4" />
+              </button>
+            </div>
           </div>
           <div class="relative min-h-0 flex-1">
             <div ref="loadout3dEl" class="h-full w-full"></div>
@@ -9108,6 +9226,16 @@ if (MDEBUG) {
         <div class="flex w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
           <div class="flex items-center gap-2 border-b border-border px-3 py-2">
             <span class="min-w-0 flex-1 truncate text-f11 uppercase tracking-cs1">{{ preview3d.name }}</span>
+            <!-- Icon-only whatever the width: this panel is 420px at its
+                 widest and the name is what it's for. -->
+            <button
+              v-if="preview3d.id != null"
+              class="flex h-7 w-7 flex-none items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
+              title="Launch CS2 and inspect this in-game"
+              @click="openItemInspect(preview3d.id)"
+            >
+              <ExternalLink class="h-3.5 w-3.5" />
+            </button>
             <button
               class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
               title="Close"
@@ -9285,7 +9413,9 @@ if (MDEBUG) {
         >
           <Pencil class="h-3.5 w-3.5" /> Edit…
         </button>
-        <button v-if="!isCoarse && canInspect(itemCtx?.inst.item)" :class="MENU_ROW" @click="itemCtxInspect">
+        <!-- Same as the loadout menu above: this is where touch gets the action
+             at all, so it can't be the desktop-only copy. -->
+        <button v-if="canInspect(itemCtx?.inst.item)" :class="MENU_ROW" @click="itemCtxInspect">
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button

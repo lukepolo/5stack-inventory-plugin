@@ -1424,6 +1424,25 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
   const link = async (itemId: number, w: number | null, seedFor: number | null, inst: number | null) => {
     if (inst != null && valid.get(inst) === itemId && !taken.has(inst)) {
       taken.add(inst);
+      // The attachment's OWN row is what read time dereferences — see
+      // resolveAttachments, which folds this row's wear/seed back OVER the
+      // spec stored in the weapon's jsonb. So an edit that changes a charm's
+      // pattern or a sticker's scratch has to land here as well; writing it
+      // into the weapon's blob alone was silently lossy, because the very
+      // response to the save read it straight back off the untouched row.
+      //
+      // COALESCE, not a plain assignment: a spec carries only the fields its
+      // kind has (a sticker has no pattern, a patch has neither), and a null
+      // there means "this spec has nothing to say about it" rather than
+      // "clear it".
+      if (w != null || seedFor != null) {
+        await pool.query(
+          `UPDATE inventory.owned_items
+              SET wear = COALESCE($3, wear), seed = COALESCE($4, seed)
+            WHERE id = $1 AND steam_id = $2`,
+          [inst, steamId, w, seedFor],
+        );
+      }
       return inst;
     }
     const { rows } = await pool.query<{ id: string }>(
