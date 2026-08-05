@@ -608,6 +608,14 @@ export function getItemsByIds(ids: number[]): (CatalogSkin & {
       legacyPaint: !!i.legacy,
       model: (i.model as string) ?? null,
       type: i.type as string,
+      // Every other catalog projection carries it, and this one dropping it was
+      // silently load-bearing: a SHARED craft link rehydrates through here, so
+      // the item arrived with no defindex and the editor's "Inspect in game"
+      // decided the item couldn't be expressed as a link. The link itself never
+      // needed the field — the backend resolves the defindex from item_id — so
+      // the only casualty was the button, on the one route where the item comes
+      // from a stranger's URL rather than from your own inventory.
+      def: i.def,
     });
   }
   return out;

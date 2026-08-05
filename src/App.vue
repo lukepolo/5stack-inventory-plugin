@@ -3333,12 +3333,6 @@ const preview3d = ref<{
   image: string;
   name: string;
   kind: string;
-  /** The economy item itself, for the inspect link — a sticker and a charm are
-   *  each an inspectable item in their own right, and this panel is the only
-   *  place either one is ever the subject rather than something stuck to a gun.
-   *  Nullable because the picker's rows are the one source that might not carry
-   *  an id back. */
-  id: number | null;
   /**
    * The slot on the weapon this was opened FROM, or null when it came from the
    * picker. What it decides is where the panel's wear/seed write to — see
@@ -3430,7 +3424,7 @@ const ATTACH_TYPE: Record<string, string> = { sticker: "sticker", patch: "patch"
  * nothing is attached yet and they drive a scratch value instead.
  */
 async function openPreview3d(
-  item: { id?: number | null; image?: string | null; name?: string | null; type?: string | null },
+  item: { image?: string | null; name?: string | null; type?: string | null },
   kind: string,
   applied?: { slot: number },
 ) {
@@ -3445,7 +3439,7 @@ async function openPreview3d(
     seed: (applied && kind === "charm" ? craft.value?.charm?.seed : null) ?? 0,
   };
   preview3dTarget = target;
-  preview3d.value = { id: item.id ?? null, image: item.image, name: item.name ?? "", kind, slot: applied?.slot ?? null };
+  preview3d.value = { image: item.image, name: item.name ?? "", kind, slot: applied?.slot ?? null };
   await mountPreview3d();
 }
 /**
@@ -3719,50 +3713,49 @@ async function sendInspect(link: () => Promise<{ inspect: string }>) {
     fail(e);
   }
 }
-/**
- * An owned row re-expressed as a DRAFT — the same shape the craft editor posts.
- *
- * What it's for: /inventory/<id>/inspect only ever answers for the caller's own
- * rows, so it can't build a link for the loadout you are VISITING. The row we
- * were handed carries the whole spec (it's what the viewer on screen is already
- * rendering), and the draft endpoint turns a spec into a link without caring
- * whose it is.
- */
-function inspectDraftBody(inst: InventoryItem) {
-  const spec = (p: { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null } | null): AttachSpec =>
-    p ? { id: p.id, x: p.x ?? null, y: p.y ?? null, r: p.r ?? null, w: p.w ?? null } : null;
-  return {
-    item_id: inst.item_id,
-    wear: inst.wear,
-    seed: inst.seed,
-    stattrak: inst.stattrak,
-    stattrak_count: inst.stattrak_count,
-    nametag: inst.nametag,
-    stickers: (inst.stickers ?? []).map(spec),
-    patches: (inst.patches ?? []).map(spec),
-    charm_id: inst.charm?.id ?? null,
-    charm_offset: inst.charm
-      ? { x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null }
-      : null,
-  };
-}
+/** An OWNED row of yours. The saved route re-reads each attachment's own row
+ *  server-side, which is where a linked sticker's scratch actually lives, so
+ *  this is the authoritative link whenever there is an instance to ask about. */
 async function openInspectLink(id: number) {
-  // Yours goes through the SAVED route: it re-reads each attachment's own row
-  // server-side, which is where a linked sticker's scratch actually lives.
-  // Someone else's can't — that route is scoped to the caller's steam_id and
-  // 404s on a row they don't own — so it goes out as a draft instead.
-  const theirs = viewerId.value ? instanceById(id) : null;
-  await sendInspect(() => (theirs ? fetchDraftInspectLink(inspectDraftBody(theirs)) : fetchInspectLink(id)));
+  await sendInspect(() => fetchInspectLink(id));
 }
 /**
  * Inspect a bare CATALOG item — one nobody owns and no editor is holding: the
  * default weapon on the loadout's 3D stage, the sticker or charm in the
  * attachment preview. Vanilla is just paintindex 0 to the link builder, so the
- * id is the whole input.
+ * id plus whatever the surface knows is the whole input.
  */
-async function openItemInspect(itemId?: number | null) {
+async function openItemInspect(
+  itemId?: number | null,
+  spec: Omit<Parameters<typeof fetchDraftInspectLink>[0], "item_id"> = {},
+) {
   if (itemId == null) return;
-  await sendInspect(() => fetchDraftInspectLink({ item_id: itemId }));
+  await sendInspect(() => fetchDraftInspectLink({ item_id: itemId, ...spec }));
+}
+/**
+ * Inspect whatever a LOADOUT CELL is showing, owned or not.
+ *
+ * Two of the three things a cell can hold have no instance id behind them: a
+ * free DEFAULT weapon (never owned), and any cell on a loadout you are VISITING
+ * (the public endpoint withholds the id on purpose — it's their row handle).
+ * Both used to mean no button, which is backwards: someone else's gun is the
+ * one you most want to see in game, and the row already carries everything this
+ * screen is rendering for it.
+ *
+ * Attachments are the one thing it can't carry — a visited row ships no
+ * stickers or charm — but the viewer next to the button isn't showing them
+ * either, so the link and the model still agree.
+ */
+async function inspectLoadoutRow(row?: LoadoutEntry) {
+  const inst = instanceById(row?.item_instance_id);
+  if (inst) return openInspectLink(inst.id);
+  await openItemInspect(row?.item?.id, {
+    wear: row?.wear,
+    seed: row?.seed,
+    stattrak: row?.stattrak,
+    stattrak_count: row?.stattrak_count,
+    nametag: row?.nametag,
+  });
 }
 async function toggleStatTrak() {
   const inst = equippedInstance(selected.value);
@@ -4557,8 +4550,7 @@ async function ctxStatTrak() {
 async function ctxInspect() {
   const pos = ctx.value?.pos;
   closeCtx();
-  const inst = pos ? equippedInstance(pos) : undefined;
-  if (inst) await openInspectLink(inst.id);
+  if (pos) await inspectLoadoutRow(rowFor(pos));
 }
 async function ctxCopy() {
   if (ctx.value) await copyToOtherTeam(ctx.value.pos);
@@ -7248,16 +7240,20 @@ if (MDEBUG) {
                 >
                   <Pencil class="h-3.5 w-3.5" /> Edit
                 </button>
-                <!-- Same rule as the item modal: a stage showing the item
-                     offers to open it in game. Not `canEdit` — inspecting is
-                     not editing, and a loadout you are VISITING is exactly the
-                     one you most want to look at in game (openInspectLink
-                     sends someone else's item as a draft for that reason). -->
+                <!-- Same rule as the item modal: a stage showing a weapon
+                     offers to open it in game. Deliberately none of the three
+                     gates the Edit button above needs — `canEdit` (inspecting
+                     is not editing, and a loadout you are VISITING is exactly
+                     the one you most want to see in game), `isSkinned` (a
+                     default weapon inspects fine — it's paintindex 0) and
+                     `focusInstance` (a cell with no instance behind it is
+                     precisely those two cases; inspectLoadoutRow sends the row
+                     as a draft instead). -->
                 <button
-                  v-if="isSkinned(focusRow) && focusInstance && canInspect(focusRow?.item)"
+                  v-if="canInspect(focusRow?.item)"
                   :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
                   title="Launch CS2 and inspect this item in-game"
-                  @click="openInspectLink(focusInstance.id)"
+                  @click="inspectLoadoutRow(focusRow)"
                 >
                   <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect' }}
                 </button>
@@ -8911,9 +8907,10 @@ if (MDEBUG) {
         </button>
         <!-- The touch path's ONLY way to this action: the tile clusters are
              hover chrome and stay desktop-only, so hiding it here too left a
-             phone with no inspect at all. -->
+             phone with no inspect at all. Asks the ROW, not the instance — a
+             default weapon in the slot is still a gun you can look at. -->
         <button
-          v-if="ctx && equippedInstance(ctx.pos) && canInspect(equippedInstance(ctx.pos)?.item)"
+          v-if="ctx && canInspect(rowFor(ctx.pos)?.item)"
           :class="MENU_ROW"
           @click="ctxInspect"
         >
@@ -9226,16 +9223,14 @@ if (MDEBUG) {
         <div class="flex w-full max-w-[420px] flex-col overflow-hidden rounded-lg border border-border bg-card shadow-2xl">
           <div class="flex items-center gap-2 border-b border-border px-3 py-2">
             <span class="min-w-0 flex-1 truncate text-f11 uppercase tracking-cs1">{{ preview3d.name }}</span>
-            <!-- Icon-only whatever the width: this panel is 420px at its
-                 widest and the name is what it's for. -->
-            <button
-              v-if="preview3d.id != null"
-              class="flex h-7 w-7 flex-none items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
-              title="Launch CS2 and inspect this in-game"
-              @click="openItemInspect(preview3d.id)"
-            >
-              <ExternalLink class="h-3.5 w-3.5" />
-            </button>
+            <!-- No inspect link here, unlike every other stage, and it is NOT
+                 an oversight to fix by copying the button in: a standalone
+                 sticker or charm carries its kit id in `index`, and the preview
+                 block has nowhere to put that except the stickers/keychains
+                 list — the slot it fills when it's ON a weapon. Sent as
+                 `paintindex` (what inspectLinkFor does for every other item) it
+                 would open CS2 on defindex 1209 with no art. Attaching it to a
+                 gun and inspecting THAT works today and is the honest link. -->
             <button
               class="flex h-7 w-7 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
               title="Close"
