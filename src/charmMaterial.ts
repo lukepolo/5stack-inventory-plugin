@@ -111,8 +111,27 @@ function hasSeedLeaf(node: VfxNode): boolean {
  */
 export function seedDrivenShading(tune?: CharmShading): boolean {
   const dyn = tune?.dynamic;
-  return !!dyn && Object.values(dyn).some(hasSeedLeaf);
+  return !!dyn && Object.entries(dyn).some(([name, node]) => HONOURED.has(name) && hasSeedLeaf(node));
 }
+
+/**
+ * The params charmTune actually honours.
+ *
+ * A material can drive glitter, iridescence, a liquid level or a detail-texture
+ * rotation from the pattern, and this renderer implements none of those — so a
+ * charm whose pattern only touches them renders IDENTICALLY at every value, and
+ * a rail over it is a control that provably does nothing. Whether the game shows
+ * a difference is a separate question from whether we can, and this one is ours.
+ */
+const HONOURED = new Set([
+  "g_fHueShift",
+  "g_fSaturation",
+  "g_fBrightness",
+  "g_fContrast",
+  "g_vMetalnessRemapRange",
+  "g_fTextureRoughnessContrast",
+  "g_fTextureRoughnessBrightness",
+]);
 
 /**
  * The shading map's key for a material path.

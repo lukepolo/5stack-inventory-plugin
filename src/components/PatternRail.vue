@@ -270,7 +270,23 @@ function resolve(image: string) {
   // Until one of those arrives, an own-model charm stays draggable. Erring
   // toward the working control costs a rail that might not move; erring the
   // other way silently removes the feature from the charm you are holding.
+  // Which texels the grade may touch, resolved before the inert test below —
+  // a mask can veto a pattern that is otherwise perfectly real.
+  const sampled = named ? maskFromProp() : (fetchedMask.value ?? maskFromProp());
   const settled = !!spec?.material || !!props.albedo;
+  // A mask that lets NOTHING through is a pattern with nowhere to land: the
+  // three event Highlight charms bind a 1x1 black tint mask, so their hue ramp
+  // is real, decoded, and invisible. Judged on a mask we actually sampled — a
+  // mask that failed to load reads as null here, and calling that "no pattern"
+  // would hide a working control.
+  if (sampled && maskBlocksAll(sampled)) {
+    state.value = "inert";
+    tune.value = null;
+    tile.value = null;
+    mask.value = null;
+    emit("update:inert", true);
+    return;
+  }
   if (settled && !seedDrivenShading(tune.value ?? undefined)) {
     state.value = "inert";
     tune.value = null;
@@ -286,7 +302,7 @@ function resolve(image: string) {
   // The mask comes from whichever source the tile did. When the RENDERER named
   // the material, its answer is complete — a null mask there means that material
   // has none, not that one has yet to arrive, so a fetched one must not stand in.
-  mask.value = named ? maskFromProp() : (fetchedMask.value ?? maskFromProp());
+  mask.value = sampled;
   if (PATTERN_LOG) {
     console.log("[patternrail]", {
       image,
@@ -323,6 +339,19 @@ async function ensureMask(image: string) {
   if (props.image !== image || charmTintMaskUrl(tune.value) !== url) return;
   fetchedMask.value = sampled;
   resolve(image);
+}
+
+/**
+ * Does this mask gate the grade off everywhere?
+ *
+ * Read on .r, the channel the shader reads, against a floor of 3/255 rather than
+ * 0: the tile is a DOWNSAMPLE, so a real region of even a few hundred texels
+ * still lands well above this, while a mask that is black by construction lands
+ * at exactly zero.
+ */
+function maskBlocksAll(m: Uint8ClampedArray): boolean {
+  for (let i = 0; i < m.length; i += 4) if (m[i] >= 3) return false;
+  return true;
 }
 
 /** The mounted model's albedo, resized to TILE² if it came in at another size. */
