@@ -42,6 +42,20 @@ const SF = {
   offset_y: 8,
   offset_z: 9,
   pattern: 10,
+  highlight_reel: 11,
+  /**
+   * The sticker a Sticker Slab charm DISPLAYS, as a sticker-kit index.
+   *
+   * 11,144 of the 11,224 charms in the catalogue are slabs, and `sticker_id`
+   * alone only picks the blank hanger — so without this every one of them
+   * inspects as the same empty slab. Exactly the gap the equipped v5 feed had
+   * (see `keychains[].sticker` there); this is the same fact on the other
+   * output path, and the two must agree or "Inspect in game" shows something
+   * the game server isn't applying.
+   *
+   * A VARINT, not a float — `optional uint32 wrapped_sticker = 12`.
+   */
+  wrapped_sticker: 12,
 } as const;
 
 /** Item quality enum — 4 is the normal "Unique", 9 is Strange (StatTrak). */
@@ -149,6 +163,8 @@ export interface InspectSticker {
   offsetZ?: number | null;
   /** Keychain pattern seed. */
   pattern?: number | null;
+  /** Sticker Slab charms only: the sticker kit the slab displays. */
+  wrappedSticker?: number | null;
 }
 
 export interface InspectItem {
@@ -179,6 +195,7 @@ function encodeSticker(sticker: InspectSticker): Uint8Array {
     .float(SF.offset_y, sticker.offsetY)
     .float(SF.offset_z, sticker.offsetZ)
     .uint32(SF.pattern, sticker.pattern)
+    .uint32(SF.wrapped_sticker, sticker.wrappedSticker)
     .finish();
 }
 

@@ -1,5 +1,5 @@
 import { readFileSync, createWriteStream } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -8,7 +8,14 @@ import Fastify, { LogController } from "fastify";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
-import { getStickerMarkup, getCharmModels, getCharmShading, getPatchMaterials } from "./stickerMarkup.ts";
+import {
+  getStickerMarkup,
+  getCharmMarkup,
+  charmBounds,
+  getCharmModels,
+  getCharmShading,
+  getPatchMaterials,
+} from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
 import {
   getWeapons,
@@ -18,6 +25,7 @@ import {
   getKnives,
   getGloves,
   getMusicKits,
+  getCollectibles,
   searchAttachments,
   type AttachKind,
   type AttachQuery,
@@ -30,6 +38,9 @@ import {
   slotForItem,
   isBaseWeapon,
   getStickerBounds,
+  validateCraftAttrs,
+  STICKER_LIMITS,
+  truncateToPrecision,
   getRenderTestCatalog,
   stickerMaterialFor,
 } from "./catalog.ts";
@@ -923,11 +934,26 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/charm-model", async (
 
 app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", async (request) => {
   const model = request.params.model;
-  const [bounds, slots] = await Promise.all([
+  const [bounds, slots, charmQuads] = await Promise.all([
     Promise.resolve(getStickerBounds(model)),
     getStickerMarkup(model),
+    getCharmMarkup(model),
   ]);
-  return { bounds, slots };
+  // Charm surfaces ride along with the sticker markup because they come out of
+  // the same DATA block, are fetched at the same moment (the viewer mounts a
+  // weapon), and would otherwise be a second round trip for one file.
+  //
+  // `charmQuads` is the game's authored placement surfaces IN GLB SPACE — see
+  // the note in stickerMarkup.ts. `charmBounds` is the convenience box over the
+  // static body only; it deliberately does NOT come from cs2-lib 9's
+  // keychainPosition* fields, which union incompatible bone frames.
+  return {
+    bounds,
+    slots,
+    charmQuads,
+    charmBounds: charmBounds(charmQuads),
+    charmBoundsLegacy: charmBounds(charmQuads, "body_legacy"),
+  };
 });
 
 app.get<{ Querystring: { slot?: string } }>(
@@ -948,6 +974,9 @@ app.get<{ Querystring: { slot?: string } }>(
     }
     if (slot === "musickit") {
       return { base: null, skins: getMusicKits() };
+    }
+    if (slot === "collectible") {
+      return { base: null, skins: getCollectibles() };
     }
     if (slot === "graffiti") {
       // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
@@ -1070,9 +1099,42 @@ type AttachSpec = {
 // Clamp on READ as well as on write: the game applies this straight to the
 // "sticker slot N wear" econ attribute, so a bad float already sitting in the
 // JSONB column must never reach a server.
+//
+// Truncated to the game's stored precision (2dp) as well as clamped. An
+// over-precise value does not survive the round trip through an inspect link,
+// so the placement the user saved comes back as a slightly different one.
 function normWear(w: unknown): number | null {
   if (typeof w !== "number" || !Number.isFinite(w)) return null;
-  return Math.min(1, Math.max(0, w));
+  return truncateToPrecision(Math.min(1, Math.max(0, w)), STICKER_LIMITS.wearFactor);
+}
+/**
+ * A sticker's in-plane rotation, in degrees.
+ *
+ * Clamped to ±180 and truncated to ONE DECIMAL PLACE, which is what cs2-lib's
+ * 0.5 "step" actually means (see truncateToPrecision — it counts decimals, it
+ * does not snap to halves). That single decimal is the whole reason the equipped
+ * feed is v5 rather than v4: upstream widened the plugin's rotation field from
+ * int to float for it, so rounding to a whole degree here would throw away the
+ * precision the version bump exists to carry.
+ */
+function normRotation(r: unknown): number | null {
+  if (typeof r !== "number" || !Number.isFinite(r)) return null;
+  const clamped = Math.min(STICKER_LIMITS.rotationMax, Math.max(STICKER_LIMITS.rotationMin, r));
+  return truncateToPrecision(clamped, STICKER_LIMITS.rotationStep);
+}
+/**
+ * A sticker's UV offset from its slot anchor.
+ *
+ * Truncated only, NOT clamped: the real limit is the authored region in the
+ * weapon's sticker markup, which is a triangle soup rather than a range and
+ * which the viewer already clamps a drag against. A range check here would have
+ * to use cs2-lib's bounding box, and that box overshoots the region badly (on
+ * the M4A1-S it runs to u +1.007 where the region ends at +0.467), so it would
+ * reject nothing real while implying a guarantee it can't make.
+ */
+function normOffset(v: unknown): number | null {
+  if (typeof v !== "number" || !Number.isFinite(v)) return null;
+  return truncateToPrecision(v, STICKER_LIMITS.offsetFactor);
 }
 /**
  * Accepts a string as well as a number, because that is how it comes BACK.
@@ -1095,7 +1157,14 @@ function normSpecs(arr: unknown): AttachSpec[] {
       const e = entry as {
         id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: number | null;
       };
-      return { id: e.id, x: e.x ?? null, y: e.y ?? null, r: e.r ?? null, w: normWear(e.w), inst: normInst(e.inst) };
+      return {
+        id: e.id,
+        x: normOffset(e.x),
+        y: normOffset(e.y),
+        r: normRotation(e.r),
+        w: normWear(e.w),
+        inst: normInst(e.inst),
+      };
     }
     return null;
   });
@@ -1157,8 +1226,8 @@ function checkAttachments(
   patches?: unknown[] | null,
 ): string | null {
   if (stickers != null) {
-    if (!Array.isArray(stickers) || stickers.length > 5) {
-      return "Up to 5 stickers can be applied.";
+    if (!Array.isArray(stickers) || stickers.length > STICKER_LIMITS.maxStickers) {
+      return `Up to ${STICKER_LIMITS.maxStickers} stickers can be applied.`;
     }
     for (const spec of normSpecs(stickers)) {
       if (spec != null && getItem(spec.id)?.type !== "sticker") return "That isn't a sticker.";
@@ -1167,8 +1236,8 @@ function checkAttachments(
     if (badWear) return badWear;
   }
   if (patches != null) {
-    if (!Array.isArray(patches) || patches.length > 5) {
-      return "Up to 5 patches can be applied.";
+    if (!Array.isArray(patches) || patches.length > STICKER_LIMITS.maxPatches) {
+      return `Up to ${STICKER_LIMITS.maxPatches} patches can be applied.`;
     }
     for (const spec of normSpecs(patches)) {
       if (spec != null && getItem(spec.id)?.type !== "patch") return "That isn't a patch.";
@@ -1366,8 +1435,10 @@ app.get("/api/inventory", async (request, reply) => {
  * type-checks the item against the slot, so a slotless instance simply has
  * nowhere to go. Nothing here can put a sticker in a rifle slot.
  *
- * Still a whitelist rather than "anything in the catalog": cases, keys, medals
- * and coins resolve to real items and are not things this app models.
+ * Still a whitelist rather than "anything in the catalog": cases and keys
+ * resolve to real items and are not things this app models. Pins and medals
+ * came off that list when the collectible slot shipped — they own a slot now,
+ * so slotForItem lets them through without an entry here.
  */
 const OWNABLE_TYPES = new Set(["sticker", "patch", "keychain"]);
 const craftable = (id: number) =>
@@ -1560,6 +1631,13 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   if (attachErr) {
     return reply.status(400).send({ error: attachErr });
   }
+  // Scalars were going into the column unchecked and straight on into the feed
+  // the CS2 server applies. cs2-lib knows each item's real float range, pattern
+  // range and whether it can be StatTrak'd at all — see validateCraftAttrs.
+  const checked = validateCraftAttrs(item_id, { wear, seed, stattrak, nametag });
+  if ("error" in checked) {
+    return reply.status(400).send({ error: checked.error });
+  }
   // Mint the attachments into the inventory and take them off anything else
   // wearing them, BEFORE the weapon row is written — the specs it stores are
   // the linked ones. selfId null: this row doesn't exist yet, so there is
@@ -1570,7 +1648,9 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
      VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)
      RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
     [
-      identity.steamId, item_id, wear ?? null, seed ?? null, stattrak ?? false, nametag ?? null,
+      identity.steamId, item_id,
+      checked.clean.wear ?? null, checked.clean.seed ?? null,
+      checked.clean.stattrak ?? false, checked.clean.nametag ?? null,
       normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null, charm_id ?? null,
       linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
       normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
@@ -1613,6 +1693,14 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
     if (attachErr) {
       return reply.status(400).send({ error: attachErr });
     }
+    // Same per-item check the craft path does. It matters MORE here: an edit is
+    // where a float gets dragged, and the row it writes is already equipped, so
+    // an impossible value reaches the game server on the next poll rather than
+    // waiting to be equipped.
+    const checked = validateCraftAttrs(chk.rows[0].item_id, { wear, seed, stattrak, nametag });
+    if ("error" in checked) {
+      return reply.status(400).send({ error: checked.error });
+    }
     const hasStickers = stickers !== undefined;
     const hasCharm = charm_id !== undefined;
     const hasPatches = patches !== undefined;
@@ -1642,7 +1730,11 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
        WHERE id = $1 AND steam_id = $2
        RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
       [
-        id, identity.steamId, wear ?? null, seed ?? null, stattrak ?? null, nametag ?? null,
+        // `?? null` keeps the COALESCE contract: a key validateCraftAttrs left
+        // unset is one the request never sent, and null means "leave it alone".
+        id, identity.steamId,
+        checked.clean.wear ?? null, checked.clean.seed ?? null,
+        checked.clean.stattrak ?? null, checked.clean.nametag ?? null,
         hasStickers, hasStickers && normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null,
         hasCharm, hasCharm ? charm_id ?? null : null,
         hasCharm && linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
@@ -1700,11 +1792,14 @@ function inspectLinkFor(
   });
 
   const keychains: InspectSticker[] = [];
-  const charmKit = row.charm_id != null ? getItem(row.charm_id)?.index : null;
-  if (charmKit != null) {
+  const charm = row.charm_id != null ? getItem(row.charm_id) : null;
+  if (charm?.index != null) {
     keychains.push({
       slot: 0,
-      id: charmKit as number,
+      id: charm.index as number,
+      // Must match what the equipped feed sends as `keychains[].sticker`, or
+      // the slab you inspect is not the slab the server puts on the gun.
+      wrappedSticker: charm.stickerIndex ?? null,
       offsetX: row.charm_offset?.x ?? null,
       offsetY: row.charm_offset?.y ?? null,
       offsetZ: row.charm_offset?.z ?? null,
@@ -1851,7 +1946,9 @@ app.get("/api/loadout", async (request, reply) => {
 // ---- CS2-style positional slots (v2) ----
 // sp = starting pistol, p1-p4 = other pistols, m1-m5 = mid-tier (SMGs +
 // shotguns + LMGs), r1-r5 = rifles (incl. snipers), plus knife/gloves/agent.
-const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti)$/;
+// KEEP IN STEP WITH the slot whitelist in schema.sql — that DELETE runs on every
+// boot, so a slot this accepts and that list omits is wiped on the next restart.
+const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti|collectible)$/;
 const START_PISTOLS = new Set(["glock", "usp_silencer", "hkp2000"]);
 function slotCategories(slot: string): string[] | null {
   if (slot === "sp" || /^p[1-4]$/.test(slot)) {
@@ -1937,6 +2034,10 @@ async function resolveEquip(
   } else if (slot === "graffiti") {
     if (item.type !== "graffiti") {
       return { error: `${item.name} isn't graffiti.` };
+    }
+  } else if (slot === "collectible") {
+    if (item.type !== "collectible") {
+      return { error: `${item.name} isn't a pin or a medal.` };
     }
   } else if (slot === "agent") {
     if (item.type !== "agent") {
@@ -3646,7 +3747,20 @@ app.post("/api/admin/server-api-key", async (request, reply) => {
 
 const TEAM_BYTE: Record<string, string> = { T: "2", CT: "3" };
 
+/**
+ * One entry in the v5 feed. Field-for-field the shape upstream documents in
+ * docs/api.md and the plugin deserialises in `src/Models/InventoryItem.cs`; a
+ * name that doesn't match is a field the game server silently drops.
+ *
+ * `charges` is deliberately never set. It is how upstream makes graffiti a
+ * consumable (50 sprays, then the item is gone), and the plugin reads a MISSING
+ * charges as "unlimited" — `ConsumeGraffitiCharge` returns before it decrements
+ * or POSTs anything. That is what we want here: this is a loadout sandbox, not
+ * an economy, so there is nothing to spend and no /api/consume-item-spray to
+ * implement. It stays on the interface so the omission reads as a decision.
+ */
 interface EquippedItem {
+  charges?: number;
   def?: number;
   paint?: number;
   seed?: number | null;
@@ -3654,11 +3768,41 @@ interface EquippedItem {
   stattrak?: number;
   nametag?: string;
   stickers?: { def: number; slot: number; wear: number; x?: number; y?: number; rotation?: number }[];
-  keychains?: { def: number; seed: number; slot: number }[];
+  keychains?: { def: number; seed: number; slot: number; sticker?: number; x?: number; y?: number; z?: number }[];
   musicId?: number;
   tint?: number;
   uid?: number;
   hash?: string;
+}
+
+/**
+ * `hash` is the plugin's ONLY change-detection signal.
+ *
+ * `InventoryItem.Equals` compares nothing but this string, and RegiveAgent /
+ * RegiveGloves / RegiveWeapons all bail on `oldItem == item`. So a field that
+ * the hash doesn't cover is a field that `!ws` cannot apply without a respawn —
+ * which is what happened while the hash was a hand-rolled
+ * `uid:item:seed:wear:stattrak`: re-stickering a rifle or swapping its charm
+ * changed the payload and not the hash, so the refresh looked broken.
+ *
+ * Hashing the WHOLE entry is what upstream does (hash-object, truncated to 7),
+ * and it can't drift out of step with the fields as they're added. Key order is
+ * normalised because ours are built in a different order per item type.
+ */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+function hashed<T extends EquippedItem>(entry: T): T {
+  entry.hash = createHash("sha1").update(stableStringify(entry)).digest("hex").slice(0, 7);
+  return entry;
 }
 
 function equippedStickers(specs?: unknown[] | null) {
@@ -3676,7 +3820,10 @@ function equippedStickers(specs?: unknown[] | null) {
     if (spec.r != null) entry.rotation = spec.r;
     out.push(entry);
   });
-  return out.length ? out : undefined;
+  // An empty ARRAY, not undefined: upstream always sends one, and the plugin
+  // reads it as "no sticker attributes" either way. Keeping the field present
+  // also keeps it inside the hash for an item whose last sticker was removed.
+  return out;
 }
 
 app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (request, reply) => {
@@ -3713,6 +3860,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
 
   const out = {
     agents: {} as Record<string, EquippedItem>,
+    collectible: undefined as EquippedItem | undefined,
     ctWeapons: {} as Record<string, EquippedItem>,
     tWeapons: {} as Record<string, EquippedItem>,
     gloves: {} as Record<string, EquippedItem>,
@@ -3724,61 +3872,82 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
   for (const row of equippedRows) {
     const item = getItem(row.item_id as number);
     if (!item) continue;
-    const base: EquippedItem = {
-      uid: Number(row.uid),
-      hash: `${row.uid}:${row.item_id}:${row.seed ?? ""}:${row.wear ?? ""}:${row.stattrak ? row.stattrak_count : -1}`,
-    };
-    if (row.stattrak) base.stattrak = row.stattrak_count ?? 0;
-    if (row.nametag) base.nametag = row.nametag;
+    const uid = Number(row.uid);
+    // -1 is the plugin's "StatTrak-capable but not counting" sentinel: it only
+    // writes the "kill eater" attribute for a value ABOVE -1, so this is how a
+    // non-StatTrak item says so out loud rather than by omission.
+    const stattrak = row.stattrak ? row.stattrak_count ?? 0 : -1;
+    const nametag = row.nametag ?? "";
     const teamByte = TEAM_BYTE[row.team];
 
     if (row.slot === "agent") {
-      out.agents[teamByte] = {
-        ...base,
+      out.agents[teamByte] = hashed({
         def: item.def as number | undefined,
         stickers: equippedStickers(row.patches), // patches apply via sticker slots
-      };
+      });
     } else if (row.slot === "knife") {
-      out.knives[teamByte] = {
-        ...base,
+      out.knives[teamByte] = hashed({
         def: item.def as number | undefined,
+        nametag,
         paint: (item.index as number | undefined) ?? 0,
         seed: row.seed ?? 1,
+        stattrak,
+        stickers: [],
+        uid,
         wear: row.wear ?? 0,
-      };
+      });
     } else if (row.slot === "gloves") {
-      out.gloves[teamByte] = {
-        ...base,
+      out.gloves[teamByte] = hashed({
         def: item.def as number | undefined,
         paint: (item.index as number | undefined) ?? 0,
         seed: row.seed ?? 1,
         wear: row.wear ?? 0,
-      };
+      });
     } else if (row.slot === "musickit") {
-      out.musicKit = { ...base, musicId: item.index as number | undefined };
+      out.musicKit = { musicId: item.index as number | undefined, stattrak, uid };
+    } else if (row.slot === "collectible") {
+      // Pins and medals carry nothing but their defindex — no paint, no wear,
+      // no uid to increment. The plugin hangs it off the player as-is.
+      out.collectible = { def: item.def as number | undefined };
     } else if (row.slot === "graffiti") {
-      out.graffiti = { ...base, def: item.index as number | undefined, tint: item.tint as number | undefined };
+      out.graffiti = {
+        def: item.index as number | undefined,
+        // `?? 0`, NOT the raw field. 438 of the 2,205 graffiti carry no tint at
+        // all, and the plugin's SprayGraffiti() returns early when Tint is null —
+        // so an omitted tint didn't mean "untinted", it meant the spray silently
+        // did nothing for one graffiti in five.
+        tint: (item.tint as number | undefined) ?? 0,
+        uid,
+      };
     } else {
       // Weapon positions incl. zeus/c4 — keyed by weapon def index.
       if (item.def == null) continue;
       const entry: EquippedItem = {
-        ...base,
         def: item.def as number,
+        nametag,
         paint: (item.index as number | undefined) ?? 0,
         seed: row.seed ?? 1,
-        wear: row.wear ?? 0,
+        stattrak,
         stickers: equippedStickers(row.stickers),
+        keychains: [],
+        uid,
+        wear: row.wear ?? 0,
       };
-      const charmKit = row.charm_id != null ? getItem(row.charm_id)?.index : null;
-      if (charmKit != null) {
-        const keychain: { def: number; seed: number; slot: number; x?: number; y?: number; z?: number } = {
-          def: charmKit as number, seed: row.charm_offset?.seed ?? 0, slot: 0,
+      const charm = row.charm_id != null ? getItem(row.charm_id) : null;
+      if (charm?.index != null) {
+        const keychain: NonNullable<EquippedItem["keychains"]>[number] = {
+          def: charm.index as number, seed: row.charm_offset?.seed ?? 0, slot: 0,
         };
+        // A Sticker Slab is one model wearing one sticker, and 10.5k of the
+        // 10.6k charms are slabs — the charm's own def only picks the slab, so
+        // without this every slab in the game arrived as the same blank hanger.
+        if (charm.stickerIndex != null) keychain.sticker = charm.stickerIndex;
         if (row.charm_offset?.x != null) keychain.x = row.charm_offset.x;
         if (row.charm_offset?.y != null) keychain.y = row.charm_offset.y;
         if (row.charm_offset?.z != null) keychain.z = row.charm_offset.z;
         entry.keychains = [keychain];
       }
+      hashed(entry);
       const bucket = row.team === "CT" ? out.ctWeapons : out.tWeapons;
       bucket[String(item.def)] = entry;
     }
@@ -3830,11 +3999,25 @@ async function start() {
   void autoExtractIfStale();
   // Freshness marker: node --watch in this container is event-based and quietly
   // misses synced edits, so "my change did nothing" is usually "the process is
-  // still on old code". Compare this mtime against the file you just edited.
+  // still on old code".
+  //
+  // Reports the NEWEST source file, not main.ts. It used to stat only itself,
+  // which reads as fresh whenever the edit landed anywhere else — and most of
+  // them do (catalog.ts, stickerMarkup.ts). Worse, the documented workaround for
+  // a missed reload was "touch main.ts", which cannot work: Mutagen syncs
+  // CONTENT, so a touch never crosses into the container at all. Naming the file
+  // makes both failures obvious.
   try {
-    const self = fileURLToPath(new URL("./main.ts", import.meta.url));
-    const { mtime } = await fs.stat(self);
-    app.log.info(`[boot] main.ts last modified ${mtime.toISOString()}`);
+    const dir = fileURLToPath(new URL(".", import.meta.url));
+    const stamps = await Promise.all(
+      (await fs.readdir(dir))
+        .filter((f) => f.endsWith(".ts"))
+        .map(async (f) => ({ f, mtime: (await fs.stat(path.join(dir, f))).mtime })),
+    );
+    const newest = stamps.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())[0];
+    if (newest) {
+      app.log.info(`[boot] newest source: ${newest.f} ${newest.mtime.toISOString()}`);
+    }
   } catch {
     /* bundled/compiled — no source to stat */
   }

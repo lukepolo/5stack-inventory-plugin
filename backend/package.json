@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
-    "@ianlucas/cs2-lib": "^8.2.0",
+    "@ianlucas/cs2-lib": "^9.0.0",
     "fastify": "^5.2.0",
     "pg": "^8.13.1"
   },

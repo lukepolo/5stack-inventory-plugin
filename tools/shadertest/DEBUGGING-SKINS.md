@@ -19,6 +19,10 @@ warrant one:
   (`g_tSubstrate` / `g_tSurface`, 22 finishes). Renders; colours still wrong.
   Carries its own ruled-out table and the open leads, in priority order.
 - `CHARM-PHYSICS.md` — charm softbody / swing.
+- `BUTANE-BUDDY.md` — the one charm on `csgo_simple_liquid.vfx`. Renders but does
+  not match the reference; carries its own ruled-out table, the open leads in
+  priority order, and a note on why transcribing more shader terms stopped
+  converging.
 
 ---
 
@@ -360,6 +364,132 @@ symptom-free until you compare against the game. When an authored mask exists,
 prefer it over any inferred limiter — and check the vmat's `F_*` flags for
 maskings you have not modelled (`g_bMaskRoughnessAdjustmentsByTintMask` lerps
 each roughness KNOB toward identity, not the result).
+
+### "It renders blank" can mean the shader is not csgo_weapon at all
+
+Charm | Butane Buddy (id 14312, `kc_db_lighter`) rendered as a featureless pale
+teal blob with everything present on the mount — GLB, colour, normal, ORM,
+`.phys.json` all 200 — and the lighter half of the same model rendering fine.
+The body is on **`csgo_simple_liquid.vfx`**, which we did not implement, so the
+glTF fallback showed the authored albedo: the EMPTY glass. Every red pixel of
+the icon comes from `g_vLiquidColor` and `g_flLiquidLevelHeight`, not a texture.
+
+**Survey the shader before assuming the pipeline.** One range-GET per model over
+the GLB's first 128KB answers it for the whole catalog in a minute, because VRF
+writes the source vmat into `material.extras.vmat`:
+
+```sh
+curl -s -r 0-131071 "$HOST/models/$stem.glb" -o /tmp/c.bin
+strings -a /tmp/c.bin | grep -o '"ShaderName":"[a-z0-9_]*\.vfx"' | sort -u
+```
+
+Across the 81 `kc_*` charms: 58 `csgo_weapon.vfx`, **1** `csgo_simple_liquid.vfx`,
+22 that 404 because they are the shared-blank community charms. A shader with
+one user still has to be implemented if it IS the item.
+
+Three traps this turned up, all worth checking on any new shader:
+
+- **The vertex program is not optional.** `csgo_simple_liquid`'s level test
+  compares two dot products against varyings whose meaning is unguessable from
+  the pixel shader — `input_3` is the model's up axis, `input_4` is world
+  gravity, `input_1` is the liquid centre already transformed. Decompile the
+  `_vs.vcs` too; it is small and fast.
+- **VRF's glTF export can destroy a channel the shader reads.** Source 2 normal
+  maps store X and Y and rebuild Z, leaving BLUE free — this shader reads
+  `g_tNormalA.z` for edge softness and bubble density. VRF reconstructs a
+  standard RGB normal map, so the exported blue is the rebuilt Z: measured
+  median 254/255. Measure the channel before transcribing anything that reads
+  it. Here both uses collapsed to constants, which is a real answer, not a
+  shortcut.
+- **Evaluate the noise before implementing it.** The wobble is eight
+  `exp(sin(dot()))` octaves scaled by `wobbleScale * agitation²` — and both
+  shipped materials leave that product at 1e-4/1e-2, bounding the whole term at
+  a 0.008 ripple on a body 1.2 units across. It is a constant. The bound is
+  re-checked at extract time so a future material with real agitation is caught.
+
+Also: params on a non-`csgo_weapon` shader can still be **seed-driven**, and
+`HONOURED` in `charmMaterial.ts` gates whether the pattern rail believes it.
+Butane Buddy drives `g_flLiquidColorHueShift = lerp(0, 320, seed)` and
+`g_flLiquidLevelHeight = lerp(0.45, 0.8, frac(seed*100))` — a full hue sweep and
+a cycling fill — and reported as pattern-inert until both names were listed.
+Its dynamic params also reference render attribute `0x4B002DCA`, the charm's
+live motion, which `vfx_decode` drops loudly; the authored constants are the
+at-rest values and the right ones for a viewer.
+
+Decompiles: `groundtruth/liquid_outer_combo12.glsl` (S_OPAQUE_REFRACT +
+S_USE_TEST_VALUES), `liquid_inner_combo8.glsl`, `liquid_vs_combo4.glsl`. The
+program is `shaders/vfx/csgo_simple_liquid_vulkan_50_ps.vcs`, archive 1, offset
+73492960, length 753297 — in the FULL tree at `/cs2-game/game/csgo/`, not the
+dedicated-server pack, same as `csgo_weapon`. Only 5 features, 24 combos.
+
+### Don't run a 30-minute extraction to change one number
+
+`ONLY_STEPS=` scopes the run and the fast steps are seconds, not minutes:
+
+```sh
+ONLY_STEPS=charm-models   ./scripts/extract-models.sh   # ~1s, all charm params
+ONLY_STEPS=charm-anchors  ./scripts/extract-models.sh   # ~5s
+```
+
+A full run is ~30 minutes and is almost never what you want while iterating. The
+paint chain is only needed when a NEW TEXTURE has to be pulled — parameter
+changes land through `charm-models` alone.
+
+Scoped runs are safe as of 2026-08-05, and were not before: the paint chain
+pruned against whatever the current run happened to reference, so a two-step run
+deleted every texture the skipped steps would have named — the live mount went
+from ~16,800 textures to 262 and every skin rendered white. A scoped run now
+prunes nothing and does not stamp `extract-version.json`, so the mount stays
+honestly stale until a full run happens.
+
+### Use csgoskins.gg's 3D viewer as reference — and read its shader
+
+**https://csgoskins.gg/items/<item-slug>** renders the same items in a real-time
+3D viewer in the browser. It is the best reference we have short of the game:
+
+- **It is a moving, lit, orbitable render**, so it answers questions a flat icon
+  cannot — is this surface glossy, does it have bubbles, does the liquid move
+  when nothing else does, how sharp is that waterline.
+- **Its own shaders are readable.** It is WebGL, so the GLSL is in the page. When
+  our render disagrees with theirs, diffing against a working browser
+  implementation is far cheaper than re-deriving from a .vcs decompile — and it
+  shows which of Valve's terms are worth approximating at all in WebGL.
+- Compare like for like: their canvas is sRGB output, so decode before taking any
+  ratio (see below).
+
+Butane Buddy's whole "why is ours flat" answer came out of this comparison:
+theirs has hard speculars on the glass, a metallic casing and visible bubbles,
+ours had none — which pointed straight at a roughness input we were not feeding.
+
+### Never compare a derived LINEAR value against a screenshot
+
+This cost a whole session's worth of wrong conclusions on Butane Buddy. The
+liquid tint `lqC` works out to linear `(1.585, 0.161, 0.377)` — ratios G/R 0.10,
+B/R 0.24. Measured off the render it read G/R 0.46, B/R 0.70, so the tint looked
+badly wrong and a whole "40% of the pixel is untinted specular" theory got built
+on it, along with a specular energy-limit to fix it.
+
+sRGB-encode the derived value first and the discrepancy vanishes: 0.161 -> 0.44,
+0.377 -> 0.65, i.e. **G/R 0.44, B/R 0.65** against the measured 0.46 / 0.70. The
+tint was right the whole time. The energy fix moved the ratios by 2% because
+there was nothing to fix, and it was reverted.
+
+**Decode both sides to linear before taking any ratio**, including the reference
+icon's — it is an sRGB PNG too. Doing that here turns "our liquid is wildly
+magenta" into "our liquid has ~2.7x too much blue in linear", which is a
+different and much smaller problem.
+
+### Probes: three traps in one session
+
+- A probe that references a variable OUT OF SCOPE fails to COMPILE, three logs
+  it and keeps drawing with a fallback, and you read meaningless pixels. Put
+  probe values on the struct you already pass around, and read the console after
+  every probe change.
+- Probe output goes through lighting AND tone mapping AND the sRGB encode, so it
+  is only ever QUALITATIVE — sign, presence of a split, saturation at 0 or 1.
+- A CDP-driven tab is `document.hidden`, so `requestAnimationFrame` fires once
+  and never again. Anything animated looks frozen and the render loop appears
+  dead. Check `document.hidden` before concluding a per-frame feature is broken.
 
 ---
 

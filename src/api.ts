@@ -60,6 +60,26 @@ export interface Skin {
    * must read as "do not restrict" rather than as zero.
    */
   patchSlots?: number | null;
+  /**
+   * What this item actually has, straight from cs2-lib PER ITEM — not inferred
+   * from its type. The distinction is load-bearing for the 68 vanilla weapons,
+   * which are `type: "weapon"` and have no float, pattern or StatTrak at all.
+   *
+   * `wearMin`/`wearMax` are the finish's real float range: 1,683 of the 2,106
+   * paintable items are narrower than 0..1 (AK-47 | Redline is 0.10–0.70), and
+   * the backend rejects a craft outside it, so the editor's slider has to agree.
+   *
+   * All optional — a catalog listing from before these existed must stay
+   * editable, so absent means "no per-item answer, use the type-level one".
+   */
+  hasWear?: boolean;
+  hasSeed?: boolean;
+  hasStatTrak?: boolean;
+  hasNameTag?: boolean;
+  wearMin?: number | null;
+  wearMax?: number | null;
+  seedMin?: number | null;
+  seedMax?: number | null;
   // ---- sheet facets. Only graffiti carries these today; the sheet's filter bar
   // is driven entirely by which of them appear on the list it loaded, so a
   // catalog without them renders exactly as it did before.

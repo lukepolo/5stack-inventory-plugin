@@ -22,6 +22,26 @@ import { english } from "@ianlucas/cs2-lib/translations/english";
 
 CS2Economy.load({ items: CS2_ITEMS, language: english });
 
+// ---- cs2-lib 8.x / 9.x field names ------------------------------------------
+//
+// v9 renamed every field this script reads (`image` -> `imagePath`,
+// `paintMaterial` -> `materialPath`, `index` -> `variantIndex`, `stickerId` ->
+// `displayedStickerId`). Read BOTH, because the failure mode of reading one is
+// catastrophic and completely silent: on the wrong version every access is
+// `undefined`, the loops below skip every item, and this emits a valid, EMPTY
+// manifest. The extractor then believes the catalogue wants 262 textures,
+// stages exactly those, and — on the second such run, since the prune keeps one
+// generation — deletes the other ~16,500 off the live mount. Skins render white
+// and nothing anywhere reports an error.
+//
+// That is exactly what happened on 2026-08-05: package.json moved to ^9.0.0 and
+// the deployed tree installed it, while this file (missed because the rename was
+// believed to be catalog.ts-only) still asked for the 8.x names.
+const imagePathOf = (i) => i.imagePath ?? i.image;
+const materialPathOf = (i) => i.materialPath ?? i.paintMaterial;
+const variantIndexOf = (i) => i.variantIndex ?? i.index;
+const displayedStickerIdOf = (i) => i.displayedStickerId ?? i.stickerId;
+
 // Types we render in 3D (see supports3d in src/itemVisuals.ts). Their flat icon
 // is only ever a placeholder while the real render bakes, so if the archive is
 // missing one it is a cosmetic delay — not a blank card. Everything else has NO
@@ -54,18 +74,19 @@ const RENDERED_IN_3D = new Set(["weapon", "melee"]);
 // Sticker SLABS (keychains) have their own index in the keychain namespace, but
 // carry `stickerId` — their art sits in the sticker's own event folder under a
 // `_1355_37` name — so they borrow the kit through that.
-const kitOfItem = new Map(CS2Economy.itemsAsArray.map((i) => [i.id, i.index]));
+const kitOfItem = new Map(CS2Economy.itemsAsArray.map((i) => [i.id, variantIndexOf(i)]));
 const DECAL_KIT_TYPES = new Set(["sticker", "patch", "graffiti"]);
 function kitOf(item) {
-  if (DECAL_KIT_TYPES.has(item.type)) return item.index;
-  if (item.type === "keychain" && item.stickerId != null) return kitOfItem.get(item.stickerId);
+  if (DECAL_KIT_TYPES.has(item.type)) return variantIndexOf(item);
+  const slabOf = displayedStickerIdOf(item);
+  if (item.type === "keychain" && slabOf != null) return kitOfItem.get(slabOf);
   return undefined;
 }
 
 const icons = [];
 const seen = new Set();
 for (const item of CS2Economy.itemsAsArray) {
-  const image = item.image;
+  const image = imagePathOf(item);
   if (typeof image !== "string" || !image.startsWith("/images/")) continue;
   if (seen.has(image)) continue;
   seen.add(image);
@@ -113,7 +134,7 @@ const DECAL_TYPES = new Set(["sticker", "patch"]);
 const paints = [];
 const seenPaint = new Set();
 for (const item of CS2Economy.itemsAsArray) {
-  const pm = item.paintMaterial;
+  const pm = materialPathOf(item);
   if (typeof pm !== "string" || !pm.startsWith("/materials/")) continue;
   const decal = DECAL_TYPES.has(item.type);
   if (!decal && !COMPOSITED_TYPES.has(item.type)) continue;
@@ -134,6 +155,22 @@ for (const item of CS2Economy.itemsAsArray) {
     // event's art on the gun as well as on the tile.
     ...(kit != null ? { kit } : {}),
   });
+}
+
+// FAIL LOUDLY on an empty manifest rather than emitting one.
+//
+// extract-models.sh treats a non-zero exit here as "could not build the
+// manifest" and SKIPS the icon and paint steps entirely — no staging, no swap,
+// no prune — which leaves the live assets exactly as they were. An empty
+// manifest that exits 0 does the opposite, and destroys them. There is no
+// catalogue in which zero icons or zero paints is a real answer.
+if (!icons.length || !paints.length) {
+  process.stderr.write(
+    `refusing to emit an empty manifest: ${icons.length} icons, ${paints.length} paints ` +
+      `from ${CS2Economy.itemsAsArray.length} items. Check the cs2-lib field names above ` +
+      `against the installed version.\n`,
+  );
+  process.exit(1);
 }
 
 process.stdout.write(JSON.stringify({ version: 4, icons, paints }));

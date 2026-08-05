@@ -25,11 +25,13 @@ import {
   charmAdjustSrgb,
   charmColorTextureUrl,
   charmSeedAdjust,
+  charmSeedLiquid,
   charmMaterialName,
   charmTintMaskUrl,
   seedDrivenShading,
   type CharmShading,
 } from "../charmMaterial";
+import { liquidSwatch } from "../charmLiquid";
 
 const props = withDefaults(
   defineProps<{
@@ -143,9 +145,18 @@ const shown = computed(() => (props.loading && state.value !== "inert" ? "loadin
  *  needle's glow both read from this, so the marker is tinted by the very
  *  thing it points at. */
 function colorAt(s: number): string | null {
-  const src = tile.value;
   const t = tune.value;
-  if (!src || !t) return null;
+  if (!t) return null;
+  // A LIQUID charm's colour is not in its albedo — see liquidSwatch. Grading the
+  // albedo here would paint the whole rail the colour of Butane Buddy's empty
+  // glass, one flat pale teal across a space that sweeps the entire hue circle.
+  const lq = charmSeedLiquid(t, s);
+  if (lq) {
+    const [r, g, b] = liquidSwatch(lq);
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  const src = tile.value;
+  if (!src) return null;
   const work = new Uint8ClampedArray(src);
   charmAdjustSrgb(work, charmSeedAdjust(t, s), mask.value);
   return average(work, src, mask.value);
@@ -417,7 +428,10 @@ function draw() {
   const cv = canvas.value;
   const src = tile.value;
   const t = tune.value;
-  if (!cv || !src || !t) return;
+  // A liquid charm needs no tile — its ramp is computed, not sampled — so the
+  // albedo is only required for the grading path below.
+  const liquid = t ? !!charmSeedLiquid(t, seed.value) : false;
+  if (!cv || !t || (!src && !liquid)) return;
   const w = Math.max(1, Math.round(cv.clientWidth));
   const dpr = Math.min(2, window.devicePixelRatio || 1);
   cv.width = Math.round(w * dpr);
@@ -425,12 +439,18 @@ function draw() {
   const ctx = cv.getContext("2d");
   if (!ctx) return;
   const span = hi.value - lo.value;
-  const work = new Uint8ClampedArray(src.length);
+  const work = src ? new Uint8ClampedArray(src.length) : null;
   const m = mask.value;
   for (let x = 0; x < w; x++) {
-    work.set(src);
-    charmAdjustSrgb(work, charmSeedAdjust(t, lo.value + (span * x) / Math.max(1, w - 1)), m);
-    const col = average(work, src, m);
+    const at = lo.value + (span * x) / Math.max(1, w - 1);
+    let col: string | null;
+    if (liquid) {
+      col = colorAt(at);
+    } else {
+      work!.set(src!);
+      charmAdjustSrgb(work!, charmSeedAdjust(t, at), m);
+      col = average(work!, src!, m);
+    }
     if (!col) continue;
     ctx.fillStyle = col;
     ctx.fillRect(x * dpr, 0, Math.ceil(dpr), cv.height);

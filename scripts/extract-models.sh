@@ -92,6 +92,21 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v23 (2026-08-05): `liquid.roughMap` — csgo_simple_liquid's glass roughness,
+# which the vmat carries only inside g_tNormalA's spare channel and VRF's glTF
+# export drops (RGB only). Without it the vessel renders dead matte.
+# v22 (2026-08-05): charm-shading.json gains `liquid` — the params of
+# `csgo_simple_liquid.vfx`, the ONE shader a charm uses that is not
+# csgo_weapon.vfx. Charm | Butane Buddy (kc_db_lighter) is the only item in the
+# catalog on it, and it rendered as a pale teal blob: every red pixel of that
+# charm is the shader's, not the texture's, so the glTF fallback showed the
+# EMPTY glass and nothing else. Its `g_tLiquidMask` joins the paint chain the
+# same way tint masks do (VRF's glTF exporter drops it — no PBR slot maps to it).
+# The two params that make the charm worth a pattern rail at all are seed-driven:
+#   g_flLiquidColorHueShift = lerp(0, 320, seed)              — a full hue sweep
+#   g_flLiquidLevelHeight   = lerp(0.45, 0.8, frac(seed*100)) — the fill level
+# Decompiled ground truth at tools/shadertest/groundtruth/liquid_outer_combo12.glsl
+# (static combo 12 = S_OPAQUE_REFRACT + S_USE_TEST_VALUES) and _inner_combo8.
 # v21 (2026-08-05): charm-shading.json gains `tintMask` (and `maskRoughness`),
 # and the pattern grade stops applying to the whole charm. CS2 ends the grade
 # with `mix(albedo, graded, g_tTintMask.r)` — decompiled and saved at
@@ -186,7 +201,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=21
+EXTRACT_VERSION=25
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -357,6 +372,22 @@ step() { # step "Name" — closes the previous step and opens this one
 # Both default to empty, i.e. today's behaviour exactly — the backend never sets
 # them, so a production run cannot be affected by this.
 #
+# A SCOPED RUN IS SAFE NOW, AND IT IS THE DEV LOOP. Use it — a full run is ~30
+# minutes and you almost never need one while iterating:
+#
+#   ONLY_STEPS=charm-models   ~1s    every charm's params (charm-shading.json)
+#   ONLY_STEPS=charm-anchors  ~5s    where charms hang
+#   ONLY_STEPS=sticker-markup ~1s    sticker slots
+#
+# Only reach for the paint chain when a NEW TEXTURE has to be extracted; params
+# alone never need it. Two things make scoped runs safe, and both had to be
+# fixed after a scoped run took the live mount from ~16,800 textures to 262:
+#
+#   · the paint chain does NOT prune on a scoped run (it cannot know what the
+#     steps it skipped would have referenced), and
+#   · a scoped run does NOT stamp extract-version.json, so the mount stays
+#     honestly stale and a full run still happens later.
+#
 # The seven model steps are individually selectable. econ-icons, paint-chain and
 # sticker-art are one interleaved flow with no seam between them, so naming any
 # of the three runs all three.
@@ -375,6 +406,13 @@ want_step() { # want_step <id> — true when this run should execute it
 }
 # Opens the step and reports whether to run its body. Skipped steps are marked
 # done with no duration so the panel doesn't sit on a step that never ran.
+# Is this a SCOPED run? Load-bearing: a scoped run has not walked the whole
+# catalogue, so anything that reasons about "everything referenced" — the paint
+# prune, the version stamp — must not act on it. See PARTIAL_RUN below.
+PARTIAL_RUN=0
+if [[ -n "${ONLY_STEPS:-}" || -n "${SKIP_STEPS:-}" ]]; then PARTIAL_RUN=1; fi
+export PARTIAL_RUN
+
 step_if() { # step_if <id>
   if want_step "$1"; then step "$1"; return 0; fi
   echo "--- [$1] SKIPPED (ONLY_STEPS/SKIP_STEPS)"
@@ -1642,8 +1680,34 @@ PYEOF
 
 fi
 
-# ---- 3d. Sticker slot markup -------------------------------------------------
+# ---- 3d. Sticker slot markup + charm placement surfaces ----------------------
 if step_if "sticker-markup"; then
+# TWO markup blocks live side by side in the same DATA dump, so one invocation
+# recovers both: `StickerMarkup` (UV anchors, below) and `KeychainMarkup` (the
+# authored surfaces a charm may hang from).
+#
+# KeychainMarkup is worth spelling out because it replaces a pile of inference.
+# Each record is one QUAD — `Corners`, 4 corners x XYZ — plus the `BoneName`
+# that animates it and a `LegacyModel` flag selecting the body variant. Measured
+# on this build: 2,155 quads across 35 weapons, 1,932 of them on `weapon_offset`
+# and the rest on moving parts (slide, bolt, magazine, silencer, pump…).
+#
+# THE CORNERS ARE ALREADY IN GLB SPACE. Verified against every weapon's GLB
+# POSITION accessor bounds: 32/32 fit as-is, 1/32 fit with `base` added, and the
+# tight ones touch the mesh bound to 3 decimal places. So unlike the keychain
+# ATTACHMENT — which is bone-relative and needs base folded in — this data needs
+# no transform to be used by the viewer at all. `BoneName` names the bone that
+# MOVES the quad, not the frame it is written in.
+#
+# Why not just take cs2-lib's `keychainPosition{X,Y,Z}{Min,Max}`: those are
+# derived from this same block and they are accurate (20 of 34 weapons identical
+# to ours, 14 looser by at most 0.561"), but they are an axis-aligned BOX. A box
+# is enough to reject an out-of-range placement and useless for putting a charm
+# flush against the weapon, which needs the surfaces themselves.
+#
+# Also covers `elite`, the one weapon with no charm anchor at all (dual-wield
+# rigs have no `weapon_offset` bone, so §3c skips it): its quads arrive under
+# `weapon_r`/`weapon_l`, which is the placement data that gap was missing.
 # Per-weapon sticker slot anchors, in the weapon's TEXCOORD_1 UV space.
 #
 # CS2 does not project stickers as 3D decals — it composites them in UV space
@@ -1791,7 +1855,85 @@ def slot(rec):
         out["region"] = [round(float(v), 5) for v in verts]
     return out
 
+def parse_keychain(lines):
+    """The array of quad records under `KeychainMarkup`.
+
+    Same indentation walk as parse_markup, but the payload is `Corners` — a flat
+    list of 4 corners x XYZ — rather than a nested Polygons tree, so the bracket
+    tracking only has to survive one level.
+
+    Corners are in GLB space already (see the header note): no base, no cal, no
+    pose. `BoneName` says which bone MOVES the quad, not which frame it is in.
+    """
+    try:
+        i = next(n for n, l in enumerate(lines) if l.strip() == "KeychainMarkup =")
+    except StopIteration:
+        return []
+    j = i + 1
+    while j < len(lines) and lines[j].strip() != "[":
+        j += 1
+    if j >= len(lines):
+        return []
+    base = len(lines[j]) - len(lines[j].lstrip("\t"))
+    out, entry = [], None
+    in_corners, depth = False, 0
+    for line in lines[j + 1:]:
+        # Same trailing-comma rule as parse_markup — VRF writes `},` and `],`.
+        stripped = line.strip().rstrip(",")
+        indent = len(line) - len(line.lstrip("\t"))
+        if in_corners:
+            closes = stripped.count("]")
+            depth += stripped.count("[") - closes
+            if closes and depth <= 0:
+                in_corners, depth = False, 0
+            elif entry is not None and NUMBER.match(stripped):
+                entry.setdefault("_corners", []).extend(
+                    float(x) for x in stripped.split(",") if x.strip()
+                )
+            continue
+        if indent <= base and stripped == "]":
+            break
+        if indent == base + 1:
+            if stripped == "{":
+                entry = {}
+            elif stripped == "}" and entry is not None:
+                out.append(entry)
+                entry = None
+            continue
+        if entry is None or indent != base + 2:
+            continue
+        if stripped == "Corners =":
+            in_corners, depth = True, 0
+            continue
+        m = SCALAR.match(stripped)
+        if m:
+            entry[m.group(1)] = value(m.group(2))
+    return out
+
+
+def quad(rec):
+    corners = rec.get("_corners")
+    # Exactly four XYZ corners or nothing. A truncated quad would define a
+    # surface that isn't there, and the viewer would snap a charm onto it.
+    if not isinstance(corners, list) or len(corners) != 12:
+        return None
+    return {
+        # Named to match sticker-markup's `mesh`, so the viewer's existing
+        # body-variant pick (body_hd / body_legacy) selects these too. An absent
+        # LegacyModel means HD — same default the game applies.
+        "mesh": "body_legacy" if rec.get("LegacyModel") is True else "body_hd",
+        # The bone that animates this surface. `weapon_offset` (1,932 of the
+        # 2,155 quads) is the static body; the rest ride a slide, bolt, magazine
+        # or silencer and move with it. A consumer that can't follow a bone
+        # should use the weapon_offset quads and skip the others rather than
+        # place a charm on a part that will slide out from under it.
+        "bone": str(rec.get("BoneName") or "weapon_offset"),
+        "corners": [round(float(v), 5) for v in corners],
+    }
+
+
 markup, empty = {}, []
+keychain, kc_empty = {}, []
 for path, lines in sections.items():
     base = os.path.basename(path).replace(".vmdl_c", "")
     key = MODEL_KEY.get(base)
@@ -1802,9 +1944,16 @@ for path, lines in sections.items():
         markup[key] = sorted(slots, key=lambda s: s["index"])
     else:
         empty.append(key)
+    quads = [q for q in (quad(r) for r in parse_keychain(lines)) if q]
+    if quads:
+        keychain[key] = quads
+    else:
+        kc_empty.append(key)
 
 with open(os.path.join(dest, "sticker-markup.json"), "w") as fh:
     json.dump(markup, fh, indent=1, sort_keys=True)
+with open(os.path.join(dest, "keychain-markup.json"), "w") as fh:
+    json.dump(keychain, fh, indent=1, sort_keys=True)
 
 total = sum(len(v) for v in markup.values())
 print(f"--- Sticker markup: {total} slots across {len(markup)} weapons")
@@ -1815,6 +1964,24 @@ if empty:
 if not markup:
     print("!!! No sticker markup recovered at all — sticker placement will fall "
           "back to the silhouette guess. Check the `-b DATA` output format.")
+
+kc_total = sum(len(v) for v in keychain.values())
+kc_bones = {}
+for quads in keychain.values():
+    for q in quads:
+        kc_bones[q["bone"]] = kc_bones.get(q["bone"], 0) + 1
+print(f"--- Charm surfaces: {kc_total} quads across {len(keychain)} weapons "
+      f"({kc_bones.get('weapon_offset', 0)} on weapon_offset, "
+      f"{len(kc_bones) - 1} other bone(s))")
+if kc_empty:
+    # Knives and gloves take no charm, so they belong here. A RIFLE in this list
+    # means the charm has no authored surface to sit on and placement falls back
+    # to the attachment point alone.
+    print(f"---   no charm surfaces (expected for melee): {len(kc_empty)} — "
+          f"{', '.join(sorted(kc_empty)[:8])}")
+if not keychain:
+    print("!!! No charm surfaces recovered at all — charm placement keeps the "
+          "raycast lift. Check that `KeychainMarkup` is still in the DATA block.")
 PYEOF
 
 fi
@@ -1956,6 +2123,21 @@ def num(block, param, key):
     return float(m.group(1)) if m else None
 
 
+def vec(block, param, n=3):
+    """A `m_vectorParams` entry as its first n components.
+
+    Every vector param is written as a float4 even when the shader declares a
+    vec3 — `g_vLiquidColor` is `[ 0.8, 0.078431, 0.188235, 0.0 ]` — so the
+    trailing 0 is padding, not a value, and taking it would ship an alpha the
+    shader never reads.
+    """
+    m = re.search(r'm_name = "%s"\s*\n\s*m_value = \[ ([^\]]+) \]' % param, block)
+    if not m:
+        return None
+    parts = [float(x) for x in m.group(1).split(",")]
+    return [round(v, 6) for v in parts[:n]] if len(parts) >= n else None
+
+
 # Source 2 dynamic-expression VM, enough of it to read what charms actually use.
 # Opcode and function tables are VfxEval's (ValveResourceFormat/Serialization).
 _VFX_FUNCS = [("sin",1),("cos",1),("tan",1),("frac",1),("floor",1),("ceil",1),
@@ -2038,6 +2220,127 @@ for block in BLOCKS:
         continue
     stem = os.path.basename(named.group(1)).split(".")[0]
     entry = {}
+    # ---- The liquid shader ---------------------------------------------------
+    #
+    # `csgo_simple_liquid.vfx` is the one shader a charm uses that is not
+    # csgo_weapon.vfx, and exactly one charm is on it: Charm | Butane Buddy
+    # (kc_db_lighter, two materials — an inner liquid volume and an outer glass
+    # shell sharing one vertex pool). It matters far out of proportion to that
+    # count, because the shader IS the charm: the authored albedo is the EMPTY
+    # glass, pale teal, and every red pixel of the official icon comes from
+    # g_vLiquidColor filling to g_flLiquidLevelHeight. Rendered through the glTF
+    # fallback it was a featureless blob.
+    #
+    # Emitted as a flat param bag rather than a curated subset: this is one
+    # material on one charm, and the renderer — the only thing that knows which
+    # terms it can honour — should not have to come back here to try another.
+    # Defaults are the shader's own, so a material that omits a param behaves as
+    # the game does rather than as a zero.
+    if re.search(r'm_shaderName = "csgo_simple_liquid\.vfx"', block):
+        liquid = {
+            # Level. The MinMidMax triples are the level scalar at fill 0 / 0.5 /
+            # 1, chosen by how upright the charm hangs — the shader picks between
+            # them with dot(objectUp, -gravity), so a charm swinging on its cord
+            # slides between the three rather than snapping.
+            "levelHeight": num(block, "g_flLiquidLevelHeight", "m_flValue") or 0.0,
+            "levelDelta": num(block, "g_flLiquidLevelHeightDelta", "m_flValue") or 0.0,
+            "up": vec(block, "g_vLiquidLevelUpwardsMinMidMax") or [0.0, 0.0, 0.0],
+            "down": vec(block, "g_vLiquidLevelDownwardsMinMidMax") or [0.0, 0.0, 0.0],
+            "side": vec(block, "g_vLiquidLevelSidewardsMinMidMax") or [0.0, 0.0, 0.0],
+            "center": vec(block, "g_flLiquidCenterOffset") or [0.0, 0.0, 0.0],
+            # Colour. hueShift is authored in DEGREES and uploaded as radians,
+            # the same convention g_fHueShift uses on csgo_weapon.
+            "color": vec(block, "g_vLiquidColor") or [1.0, 1.0, 1.0],
+            "hueShift": num(block, "g_flLiquidColorHueShift", "m_flValue") or 0.0,
+            "brightness": num(block, "g_flLiquidBrightness", "m_flValue") or 1.0,
+            "innerGlow": num(block, "g_flLiquidInnerGlow", "m_flValue") or 0.0,
+            # Edges: the meniscus, the sharpness of the fill boundary, and the
+            # bright line the surface draws where it meets the glass.
+            "surfaceTension": num(block, "g_flSurfaceTension", "m_flValue") or 0.0,
+            "sharpness": num(block, "g_flLiquidSharpness", "m_flValue") or 0.0,
+            "waterLine": num(block, "g_flWaterLineStrength", "m_flValue") or 0.0,
+            "brightenEmpty": num(block, "g_flBrightenEmptyArea", "m_flValue") or 0.0,
+            "fresnelThickness": num(block, "g_flFresnelGlassThickness", "m_flValue") or 0.0,
+            # The BACK wall of the volume, so the fill reads as a body of liquid
+            # rather than a flat cut across the silhouette.
+            "backOffset": num(block, "g_flLiquidBackOffset", "m_flValue") or 0.0,
+            "backFade": num(block, "g_flLiquidBackFade", "m_flValue") or 0.0,
+            "backShape": num(block, "g_flLiquidBackCylinderOrSphere", "m_flValue") or 0.0,
+            "roughness": num(block, "g_flLiquidRoughness", "m_flValue") or 0.0,
+            "maskMin": num(block, "g_flMaskMinimum", "m_flValue") or 0.0,
+            "maskMax": num(block, "g_flMaskMaximum", "m_flValue") or 0.0,
+            # Wobble, and the gravity the whole level test is taken along. Both
+            # are STATIC here on purpose: the game drives g_vTestGravityDir and
+            # g_flTestAgitation from a dynamic expression on render attribute
+            # 0x4B002DCA — the charm's live motion, which vfx_decode reports as
+            # unknown and drops — so the authored constants are the only honest
+            # answer. They are the at-rest values, which is what a viewer shows.
+            # Bubbles. Their density is gated by the roughness channel (see
+            # roughMap) — which is why they were first, wrongly, measured as
+            # never appearing at all.
+            "bubbleScale": num(block, "g_flBubbleScale", "m_flValue") or 0.0,
+            "bubbleDepthFalloff": num(block, "g_flBubbleDepthFalloff", "m_flValue") or 0.0,
+            "bubblesMin": num(block, "g_flBubblesMinimum", "m_flValue") or 0.0,
+            "bubblesMax": num(block, "g_flBubblesMaximum", "m_flValue") or 0.0,
+            "bubbleSpeed": num(block, "g_flBubbleSpeed", "m_flValue") or 0.0,
+            "bubbleSpaceScale": num(block, "g_flBubbleSpaceScale", "m_flValue") or 0.0,
+            "bubbleOpacity": num(block, "g_flBubbleOpacity", "m_flValue") or 0.0,
+            # Spent on the NORMAL, not the colour — see the bubbleStrength note in
+            # charmLiquid.ts. Without it the bubbles compute and stay invisible.
+            "bubbleStrength": num(block, "g_flBubbleStrength", "m_flValue") or 0.0,
+            "bubbleColorInner": vec(block, "g_vBubbleColorInner") or [0.0, 0.0, 0.0],
+            "bubbleColorOuter": vec(block, "g_vBubbleColorOuter") or [1.0, 1.0, 1.0],
+            "wobbleScale": num(block, "g_flLiquidWobbleScale", "m_flValue") or 0.0,
+            "wobbleSpeed": num(block, "g_flLiquidWobbleSpeed", "m_flValue") or 0.0,
+            "wobbleWavelength": num(block, "g_flLiquidWobbleWavelength", "m_flValue") or 0.0,
+            "agitation": num(block, "g_flTestAgitation", "m_flValue") or 0.0,
+            "gravity": vec(block, "g_vTestGravityDir") or [0.0, 0.0, -1.0],
+            # The outer shell sets F_OPAQUE_REFRACT and the inner volume does not,
+            # which is how the two halves of one vertex pool tell themselves apart.
+            "opaqueRefract": bool(num(block, "F_OPAQUE_REFRACT", "m_nValue")),
+        }
+        # Gates the fill, the waterline and the empty-area brighten. Without it
+        # the liquid covers the whole material — including the parts of the mesh
+        # that are not the vessel — so a missing mask is worth saying out loud.
+        # THE GLASS'S ROUGHNESS, which VRF's glTF export throws away.
+        #
+        # csgo_simple_liquid reads it as `g_tNormalA.z` (the decompile is explicit:
+        # `_13387 = vec2(_23988)` and _13387 is the base roughness). The vmat binds
+        # no roughness texture at all, so without this the vessel falls back to
+        # glTF's default 1.0 and renders DEAD MATTE — no speculars, no
+        # reflections, which is most of what the reference render is made of.
+        #
+        # It rides the chain as a bare texture, exactly like the tint masks, and
+        # for the same reason: the glTF carries RGB only. Measured inside the
+        # liquid mask on kc_db_lighter's normal map, blue is a flat 255 (VRF has
+        # rebuilt it as the octahedral Z) while ALPHA runs p10 30 / median 93 /
+        # p90 167 — the authored channel survives there and nowhere else, so the
+        # client samples .a.
+        nrm = re.search(r'm_name = "g_tNormalA"\s*\n\s*m_pValue = resource:"([^"]+)"', block)
+        if nrm:
+            liquid["roughMap"] = f"/textures/{tex_out_name(nrm.group(1))}"
+            mask_textures[nrm.group(1) + "_c"] = tex_out_name(nrm.group(1))
+        else:
+            print(f"!!! {stem}: csgo_simple_liquid with no g_tNormalA — the glass will render matte")
+        lmask = re.search(r'm_name = "g_tLiquidMask"\s*\n\s*m_pValue = resource:"([^"]+)"', block)
+        if lmask:
+            liquid["mask"] = f"/textures/{tex_out_name(lmask.group(1))}"
+            mask_textures[lmask.group(1) + "_c"] = tex_out_name(lmask.group(1))
+        else:
+            print(f"!!! {stem}: csgo_simple_liquid with no g_tLiquidMask — the fill will not be gated")
+        # The renderer ships the WOBBLE as a constant, because the shader scales
+        # its noise by `wobbleScale * agitation^2` and both of Butane Buddy's
+        # materials leave that at 1e-4/1e-2 — at most a 0.008 ripple on a body
+        # 1.2 units across. Checked HERE because here is where a new liquid charm
+        # would first be seen; the bound is the noise term's own maximum,
+        # `0.35 * wobbleScale * agit^2 * 15 * 1.5`.
+        _agit = liquid["agitation"] ** 2 + 0.01
+        _ripple = 0.35 * liquid["wobbleScale"] * _agit * _agit * 22.5
+        if _ripple > 0.01:
+            print(f"!!! {stem}: wobble amplitude {_ripple:.4f} is no longer negligible — "
+                  "the renderer's constant needs replacing with the real noise "
+                  "(see wobbleConstant in src/charmLiquid.ts)")
+        entry["liquid"] = liquid
     # ---- WHICH PART of the charm the pattern recolours ----------------------
     #
     # Not all of it, on 52 of the 81 seed-driven materials. `F_TINT_MASK` binds
@@ -2133,9 +2436,14 @@ with open(os.environ["CHARM_TEXTURES"], "w") as fh:
 shared = len([c for c in charms.values() if "material" in c])
 seeded = len([e for e in shading.values() if "dynamic" in e])
 masked = len([e for e in shading.values() if "tintMask" in e])
+liquids = len([e for e in shading.values() if "liquid" in e])
 print(f"--- Charm models: {len(charms)} charms, {shared} sharing a blank mesh with their own material")
 print(f"--- Charm shading: {len(shading)} of {len(BLOCKS)} materials corrected, "
       f"{seeded} pattern-driven, {masked} tint-masked ({len(mask_textures)} mask textures)")
+# Two on this build, both Butane Buddy's. A zero here means the liquid parse
+# stopped matching and that charm is back to rendering as empty glass — which
+# looks like a texture problem and is not one.
+print(f"--- Charm liquid: {liquids} csgo_simple_liquid materials")
 if not charms:
     print("!!! No charm definitions recovered — charms will fall back to their "
           "flat art. Check that scripts/items/items_game.txt extracted.")
@@ -3889,25 +4197,35 @@ print(f"---   wrote {written} material JSON files")
 # moment they go unreferenced would 404 those and render that tab's guns white,
 # which is exactly the interruption staging exists to avoid. One run of grace is
 # enough — a tab that old has reloaded.
-keep = {out_name(t, "vtex") for t in textures}
-prev_file = os.path.join(dest, "referenced.json")
-try:
-    with open(prev_file) as fh:
-        keep |= set(json.load(fh))
-except Exception:
-    pass  # first run, or unreadable — prune nothing this time
-removed = 0
-for f in os.listdir(tex_dir):
-    if f not in keep:
-        try:
-            os.remove(os.path.join(tex_dir, f))
-            removed += 1
-        except OSError:
-            pass
-with open(prev_file, "w") as fh:
-    json.dump(sorted(out_name(t, "vtex") for t in textures), fh)
-if removed:
-    print(f"---   pruned {removed} textures no longer referenced by this or the previous run")
+# A SCOPED RUN MUST NOT PRUNE. `textures` is only what THIS run walked, so on a
+# partial run it is a tiny fraction of the catalogue and pruning against it
+# deletes everything else. That is not hypothetical: a two-step run on
+# 2026-08-05 took the live mount from ~16,800 textures to 262 and every skin
+# rendered white. Staging is seeded from live, so skipping the prune simply
+# leaves the untouched files in place — and referenced.json keeps the FULL run's
+# answer, which is what the next full run needs to prune correctly.
+if os.environ.get("PARTIAL_RUN") == "1":
+    print("---   scoped run: no prune, referenced.json left alone")
+else:
+    keep = {out_name(t, "vtex") for t in textures}
+    prev_file = os.path.join(dest, "referenced.json")
+    try:
+        with open(prev_file) as fh:
+            keep |= set(json.load(fh))
+    except Exception:
+        pass  # first run, or unreadable — prune nothing this time
+    removed = 0
+    for f in os.listdir(tex_dir):
+        if f not in keep:
+            try:
+                os.remove(os.path.join(tex_dir, f))
+                removed += 1
+            except OSError:
+                pass
+    with open(prev_file, "w") as fh:
+        json.dump(sorted(out_name(t, "vtex") for t in textures), fh)
+    if removed:
+        print(f"---   pruned {removed} textures no longer referenced by this or the previous run")
 
 print(f"--- Paint chain: {written} materials, {len(textures)} textures -> {dest}")
 if unresolved:
@@ -3958,6 +4276,17 @@ steps_json() {
   done
   printf '%s}' "$out"
 }
+# A SCOPED RUN DOES NOT STAMP.
+#
+# The version means "this mount has everything the pipeline at vN produces", and
+# a run that skipped steps has not earned that. Leaving the mount stale is the
+# safe direction: the next full run still happens, and nothing downstream is
+# fooled into treating a partial mount as complete. It also keeps the dev loop
+# honest — a scoped run is for iterating, not for shipping a version.
+if [[ "$PARTIAL_RUN" == "1" ]]; then
+  echo "--- Total run time: $(fmt_dur "$RUN_SECONDS")"
+  echo "--- Scoped run — NOT stamping extract-version.json (mount stays stale on purpose)"
+else
 cat >"$DEST/extract-version.json" <<JSON
 {
  "version": $EXTRACT_VERSION,
@@ -3971,6 +4300,7 @@ cat >"$DEST/extract-version.json" <<JSON
 JSON
 echo "--- Total run time: $(fmt_dur "$RUN_SECONDS")"
 echo "--- Stamped extract-version.json (pipeline v$EXTRACT_VERSION, CS2 build ${GAME_BUILD:-unknown})"
+fi
 
 # ---- 7. Bundle ---------------------------------------------------------------
 if [[ -n "$OUT_DIR" ]]; then

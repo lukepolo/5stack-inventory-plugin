@@ -13,6 +13,13 @@
  * lands in the main bundle, and a static import here would undo that.
  */
 import type * as ThreeNS from "three";
+import {
+  parseCharmLiquid,
+  patchCharmLiquidShader,
+  resolveCharmLiquid,
+  setCharmLiquidUniforms,
+  type ResolvedLiquid,
+} from "./charmLiquid";
 import { paintTextureUrl } from "./paintComposite";
 
 type Three = typeof ThreeNS;
@@ -36,6 +43,13 @@ export interface CharmShading {
   maskRoughness?: boolean;
   /** Seed-driven shader params as decoded expression trees — see evalVfx. */
   dynamic?: Record<string, VfxNode>;
+  /**
+   * `csgo_simple_liquid.vfx`'s params, when this material is on that shader.
+   *
+   * Two materials, both Charm | Butane Buddy's. Untyped here and validated in
+   * charmLiquid's parseCharmLiquid, which is the module that knows the shape.
+   */
+  liquid?: Record<string, unknown>;
 }
 export type VfxNode = number | { f: string; a: VfxNode[] };
 
@@ -131,6 +145,12 @@ const HONOURED = new Set([
   "g_vMetalnessRemapRange",
   "g_fTextureRoughnessContrast",
   "g_fTextureRoughnessBrightness",
+  // csgo_simple_liquid's two seed-driven params, which is the whole of Charm |
+  // Butane Buddy's pattern space: a full hue sweep on the butane and a fill
+  // level that cycles. Listing them is what lets the rail offer that space —
+  // until they were here the one charm with a liquid reported as pattern-inert.
+  "g_flLiquidColorHueShift",
+  "g_flLiquidLevelHeight",
 ]);
 
 /**
@@ -181,6 +201,8 @@ interface CharmTune extends CharmAdjust {
   metalness?: number;
   /** True when any colour knob is off identity at THIS pattern. */
   graded: boolean;
+  /** Present only on a `csgo_simple_liquid` material — see charmLiquid.ts. */
+  liquid?: ResolvedLiquid;
 }
 
 /**
@@ -225,6 +247,10 @@ function charmTune(tune: CharmShading, seed: number): CharmTune {
     roughContrast = one("g_fTextureRoughnessContrast", 1);
     roughBright = one("g_fTextureRoughnessBrightness", 1);
   }
+  // The liquid resolves against the SAME seed-driven map — `one` is exactly the
+  // evaluator its two params need, so the pattern reaches the butane's hue and
+  // fill level by the same route it reaches everything else's colour.
+  const liq = parseCharmLiquid(tune.liquid);
   return {
     hueRad: (hueDeg * Math.PI) / 180,
     sat,
@@ -234,6 +260,7 @@ function charmTune(tune: CharmShading, seed: number): CharmTune {
     roughBright,
     metalness,
     graded: hueDeg !== 0 || sat !== 1 || bright !== 1 || contrast !== 1,
+    ...(liq ? { liquid: resolveCharmLiquid(liq, one) } : {}),
   };
 }
 
@@ -241,6 +268,16 @@ function charmTune(tune: CharmShading, seed: number): CharmTune {
 export function charmSeedAdjust(tune: CharmShading, seed: number): CharmAdjust {
   const { hueRad, sat, contrast, bright } = charmTune(tune, seed);
   return { hueRad, sat, contrast, bright };
+}
+
+/**
+ * The liquid at one pattern, for the same callers — null on any other material.
+ *
+ * Exists so the pattern rail can ask "what colour is this pattern" of a charm
+ * whose colour is not in its albedo. See liquidSwatch.
+ */
+export function charmSeedLiquid(tune: CharmShading, seed: number): ResolvedLiquid | null {
+  return charmTune(tune, seed).liquid ?? null;
 }
 
 const LUM = [0.2125, 0.7154, 0.0721] as const;
@@ -388,6 +425,7 @@ vec3 csCharmAdjust( vec3 linear ) {
  * caller awaits first. Kept out of here so this stays SYNCHRONOUS: it is called
  * per tick of a pattern drag, and a mask does not change with the pattern.
  */
+
 export function tuneCharmShading(
   THREE: Three,
   model: ThreeNS.Object3D,
@@ -411,6 +449,9 @@ export function tuneCharmShading(
       (mat.userData.colorAdjust as ThreeNS.Vector4).set(v.hueRad, v.sat, v.contrast, v.bright);
       (mat.userData.roughAdjust as ThreeNS.Vector2).set(v.roughContrast, v.roughBright);
       if (v.metalness !== undefined) mat.metalness = v.metalness;
+      // Same deal for the liquid: its hue and fill level are seed-driven, so a
+      // rail drag has to reach them without rebuilding the program.
+      if (v.liquid) setCharmLiquidUniforms(THREE, mat, v.liquid);
       return;
     }
     // Clone whenever the shading is SEED-DRIVEN, even where this particular
@@ -421,7 +462,15 @@ export function tuneCharmShading(
     // A material the seed cannot touch still takes the old early exit, so an
     // untouched charm keeps sharing the cached material and its program.
     const seedDriven = seedDrivenShading(tune);
-    if (!seedDriven && v.roughContrast === 1 && v.roughBright === 1 && !v.graded && v.metalness === undefined) return;
+    if (
+      !seedDriven &&
+      !v.liquid &&
+      v.roughContrast === 1 &&
+      v.roughBright === 1 &&
+      !v.graded &&
+      v.metalness === undefined
+    )
+      return;
     // CLONED, not mutated in place: the gltf comes out of a shared LRU and the
     // tuning is seed-dependent, so two viewers showing the same charm at
     // different patterns would otherwise overwrite each other's colour. (It
@@ -430,6 +479,13 @@ export function tuneCharmShading(
     owned.name = mat.name;
     mesh.material = owned;
     mesh.userData.charmTuned = owned;
+    // Does THIS material's look move with the pattern? Recorded on the material
+    // because a charm can own several and they need not agree: Butane Buddy's
+    // outer shell is seed-driven while its inner liquid volume is static, and
+    // charmAlbedoTile has to hand the rail the one that varies or the rail
+    // declares the whole charm inert. Written even when false — the absence of
+    // the flag would otherwise be indistinguishable from an untuned material.
+    owned.userData.charmSeedDriven = seedDriven;
     if (v.metalness !== undefined) owned.metalness = v.metalness;
     // Roughness rides the uniform whole — `roughness` stays 1 — because the
     // game's adjust is `((r - 0.5) * contrast + 0.5) * brightness` and neither
@@ -442,9 +498,19 @@ export function tuneCharmShading(
     // a 1x1 white stands in where there is no mask. Branching the source
     // instead would compile a second program and cost a hitch mid-scrub, and
     // one extra texture unit is nothing on a material with four.
+    // A material is on csgo_weapon OR csgo_simple_liquid, never both, so the
+    // liquid's `g_tLiquidMask` rides this same slot rather than costing a second
+    // sampler — see loadCharmTintMasks, which loads whichever one the material
+    // names under exactly the same two rules (the albedo's flipY, NoColorSpace).
     const mask = masks?.get(mat.name) ?? null;
     owned.userData.tintMask = mask ?? whiteTexture(THREE);
     owned.userData.charmMask = new THREE.Vector2(mask ? 1 : 0, mask && tune.maskRoughness ? 1 : 0);
+    // Bound before the uniforms are seeded: setCharmLiquidUniforms reads whether
+    // a roughness map is present to decide between it and the constant.
+    const lqRough = masks?.get(`${mat.name}\u0000rough`) ?? null;
+    owned.userData.lqRough = lqRough ?? whiteTexture(THREE);
+    owned.userData.lqRoughBound = !!lqRough;
+    if (v.liquid) setCharmLiquidUniforms(THREE, owned, v.liquid);
     owned.onBeforeCompile = (shader) => {
       shader.uniforms.uRoughAdjust = { value: owned.userData.roughAdjust };
       shader.uniforms.uColorAdjust = { value: owned.userData.colorAdjust };
@@ -469,6 +535,10 @@ export function tuneCharmShading(
           "#include <map_fragment>",
           "#include <map_fragment>\n\tdiffuseColor.rgb = csCharmAdjust( diffuseColor.rgb );",
         );
+      // AFTER the block above, never before: both inject at `void main() {`, so
+      // whichever runs last sits closest to it — and the liquid calls
+      // csCharmMask(), which GLSL requires to be declared first.
+      if (v.liquid) patchCharmLiquidShader(shader, owned);
     };
     owned.needsUpdate = true;
   });
@@ -511,15 +581,30 @@ export async function loadCharmTintMasks(
   const out = new Map<string, ThreeNS.Texture>();
   if (!shading || !Object.keys(shading).length) return out;
   const wanted = new Map<string, { path: string; flipY: boolean }>();
+  const wantedRough = new Map<string, { path: string; flipY: boolean }>();
   model.traverse((n) => {
     const mesh = n as ThreeNS.Mesh;
     if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
     const mat = mesh.material as ThreeNS.MeshStandardMaterial;
     const name = mat?.name;
-    const url = name ? shading[name]?.tintMask : null;
+    const tune = name ? shading[name] : null;
+    // A csgo_weapon material names a tint mask; a csgo_simple_liquid one names
+    // `g_tLiquidMask`. Different shaders, but the same kind of texture with the
+    // same two requirements, and no material is ever on both — so they load
+    // together and land in one map keyed by material.
+    const liquidMask = tune?.liquid?.mask;
+    const url = tune?.tintMask ?? (typeof liquidMask === "string" ? liquidMask : null);
+    // The liquid's ROUGHNESS rides along on the same trip: it is the same kind of
+    // texture with the same two rules, and fetching it separately would mean a
+    // second async pass the tune has to wait on. Keyed apart so one material can
+    // legitimately want both.
+    const rough = tune?.liquid?.roughMap;
+    if (typeof rough === "string" && name) {
+      wantedRough.set(name, { path: rough, flipY: mat.map?.flipY ?? true });
+    }
     // The ALBEDO's orientation, carried along, because the mask has to be read
     // in the same one — see the flipY note below.
-    if (url) wanted.set(name, { path: url, flipY: mat.map?.flipY ?? true });
+    if (url && name) wanted.set(name, { path: url, flipY: mat.map?.flipY ?? true });
   });
   await Promise.all(
     [...wanted].map(async ([name, { path, flipY }]) => {
@@ -551,6 +636,23 @@ export async function loadCharmTintMasks(
         tex.needsUpdate = true;
       }
       out.set(name, tex);
+    }),
+  );
+  await Promise.all(
+    [...wantedRough].map(async ([name, { path, flipY }]) => {
+      const tex = await loadTexture(paintTextureUrl(path)).catch(() => null);
+      if (!tex) return;
+      if (tex.flipY !== flipY) {
+        tex.flipY = flipY;
+        tex.needsUpdate = true;
+      }
+      // Raw, like the masks: this is a roughness map, and letting the shared
+      // loader mark it sRGB would have the GPU decode every sample.
+      if (tex.colorSpace !== THREE.NoColorSpace) {
+        tex.colorSpace = THREE.NoColorSpace;
+        tex.needsUpdate = true;
+      }
+      out.set(`${name}\u0000rough`, tex);
     }),
   );
   return out;

@@ -155,10 +155,25 @@ if you're looking for it in git history, this section is what it became.
   fallback — see `scripts/extract-models.sh`.
 - **Loadout model**: one row per `(steam_id, team, slot)` in `inventory.loadout`,
   where `slot` is a weapon model (`ak47`) or a special slot (`knife`, `gloves`,
-  `agent`) and `item_id` is a cs2-lib item id.
+  `agent`, `zeus`, `c4`, `musickit`, `graffiti`, `collectible`) and `item_id` is
+  a cs2-lib item id. The set of legal slots lives in **two** places that must
+  agree — `SLOT_RE` in `backend/src/main.ts` and the whitelist in the boot-time
+  `DELETE` in `backend/src/schema.sql`. A slot the API accepts and the SQL
+  forgets gets wiped on the next restart.
+- **Craft attributes are validated per ITEM, not per type** (`validateCraftAttrs`
+  in `backend/src/catalog.ts`). cs2-lib knows each finish's real float range, and
+  most of them are not 0..1: **1,683 of the 2,106 paintable items are narrower**
+  (AK-47 | Redline is 0.10–0.70, Desert Eagle | Blaze is 0.00–0.08). It also
+  knows that the 68 vanilla weapons have no float, no pattern and no StatTrak at
+  all, which a type-level rule cannot express. Values are truncated to the
+  game's own quantization step *before* validating, because an 0.01 browser
+  slider emits `0.30000000000000004` and rejecting that would be rejecting the
+  user's honest input. The craft editor's slider reads the same bounds off the
+  catalog listing (`wearMin`/`wearMax`), so the UI and the door agree.
 - **API**:
   - `GET /api/catalog` → base weapons (grouped by category client-side) + agents
-  - `GET /api/catalog/skins?slot=<model|knife|gloves|agent>` → skins for a slot
+  - `GET /api/catalog/skins?slot=<model|knife|gloves|agent|musickit|graffiti|collectible>`
+    → skins for a slot
   - `GET /api/loadout` → the user's equipped slots (enriched with item name/image)
   - `POST /api/loadout` `{team, slot, item_id}` → equip
   - `DELETE /api/loadout?team=&slot=` → unequip
@@ -231,6 +246,30 @@ debugging session:
 `/api/sign-in` and its browser-facing `/api/sign-in/callback` page are **not
 implemented yet** — only relevant if a server enables `invsim_wslogin`
 (defaults off).
+
+### What the v5 payload has to get right
+
+`/api/equipped/v5` is generated field-for-field against upstream's `docs/api.md`
+and the plugin's `src/Models/InventoryItem.cs`. Four of those fields are quiet
+failure modes rather than cosmetic mismatches:
+
+- **`hash`** is the plugin's *only* change-detection signal —
+  `InventoryItem.Equals` compares nothing else, and `RegiveAgent` /
+  `RegiveGloves` / `RegiveWeapons` all bail on `oldItem == item`. It is computed
+  over the whole entry, so anything added to the payload is covered
+  automatically. A hash over a hand-picked subset means `!ws` cannot apply
+  whatever it left out until the player respawns.
+- **`keychains[].sticker`** names the sticker a Sticker Slab displays. 11,144 of
+  the 11,224 charms in the catalog are slabs, and the charm's own `def` only
+  picks the hanger — without this every slab in the game arrives blank.
+- **`graffiti.tint`** must be `?? 0`, never omitted. The plugin's
+  `SprayGraffiti()` returns early when `Tint` is null, and 438 of the 2,205
+  graffiti carry no tint of their own — so an omitted field is a spray that
+  silently does nothing.
+- **`charges`** is *deliberately absent*. Upstream uses it to make graffiti a
+  consumable (50 sprays, then the item is gone); a missing `charges` is the
+  plugin's "unlimited", which is what a loadout sandbox wants. That is also why
+  there is no `/api/consume-item-spray` here.
 
 [invsim]: https://github.com/ianlucas/cs2-ss2-inventory-simulator
 [invsim-css]: https://github.com/ianlucas/cs2-css-inventory-simulator

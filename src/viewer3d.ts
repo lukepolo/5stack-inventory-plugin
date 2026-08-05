@@ -18,6 +18,7 @@ import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
 import { FLAGS, flagValue, setFlag } from "./devFlags";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
+import { tickCharmLiquid } from "./charmLiquid";
 import {
   buildCharmSim,
   charmMotion,
@@ -6548,6 +6549,50 @@ async function buildViewer(
     }
   }
 
+  /**
+   * The liquid's own animation, for the one charm that has one.
+   *
+   * A liquid surface stays level while its vessel tips, and agitates when the
+   * vessel moves — CS2 drives both from the charm's live motion (see
+   * tickCharmLiquid). The signal is the OBJECT's rotation, so this covers every
+   * way a charm moves here: swinging on the cloth solver while attached, and
+   * being orbited or spun in a standalone preview.
+   *
+   * Cheap enough to run unconditionally: it early-outs on the first traverse for
+   * any model with no liquid material, which is every charm but one.
+   */
+  /**
+   * Idle sway for a charm shown on its own.
+   *
+   * A charm hanging in CS2's inspect view is never still, and that motion is
+   * what its liquid answers to. Here the model genuinely does not move: orbiting
+   * drives OrbitControls, which moves the CAMERA — so a liquid keyed off the
+   * object's rotation (correctly: turning your head must not slosh a bottle) had
+   * nothing to respond to and read as broken.
+   *
+   * A couple of degrees, two slow incommensurate periods so it never visibly
+   * loops. Deliberately NOT applied to `still` viewers: those exist to be
+   * photographed, and a card bake has to be deterministic.
+   */
+  let swayBase: import("three").Quaternion | null = null;
+  function stepCharmIdle(now: number) {
+    if (kind !== "charm" || opts?.still) return;
+    if (!swayBase) swayBase = object.quaternion.clone();
+    const t = now / 1000;
+    const e = new THREE.Euler(Math.sin(t * 1.07) * 0.06, 0, Math.cos(t * 0.63) * 0.04);
+    object.quaternion.copy(swayBase).multiply(new THREE.Quaternion().setFromEuler(e));
+  }
+
+  let lqLast = 0;
+  function stepCharmLiquid() {
+    const root = kind === "charm" ? object : charm?.sprite;
+    if (!root) return;
+    const now = performance.now();
+    const dt = lqLast ? Math.min(0.1, (now - lqLast) / 1000) : 1 / 60;
+    lqLast = now;
+    tickCharmLiquid(THREE, root, WORLD_Y, dt);
+  }
+
   function updateCharmVisuals() {
     if (!charm || charm.sim) return;
     charm.sprite.position.copy(charm.pos);
@@ -8242,6 +8287,8 @@ async function buildViewer(
     controls.update();
     const tCtrl = perfHud ? performance.now() : 0;
     stepCharm();
+    stepCharmIdle(performance.now());
+    stepCharmLiquid();
     updateRing();
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
@@ -8366,6 +8413,10 @@ async function buildViewer(
       let img: CanvasImageSource | null = null;
       let material: string | null = null;
       let maskImg: CanvasImageSource | null = null;
+      /** The first TUNED material, used only if none of them is seed-driven. */
+      let anyImg: CanvasImageSource | null = null;
+      let anyMaterial: string | null = null;
+      let anyMaskImg: CanvasImageSource | null = null;
       /** Fallback albedo, used only when nothing on this charm was tuned. */
       let plain: CanvasImageSource | null = null;
       root.traverse((n) => {
@@ -8380,15 +8431,31 @@ async function buildViewer(
         // separate materials shared across a collection, and averaging their
         // chrome into the swatch would grey out every band on the rail.
         if (mesh.userData.charmTuned === mat) {
-          img = src;
-          material = mat.name || null;
           // Its tint mask, taken off the same material rather than refetched, so
           // a caller predicting the grade masks it with the very texels the
           // shader samples. The white stand-in is skipped on the flag, not on
           // its pixels — see tuneCharmShading.
           const flag = mat.userData.charmMask as { x: number } | undefined;
           const tint = mat.userData.tintMask as import("three").Texture | undefined;
-          if (flag?.x === 1 && tint?.image) maskImg = tint.image as CanvasImageSource;
+          const thisMask = flag?.x === 1 && tint?.image ? (tint.image as CanvasImageSource) : null;
+          // PREFER A MATERIAL THAT ACTUALLY MOVES WITH THE PATTERN. A charm can
+          // own several tuned materials and they need not agree: Butane Buddy is
+          // an inner liquid volume with a STATIC level and hue, drawn before the
+          // outer shell whose two are seed-driven. Taking the first tuned one
+          // reported the static half, the rail read that as "this charm's
+          // pattern does nothing", and — because an inert rail hides its whole
+          // panel — the craft modal lost every control it had.
+          if (mat.userData.charmSeedDriven !== true) {
+            if (!anyImg) {
+              anyImg = src;
+              anyMaterial = mat.name || null;
+              anyMaskImg = thisMask;
+            }
+            return;
+          }
+          img = src;
+          material = mat.name || null;
+          maskImg = thisMask;
           return;
         }
         // Nothing tuned yet. Keep the first body texture anyway so a caller
@@ -8396,6 +8463,11 @@ async function buildViewer(
         // honest report that no shading entry matched this charm at all.
         if (!plain && !/(^|[^a-z])(chain|clasp|ring)([^a-z]|$)/i.test(mesh.name)) plain = src;
       });
+      if (!img && anyImg) {
+        img = anyImg;
+        material = anyMaterial;
+        maskImg = anyMaskImg;
+      }
       const source = img ?? plain;
       if (!source) return null;
       try {

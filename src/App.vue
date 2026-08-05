@@ -1347,10 +1347,10 @@ const craftSlotSays = (nope: string[]) => !nope.includes(selected.value);
  */
 const craftSeedIsCharm = computed(() => craftType.value === "keychain");
 const craftHasSeed = computed(() =>
-  craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti"]),
+  craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible"]),
 );
 const craftHasWear = computed(() =>
-  craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti"]),
+  craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible"]),
 );
 /**
  * Can this finish's pattern move its artwork at all?
@@ -1376,6 +1376,30 @@ const patternMoves = ref<boolean | null>(null);
  */
 const craftHasScratch = computed(() => hasScratch({ type: craftType.value }));
 /**
+ * The float range this FINISH actually exists in — not 0..1.
+ *
+ * 1,683 of the 2,106 paintable items are narrower than the full range (AK-47 |
+ * Redline is 0.10–0.70, Desert Eagle | Blaze is 0.00–0.08), and the editor used
+ * to offer every one of them a 0..1 slider. That built items that cannot exist,
+ * and shipped the impossible float to the game server through the v5 feed.
+ *
+ * The backend now rejects those (validateCraftAttrs), so the slider agreeing
+ * with it is not cosmetic — an unbounded slider would just turn an impossible
+ * item into a save that 400s.
+ *
+ * Falls back to the full range while the item's own bounds are unknown: a
+ * catalog listing from before the field existed must stay editable.
+ */
+const craftWearRange = computed(() => {
+  const i = (craft.value?.skin ?? craftInst.value?.item) as
+    | { wearMin?: number | null; wearMax?: number | null }
+    | undefined;
+  // A sticker's scratch is a different attribute that happens to share the
+  // column — it is always the full 0..1 and has no per-item bound.
+  if (craftHasScratch.value) return { min: 0, max: 1 };
+  return { min: i?.wearMin ?? 0, max: i?.wearMax ?? 1 };
+});
+/**
  * Name tag. Asks the type for the same reason every gate here does — the old
  * slot-shaped test would offer one to a sticker opened from the inventory,
  * because `selected` was still on a rifle.
@@ -1387,14 +1411,14 @@ const craftHasNameTag = computed(() =>
     // the field was offered to gloves and charms purely because the old
     // exclusion list was written before either could be opened on its own.
     ? ["weapon", "melee"].includes(craftType.value)
-    : craftSlotSays(["agent", "musickit", "graffiti", "gloves"]),
+    : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "gloves"]),
 );
 // StatTrak is weapons, knives and music kits — NOT gloves, which do have a float
 // and a pattern. That distinction is invisible to a slot-shaped gate.
 const craftHasStatTrak = computed(() =>
   craftType.value
     ? ["weapon", "melee", "musickit"].includes(craftType.value)
-    : craftSlotSays(["agent", "graffiti"]),
+    : craftSlotSays(["agent", "graffiti", "collectible"]),
 );
 /**
  * Does the options column have anything to put in it?
@@ -1783,8 +1807,33 @@ function randomWear() {
   // a sticker's scratch is the same 0..1 the per-slot sliders step at 0.01 and
   // print at 2dp, so rolling 0.4837 here would have the sticker's own page and
   // the weapon's options column disagree about the same number.
-  if (craft.value) craft.value.wear = Number(rand(0, 1).toFixed(craftHasScratch.value ? 2 : 4));
+  //
+  // Rolls inside the finish's OWN range — a die that can land on a float the
+  // item cannot have is a die that produces a save error.
+  const { min, max } = craftWearRange.value;
+  if (craft.value) craft.value.wear = Number(rand(min, max).toFixed(craftHasScratch.value ? 2 : 4));
 }
+/**
+ * Pull the float back inside the finish's range whenever the subject changes.
+ *
+ * The editor keeps `craft.wear` across a skin swap (deliberately — you compare
+ * two finishes at the same float), so switching from a 0..1 finish to Blaze at
+ * 0.00–0.08 would otherwise leave 0.5 sitting in a slider that cannot express
+ * it: the thumb pins to the end, the number says 0.5, and the save 400s.
+ *
+ * Clamp only — never rewrites a float already inside the range, so it can't
+ * quietly "fix" a value the user chose.
+ */
+watch(
+  () => [craftWearRange.value.min, craftWearRange.value.max, craft.value?.skin?.id] as const,
+  () => {
+    const c = craft.value;
+    if (!c || typeof c.wear !== "number") return;
+    const { min, max } = craftWearRange.value;
+    if (c.wear < min) c.wear = min;
+    else if (c.wear > max) c.wear = max;
+  },
+);
 function randomSeed() {
   if (craft.value) craft.value.seed = Math.floor(rand(1, 1001));
 }
@@ -6873,6 +6922,10 @@ if (MDEBUG) {
                 class="group relative flex flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
                 :class="[
                   s.slot === 'agent' ? 'col-span-2 min-h-[132px]' : 'min-h-[96px]',
+                  // Agent already eats two cells, so the row parity flips on an
+                  // EVEN item count — then the last tile takes the full width
+                  // instead of sitting alone next to a gap.
+                  compactEquipment.length % 2 === 0 && si === compactEquipment.length - 1 && 'col-span-2',
                   selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
                   pulsePos === s.slot && 'animate-equip-pulse',
                 ]"
@@ -7099,6 +7152,9 @@ if (MDEBUG) {
                 :class="[
                   selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                   pulsePos === s.slot && 'animate-equip-pulse',
+                  // Odd count in a two-column grid: the last tile takes the whole
+                  // row rather than leaving a half-width orphan beside a gap.
+                  EXTRAS.length % 2 === 1 && si === EXTRAS.length - 1 && 'col-span-2',
                 ]"
                 :style="[selRing(selected === s.slot), dropStyle(s.slot)]"
                 :data-slot="s.slot" data-role="rail"
@@ -8744,15 +8800,24 @@ if (MDEBUG) {
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
                 <input
                   v-model.number="craft.wear"
-                  type="number" min="0" max="1" step="0.0001"
+                  type="number" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001"
                   class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
                 />
                 <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random wear" @click="randomWear">🎲</button>
               </div>
               <div class="mt-2 flex items-center gap-2">
-                <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
+                <input v-model.number="craft.wear" type="range" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001" class="wear-range w-full" />
               </div>
-              <div class="mt-1 text-right font-mono text-f9 text-muted-foreground">{{ wearTier(craft.wear) }}</div>
+              <div class="mt-1 flex items-center justify-between font-mono text-f9 text-muted-foreground">
+                <!-- Only worth saying when it ISN'T the full range, which is
+                     most finishes — otherwise it reads as noise on the few that
+                     genuinely go 0.00–1.00. -->
+                <span v-if="craftWearRange.min > 0 || craftWearRange.max < 1">
+                  {{ craftWearRange.min.toFixed(2) }}–{{ craftWearRange.max.toFixed(2) }} only
+                </span>
+                <span v-else></span>
+                <span>{{ wearTier(craft.wear) }}</span>
+              </div>
             </div>
             <!-- A sticker's scratch. Same box and rhythm as the weapon's Wear
                  above but NO tier caption: "Factory New" is a float's vocabulary
@@ -8985,7 +9050,7 @@ if (MDEBUG) {
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button
-          v-if="ctx && !['agent', 'graffiti', 'musickit'].includes(ctx.pos)"
+          v-if="ctx && !['agent', 'graffiti', 'musickit', 'collectible'].includes(ctx.pos)"
           :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent']"
           :disabled="!equippedInstance(ctx.pos)"
           @click="ctxStatTrak"
@@ -9464,7 +9529,7 @@ if (MDEBUG) {
           </button>
         </template>
         <button
-          v-if="itemCtx && !['agent', 'graffiti', 'musickit'].includes(itemCtx.inst.slot ?? '')"
+          v-if="itemCtx && !['agent', 'graffiti', 'musickit', 'collectible'].includes(itemCtx.inst.slot ?? '')"
           :class="MENU_ROW"
           @click="itemCtxStatTrak"
         >

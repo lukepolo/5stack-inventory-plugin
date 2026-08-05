@@ -21,8 +21,9 @@ export const POSITION_GROUPS = [
 ] as const;
 export const START_PISTOLS = ["glock", "usp_silencer", "hkp2000"];
 export const isWeaponPos = (s: string) => /^(sp|p[1-4]|m[1-5]|r[1-5])$/.test(s);
-export const isSpecial = (s: string) => ["knife", "gloves", "agent", "zeus", "c4", "musickit", "graffiti"].includes(s);
-export const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti"].includes(s);
+export const isSpecial = (s: string) =>
+  ["knife", "gloves", "agent", "zeus", "c4", "musickit", "graffiti", "collectible"].includes(s);
+export const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti", "collectible"].includes(s);
 // "Special" is a LAYOUT concept (slot rail, catalog fetch, sheet keys) and was
 // doing double duty as the 3D gate, which is why knives could never show 3D
 // even once their GLBs existed. Split: this is the 3D one, and it's about
@@ -36,7 +37,7 @@ export const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti"].in
 // A slot-level answer is necessarily coarse — it is asked before an occupant is
 // known. The per-ITEM answer (a painted glove has no compositor yet) lives in
 // resolveViewerModel, and the focus/ctx paths below still HEAD-probe on top.
-export const isNo3d = (s: string) => ["c4", "musickit", "graffiti"].includes(s);
+export const isNo3d = (s: string) => ["c4", "musickit", "graffiti", "collectible"].includes(s);
 // Origin filter — the same control on the Inventory grid and on the loadout
 // sheet's Owned section, so "hide my Steam imports" works the same in both.
 export type OriginFilter = "all" | "steam" | "crafted";
@@ -69,6 +70,7 @@ export const GEAR_TYPES = [
   ["patch", "Patches"],
   ["musickit", "Music Kits"],
   ["graffiti", "Graffiti"],
+  ["collectible", "Pins & Medals"],
 ] as const;
 export const WEAPONISH = new Set<string>(WEAPON_GROUPS.map(([k]) => k));
 // Weapons are addressed by their category ("rifle"), everything else by its
@@ -115,5 +117,6 @@ export const EXTRAS = [
   { slot: "c4", name: "C4" },
   { slot: "musickit", name: "Music Kit" },
   { slot: "graffiti", name: "Graffiti" },
+  { slot: "collectible", name: "Pin / Medal" },
 ];
 export const ALL_SPECIALS = [...RAIL, ...EXTRAS];

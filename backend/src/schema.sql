@@ -46,8 +46,15 @@ CREATE INDEX IF NOT EXISTS loadout_steam_id_idx ON inventory.loadout (steam_id);
 -- CS2-style positional slots: sp (starting pistol), p1-p4 (other pistols),
 -- m1-m5 (mid-tier), r1-r5 (rifles), knife, gloves, agent. Drop rows from the
 -- legacy one-slot-per-weapon scheme.
+--
+-- KEEP THIS IN STEP WITH SLOT_RE IN main.ts. This file is re-applied on every
+-- boot, so a slot the API accepts but this list forgets is not a stale-data
+-- cleanup — it is a wipe on the next restart, and it looks like the equip
+-- silently failing hours later. 'graffiti' was exactly that: equippable since
+-- the graffiti sheet shipped, absent here, deleted on every backend restart.
 DELETE FROM inventory.loadout WHERE slot NOT IN
-  ('sp','p1','p2','p3','p4','m1','m2','m3','m4','m5','r1','r2','r3','r4','r5','knife','gloves','agent','zeus','c4','musickit');
+  ('sp','p1','p2','p3','p4','m1','m2','m3','m4','m5','r1','r2','r3','r4','r5',
+   'knife','gloves','agent','zeus','c4','musickit','graffiti','collectible');
 
 -- Migration: point the loadout at an owned instance instead of an inline item.
 ALTER TABLE inventory.loadout ADD COLUMN IF NOT EXISTS item_instance_id bigint;

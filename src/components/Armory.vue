@@ -67,6 +67,7 @@ const SECTIONS: Section[] = [
   { key: "agent", label: "Agents", kind: "slot", slot: "agent" },
   { key: "musickit", label: "Music Kits", kind: "slot", slot: "musickit" },
   { key: "graffiti", label: "Graffiti", kind: "slot", slot: "graffiti" },
+  { key: "collectible", label: "Pins & Medals", kind: "slot", slot: "collectible" },
   { key: "sticker", label: "Stickers", kind: "attach", attach: "sticker" },
   { key: "charm", label: "Charms", kind: "attach", attach: "charm" },
   { key: "patch", label: "Patches", kind: "attach", attach: "patch" },
@@ -79,7 +80,7 @@ const SECTIONS: Section[] = [
  * leaves you to infer what the rule meant.
  */
 const RAIL_GROUPS: { label: string; keys: string[] }[] = [
-  { label: "Gear", keys: ["weapon", "knife", "gloves", "agent", "musickit", "graffiti"] },
+  { label: "Gear", keys: ["weapon", "knife", "gloves", "agent", "musickit", "graffiti", "collectible"] },
   { label: "Attachments", keys: ["sticker", "charm", "patch"] },
 ];
 const railGroups = computed(() =>

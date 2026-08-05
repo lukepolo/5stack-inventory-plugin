@@ -16,7 +16,13 @@
 import { buildInspectHex } from "../backend/src/inspect.ts";
 
 const F_KEYCHAINS = 20;
-const SF = { slot: 1, id: 2, wear: 3, scale: 4, rotation: 5, offset_x: 7, offset_y: 8, offset_z: 9 } as const;
+// Deliberately a SECOND, independent copy of the wire numbers — importing
+// inspect.ts's own map would make this test agree with the encoder by
+// construction and prove nothing. Keep the literals.
+const SF = {
+  slot: 1, id: 2, wear: 3, scale: 4, rotation: 5,
+  offset_x: 7, offset_y: 8, offset_z: 9, pattern: 10, wrapped_sticker: 12,
+} as const;
 
 interface Field { field: number; wire: number; value: number | Uint8Array }
 
@@ -66,7 +72,9 @@ const hex = buildInspectHex({
   defindex: 7, paintindex: 1023, paintseed: 67, paintwear: 0.0001,
   stattrak: true, killeatervalue: 0, nametag: "5stuck Sc Test",
   stickers: [],
-  keychains: [{ slot: 0, id: 14290, offsetX: OFF.x, offsetY: OFF.y, offsetZ: OFF.z, pattern: 0 }],
+  // wrappedSticker set because a Sticker Slab is 11,144 of the 11,224 charms:
+  // `id` alone picks the blank hanger, and the slab's art rides field 12.
+  keychains: [{ slot: 0, id: 14290, wrappedSticker: 1847, offsetX: OFF.x, offsetY: OFF.y, offsetZ: OFF.z, pattern: 0 }],
 });
 
 // buildInspectHex returns the payload as hex; strip the leading mask byte and
@@ -97,6 +105,18 @@ if (kc.length === 1) {
   const byId = new Map(fields.map((f) => [f.field, f]));
 
   check("keychain id survives", byId.get(SF.id)?.value === 14290, `got ${byId.get(SF.id)?.value}`);
+
+  // A VARINT here, unlike the offsets below — `optional uint32 wrapped_sticker
+  // = 12`. Without it every Sticker Slab charm inspects as the same blank slab,
+  // and cs2-lib's own parser cannot even resolve which slab it is. Must agree
+  // with `keychains[].sticker` in the equipped v5 feed, or the gun you inspect
+  // is not the gun the server builds.
+  const ws = byId.get(SF.wrapped_sticker);
+  check("wrapped_sticker present", !!ws, "field absent — every sticker slab inspects blank");
+  if (ws) {
+    check("wrapped_sticker survives", ws.value === 1847, `got ${ws.value}`);
+    check("wrapped_sticker wire type is varint", ws.wire === 0, `wire=${ws.wire}`);
+  }
 
   for (const [name, fieldNo, want] of [
     ["offset_x", SF.offset_x, OFF.x],

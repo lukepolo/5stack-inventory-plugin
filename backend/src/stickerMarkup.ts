@@ -129,6 +129,131 @@ export function slotCount(slots: StickerSlot[], mesh = "body_hd"): number {
   return slots.filter((s) => s.mesh === mesh).length;
 }
 
+// ---- Charm placement surfaces (KeychainMarkup) ------------------------------
+//
+// The sticker markup's counterpart for charms, out of the same DATA block and
+// written by the same extraction step. Each entry is one authored QUAD the game
+// will let a charm hang from.
+//
+// THE ONE THING THAT MATTERS: the corners are already in GLB space. Verified
+// against every weapon's GLB POSITION bounds — 32/32 fit as-is and 1/32 fits
+// with `base` added — so unlike the keychain ATTACHMENT (bone-relative, needs
+// base folded in; see the two-space note on offsetToWorld in viewer3d.ts) this
+// needs no transform, no `cal` and no pose to be used directly.
+//
+// WHY NOT cs2-lib 9's `keychainPosition{X,Y,Z}{Min,Max}` — and it is not because
+// they are wrong. Measured against ours on all 34 weapons that have both: 20 are
+// identical to the decimal and 14 differ by at most 0.561" (galilar), always in
+// the direction of cs2-lib being looser, because it folds the moving-part quads
+// (slide, bolt, pump, charge handle) into the same box as the body's. As a
+// CLAMP its box is fine.
+//
+// The reason to read the block ourselves is that a box cannot do the job. A
+// charm has to sit ON a surface, and only the quads say where the surfaces are —
+// an axis-aligned box around them includes plenty of empty air, which is exactly
+// how a charm ends up floating beside the weapon instead of flush against it.
+
+export interface CharmQuad {
+  /** "body_hd" | "body_legacy" — the same body-variant key sticker slots use. */
+  mesh: string;
+  /**
+   * The bone that MOVES this surface, not the frame it is written in.
+   *
+   * `weapon_offset` is the static body and covers 1,915 of the 2,141 quads. The
+   * rest ride a slide, bolt, magazine, silencer or pump and travel with the
+   * animation — a consumer that can't follow a bone should prefer the
+   * weapon_offset quads rather than pin a charm to a part that slides away.
+   *
+   * `elite` (Dual Berettas) has NO weapon_offset at all — its quads are on
+   * `weapon_r`/`weapon_l`, which is exactly the data its missing charm anchor
+   * needed.
+   */
+  bone: string;
+  /** 4 corners x XYZ, flat. GLB space. */
+  corners: number[];
+}
+
+const KEYCHAIN_MARKUP_FILE = path.join(MODELS_DIR, "keychain-markup.json");
+type CharmMarkup = Record<string, CharmQuad[]>;
+let keychainCache: { mtimeMs: number; markup: CharmMarkup } | null = null;
+let keychainInflight: Promise<CharmMarkup> | null = null;
+
+/** Whole quads or nothing — a truncated one would describe a surface that isn't
+ *  there, and a consumer would snap a charm onto it. */
+function validateCharm(raw: unknown): CharmQuad[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CharmQuad[] = [];
+  for (const item of raw) {
+    const e = item as Record<string, unknown>;
+    const corners = Array.isArray(e.corners) ? (e.corners as unknown[]).map(Number) : null;
+    if (!corners || corners.length !== 12 || corners.some((v) => !Number.isFinite(v))) continue;
+    out.push({
+      mesh: String(e.mesh ?? "body_hd"),
+      bone: String(e.bone ?? "weapon_offset"),
+      corners,
+    });
+  }
+  return out;
+}
+
+async function loadCharm(): Promise<CharmMarkup> {
+  const { mtimeMs } = await stat(KEYCHAIN_MARKUP_FILE);
+  if (keychainCache && keychainCache.mtimeMs === mtimeMs) return keychainCache.markup;
+  if (keychainInflight) return keychainInflight;
+  keychainInflight = (async () => {
+    try {
+      const doc = JSON.parse(await readFile(KEYCHAIN_MARKUP_FILE, "utf8")) as Record<string, unknown>;
+      const markup: CharmMarkup = {};
+      for (const [model, quads] of Object.entries(doc)) markup[model] = validateCharm(quads);
+      keychainCache = { mtimeMs, markup };
+      return markup;
+    } finally {
+      keychainInflight = null;
+    }
+  })();
+  return keychainInflight;
+}
+
+/** Charm surfaces for a weapon model key, or [] when unavailable. Never throws.
+ *  Empty is the honest answer for a knife (charms don't go on knives) and for a
+ *  mount extracted before v23 — callers keep whatever placement they had. */
+export async function getCharmMarkup(model: string): Promise<CharmQuad[]> {
+  try {
+    return (await loadCharm())[model] ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Axis-aligned bounds of a weapon's charm surfaces, per body variant.
+ *
+ * Restricted to ONE bone (default the static body) precisely because that is
+ * what cs2-lib gets wrong — corners from different bones are in different
+ * frames and their union is not a box in any of them.
+ */
+export function charmBounds(
+  quads: CharmQuad[],
+  mesh = "body_hd",
+  bone = "weapon_offset",
+): { x: [number, number]; y: [number, number]; z: [number, number] } | null {
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  let any = false;
+  for (const q of quads) {
+    if (q.mesh !== mesh || q.bone !== bone) continue;
+    for (let i = 0; i < 12; i += 3) {
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], q.corners[i + a]);
+        hi[a] = Math.max(hi[a], q.corners[i + a]);
+      }
+    }
+    any = true;
+  }
+  if (!any) return null;
+  return { x: [lo[0], hi[0]], y: [lo[1], hi[1]], z: [lo[2], hi[2]] };
+}
+
 /**
  * Which model and material a charm is, from the econ schema — see the
  * charm-models step in extract-models.sh.
@@ -201,6 +326,19 @@ export interface CharmShading {
    * only thing that knows which params it can honour.
    */
   dynamic?: Record<string, unknown>;
+  /**
+   * `csgo_simple_liquid.vfx`'s params, when this material is on that shader.
+   *
+   * Two materials on this build, both Charm | Butane Buddy's — an inner liquid
+   * volume and an outer glass shell. Worth its own channel despite that count
+   * because the shader IS the charm: its albedo is the empty glass, so without
+   * these the charm renders as a featureless pale blob.
+   *
+   * Passed through verbatim, like `dynamic` and for the same reason. Only the
+   * shape is checked here — a param the renderer cannot honour is its business,
+   * and a param this file filtered out would be invisible to diagnose.
+   */
+  liquid?: Record<string, unknown>;
 }
 
 const CHARM_FILE = path.join(MODELS_DIR, "charm-models.json");
@@ -231,6 +369,15 @@ export async function getCharmShading(): Promise<Record<string, CharmShading>> {
       if (e.maskRoughness === true) out.maskRoughness = true;
       if (e.dynamic && typeof e.dynamic === "object" && !Array.isArray(e.dynamic)) {
         out.dynamic = e.dynamic as Record<string, unknown>;
+      }
+      if (e.liquid && typeof e.liquid === "object" && !Array.isArray(e.liquid)) {
+        const liquid = { ...(e.liquid as Record<string, unknown>) };
+        // Path-checked like tintMask above, and for the same reason: this one
+        // field becomes a fetch URL in the client. Dropping just the mask leaves
+        // the rest of the liquid renderable — ungated, which is visibly wrong but
+        // far better than no liquid at all.
+        if (typeof liquid.mask === "string" && !liquid.mask.startsWith("/textures/")) delete liquid.mask;
+        out.liquid = liquid;
       }
       if (Object.keys(out).length) map[stem] = out;
     }
