@@ -1649,7 +1649,13 @@ function openEdit(inst: InventoryItem) {
     // stage mounts (see resolveViewerModel) — a charm carries no model at all,
     // so without the type this projection resolves to "no 3D form" and the
     // modal silently stays flat.
-    skin: { id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null },
+    //
+    // `def` for the same class of reason: canInspect() asks the item for its
+    // defindex, and this projection dropping it was what made "Inspect in game"
+    // vanish the moment you pressed Edit on an item that inspects fine in view
+    // mode. The link itself never needed it — the backend resolves the defindex
+    // from item_id — so it was only ever the button that went missing.
+    skin: { id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null, def: inst.item.def },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,
     stattrak: inst.stattrak,
@@ -1820,7 +1826,15 @@ function craftBody() {
 async function openCraftInspect() {
   if (!craft.value) return;
   try {
-    const { inspect } = await fetchDraftInspectLink({ item_id: craft.value.skin.id, ...craftBody() });
+    const { inspect } = await fetchDraftInspectLink({
+      item_id: craft.value.skin.id,
+      ...craftBody(),
+      // Kills are NOT part of craftBody(): they live on the owned row, not in
+      // the form, and craftBody() is also what save sends. Same number the 3D
+      // stage puts on the module, so inspecting an edit of a StatTrak item
+      // opens CS2 on its real count instead of a fresh 0.
+      stattrak_count: craft.value.stattrak ? craftInst.value?.stattrak_count ?? 0 : 0,
+    });
     window.location.href = inspect;
     linkOpening.value = true;
     notifyInspectSent();
@@ -5427,7 +5441,8 @@ function onGlobalKey(e: KeyboardEvent) {
     // there, the sheet's box everywhere else.
     e.preventDefault();
     (view.value === "inventory" ? invSearchEl.value : sheetSearchEl.value)?.focus();
-  } else if ((e.key === "t" || e.key === "T") && view.value !== "inventory") {
+    // Matches the header pill: no visible toggle, no shortcut for it.
+  } else if ((e.key === "t" || e.key === "T") && (view.value === "grid" || view.value === "focus")) {
     switchTeam(team.value === "CT" ? "T" : "CT");
   } else if (view.value === "focus" && e.key.startsWith("Arrow")) {
     // Walk the focus rail from the keyboard: ←/→ step, ↑/↓ hop rows (the
@@ -5879,8 +5894,12 @@ if (MDEBUG) {
            pills, h-8 on the buttons. Four pixels a control does not sound like
            much, but this bar plus the category rail under it were eating two
            bands off the top of a phone before any loadout showed. -->
+      <!-- Only the loadout screens are per-side. The inventory is one list of
+           what you own, and the armory is a catalogue you craft FROM — neither
+           reads `team`, so a side toggle there is a control with nothing on the
+           other end of it. -->
       <PillTabs
-        v-if="view !== 'inventory'"
+        v-if="view === 'grid' || view === 'focus'"
         :items="(['CT', 'T'] as Team[])"
         :item-key="(t) => t"
         :active="team"
@@ -8026,9 +8045,14 @@ if (MDEBUG) {
           <div class="flex flex-none items-center gap-3">
             <!-- Needs auth: the inspect-link endpoints are the one part of the
                  craft editor that isn't client-side, so signed out it would
-                 just 401 into a toast. -->
+                 just 401 into a toast.
+
+                 View and edit are the SAME item, so they get the same button —
+                 either source answering "this has a defindex" is enough. Asking
+                 only the mode's own copy is what let a dropped field on one of
+                 them take the button away on Edit. -->
             <button
-              v-if="!isCoarse && signedIn && canInspect(viewOnly ? craftInst?.item : craft.skin)"
+              v-if="!isCoarse && signedIn && (canInspect(craft.skin) || canInspect(craftInst?.item))"
               class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
               :title="viewOnly ? 'Launch CS2 and inspect this item in-game' : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
               @click="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"

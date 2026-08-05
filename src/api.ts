@@ -792,6 +792,8 @@ export const fetchDraftInspectLink = (body: {
   wear?: number | null;
   seed?: number | null;
   stattrak?: boolean;
+  /** Kills for the StatTrak module. Comes off the owned row, not the form. */
+  stattrak_count?: number | null;
   nametag?: string | null;
   stickers?: AttachSpec[];
   patches?: AttachSpec[];

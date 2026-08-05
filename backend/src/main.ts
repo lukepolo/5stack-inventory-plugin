@@ -1691,6 +1691,9 @@ function inspectLinkFor(
   });
 }
 
+const clampCount = (n: unknown): number =>
+  typeof n === "number" && Number.isFinite(n) ? Math.min(Math.max(Math.trunc(n), 0), 0xffffffff) : 0;
+
 // Inspect link for an UNSAVED craft — the state sitting in the editor right
 // now. Without this, "Inspect in game" could only ever show the last saved
 // version, so moving a sticker or charm and inspecting showed the old
@@ -1711,6 +1714,10 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inspect/preview", async (request, rep
     wear: b.wear,
     seed: b.seed,
     stattrak: b.stattrak,
+    // The count comes from the client here because a draft has no row to read
+    // it off — clamped to what the protobuf field can hold, since it goes out
+    // as a uint32 varint and a negative or fractional one writes garbage.
+    stattrak_count: clampCount(b.stattrak_count),
     nametag: b.nametag,
     stickers: b.stickers,
     patches: b.patches,
