@@ -1307,23 +1307,22 @@ const craft = ref<{
  * are cs2-lib `weapon` type, so the item answer covers them without the special
  * case the slot form needed.
  */
-const attachKind = computed<"weapon" | "melee" | "agent" | "none">(() => {
+const attachKind = computed<"weapon" | "agent" | "none">(() => {
   const type = craftType.value;
   if (type) {
     if (type === "agent") return "agent";
-    // Melee is its own answer, not a weapon: a knife takes a CHARM but has no
-    // sticker slots — CS2 offers stickers on guns only. Folded in with weapons
-    // it was handed five of them, which the game would simply drop.
-    if (type === "melee") return "melee";
+    // Melee answers "none": CS2 hangs neither a sticker nor a charm off a
+    // knife. It used to be its own kind so it could be offered a charm, which
+    // the game drops on the floor — the same way folding it in with weapons
+    // handed it five sticker slots it has nowhere to put.
     return type === "weapon" ? "weapon" : "none";
   }
   if (selected.value === "agent") return "agent";
-  if (selected.value === "knife") return "melee";
   if (isWeaponPos(selected.value) || selected.value === "zeus" || selected.value === "c4") return "weapon";
   return "none";
 });
-/** Everything that can wear a charm — guns and knives, not gloves or agents. */
-const attachTakesCharm = computed(() => attachKind.value === "weapon" || attachKind.value === "melee");
+/** Everything that can wear a charm — guns only, not knives, gloves or agents. */
+const attachTakesCharm = computed(() => attachKind.value === "weapon");
 /**
  * The cs2-lib type of whatever the craft modal is editing, when it knows it.
  *
@@ -2852,6 +2851,25 @@ watch(
     if (img === was) return;
     charmPending.value = !!img && craftTarget.value?.kind === "weapon";
   },
+);
+// A charm on something that can't wear one is dropped as the editor opens.
+// Knives could take one until the slot came out, so those rows still exist —
+// and with no slot to clear it from, the charm would be stuck on the knife
+// forever (still hanging in 3D, still marked attached, so unusable anywhere
+// else). Clearing it here means opening the knife and saving releases it.
+// A watcher rather than a check inside craftBody() because every consumer —
+// the 3D stage, the inspect link, the "takes it off your X" prompt — reads
+// `craft.charm` directly, and they should all agree there is no charm.
+// Watched as the CONJUNCTION, not on attachTakesCharm alone: opening a knife
+// from the knife slot never flips that flag (it reads false either side of the
+// modal opening), so a plain gate would sit there while the charm rode in
+// underneath it.
+watch(
+  () => !attachTakesCharm.value && !!craft.value?.charm,
+  (stray) => {
+    if (stray) craft.value!.charm = null;
+  },
+  { immediate: true },
 );
 // Patches → re-composite the agent's body texture on the live viewer. Its own
 // watcher rather than a remount for the same reason the three above have one:

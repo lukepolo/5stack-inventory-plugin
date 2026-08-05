@@ -1147,7 +1147,11 @@ function checkWear(arr: unknown[]): string | null {
 }
 
 // Validate sticker/charm attachments; returns an error string or null.
+//
+// `item_id` is the thing being attached TO — needed because some attachments
+// are only legal on some bases (see the charm rule at the bottom).
 function checkAttachments(
+  item_id: number | null | undefined,
   stickers?: unknown[] | null,
   charm_id?: number | null,
   patches?: unknown[] | null,
@@ -1172,8 +1176,19 @@ function checkAttachments(
     const badWear = checkWear(patches);
     if (badWear) return badWear;
   }
-  if (charm_id != null && getItem(charm_id)?.type !== "keychain") {
-    return "That isn't a charm.";
+  if (charm_id != null) {
+    if (getItem(charm_id)?.type !== "keychain") {
+      return "That isn't a charm.";
+    }
+    // Charms hang off GUNS only — CS2 has no attachment point on a knife, a
+    // glove or an agent, and one sent anyway is dropped by the game. The
+    // editor doesn't offer the slot; this is the same rule at the door, so a
+    // stale client or a hand-rolled request can't leave a charm marked
+    // attached to something that can never show it.
+    const base = item_id != null ? getItem(item_id) : null;
+    if (base && base.type !== "weapon") {
+      return "That item can't take a charm.";
+    }
   }
   return null;
 }
@@ -1541,7 +1556,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   if (!craftable(item_id)) {
     return reply.status(400).send({ error: "That item can't be owned." });
   }
-  const attachErr = checkAttachments(stickers, charm_id, patches);
+  const attachErr = checkAttachments(item_id, stickers, charm_id, patches);
   if (attachErr) {
     return reply.status(400).send({ error: attachErr });
   }
@@ -1576,25 +1591,25 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
     if (!identity) {
       return reply.status(401).send({ error: "unauthorized" });
     }
-    {
-      // Imported items mirror a real Steam inventory — read-only by design.
-      const chk = await pool.query(
-        `SELECT origin FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
-        [Number(request.params.id), identity.steamId],
-      );
-      // Existence is settled HERE, before anything is written. linkAttachments
-      // mints rows, and running it against an id that turns out not to be the
-      // caller's would leave those mints behind with no weapon to hang on.
-      if (!chk.rows.length) {
-        return reply.status(404).send({ error: "That item isn't in your inventory." });
-      }
-      if (chk.rows[0]?.origin === "steam") {
-        return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
-      }
+    // Imported items mirror a real Steam inventory — read-only by design.
+    // `item_id` comes back too: the body doesn't carry it on an edit, and the
+    // attachment rules need to know WHAT is being attached to.
+    const chk = await pool.query<{ origin: string | null; item_id: number }>(
+      `SELECT origin, item_id FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+      [Number(request.params.id), identity.steamId],
+    );
+    // Existence is settled HERE, before anything is written. linkAttachments
+    // mints rows, and running it against an id that turns out not to be the
+    // caller's would leave those mints behind with no weapon to hang on.
+    if (!chk.rows.length) {
+      return reply.status(404).send({ error: "That item isn't in your inventory." });
+    }
+    if (chk.rows[0]?.origin === "steam") {
+      return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
     }
     const id = Number(request.params.id);
     const { wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches } = request.body;
-    const attachErr = checkAttachments(stickers, charm_id, patches);
+    const attachErr = checkAttachments(chk.rows[0].item_id, stickers, charm_id, patches);
     if (attachErr) {
       return reply.status(400).send({ error: attachErr });
     }
@@ -1725,7 +1740,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inspect/preview", async (request, rep
   if (typeof b.item_id !== "number") {
     return reply.status(400).send({ error: "Nothing to inspect yet." });
   }
-  const attachErr = checkAttachments(b.stickers, b.charm_id, b.patches);
+  const attachErr = checkAttachments(b.item_id, b.stickers, b.charm_id, b.patches);
   if (attachErr) {
     return reply.status(400).send({ error: attachErr });
   }

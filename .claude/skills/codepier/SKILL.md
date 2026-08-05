@@ -11,7 +11,7 @@ description: |
   in the pod" failures, native-module/platform errors right after an install, or when resolving a
   .local hostname or port to a service.
 metadata:
-  version: 2.0.35
+  version: 2.0.36
 ---
 
 # CodePier
@@ -112,10 +112,21 @@ rewrites the `Host` header sent upstream.
 
 ## 6. Logs
 
-`codepier tail` streams pod logs — but the hot-swap container's entrypoint is a sleep, so it has
-none of its own. The application's output goes to whatever the user started in their own
-`codepier ssh` shell. **Empty `tail` output does not mean the app is down**; ask the user what their
-shell is showing.
+`codepier tail` is how you read the running app. The hot-swap container's entrypoint is a sleep, so
+`kubectl logs` shows nothing useful — the app's output belongs to whatever the user started in
+their own `codepier up` / `codepier ssh` shell. While that shell is open, the CLI mirrors it to
+`~/.codepier/sessions/<namespace>-<workload>.log`, and `tail` follows that file:
+
+```bash
+codepier tail
+```
+
+It streams until the user's shell exits, so **run it in the background and read the output**, or it
+will block. The mirror is stripped of ANSI codes and capped at the most recent 2MB, and the file
+exists only while a session is live — no file means no shell, and with no session `tail` falls back
+to the container's own (near-empty) logs. **Empty output still does not mean the app is down**: it
+can equally mean the user has no shell open. Check for the session file before concluding anything,
+and ask the user if it isn't there.
 
 `forward:` lists `local:remote` port forwards. Don't assume a port is reachable on localhost unless
 it's there or covered by a `proxy` entry.
