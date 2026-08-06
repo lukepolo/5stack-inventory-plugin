@@ -21,7 +21,7 @@ import {
   Plus,
 } from "lucide-vue-next";
 import SkinTests from "./SkinTests.vue";
-import { FLAGS, activeFlags, devToolsEnabled, flagValue, flagsVersion, setDevToolsEnabled, setFlag } from "../devFlags";
+import { FLAGS, activeFlags, flagValue, flagsVersion, setFlag } from "../devFlags";
 import {
   API_ORIGIN,
   fetchServerApiKey,
@@ -250,13 +250,6 @@ const extractedGroups = computed(() => {
   ];
 });
 // ---- shared asset CDN (opt-in) ----------------------------------------------
-// Browser-local developer tooling switch — see devFlags.ts.
-const devTools = ref(devToolsEnabled());
-function toggleDevTools(on: boolean) {
-  setDevToolsEnabled(on);
-  devTools.value = on;
-  emit("notify", on ? "Developer cog shown in the header." : "Developer cog hidden.", "success");
-}
 const flagOn = (name: string) => {
   void flagsVersion.value;
   return flagValue(name);
@@ -1046,17 +1039,21 @@ const BTN_DANGER =
               </div>
             </div>
 
+            <!-- The "show the cog" switch that used to live here is GONE, not
+                 hidden: the cog is now always in the 3D viewer, because the panel
+                 behind it carries real user settings (bloom) alongside the
+                 diagnostics, and those sit behind its own Advanced disclosure. A
+                 control that no longer controls anything is worse than no control,
+                 so it was removed rather than left to lie. -->
             <div class="rounded-md border border-border">
-              <div class="flex items-start justify-between gap-4 px-4 py-3">
-                <span class="min-w-0">
-                  <span class="block text-sm text-foreground">Show the developer cog</span>
-                  <span class="block text-xs text-muted-foreground">
-                    Adds a cog in the bottom-right that opens these switches in context, over the 3D viewer.
-                    <span class="font-mono">Ctrl/Cmd + Shift + D</span> toggles it too. Always on when the app is served
-                    from localhost.
-                  </span>
+              <div class="px-4 py-3">
+                <span class="block text-sm text-foreground">Where these live</span>
+                <span class="block text-xs text-muted-foreground">
+                  The cog over the 3D viewer opens the same switches in context, next to the model they change —
+                  that is the better place to use them. <span class="font-mono">Ctrl/Cmd + Shift + D</span> opens it too.
+                  Look under <span class="font-medium">Advanced</span> there; the top of that panel is user-facing
+                  settings.
                 </span>
-                <button :class="BTN" @click="toggleDevTools(!devTools)">{{ devTools ? "Hide" : "Show" }}</button>
               </div>
             </div>
 

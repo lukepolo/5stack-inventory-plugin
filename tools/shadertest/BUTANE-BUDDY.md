@@ -466,8 +466,47 @@ a flat neutral box, so correct chrome still came out flat grey. With a sky and a
 ground to reflect, the case goes dark and contrasty and the ring picks up a blue
 sky tint, both like the reference.
 
-**Still not replicated:** `toneMappingExposure` 0.75 (we are at 1.0) and **bloom**,
-which is a post-processing pass we have no pipeline for.
+**Bloom is ON by default**, at a deliberately tiny strength, behind the `bloom` dev flag with live
+sliders for strength / radius / threshold in the dev HUD (they are read per frame,
+so dragging one moves the model). Their exposure (0.75) IS applied globally.
+
+**Settings: strength 0.05, radius 0.30, threshold 0.18** — and the strength being
+almost nothing is the point. The first attempt used csgoskins' own 1.2 / 1 / 0.06
+and destroyed bright skins: a Glock's slide went solid white with the whole upper
+receiver lost. The shape that works is theirs (a LOW threshold, so everything
+blooms a little and reads as the material being luminous) at a hundredth of their
+amplitude.
+
+Verified on Glock-18 | Water Elemental, the case that broke it: **0.00% near-white
+pixels** and a mean within 0.02 of bloom-off, i.e. the effect lives entirely on
+genuinely bright pixels. Corner alpha 0 on charm, rifle and pistol — the composite
+patch is doing its job.
+
+The three sliders are capped at the range that turned out to matter (strength
+0-0.5 in 0.01 steps); the original 0-2 at 0.05 put every useful value in one notch
+against the left edge. `viewer3d.ts` builds an
+`EffectComposer` per viewer, lazily, disposed with it — RenderPass + UnrealBloomPass
++ OutputPass. `?bloom=0` turns it off; `?bloomstrength=`, `?bloomradius=`,
+`?bloomthreshold=` tune it without a rebuild.
+
+Three things worth knowing, all learned the hard way:
+
+- **A HALF-FLOAT target is required.** The composer's default is LDR, so the scene
+  clamps at 1.0 before the bright-pass sees it and every highlight becomes the
+  same white. csgoskins switch to `type: 1016` exactly when bloom is on.
+- **Their strength/radius/threshold (1.2 / 1 / 0.06) DO NOT TRANSFER.** three
+  forces `NoToneMapping` when rendering into a render target, so the bright-pass
+  sees LINEAR HDR — 0.06 there is nearly black, a lit mid-grey surface (~0.2
+  linear) sails past it, and the additive composite washes the render to white.
+  Tried it; it is unmistakable. A threshold near 1.0 means "brighter than white",
+  which is the useful gate.
+- **ALPHA. Transcribe their composite patch or every card bake gets a grey haze.**
+  UnrealBloomPass composites additively across the whole frame, including the
+  transparent background. They rewrite the composite material to derive alpha from
+  the bloom's own luminance:
+  `texel.a = mix(0.0, texel.a, clamp(length(texel.rgb) * 10.0, 0.0, 1.0))`
+  with additive blending, `transparent: true`, no depth. Verified after: corner
+  pixels alpha 0, 86.7% of the frame fully transparent.
 
 ### A measurement error worth not repeating
 

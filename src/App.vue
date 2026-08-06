@@ -62,7 +62,7 @@ import {
 } from "./routes";
 import AdminConsole from "./components/AdminConsole.vue";
 import DevHud from "./components/DevHud.vue";
-import { devToolsEnabled, devToolsVersion, activeFlags, flagsVersion } from "./devFlags";
+import { activeFlags, flagsVersion } from "./devFlags";
 import CatalogFilters, { type FacetAxis } from "./components/CatalogFilters.vue";
 import Armory from "./components/Armory.vue";
 import ShareMenu from "./components/ShareMenu.vue";
@@ -1510,15 +1510,16 @@ watch(
  * a material flag.
  */
 const gloveArms = ref(false);
-// ---- developer HUD ---------------------------------------------------------
-// The cog is only offered where the tools are: always in a dev build, and in
-// production only once someone turns it on from the admin console. See
-// devFlags.ts for why that gate exists.
+// ---- viewer settings -------------------------------------------------------
+// ALWAYS OFFERED. The cog used to be gated on devToolsEnabled() — dev builds, or
+// opt-in from the admin console — because everything behind it was a diagnostic
+// that could make a correct render look broken.
+//
+// That stopped being true when bloom landed: it is a look preference, and a
+// preference nobody can find is not a preference. The panel now separates the two
+// (see DevHud), so the gate moved DOWN a level: everyone gets the settings, the
+// diagnostics sit behind Advanced.
 const devHudOpen = ref(false);
-const showDevCog = computed(() => {
-  void devToolsVersion.value;
-  return devToolsEnabled();
-});
 /** Flags currently off their default — surfaced ON the cog so a switch left on
  *  is visible without opening the panel. That is the failure this whole thing is
  *  meant to prevent. */
@@ -1527,9 +1528,7 @@ const devFlagCount = computed(() => {
   return activeFlags().length;
 });
 function onDevHudKey(e: KeyboardEvent) {
-  // Ctrl/Cmd+Shift+D. Shift keeps it clear of the browser's own Cmd+D
-  // (bookmark), and the shortcut is inert unless the tools are enabled at all.
-  if (!showDevCog.value) return;
+  // Ctrl/Cmd+Shift+D. Shift keeps it clear of the browser's own Cmd+D (bookmark).
   if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "D" || e.key === "d")) {
     e.preventDefault();
     devHudOpen.value = !devHudOpen.value;
@@ -8381,7 +8380,7 @@ if (MDEBUG) {
                    and that spot came free when the pose tabs moved to their own
                    row. The panel drops below both rows (top-20) so it never
                    covers the controls that opened it. -->
-              <template v-if="modal3d && showDevCog">
+              <template v-if="modal3d">
                 <!-- Click-away catcher, the same idiom FilterDropdown and
                      ShareMenu use. `absolute inset-0`, not `fixed`: a fixed
                      element in this plugin resolves against the nearest

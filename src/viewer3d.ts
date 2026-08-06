@@ -15,7 +15,7 @@
 // Skin rendering is a faithful port of CS2's compositing pipeline — see
 // paintComposite.ts for the shader and its provenance.
 import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
-import { FLAGS, flagValue, setFlag } from "./devFlags";
+import { FLAGS, NUMBERS, flagValue, numberValue, setFlag, setNumber } from "./devFlags";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
 import { tickCharmLiquid } from "./charmLiquid";
@@ -74,6 +74,10 @@ type ThreeBundle = {
   cloneSkeleton: typeof import("three/examples/jsm/utils/SkeletonUtils.js").clone;
   /** The lighting environment, or null if it could not be fetched — see loadThree. */
   hdr: import("three").DataTexture | null;
+  EffectComposer: typeof import("three/examples/jsm/postprocessing/EffectComposer.js").EffectComposer;
+  RenderPass: typeof import("three/examples/jsm/postprocessing/RenderPass.js").RenderPass;
+  UnrealBloomPass: typeof import("three/examples/jsm/postprocessing/UnrealBloomPass.js").UnrealBloomPass;
+  OutputPass: typeof import("three/examples/jsm/postprocessing/OutputPass.js").OutputPass;
 };
 
 /**
@@ -183,7 +187,11 @@ function loadThree(): Promise<ThreeBundle> {
     import("three/examples/jsm/environments/RoomEnvironment.js"),
     import("three/examples/jsm/utils/SkeletonUtils.js"),
     import("three/examples/jsm/loaders/RGBELoader.js"),
-  ]).then(async ([THREE, gltf, orbit, decal, env, skel, rgbe]) => ({
+    import("three/examples/jsm/postprocessing/EffectComposer.js"),
+    import("three/examples/jsm/postprocessing/RenderPass.js"),
+    import("three/examples/jsm/postprocessing/UnrealBloomPass.js"),
+    import("three/examples/jsm/postprocessing/OutputPass.js"),
+  ]).then(async ([THREE, gltf, orbit, decal, env, skel, rgbe, comp, rp, bloom, out]) => ({
     THREE,
     GLTFLoader: gltf.GLTFLoader,
     OrbitControls: orbit.OrbitControls,
@@ -200,6 +208,10 @@ function loadThree(): Promise<ThreeBundle> {
     // than its own. If that ever resolves wrong, the viewer must fall back to
     // RoomEnvironment and keep working rather than refusing to render anything.
     hdr: await new rgbe.RGBELoader().loadAsync(HDR_URL).catch(() => null),
+    EffectComposer: comp.EffectComposer,
+    RenderPass: rp.RenderPass,
+    UnrealBloomPass: bloom.UnrealBloomPass,
+    OutputPass: out.OutputPass,
   }));
   return threePromise;
 }
@@ -286,7 +298,11 @@ function getSharedGL(
   // Khronos PBR-neutral: color-accurate product rendering (ACES pushes
   // saturated skin colors toward orange/teal — wrong for a skin inspector).
   renderer.toneMapping = THREE.NeutralToneMapping;
-  renderer.toneMappingExposure = 1.0;
+  // 0.75 is csgoskins' default (`env.toneMappingExposure || 0.75`); their
+  // per-scenery overrides run 0.65-1.2. It matters more than it looks with bloom
+  // on: the bright-pass threshold is absolute, so exposure decides how much of
+  // the frame is "bright".
+  renderer.toneMappingExposure = 0.75;
   // Image-based studio lighting carries the shading (composited metal/rough
   // maps need real reflections); directionals only shape highlights.
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -525,6 +541,29 @@ async function loadGltf(model: string, variant: GltfVariant) {
  * `dflt` is what applies when the switch has never been touched — so a flag can
  * ship on with `?name=0` as the escape hatch.
  */
+/**
+ * A NUMERIC tuning knob from the query string, for values that are being dialled
+ * in rather than switched on. Not in the FLAGS registry — that is booleans with a
+ * UI, and these are three bloom parameters nobody wants a checkbox for.
+ * Deliberately not persisted: a stored bloom strength you forgot about would be
+ * indistinguishable from a rendering bug.
+ */
+function debugNumber(name: string, dflt: number): number {
+  try {
+    const q = new URLSearchParams(location.search).get(name);
+    const n = q === null ? NaN : Number(q);
+    // A query value WRITES the stored one, so it behaves like ?flag=1 and a
+    // shared debug URL leaves the HUD showing what is actually in effect.
+    if (Number.isFinite(n)) {
+      if (numberValue(name) !== n) setNumber(name, n);
+      return n;
+    }
+  } catch {
+    /* no location/localStorage — fall through to the stored/default read */
+  }
+  return NUMBERS.some((x) => x.name === name) ? numberValue(name) : dflt;
+}
+
 function debugFlag(name: string, dflt = false): boolean {
   try {
     // `?name=1` still writes the switch, so debug URLs shared before the HUD
@@ -599,6 +638,25 @@ const PATCH_FLIP_V = debugFlag("patchflipv", false);
  * behaviour projection could only fake by draping a flat film over the edges.
  */
 const UV_DECAL = debugFlag("uvdecal", true);
+/** Post-process bloom. `?bloom=0` renders straight to the canvas instead — the
+ *  A/B for "is that glow real or is the composer eating my alpha". */
+const BLOOM = debugFlag("bloom", true);
+/**
+ * Bloom tuning, read PER FRAME rather than at mount.
+ *
+ * These are sliders in the dev HUD, and a slider you have to reload to see is
+ * not a slider — the whole point is dragging strength while watching the model.
+ * The read is a localStorage hit per frame per knob, which is nothing next to a
+ * five-mip bloom, and it only happens while bloom is on.
+ *
+ * `?bloomstrength=0.8` still works and still writes the stored value, exactly as
+ * the boolean flags do.
+ */
+const bloomParams = () => ({
+  strength: debugNumber("bloomstrength", 0.05),
+  radius: debugNumber("bloomradius", 0.3),
+  threshold: debugNumber("bloomthreshold", 0.18),
+});
 
 /**
  * Frame-time and mount-cost HUD — `?perf=1`. Hoisted to module scope because the
@@ -1747,7 +1805,7 @@ async function snapshotModelNow(
     const mountOpts = bare
       ? { ...opts, stickers: undefined, charm: undefined, nameTag: undefined, statTrak: undefined }
       : opts;
-    handle = await mountViewer(holder, model, { ...mountOpts, interactive: false, still: true, frame: "fit", priority });
+    handle = await mountViewer(holder, model, { ...mountOpts, interactive: false, still: true, bloom: false, frame: "fit", priority });
     // Decal texture loads + a few physics frames for the charm to hang. A bare
     // bake has neither, but still takes a short beat: the paint's textures are
     // awaited by the mount, and this leaves room for their upload to land
@@ -2229,6 +2287,16 @@ export interface ViewerOpts {
    * "it looks washed out" went wrong.
    */
   lighting?: { env?: number; key?: number; rim?: number; ambient?: number; spot?: number };
+  /**
+   * Post-process bloom. Defaults to the user's setting; card bakes force it OFF.
+   *
+   * A baked card is CACHED FOREVER against its render key, so whatever look is on
+   * at bake time is frozen into it — a user toggling bloom afterwards would get a
+   * grid of cards half glowing and half not, with no way to tell why. Cards are
+   * also small and sit on a busy tile, which is the worst case for a glow. The
+   * interactive viewer is where the effect is worth its cost.
+   */
+  bloom?: boolean;
   /** Orbit the camera by this many radians about Y. tools/shadertest only —
    *  lets a sweep measure the same decal from many angles deterministically. */
   viewAngle?: number;
@@ -2297,7 +2365,8 @@ async function buildViewer(
   mounted: { view?: HTMLCanvasElement } = {},
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
-  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton, hdr } = await loadThree();
+  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton, hdr,
+    EffectComposer, RenderPass, UnrealBloomPass, OutputPass } = await loadThree();
   mt.mark("three");
   throwIfAborted(signal);
   // Set by the paint build below when a texture the skin names wasn't on the
@@ -8407,9 +8476,90 @@ async function buildViewer(
    * setting that costs a full-buffer copy on every frame instead of only when a
    * viewer is actually on screen.
    */
+  /**
+   * BLOOM, built lazily and per viewer.
+   *
+   * The composer wraps the SHARED renderer but owns its own render targets, so it
+   * has to be per viewer (each has its own scene, camera and size) and disposed
+   * with it — it is five mip levels of float targets, not free.
+   *
+   * Parameters are csgoskins': strength 1.2, radius 1, threshold 0.06. The
+   * threshold is the interesting one — 0.06 is very low, so almost everything
+   * bright blooms a little rather than only blown-out highlights. That is what
+   * makes their small specular hits (a charm's bubbles, a polished edge) read as
+   * glowing instead of as single bright pixels.
+   *
+   * ALPHA IS THE TRAP, and their fix is transcribed below. UnrealBloomPass
+   * composites additively over the whole frame, which on a TRANSPARENT canvas
+   * turns the empty background into a grey haze — and every card bake we take is
+   * RGBA. They patch the composite material to derive alpha from the bloom's own
+   * luminance, so black bloom stays invisible:
+   *
+   *     texel.a = mix(0.0, texel.a, clamp(length(texel.rgb) * 10.0, 0.0, 1.0))
+   *
+   * OutputPass is what applies tone mapping and the sRGB conversion. That is not
+   * double work: three forces NoToneMapping while rendering into a render target,
+   * so the scene lands linear, blooms linear, and is tonemapped exactly once at
+   * the end.
+   */
+  let composer: import("three/examples/jsm/postprocessing/EffectComposer.js").EffectComposer | null = null;
+  let bloomPass: import("three/examples/jsm/postprocessing/UnrealBloomPass.js").UnrealBloomPass | null = null;
+  const buildComposer = () => {
+    // HALF FLOAT, which is what they use when bloom is on (`type: 1016`, versus
+    // UnsignedByte when it is off). The composer's default target is LDR, so the
+    // scene clamps at 1.0 before the bright-pass ever sees it — every specular
+    // highlight becomes the same white, the 0.06 threshold catches most of the
+    // frame, and the additive composite washes the whole render out. With HDR the
+    // threshold separates real highlights from lit surfaces again.
+    const rt = new THREE.WebGLRenderTarget(cssW, cssH, { type: THREE.HalfFloatType });
+    const c = new EffectComposer(renderer, rt);
+    c.addPass(new RenderPass(scene, camera));
+    // THEIR NUMBERS DO NOT TRANSFER, and it is worth knowing why before reaching
+    // for them again. csgoskins use strength 1.2 / radius 1 / threshold 0.06, and
+    // 0.06 washes our render to white: three forces NoToneMapping when rendering
+    // into a render target, so the bright-pass sees LINEAR HDR, where 0.06 is
+    // almost black and a lit mid-grey surface (~0.2 linear) sails past it. Their
+    // scene is simply darker in linear than ours.
+    //
+    // A threshold near 1.0 is the meaningful one here: it means "brighter than
+    // white", i.e. only real specular hits — the bubbles' lens highlights and the
+    // polished metal — which is exactly what bloom is wanted for.
+    const p0 = bloomParams();
+    const bloom = new UnrealBloomPass(new THREE.Vector2(cssW, cssH), p0.strength, p0.radius, p0.threshold);
+    bloomPass = bloom;
+    const cm = bloom.compositeMaterial as import("three").ShaderMaterial;
+    cm.fragmentShader = cm.fragmentShader.replace(
+      "vec4 texel = texture2D( tDiffuse, vUv );",
+      "vec4 texel = texture2D( tDiffuse, vUv );" +
+        "float flLength = length(texel.rgb);" +
+        "float flFactor = clamp(flLength * 10.0, 0.0, 1.0);" +
+        "texel.a = mix(0.0, texel.a, flFactor);",
+    );
+    cm.blending = THREE.AdditiveBlending;
+    cm.depthTest = false;
+    cm.depthWrite = false;
+    cm.transparent = true;
+    cm.needsUpdate = true;
+    c.addPass(bloom);
+    c.addPass(new OutputPass());
+    return c;
+  };
   const drawFrame = () => {
     renderer.setSize(cssW, cssH, false);
-    renderer.render(scene, camera);
+    if (opts?.bloom ?? BLOOM) {
+      const c = (composer ??= buildComposer());
+      if (bloomPass) {
+        // Live, so the HUD sliders move the picture as they are dragged.
+        const p = bloomParams();
+        bloomPass.strength = p.strength;
+        bloomPass.radius = p.radius;
+        bloomPass.threshold = p.threshold;
+      }
+      c.setSize(cssW, cssH);
+      c.render();
+    } else {
+      renderer.render(scene, camera);
+    }
     if (!viewCtx) return;
     viewCtx.clearRect(0, 0, view.width, view.height);
     viewCtx.drawImage(renderer.domElement, 0, 0, view.width, view.height);
@@ -8844,6 +8994,11 @@ async function buildViewer(
       cancelAnimationFrame(raf);
       observer.disconnect();
       contextLostSubscribers.delete(onContextLost);
+      // Five mip levels of float render targets per viewer — not something to
+      // leave to the GC, and the reason the composer is built lazily at all.
+      composer?.dispose();
+      composer = null;
+      bloomPass = null;
       if (!opts?.still) {
         container.removeEventListener("pointerdown", onPointerDown, { capture: true });
         el.removeEventListener("pointermove", onPointerMove);

@@ -35,8 +35,17 @@ export interface DevFlag {
    * is the difference between "this toggle is broken" and "reopen the item".
    */
   remount?: boolean;
-  /** Grouping in the HUD. */
+  /** Grouping in the panel. */
   group: "3D viewer" | "Patches" | "Diagnostics";
+  /**
+   * Who this is for.
+   *
+   * "user" settings are shown plainly to everyone and are safe to leave in any
+   * position — they change how the viewer LOOKS. "developer" ones live behind the
+   * Advanced disclosure because most of them make a correct render look broken,
+   * which is a support ticket rather than a preference.
+   */
+  audience?: "user" | "developer";
 }
 
 export const FLAGS: DevFlag[] = [
@@ -63,6 +72,15 @@ export const FLAGS: DevFlag[] = [
     dflt: true,
     remount: true,
     group: "3D viewer",
+  },
+  {
+    name: "bloom",
+    label: "Bloom",
+    hint: "A soft glow on the brightest parts of a skin. Applies to the 3D viewer; item cards are always rendered without it.",
+    dflt: true,
+    remount: true,
+    group: "3D viewer",
+    audience: "user",
   },
   {
     name: "perf",
@@ -97,6 +115,57 @@ export const FLAGS: DevFlag[] = [
   },
 ];
 
+/**
+ * A numeric knob, for values that get DIALLED rather than switched.
+ *
+ * Separate from DevFlag because the UI is different (a slider, with a live
+ * readout) and so is the intent: a flag answers "which code path", a number
+ * answers "how much". They share the localStorage convention so a debug URL
+ * behaves the same for both.
+ */
+export interface DevNumber {
+  name: string;
+  label: string;
+  hint: string;
+  dflt: number;
+  min: number;
+  max: number;
+  step: number;
+  group: DevFlag["group"];
+  /** Only shown when this flag is on — a bloom slider is noise with bloom off. */
+  requires?: string;
+  /** See DevFlag.audience. */
+  audience?: "user" | "developer";
+}
+
+export const NUMBERS: DevNumber[] = [
+  // Defaults are the dialled-in set, not three's. The useful range turned out to
+  // be the bottom of the slider, so the maxima are tightened and the steps are
+  // fine — a 0-2 range at 0.05 steps gave strength exactly one notch of travel
+  // between "nothing" and "too much".
+  {
+    name: "bloomstrength",
+    label: "Bloom strength",
+    hint: "How much the glow adds. Tiny is the whole trick: csgoskins use 1.2, which at our exposure turns a bright slide solid white.",
+    dflt: 0.05, min: 0, max: 0.5, step: 0.01,
+    group: "3D viewer", requires: "bloom", audience: "user",
+  },
+  {
+    name: "bloomradius",
+    label: "Bloom radius",
+    hint: "How far the glow spreads.",
+    dflt: 0.3, min: 0, max: 1.5, step: 0.05,
+    group: "3D viewer", requires: "bloom", audience: "user",
+  },
+  {
+    name: "bloomthreshold",
+    label: "Bloom threshold",
+    hint: "How bright a pixel must be to glow, in LINEAR light. Low (~0.2) blooms almost everything a little, which is what reads as the material being luminous; ~1.0 means 'brighter than white' and picks out only specular hits.",
+    dflt: 0.18, min: 0, max: 1.5, step: 0.02,
+    group: "3D viewer", requires: "bloom", audience: "user",
+  },
+];
+
 const key = (name: string) => `viewer3d.${name}`;
 
 /** Bumped on every write, so the HUD re-renders without polling storage. */
@@ -123,6 +192,14 @@ export function setFlag(name: string, on: boolean): void {
 
 /** Back to defaults, and forget every stored answer. */
 export function resetFlags(): void {
+  for (const n of NUMBERS) {
+    try {
+      localStorage.removeItem(key(n.name));
+    } catch {
+      /* ignore */
+    }
+  }
+  numbersVersion.value++;
   for (const f of FLAGS) {
     try {
       localStorage.removeItem(key(f.name));
@@ -133,54 +210,48 @@ export function resetFlags(): void {
   flagsVersion.value++;
 }
 
+/** Bumped on every numeric write, so a slider re-renders and the viewer re-reads. */
+export const numbersVersion = ref(0);
+
+export function numberValue(name: string): number {
+  const spec = NUMBERS.find((n) => n.name === name);
+  const dflt = spec?.dflt ?? 0;
+  try {
+    const stored = localStorage.getItem(key(name));
+    if (stored === null) return dflt;
+    const v = Number(stored);
+    return Number.isFinite(v) ? v : dflt;
+  } catch {
+    return dflt;
+  }
+}
+
+export function setNumber(name: string, v: number): void {
+  try {
+    localStorage.setItem(key(name), String(v));
+  } catch {
+    /* private mode — the value just doesn't stick */
+  }
+  numbersVersion.value++;
+}
+
+/** Everything a normal user is offered, in declaration order. */
+export const userFlags = (): DevFlag[] => FLAGS.filter((f) => f.audience === "user");
+export const userNumbers = (): DevNumber[] => NUMBERS.filter((n) => n.audience === "user");
+/** Everything behind Advanced — the default for anything that does not say. */
+export const devFlags = (): DevFlag[] => FLAGS.filter((f) => f.audience !== "user");
+export const devNumbers = (): DevNumber[] => NUMBERS.filter((n) => n.audience !== "user");
+
 /** Flags currently differing from their default — what the HUD badge counts. */
 export const activeFlags = (): DevFlag[] => FLAGS.filter((f) => flagValue(f.name) !== f.dflt);
 
 /**
- * Whether the developer cog is offered at all.
+ * The developer-cog gate USED TO LIVE HERE and is deliberately gone.
  *
- * Always on a dev host. Everywhere else it stays hidden until someone turns it
- * on from the admin console — the flags below it change how the 3D viewer
- * renders, and a player who finds "Flip patch V" has only found a way to make
- * their own inventory look broken.
- */
-const DEV_TOOLS_KEY = "inventory.devTools";
-export const devToolsVersion = ref(0);
-
-/**
- * "Development" for this app is the HOST, not the build mode.
+ * It answered "should the cog be shown at all", which mattered while everything
+ * behind it was a diagnostic that could make a correct render look broken. The
+ * panel now separates user settings (bloom) from those diagnostics itself, so the
+ * cog is always offered and the gate moved down a level — see DevHud.
  *
- * `import.meta.env.DEV` is false in the local loop too — `npm run dev` here is
- * `vite build` plus a static server, because the plugin is consumed through
- * Module Federation and has to be built to be loadable at all. So the flag that
- * looks like it means "running locally" is false exactly where you want the cog
- * most. The served hostname is the signal that actually distinguishes the two.
+ * `isDevHost()` went with it: nothing else asked.
  */
-function isDevHost(): boolean {
-  if (import.meta.env.DEV) return true;
-  try {
-    const h = location.hostname;
-    return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h.endsWith(".local");
-  } catch {
-    return false;
-  }
-}
-
-export function devToolsEnabled(): boolean {
-  if (isDevHost()) return true;
-  try {
-    return localStorage.getItem(DEV_TOOLS_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-export function setDevToolsEnabled(on: boolean): void {
-  try {
-    if (on) localStorage.setItem(DEV_TOOLS_KEY, "1");
-    else localStorage.removeItem(DEV_TOOLS_KEY);
-  } catch {
-    /* ignore */
-  }
-  devToolsVersion.value++;
-}
