@@ -66,9 +66,24 @@ export interface CharmLiquid {
   gravity: [number, number, number];
   bubbleColorInner: [number, number, number];
   bubbleColorOuter: [number, number, number];
+  /** Index of refraction per region — glass, the volume, and the surface itself. */
+  glassRefraction: number;
+  liquidRefraction: number;
+  surfaceRefraction: number;
+  refractRoughMul: number;
+  cubeTransparency: number;
+  cubeLiquidTransparency: number;
+  cubeBrightness: number;
+  reflectance: number;
+  specularStrength: number;
+  surfaceSpecularStrength: number;
+  transmissive: number;
+  emissive: number;
   opaqueRefract: boolean;
   mask?: string;
   roughMap?: string;
+  /** The albedo, kept for its ALPHA: csgo_simple_liquid's metalness. */
+  metalMap?: string;
 }
 
 const vec3 = (v: unknown, dflt: [number, number, number]): [number, number, number] =>
@@ -126,9 +141,25 @@ export function parseCharmLiquid(raw: unknown): CharmLiquid | null {
     bubbleColorOuter: vec3(e.bubbleColorOuter, [1, 1, 1]),
     agitation: num(e.agitation, 0),
     gravity: vec3(e.gravity, [0, 0, -1]),
+    // Refraction. The defaults are AIR — ior 1, no cube contribution — so a mount
+    // extracted before these shipped renders exactly as it did before rather than
+    // bending light through a value nobody authored.
+    glassRefraction: num(e.glassRefraction, 1),
+    liquidRefraction: num(e.liquidRefraction, 1),
+    surfaceRefraction: num(e.surfaceRefraction, 1),
+    refractRoughMul: num(e.refractRoughMul, 1),
+    cubeTransparency: num(e.cubeTransparency, 0),
+    cubeLiquidTransparency: num(e.cubeLiquidTransparency, 0),
+    cubeBrightness: num(e.cubeBrightness, 0),
+    reflectance: num(e.reflectance, 0),
+    specularStrength: num(e.specularStrength, 0),
+    surfaceSpecularStrength: num(e.surfaceSpecularStrength, 0),
+    transmissive: num(e.transmissive, 0),
+    emissive: num(e.emissive, 0),
     opaqueRefract: e.opaqueRefract === true,
     ...(typeof e.mask === "string" ? { mask: e.mask } : {}),
     ...(typeof e.roughMap === "string" ? { roughMap: e.roughMap } : {}),
+    ...(typeof e.metalMap === "string" ? { metalMap: e.metalMap } : {}),
   };
 }
 
@@ -160,6 +191,10 @@ export interface ResolvedLiquid {
   bubOut: [number, number, number];
   /** maskMin, maskMax. */
   mask: [number, number];
+  /** glassRefraction, liquidRefraction, surfaceRefraction, refractRoughnessMultiplier. */
+  r: [number, number, number, number];
+  /** cubeTransparency, cubeLiquidTransparency, cubeBrightness, specularStrength. */
+  s: [number, number, number, number];
   /** `F_OPAQUE_REFRACT` — this is the GLASS pass, not the inner volume. */
   opaqueRefract: boolean;
   /** The material's AUTHORED at-rest agitation; live motion adds to it. */
@@ -210,6 +245,15 @@ function sourceToViewer([x, y, z]: [number, number, number]): [number, number, n
  *   4  the object-space up axis;  5  |vLqHeight|;  6  vdg;  7  thickness;
  *   8  the view vector;  9  world up.
  *
+ *  30  the CUBE-REFRACT term alone — everything else in the lighting blanked. Use
+ *      this before concluding the refraction "does nothing": at the authored
+ *      brightness it is a modest add on top of a lit surface, and the question of
+ *      whether it is present is separate from whether it is strong enough.
+ *  31  the liquid's own specular alone. The tight 400/roughness lobe is a few
+ *      pixels wide by design, so on a still render it can be entirely off-screen
+ *      — orbit before deciding it is zero.
+ *  32  the refracted direction as colour;  33  the refraction roughness.
+ *
  * Any non-zero mode also stashes the live materials on `globalThis.__lqMats` and
  * counts ticks on `__lqTick` / `__lqFound`. Use 99 for that alone — it injects no
  * probe GLSL, so the render stays honest while you read uniforms out of it. That
@@ -238,8 +282,37 @@ export const liquidProbe = { mode: 0 };
  */
 const GLASS_ROUGHNESS = 0.33;
 
-const NORMAL_B = 1.0;
-const SHARP_SCALE = 1.0 + (0.2 - 1.0) * Math.pow(NORMAL_B, 1.5); // mix(1, 0.2, b^1.5)
+/**
+ * The agitation a charm that is just hanging there actually has.
+ *
+ * NOT a guess: csgoskins' port of this shader runs
+ * `mix(0.9, 0.7, saturate(pow((time - 5) / 10, 2)))` — sloshing at 0.9 on load,
+ * settled to 0.7 about fifteen seconds later. Their decay is keyed to page load,
+ * which for a charm that can be mounted and dismissed in a grid would restart the
+ * slosh on every open; settling straight to their settled value is the honest
+ * version of a charm that has been hanging there a while.
+ *
+ * Seeded into the uniform AND used as the tick's floor, because those are two
+ * different code paths and only one of them runs in a still render — see the note
+ * at the `d` vector in resolveCharmLiquid.
+ */
+export const REST_AGITATION = 0.7;
+
+// The waterline's sharpness scale USED to be a constant here:
+//
+//   const NORMAL_B = 1.0;
+//   const SHARP_SCALE = 1.0 + (0.2 - 1.0) * Math.pow(NORMAL_B, 1.5);   // = 0.2
+//
+// The shader's term is mix(1.0, 0.2, pow(b, 1.5)) with b = g_tNormalA.z, and
+// b was measured as 1.0 — off the exported normal map's BLUE channel, which VRF
+// had rebuilt as the octahedral Z. Extraction v24 established that the authored
+// channel is the ROUGHNESS and that it survives in ALPHA (p10 0.15, median 0.33,
+// p90 0.56); the constant was never revisited.
+//
+// At the real median that term is mix(1, 0.2, 0.33^1.5) = 0.848, not 0.2 — so the
+// waterline was being softened 4.2x too far, which is exactly the difference
+// between our smooth gradient and the sharp jagged meniscus a correct render has.
+// It is a TEXTURE, so it belongs per-fragment: see csLiquidSample.
 
 /**
  * Resolve the liquid at one pattern.
@@ -269,15 +342,28 @@ export function resolveCharmLiquid(
     center: liq.center,
     color: liq.color,
     a: [levelHeight, 0, (hueDeg * Math.PI) / 180, liq.brightness],
-    b: [liq.surfaceTension, liq.sharpness * SHARP_SCALE, liq.waterLine, liq.fresnelThickness],
+    b: [liq.surfaceTension, liq.sharpness, liq.waterLine, liq.fresnelThickness],
     c: [liq.backOffset, liq.backFade, liq.backShape, liq.brightenEmpty],
-    d: [liq.innerGlow, liq.roughness, liq.wobbleSpeed, liq.agitation],
+    // THE FLOOR IS APPLIED HERE, not only in tickCharmLiquid.
+    //
+    // The tick is what normally raises agitation to REST_AGITATION, and it only
+    // runs on a live render loop — so a STILL render (every card bake, every rig
+    // snapshot, the craft preview) kept the material's authored value, which on
+    // this vessel is 0.0 because the real one rides a render attribute the
+    // decompiler drops. Bubble size goes as a^9, so 0.0 meant no bubbles at all
+    // in exactly the renders anyone looks at closely.
+    d: [liq.innerGlow, liq.roughness, liq.wobbleSpeed, Math.max(liq.agitation, REST_AGITATION)],
     w: [liq.wobbleScale, liq.wobbleWavelength],
     f: [liq.bubbleScale, liq.bubbleDepthFalloff, liq.bubblesMin, liq.bubblesMax],
     g: [liq.bubbleSpeed, liq.bubbleSpaceScale, liq.bubbleStrength],
     bub: liq.bubbleColorInner,
     bubOut: liq.bubbleColorOuter,
     mask: [liq.maskMin, liq.maskMax],
+    r: [liq.glassRefraction, liq.liquidRefraction, liq.surfaceRefraction, liq.refractRoughMul],
+    // The surface's own specular strength rides with the liquid's — the shader
+    // picks between them by the same surface mask the ior does.
+    s: [liq.cubeTransparency, liq.cubeLiquidTransparency, liq.cubeBrightness,
+        Math.max(liq.specularStrength, liq.surfaceSpecularStrength)],
     opaqueRefract: liq.opaqueRefract,
     agitation: liq.agitation,
   };
@@ -430,11 +516,13 @@ export const CHARM_LIQUID_VERTEX = `
  * masks have the same two requirements (the albedo's flipY, and NoColorSpace),
  * which is the other reason they share a loader.
  *
- * NOT implemented, all of it needing a scene buffer we do not render:
- * `F_OPAQUE_REFRACT`'s refracted background (`g_flGlassRefraction`,
- * `g_flLiquidRefraction`, `g_flLiquidSurfaceRefraction`), the cube-refract
- * terms, and the liquid's own specular add. Three's BRDF stands in for the
- * last, fed the liquid roughness below.
+ * The refraction and the liquid's own specular are NOT here — they are at
+ * <lights_fragment_end>, in CHARM_LIQUID_REFRACT, because they need the scene's
+ * environment and its direct lights. They used to be described in this comment as
+ * unimplementable without "a scene buffer we do not render", which was simply
+ * wrong and cost this charm four rounds of chasing smaller terms: the game
+ * refracts against a CUBEMAP, not the framebuffer. See the note over
+ * CHARM_LIQUID_REFRACT.
  */
 export const CHARM_LIQUID_GLSL = `
 uniform vec3 uLqUp;
@@ -449,12 +537,15 @@ uniform vec4 uLqC;
 uniform vec4 uLqD;
 uniform vec2 uLqMask;
 uniform vec2 uLqW;
-uniform vec2 uLqE;
+uniform vec3 uLqE;
 uniform sampler2D uLqRough;
+uniform sampler2D uLqMetal;
 uniform vec4 uLqF;
 uniform vec3 uLqG;
 uniform vec3 uLqBubIn;
 uniform vec3 uLqBubOut;
+uniform vec4 uLqR;
+uniform vec4 uLqS;
 varying vec3 vLqViewOff;
 varying vec3 vLqWorld;
 varying vec3 vLqObj;
@@ -511,8 +602,41 @@ float csLiquidWobble( float agit, float upright, float fres, float alongUp ) {
  * bubble size; 1/size scales the cell so a bigger bubble covers more of it.
  * Returns coverage in .a and the inner/outer tint in .rgb.
  */
+/**
+ * TWO AGITATION CURVES, and feeding the wrong one here is why the bubbles were
+ * invisible for this charm's entire history.
+ *
+ * The shader derives two separate quantities from the live agitation a:
+ *   agitationBase    = a * a + 0.01     drives the WOBBLE
+ *   agitationBubbles = pow( a, 9.0 )    drives the bubble SIZE, and only this
+ *
+ * The agit parameter here must therefore be the RAW agitation. It used to be
+ * handed agitationBase — already squared — which this function then raised to
+ * the ninth, i.e. a^18. At a resting 0.55 that is (0.3125)^9 = 6e-5 against the
+ * 0.7^9 = 0.040 a settled charm should have: **660x too small**, which rounds to
+ * nothing at every stage downstream. The four layers, the tint and the normal
+ * displacement were all correct and all multiplied by ~zero.
+ *
+ * Confirmed against csgoskins.gg's independent port of the same Valve shader
+ * (groundtruth/csgoskins_simple_liquid.glsl), which names the two explicitly.
+ */
 vec4 csLiquidBubbles( float agit, float depth, float rough, out vec2 disp ) {
-	float size = ( 1.5 * uLqF.x * mix( uLqF.z, uLqF.w, pow( agit, 9.0 ) ) )
+	// THE + 0.25 IS NOT OPTIONAL, and leaving it out is why the bubbles were
+	// still invisible after three other real fixes.
+	//
+	// The shader's term is mix(min, max, agitationBubbles + input_11.y * 0.25),
+	// where input_11 is a vertex COLOUR. Our GLB has no COLOR_0 at all (it carries
+	// POSITION/TEXCOORD_0/NORMAL/TANGENT/JOINTS_0/WEIGHTS_0), so it read as absent
+	// and the term vanished. csgoskins hit the same missing attribute and answer it
+	// explicitly — their port opens with a #define of input_11 to vec4(1.0) — so
+	// this a constant +0.25, not a per-vertex value we are failing to supply.
+	//
+	// It dominates at rest, because agitationBubbles is a NINTH power:
+	//   without:  mix(0.1, 0.4, 0.040)        = 0.112 -> size 0.050 -> disc 2.2px
+	//   with:     mix(0.1, 0.4, 0.040 + 0.25) = 0.187 -> size 0.084 -> disc 3.7px
+	// i.e. 2.8x the covered area. Not clamped — the shader lets mix() extrapolate
+	// past the max at high agitation and so do we.
+	float size = ( 1.5 * uLqF.x * mix( uLqF.z, uLqF.w, pow( agit, 9.0 ) + 0.25 ) )
 		/ ( 1.0 + abs( depth ) * uLqF.y );
 	float density = 4.0 * ( 1.0 - rough );
 	disp = vec2( 0.0 );
@@ -520,7 +644,34 @@ vec4 csLiquidBubbles( float agit, float depth, float rough, out vec2 disp ) {
 	float inv = 1.0 / max( size, 0.001 );
 	float tw = ( 3.0 * uLqA.y ) * floor( uLqD.z * 200.0 );
 	float t = tw * 0.005 * uLqG.x;
-	vec2 base = vLqViewOff.xy * uLqG.y;
+	// THE LATTICE IS GRAVITY-ALIGNED, and using raw view x/y is why the bubbles
+	// drift ACROSS the liquid instead of rising through it.
+	//
+	// The shader builds a screen-space frame out of gravity and projects onto it:
+	//     viewGravityDir2D = normalize(vec3(gravityInView.xy, 0.0))
+	//     x = dot(offset, cross(viewGravityDir2D, vec3(0,0,1)))   perpendicular
+	//     y = dot(offset, viewGravityDir2D)                       along gravity
+	// so the layers' scroll (dir is roughly (0.1, 1.0)) runs along the gravity
+	// axis and the bubbles travel up. Ours scrolled along view +Y no matter which
+	// way was down, which reads as sideways drift the moment the charm tips or the
+	// camera orbits.
+	//
+	// SCALE: the offset stays in GLB units. The frequency is fixed in the shader
+	// (sc * cell = 0.6 * 1.74 on the first layer), so the coordinate's scale sets
+	// how many cells land on the charm, and the disc in each has radius size —
+	// 0.05 of a half-cell:
+	//
+	//   GLB units (this)          2.3 cells across   cell 87px   disc r = 2.2px
+	//   x39.37 into inches        90  cells across   cell 2.2px  disc r = 0.06px
+	//
+	// The inch conversion was tried because csgoskins fold a meterToInchMultiplier
+	// into their liquid matrix and then divide by 0.0254 again. It is SUB-PIXEL —
+	// the discs stop being sampled at all. Their world is metres like ours and the
+	// two conversions cancel against a centre term that is itself inch-scaled.
+	vec3 lqGView = normalize( ( viewMatrix * vec4( -uLqUp, 0.0 ) ).xyz );
+	vec2 lqGy = normalize( lqGView.xy + vec2( 1e-5, 0.0 ) );
+	vec2 lqGx = vec2( lqGy.y, -lqGy.x );
+	vec2 base = vec2( dot( vLqViewOff.xy, lqGx ), dot( vLqViewOff.xy, lqGy ) ) * uLqG.y;
 	// The shader wobbles each layer's phase with two sines of the base coords so
 	// the lattices never line up into a visible grid.
 	float sy = sin( base.y ) * 0.25 + sin( base.y * 23.1984 ) * 0.02;
@@ -537,7 +688,18 @@ vec4 csLiquidBubbles( float agit, float depth, float rough, out vec2 disp ) {
 		vec2 dir = i == 0 ? vec2( 0.1, 1.0 ) : i == 1 ? vec2( -0.1, 1.0 )
 			: i == 2 ? vec2( 0.13, 1.0 ) : vec2( -0.14, 1.0 );
 		float spd = i == 0 ? 0.25 : i == 1 ? 0.3 : i == 2 ? 0.35 : 0.4;
-		vec2 p = ( ( fract( ( ( base + off ) * sc ) + dir * t * spd ) * cell ) * 2.0 - 1.0 ) * inv;
+		// THE CELL FREQUENCY GOES INSIDE fract(), and having it outside is why
+		// there were never any bubbles.
+		//
+		//   theirs:  ((fract( X * 1.74 ) * 2.0) - 1.0) * inv
+		//   ours:    ((fract( X ) * 1.74  * 2.0) - 1.0) * inv     <- wrong
+		//
+		// Inside, it is the lattice FREQUENCY and the cell coordinate lands in
+		// [-1, 1) so length() is a clean radius. Outside, the lattice has no
+		// frequency at all and the coordinate runs [-1, 2.48) — asymmetric, so
+		// most of every cell sits beyond the disc test and the few texels that
+		// survive form a thin band rather than a bubble.
+		vec2 p = ( fract( ( ( ( base + off ) * sc ) + dir * t * spd ) * cell ) * 2.0 - 1.0 ) * inv;
 		float r = length( p );
 		float a = clamp( density * ( 1.0 - r ), 0.0, 1.0 );
 		cover += a;
@@ -564,7 +726,7 @@ struct LqSample {
 	float depth;    // _3921 - _11687 — how far UNDER the surface, before the meniscus
 };
 
-LqSample csLiquidSample( vec3 N ) {
+LqSample csLiquidSample( vec3 N, float rough ) {
 	LqSample s;
 	vec3 up = uLqUp;
 	// THE VIEWER IS ORTHOGRAPHIC — see the settled note on viewer3d's projection.
@@ -584,9 +746,18 @@ LqSample csLiquidSample( vec3 N ) {
 	s.fres = clamp( 1.0 - dot( -Vd, N ), 0.0, 1.0 );
 	s.ndv = 1.0 - s.fres;
 	s.ndv2 = s.ndv * s.ndv;
-	float m = uLqD.w > 0.5 ? csCharmMask() : 1.0;
-	s.mask = clamp( ( m - uLqMask.x ) / ( uLqMask.y + 0.001 ), 0.0, 1.0 );
-	s.sharp = uLqB.y * s.mask;
+	// _22843. csCharmMask SELF-GATES on uCharmMask.x — the "a mask is bound" flag,
+	// see charmMaterial's whiteTexture note — so calling it unconditionally is
+	// safe, and the test that used to sit here was reading uLqD.w, which is the
+	// live AGITATION. That made the mask switch itself off whenever the charm was
+	// calm enough (below 0.55 it never is once tickCharmLiquid has run, but the
+	// material's own authored value is 0.0 on the vessel, so every frame before
+	// the first tick flooded the whole material). The refraction below gates on
+	// this mask, so a wrong one is no longer a subtle error.
+	s.mask = clamp( ( csCharmMask() - uLqMask.x ) / ( uLqMask.y + 0.001 ), 0.0, 1.0 );
+	// _4095 = sharpness * mask * mix(1.0, 0.2, pow(b, 1.5)), b being the normal
+	// map's spare channel — the ROUGHNESS. Per-fragment, not the constant it was.
+	s.sharp = uLqB.y * s.mask * mix( 1.0, 0.2, pow( clamp( rough, 0.0, 1.0 ), 1.5 ) );
 
 	// WHERE THE SURFACE SITS. The three MinMidMax triples are the level scalar
 	// at fill 0 / 0.5 / 1, and the shader picks between them by how upright the
@@ -763,10 +934,21 @@ export function tickCharmLiquid(
   // on our own idle sway to supply it was the wrong shape — the sway exists to
   // look like a hanging charm, not to be the liquid's only power source.
   //
-  // 0.55 sits just inside the range where the wobble reads (it scales as
-  // (a^2 + 0.01)^2, measured: 0.4 -> 2px of motion, 0.7 -> 7px, 1.0 -> 30px), so
-  // a still charm ripples gently and real motion still adds on top.
-  const REST_AGITATION = 0.55;
+  // 0.7 IS NOT A GUESS ANYMORE. csgoskins' port of this shader drives agitation
+  // as `mix(0.9, 0.7, saturate(pow((time - 5) / 10, 2)))` — it starts sloshing at
+  // 0.9 and settles to 0.7 about fifteen seconds after load. The material's own
+  // authored g_flTestAgitation is 0.375 on the vessel, but that is the static
+  // fallback behind a render-attribute expression the decompiler drops, and it is
+  // plainly not what a rendered charm uses.
+  //
+  // The value matters far more than "some sloshing" suggests, because the bubble
+  // size goes as a^9: 0.55 gives 0.005 and 0.7 gives 0.040, an eightfold
+  // difference in a term that was already rounding to nothing. See csLiquidBubbles.
+  //
+  // Their 0.9 -> 0.7 decay is not reproduced: it is keyed to page load, which for
+  // a charm that can be mounted, dismissed and re-mounted in a grid would restart
+  // the slosh every time. Settling straight to their settled value is the honest
+  // version of a charm that has been hanging there.
   const decayed = Math.max(
     REST_AGITATION,
     ((ud.lqAgit as number) ?? 0) * Math.max(0, 1 - dt * 2.5),
@@ -827,13 +1009,18 @@ export function setCharmLiquidUniforms(
   v4("lqC", lq.c);
   v4("lqD", lq.d);
   v4("lqF", lq.f);
+  v4("lqR", lq.r);
+  v4("lqS", lq.s);
   v3("lqBubIn", lq.bub);
   v3("lqBubOut", lq.bubOut);
   v3("lqG", lq.g);
-  const e = u.lqE as ThreeNS.Vector2 | undefined;
+  const e = u.lqE as ThreeNS.Vector3 | undefined;
   const hasRough = u.lqRough && (u.lqRough as { isTexture?: boolean }).isTexture && u.lqRoughBound === true;
-  if (e) e.set(GLASS_ROUGHNESS, hasRough ? 1 : 0);
-  else u.lqE = new THREE.Vector2(GLASS_ROUGHNESS, hasRough ? 1 : 0);
+  // .z gates the metalness: the fallback texture is white, so an unbound map
+  // would otherwise read alpha 1.0 and render the whole charm as chrome.
+  const hasMetal = u.lqMetal && (u.lqMetal as { isTexture?: boolean }).isTexture && u.lqMetalBound === true;
+  if (e) e.set(GLASS_ROUGHNESS, hasRough ? 1 : 0, hasMetal ? 1 : 0);
+  else u.lqE = new THREE.Vector3(GLASS_ROUGHNESS, hasRough ? 1 : 0, hasMetal ? 1 : 0);
   const w = u.lqW as ThreeNS.Vector2 | undefined;
   if (w) w.set(lq.w[0], lq.w[1]);
   else u.lqW = new THREE.Vector2(lq.w[0], lq.w[1]);
@@ -874,8 +1061,11 @@ export function patchCharmLiquidShader(
   shader.uniforms.uLqW = { value: u.lqW };
   shader.uniforms.uLqE = { value: u.lqE };
   shader.uniforms.uLqRough = { value: u.lqRough };
+  shader.uniforms.uLqMetal = { value: u.lqMetal };
   shader.uniforms.uLqF = { value: u.lqF };
   shader.uniforms.uLqG = { value: u.lqG };
+  shader.uniforms.uLqR = { value: u.lqR };
+  shader.uniforms.uLqS = { value: u.lqS };
   shader.uniforms.uLqBubIn = { value: u.lqBubIn };
   shader.uniforms.uLqBubOut = { value: u.lqBubOut };
 
@@ -890,11 +1080,31 @@ export function patchCharmLiquidShader(
       [
         "#include <normal_fragment_maps>",
         "\tfloat lqSpecKill = 1.0;",
+        // HOISTED FOR THE REFRACTION, which runs at <lights_fragment_end> — it
+        // needs the scene's environment and the direct lights, and neither exists
+        // this early. Everything the refraction reads is computed here anyway;
+        // recomputing the sample down there would double the cost of the most
+        // expensive part of the shader for no new information.
+        //
+        // Names carry the decompile's temporary alongside them so the transcription
+        // below can be checked against liquid_outer_combo12.glsl line by line.
+        "\tfloat lqRefrCover = 0.0;              // _21055",
+        "\tfloat lqRefrMask = 0.0;               // _22843",
+        "\tfloat lqRefrSurf = 0.0;               // _9387",
+        "\tfloat lqRefrRough = 1.0;              // _23988",
+        "\tfloat lqRefrFres = 0.0;               // _13948",
+        "\tvec3 lqRefrN = vec3( 0.0, 0.0, 1.0 ); // _14278, WORLD",
+        "\tvec3 lqRefrV = vec3( 0.0, 0.0, -1.0 );// _23996, WORLD, camera -> fragment",
+        "\tvec3 lqRefrAlb = vec3( 0.0 );         // _8673",
+        "\tfloat lqBubA = 0.0;                   // bubble coverage, for probe 21",
+        "\tvec3 lqBubRGB = vec3( 0.0 );          // bubble tint, for probe 22",
         "\t{",
         // three's `normal` is VIEW space by here; the whole liquid works in
         // world, where gravity and the level are.
         "\t\tvec3 lqN = normalize( ( vec4( normal, 0.0 ) * viewMatrix ).xyz );",
-        "\t\tLqSample lqS = csLiquidSample( lqN );",
+        // Sampled BEFORE csLiquidSample: the waterline sharpness reads it too.
+        "\t\tfloat lqRoughS = uLqE.y > 0.5 ? texture2D( uLqRough, vMapUv ).a : uLqE.x;",
+        "\t\tLqSample lqS = csLiquidSample( lqN, lqRoughS );",
         "\t\tfloat lqWater, lqFront, lqBack;",
         "\t\tfloat lqCover = csLiquidCoverage( lqS, lqWater, lqFront, lqBack );",
         "\t\tfloat lqA = clamp( lqCover * lqS.mask, 0.0, 1.0 );",
@@ -924,9 +1134,10 @@ export function patchCharmLiquidShader(
         // Bubbles ride INSIDE the liquid: brighten toward their own colour where
         // they cover, exactly as the shader's `mix(1, bubbleTint*4, opacity*cover)`.
         "\t\tfloat lqAgitF = uLqD.w * uLqD.w + 0.01;",
-        "\t\tfloat lqRoughS = uLqE.y > 0.5 ? texture2D( uLqRough, vMapUv ).a : uLqE.x;",
         "\t\tvec2 lqDisp;",
-        "\t\tvec4 lqBub = csLiquidBubbles( lqAgitF, lqS.depth, lqRoughS, lqDisp );",
+        // uLqD.w (RAW agitation), NOT lqAgitF (which is already a*a + 0.01) —
+        // see the two-curve note over csLiquidBubbles.
+        "\t\tvec4 lqBub = csLiquidBubbles( uLqD.w, lqS.depth, lqRoughS, lqDisp );",
         // BUBBLES ARE A NORMAL PERTURBATION, and that is why they were invisible.
         //
         // g_flBubbleStrength (10.0) appears nowhere near the colour: the shader
@@ -937,6 +1148,8 @@ export function patchCharmLiquidShader(
         // _4789 path, kept below) moves the pixel ~5% and looks like nothing.
         "\t\tvec3 lqCamR = normalize( vec3( viewMatrix[ 0 ][ 0 ], viewMatrix[ 1 ][ 0 ], viewMatrix[ 2 ][ 0 ] ) );",
         "\t\tnormal = normalize( normal + ( ( lqCamR * lqDisp.y + cross( lqCamR, lqS.viewDir ) * lqDisp.x ) * uLqG.z * lqA ) );",
+        "\t\tlqBubA = lqBub.a;",
+        "\t\tlqBubRGB = lqBub.rgb;",
         "\t\tvec3 lqCB = lqC * mix( vec3( 1.0 ), lqBub.rgb * 4.0, clamp( lqBub.a, 0.0, 1.0 ) );",
         "\t\tdiffuseColor.rgb *= mix( vec3( 1.0 ), lqCB, lqA );",
         // Inner glow: brightest right at the surface, where the denominator is 1.
@@ -944,6 +1157,26 @@ export function patchCharmLiquidShader(
         "\t\tdiffuseColor.rgb += lqC * uLqA.w * pow( lqS.ndv, 3.0 ) * lqA / lqDepth * uLqD.x;",
         // And the empty half is lifted, so glass above the line reads as air.
         "\t\tdiffuseColor.rgb *= 1.0 + uLqC.w * lqS.mask * clamp( 1.0 - lqCover, 0.0, 1.0 );",
+        // Hand the refraction everything it needs. `_8673` is the albedo at
+        // exactly this point — after the empty-area lift and before the roughness
+        // overrides — which is what the cube-refract tints itself by.
+        "\t\tlqRefrCover = lqCover;",
+        "\t\tlqRefrMask = lqS.mask;",
+        // _9387 = saturate((back - front) * mask): where you see through the far
+        // wall but not the near one, i.e. the liquid's own SURFACE. It picks the
+        // third index of refraction. Note the sign is the opposite way round from
+        // lqInside below, which is a different term despite the similar shape.
+        "\t\tlqRefrSurf = clamp( ( lqBack - lqFront ) * lqS.mask, 0.0, 1.0 );",
+        "\t\tlqRefrRough = lqRoughS;",
+        "\t\tlqRefrFres = lqS.fres;",
+        "\t\tlqRefrV = lqS.viewDir;",
+        "\t\tlqRefrAlb = diffuseColor.rgb;",
+        // _14278 — the refraction normal leans toward the BUBBLE-perturbed normal
+        // inside the liquid and stays geometric outside it. `normal` has already
+        // been bent above, so read it back out of view space rather than
+        // recomputing the displacement.
+        "\t\tvec3 lqNbub = normalize( ( vec4( normal, 0.0 ) * viewMatrix ).xyz );",
+        "\t\tlqRefrN = normalize( mix( lqN, mix( lqN, lqNbub, vec3( 0.75 ) ), vec3( lqCover ) ) );",
         // Roughness follows the liquid inside the body, and goes broad at the
         // waterline — the 0.09 offset is the shader's, not a copy of the 0.05 above.
         ...(liquidProbe.mode === 1
@@ -960,12 +1193,32 @@ export function patchCharmLiquidShader(
                     ? ["\t\tdiffuseColor.rgb = uLqUp * 0.5 + 0.5;"]
                     : liquidProbe.mode === 7
                   ? ["\t\tdiffuseColor.rgb = vec3( clamp( lqS.back, 0.0, 1.0 ), clamp( lqS.back - 1.0, 0.0, 1.0 ), 0.0 );"]
+                  // 21 was DOCUMENTED AND NEVER IMPLEMENTED. Selecting it silently
+                  // rendered the charm normally, so every "bubble coverage"
+                  // measurement taken through it was really measuring the lit
+                  // render's brightness — including one that reported the bubbles
+                  // as fixed when they were not. A probe that does nothing is worse
+                  // than no probe: it answers.
                   : []),
         // The vessel's own surface, before the liquid and waterline overrides
         // below take it toward g_flLiquidRoughness and the meniscus.
         // The AUTHORED glass roughness, out of the normal map's alpha — see the
         // roughMap note in extract-models.sh. uLqE.y is 1 when one is bound;
         // without it the constant stands in so the vessel is never matte.
+        // METALNESS, from the albedo's ALPHA — the channel VRF's glTF export drops.
+        //
+        // The decompile does the textbook split off g_tColorA.w:
+        //   _18392 = g_tColorA.w
+        //   _24253 = mix(vec3(g_flReflectance), albedo, _18392)   specular colour
+        //   ...    = mix(albedo * (1.0 - _18392), cubeRefract, …) diffuse killed
+        //
+        // three's PhysicalMaterial does exactly this given metalnessFactor, so it
+        // is one assignment rather than a transcription. It is the difference
+        // between the polished lighter case and hinge pin reading as chrome, and
+        // reading as the flat matte plastic they did — the shader declares no
+        // metalness TEXTURE, which is what made "this shader has no metalness"
+        // look true for so long.
+        "\t\tif ( uLqE.z > 0.5 ) metalnessFactor = texture2D( uLqMetal, vMapUv ).a;",
         "\t\troughnessFactor = min( roughnessFactor, lqRoughS );",
         "\t\tfloat lqInside = clamp( ( lqFront - lqBack ) * 2.0, 0.0, 1.0 );",
         "\t\troughnessFactor = mix( roughnessFactor, clamp( uLqD.y, 0.0, 1.0 ), lqInside );",
@@ -977,6 +1230,186 @@ export function patchCharmLiquidShader(
     )
     .replace(
       "#include <lights_fragment_end>",
-      "#include <lights_fragment_end>\n\treflectedLight.directSpecular *= lqSpecKill;\n\treflectedLight.indirectSpecular *= lqSpecKill;",
+      [
+        "#include <lights_fragment_end>",
+        "\treflectedLight.directSpecular *= lqSpecKill;",
+        "\treflectedLight.indirectSpecular *= lqSpecKill;",
+        CHARM_LIQUID_REFRACT.replace("LQ_REFRACT_PROBE", refractProbe()),
+      ].join("\n"),
     );
 }
+
+/**
+ * Probe GLSL for the refraction stage, or nothing.
+ *
+ * Each mode blanks the rest of the lighting and shows one term alone, which is
+ * the only way to tell "the refraction is wrong" from "the refraction is fine and
+ * something else is drowning it". Kept as a function rather than inlined so a
+ * mode that references an out-of-scope name is a TypeScript-adjacent mistake in
+ * one place instead of a silent shader-compile failure — see DEBUGGING-SKINS.md:
+ * three logs the failure once and keeps drawing with the previous program, so a
+ * broken probe reads as garbage data rather than as a broken probe.
+ */
+function refractProbe(): string {
+  const term =
+    liquidProbe.mode === 30
+      ? "lqCube * clamp( lqTrans * lqRefrMask, 0.0, 1.0 )"
+      : liquidProbe.mode === 31
+        ? "lqSpecOut"
+        : liquidProbe.mode === 32
+          ? "normalize( lqDir ) * 0.5 + 0.5"
+          : liquidProbe.mode === 33
+            ? "vec3( lqRRough )"
+            : // GREEN where the refracted ray points at the light (the specular
+              // can fire), RED where it points away (it never will). A fully red
+              // charm means the lobe is not merely narrow, it is on the wrong
+              // side — which is the one thing a black probe 31 cannot tell you.
+              liquidProbe.mode === 34
+              ? "vec3( clamp( -lqSunDot, 0.0, 1.0 ), clamp( lqSunDot, 0.0, 1.0 ), 0.0 )"
+              // 21/22 live here rather than with the albedo probes because these
+              // blank the lighting. Read against a lit surface, a coverage map is
+              // coverage x lighting x reflections, which is unreadable — and that
+              // is how "100% coverage" got reported off a probe that was in fact
+              // showing the ordinary render.
+              : liquidProbe.mode === 21
+                ? "vec3( clamp( lqBubA, 0.0, 1.0 ) )"
+                : liquidProbe.mode === 22
+                  ? "lqBubRGB"
+                  : null;
+  if (!term) return "";
+  return [
+    "\t\treflectedLight.directDiffuse = vec3( 0.0 );",
+    "\t\treflectedLight.indirectDiffuse = vec3( 0.0 );",
+    "\t\treflectedLight.directSpecular = vec3( 0.0 );",
+    "\t\treflectedLight.indirectSpecular = vec3( 0.0 );",
+    `\t\ttotalEmissiveRadiance = ${term};`,
+  ].join("\n");
+}
+
+/**
+ * CUBE REFRACTION AND THE LIQUID'S OWN SPECULAR — the missing character.
+ *
+ * This file and the handover doc both had these filed as blocked on "a scene
+ * colour buffer the viewer does not render". They are not, and that wrong note is
+ * most of why four rounds of transcribing other terms each landed a correct and
+ * invisible change: the two terms that carry the reference render's HARD
+ * SPECULARS and REFLECTIONS were the ones nobody attempted.
+ *
+ * The decompile is explicit. liquid_outer_combo12.glsl:707 samples the refracted
+ * ray out of `g_tEnvironmentMap` — a CUBEMAP ARRAY — and :1462 builds a
+ * `refract()`-based sun highlight out of the light constants. A prefiltered
+ * environment and one directional light is the whole requirement, and viewer3d
+ * has had both since it was written (getSharedGL PMREMs RoomEnvironment; the
+ * scene carries a key light).
+ *
+ * This is also the "metallic casing". `csgo_simple_liquid` declares no metalness
+ * texture at all — g_tColorA, g_tNormalA, g_tLiquidMask, g_tDroplets and nothing
+ * else — so the brass read on kc_db_lighter_02 was never a dropped channel
+ * waiting to be recovered. It is this reflection.
+ *
+ * THREE DELIBERATE DEVIATIONS, all because the game's frame constants have no
+ * counterpart here:
+ *
+ *  · No parallax correction. The game intersects the refracted ray against each
+ *    env probe's AABB (`abs(min(_11253.x, ...))`) and blends toward the raw
+ *    direction as roughness rises. RoomEnvironment is a single infinite probe
+ *    with no box, so the raw direction is all there is — which is what the game
+ *    itself converges to at roughness 1.
+ *  · No energy-limit ratio. `min(luminance(irradiance) / dot(...), max(...))` in
+ *    :735 clamps the env against the diffuse the same pixel already received.
+ *    Both sides of that come from Valve's lighting buffers; 1.0 stands in.
+ *  · Lights are three's, in three's units. The absolute brightness of both terms
+ *    therefore rides envMapIntensity and the key light rather than the game's
+ *    exposure, so treat `g_flCubeRefractBrightness` as authored-relative.
+ *
+ * Guarded on ENVMAP_TYPE_CUBE_UV: without a prefiltered environment there is no
+ * `textureCubeUV` to call, and the charm renders exactly as it did before rather
+ * than failing to compile.
+ */
+const CHARM_LIQUID_REFRACT = `
+#if defined( USE_ENVMAP ) && defined( ENVMAP_TYPE_CUBE_UV )
+	{
+		// _11859 — one index of refraction per region: the glass, the volume
+		// behind it, and the liquid's own surface.
+		float lqIor = mix( mix( uLqR.x, uLqR.y, lqRefrCover ), uLqR.z, lqRefrSurf );
+		// _11823 / _7431. refract() returns exactly 0 under total internal
+		// reflection, and the game leans on that: the length IS the blend weight,
+		// so a grazing fragment falls back to the reflection on its own.
+		vec3 lqRefracted = refract( lqRefrV, lqRefrN, lqIor );
+		vec3 lqDir = mix( reflect( lqRefrV, lqRefrN ), lqRefracted, length( lqRefracted ) );
+		// _23698. The shader writes dot(vec2(r), vec2(0.5)), which is just r.
+		float lqRRough = mix( 0.1, 1.0, clamp( lqRefrRough * uLqR.w, 0.0, 1.0 ) );
+		vec3 lqEnv = textureCubeUV( envMap, envMapRotation * normalize( lqDir ), lqRRough ).rgb * envMapIntensity;
+		// _18406 — how transparent this region is, glass vs liquid.
+		float lqTrans = mix( uLqS.x, uLqS.y, lqRefrCover );
+		// _19791's tint: the albedo, darkened where the view grazes, fading to
+		// white as transparency passes 1 (it is 1.02 on the liquid, so the
+		// submerged half is very nearly untinted — which is exactly the reason the
+		// glass's own teal must not survive under the liquid, see above).
+		vec3 lqTint = mix( lqRefrAlb * mix( 1.25, 0.75, lqRefrFres ), vec3( 1.0 ), clamp( lqTrans - 1.0, 0.0, 1.0 ) );
+		// ENERGY LIMIT. The game scales the refracted env by the ratio of the
+		// irradiance this pixel actually received to the environment's own average
+		// radiance, so a bright cubemap cannot dump light into a dim spot:
+		//   min( luminance(probeIrradiance) / dot(vec4(refractDir,1), envAverage),
+		//        max(rough * a + b, 1.0) )
+		// Both of the game's operands come from Valve's lighting buffers. three's
+		// own irradiance stands in for the numerator and the env sample we just
+		// took for the denominator, which preserves the SHAPE of the clamp — env
+		// brighter than the local light gets scaled down, never up.
+		//
+		// This was skipped in the first pass and it mattered: without it the liquid
+		// measured sRGB (209,71,89) against the icon's (146,27,41) — brighter AND
+		// more desaturated on both ratios, which is the signature of unbounded
+		// white being added. The upper bound is 1.0 rather than the game's
+		// roughness expression, whose two constants are per-view.
+		const vec3 LQ_LUMA = vec3( 0.2125, 0.7154, 0.0721 );
+		float lqEnergy = min( dot( irradiance + iblIrradiance, LQ_LUMA ) / max( dot( lqEnv, LQ_LUMA ), 1e-4 ), 1.0 );
+		vec3 lqCube = lqTint * lqEnv * uLqS.z * lqEnergy;
+		// _7811 — added, gated by transparency x mask, exactly where the game adds
+		// it: alongside the emissive, not into the diffuse.
+		totalEmissiveRadiance += lqCube * clamp( lqTrans * lqRefrMask, 0.0, 1.0 );
+
+		// Hoisted so a probe can isolate them — the terms live inside the light
+		// guard, and a probe cannot reach into a preprocessor branch. lqSunDot is
+		// here for one specific question: this specular only fires when the
+		// refracted ray points AT the light, so "it renders black" has two very
+		// different causes (the lobe is off-camera, or the sun is on the wrong
+		// side) and they are indistinguishable in a screenshot.
+		vec3 lqSpecOut = vec3( 0.0 );
+		float lqSunDot = 0.0;
+		#if NUM_DIR_LIGHTS > 0
+			// :1462 — THE HARD SPECULAR. Not a BRDF lobe: it is the refracted view
+			// ray pointed at the sun, raised to 40/roughness, plus a second lobe at
+			// 400/roughness scaled by 4. That inner lobe is the tight glint the
+			// reference has on the casing and the vessel and we never did — three's
+			// own specular is far too broad to stand in for it.
+			//
+			// TWO conversions, and the second was settled by measurement.
+			//
+			// three keeps light directions in VIEW space, so rotate to world the
+			// same way the view vector is (v * viewMatrix).
+			//
+			// Then NEGATE. three's directionalLights[].direction points from the
+			// surface TOWARD the light; Source's sun vector is the direction light
+			// TRAVELS. (No backticks in this comment on purpose — one inside a GLSL
+			// comment terminates the TS template literal, see DEBUGGING-SKINS.md.)
+			// Without
+			// the flip, probe 34 renders the charm SOLID RED — the refracted ray
+			// points away from the light over the entire model, at every angle, so
+			// the lobe is not narrow, it is unreachable. Guessing between the two
+			// conventions would have been a coin flip; the probe exists precisely
+			// because "renders black" is the same picture either way.
+			vec3 lqSun = -normalize( ( vec4( directionalLights[ 0 ].direction, 0.0 ) * viewMatrix ).xyz );
+			float lqSpecRough = lqRefrRough + 0.2;
+			vec3 lqSpecDir = normalize( refract( lqRefrV, lqRefrN, mix( lqIor, 1.0, 0.5 ) ) );
+			lqSunDot = dot( lqSpecDir, lqSun );
+			float lqLobe = pow( clamp( lqSunDot, 0.0, 1.0 ), 40.0 / lqSpecRough );
+			vec3 lqSpec = lqRefrAlb * ( pow( directionalLights[ 0 ].color, vec3( 2.0 ) )
+				* ( ( ( lqLobe + pow( lqLobe, 400.0 / lqSpecRough ) * 4.0 ) * lqRefrMask ) * 4.0 ) );
+			lqSpecOut = lqSpec * lqTrans * 2.0 * uLqS.z * lqRefrMask;
+			totalEmissiveRadiance += lqSpecOut;
+		#endif
+LQ_REFRACT_PROBE
+	}
+#endif
+`;

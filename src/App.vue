@@ -8671,8 +8671,12 @@ if (MDEBUG) {
                   <input v-if="st" v-model.number="st.y" type="number" step="0.05" placeholder="0"
                     class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
                 </label>
+                <!-- ±180, the range the GAME stores. It read 0..360 before, which
+                     is the same set of angles and the wrong half of them: the
+                     backend folds anything past 180 to its negative equivalent,
+                     so a typed 286.5 came straight back as -73.5. -->
                 <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">ROT
-                  <input v-if="st" v-model.number="st.r" type="number" step="0.5" min="0" max="360" placeholder="0"
+                  <input v-if="st" v-model.number="st.r" type="number" step="0.5" min="-180" max="180" placeholder="0"
                     class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
                 </label>
               </div>

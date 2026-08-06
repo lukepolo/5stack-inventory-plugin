@@ -34,9 +34,19 @@
 //   ?shoot              also snapshot each regression case
 import { mountViewer, type ViewerKind } from "../../src/viewer3d";
 import { resolveViewerModel, type CharmSpec } from "../../src/viewerModel";
+import { liquidProbe } from "../../src/charmLiquid";
 
 const out = document.getElementById("out")!;
 const params = new URLSearchParams(location.search);
+
+// ?lqprobe=N — the liquid's stage probes (see liquidProbe in charmLiquid.ts).
+//
+// Set HERE, at module scope, because the mode is read when the shader is
+// PATCHED: anything that sets it after a mount has started is setting it for the
+// next material, not this one. That timing is also why it is a URL parameter and
+// not a console handle — BUTANE-BUDDY.md has told people to use these probes
+// since they were written, and there was no way to reach them from the rig.
+if (params.has("lqprobe")) liquidProbe.mode = Number(params.get("lqprobe"));
 const line = (s: string, cls = "") => {
   const d = document.createElement("div");
   if (cls) d.className = cls;

@@ -14,6 +14,10 @@
 // This decodes with a generic protobuf reader that knows nothing about our
 // writer, so it cannot inherit the writer's assumptions.
 import { buildInspectHex } from "../backend/src/inspect.ts";
+// From catalog.ts, not main.ts: main boots a Fastify server on import. This is
+// the same function the craft save, the equipped v5 feed and buildInspectHex all
+// run every rotation through.
+import { normStickerRotation } from "../backend/src/catalog.ts";
 
 const F_KEYCHAINS = 20;
 // Deliberately a SECOND, independent copy of the wire numbers — importing
@@ -130,6 +134,60 @@ if (kc.length === 1) {
     check(`${name} wire type is fixed32`, f.wire === 5, `wire=${f.wire}`);
     check(`${name} value round-trips`, Math.abs((f.value as number) - want) < 1e-3,
           `got ${f.value}, want ${want}`);
+  }
+}
+
+// ---- Sticker rotation --------------------------------------------------------
+//
+// Does the angle the user set actually reach the game?
+//
+// It did not. normStickerRotation used to CLAMP to ±180 where a rotation is an
+// angle and wants WRAPPING, so every placement past a half turn arrived as a flat
+// 180 — the sticker stopped turning partway through the drag, and typing the
+// negative did not help because -286.5 clamped to -180 just the same.
+//
+// Checked at both ends: the arithmetic on its own, and then the same value out
+// the far side of the protobuf writer, because a correct number that the encoder
+// mangles is the failure this whole file exists to catch.
+console.log("");
+for (const [input, want, why] of [
+  [286.5, -73.5, "past a half turn — used to clamp to 180"],
+  [355, -5, "just short of a full turn"],
+  [-286.5, 73.5, "the negative the workaround typed"],
+  [180, 180, "the boundary stays put, it does not fold to -180"],
+  [-180, -180, "and so does the other one"],
+  [45, 45, "an ordinary angle is untouched"],
+  [11.94, 11.9, "truncated to the 1dp the v5 feed carries"],
+  [-159.7, -159.7, "already on the grid and in range"],
+  [720, 0, "two full turns is no rotation at all"],
+] as const) {
+  const got = normStickerRotation(input);
+  check(`rotation ${input} -> ${want}`, Object.is(got, want) || Math.abs(got - want) < 1e-9,
+        `got ${got} (${why})`);
+}
+
+// Straight through the encoder. `scale` is deliberately left null: the game
+// treats an absent scale as the slot's authored one, and sending a 0 would
+// collapse the sticker to nothing.
+const rotHex = buildInspectHex({
+  defindex: 7, paintindex: 1023,
+  stickers: [{ slot: 0, id: 1847, rotation: normStickerRotation(286.5), offsetX: 0.0484, offsetY: 0.0292 }],
+});
+const rotBytes = Uint8Array.from((rotHex.match(/../g) ?? []).map((h) => parseInt(h, 16)));
+const rotMask = rotBytes[0];
+const rotBody = rotBytes.slice(1).map((b) => b ^ rotMask).slice(0, rotBytes.length - 5);
+const F_STICKERS = 12;
+const stick = decode(rotBody).filter((f) => f.field === F_STICKERS && f.wire === 2);
+check("sticker submessage present", stick.length === 1, `found ${stick.length}`);
+if (stick.length === 1) {
+  const f = new Map(decode(stick[0].value as Uint8Array).map((x) => [x.field, x])).get(SF.rotation);
+  if (!f) check("rotation present", false, "field absent — the game uses the slot's default angle");
+  else {
+    // Same trap as the offsets: a varint here lands in unknown-fields and the
+    // game silently draws the sticker unrotated.
+    check("rotation wire type is fixed32", f.wire === 5, `wire=${f.wire}`);
+    check("rotation reaches the wire wrapped", Math.abs((f.value as number) - -73.5) < 1e-3,
+          `got ${f.value}, want -73.5`);
   }
 }
 

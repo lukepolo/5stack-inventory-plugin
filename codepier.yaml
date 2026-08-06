@@ -20,3 +20,12 @@ ignore:
   - "/node_modules"
   - "/dist"
   - "/backend/node_modules"
+  # extract-models.sh's work dir, and it is 5.5GB: the Source2Viewer CLI plus
+  # every decompiled intermediate (raw, raw_att, raw_ci, raw_items). Pod-side
+  # build output that has no business crossing the boundary — exactly the case
+  # `ignore` exists for. Without this entry a single extraction run mirrors the
+  # whole thing onto the local machine, and a local cleanup then deletes the
+  # pod's copy too, forcing the next run to re-extract cold.
+  - "/cs2-model-extract"
+  # Its tarball output, same reasoning.
+  - "/cs2-models-glb.tar.gz"

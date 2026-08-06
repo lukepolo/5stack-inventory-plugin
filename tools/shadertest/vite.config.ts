@@ -10,14 +10,21 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // eyeballed and diffed across runs instead of only ever being reduced to
 // statistics. "sat=18" tells you it isn't grey; only the image tells you the
 // pattern is the right pattern.
-// Serve /models/* straight off disk from a local extraction.
-function localModels(dir: string): Plugin {
+// Serve an asset prefix straight off disk, falling through to the proxy on a
+// miss. The fall-through is the whole point: a local mirror is a CACHE, not a
+// replacement. Pulling all 27GB of the mount is not something anyone will do, so
+// the useful state is a partial one — GLBs and sidecars local (173MB + change),
+// the 21GB of paint textures still coming off the deployment. `next()` on a miss
+// is what makes that state work instead of 404ing.
+function localDir(prefix: string, dir: string): Plugin {
   return {
-    name: "local-models",
+    name: `local${prefix.replace(/\W/g, "-")}`,
     configureServer(server) {
-      server.middlewares.use("/models", (req, res, next) => {
+      server.middlewares.use(prefix, (req, res, next) => {
         const rel = decodeURIComponent((req.url ?? "/").split("?")[0]).replace(/^\/+/, "");
         const file = resolve(dir, rel);
+        // Path traversal: `rel` comes off the wire, and this server has fs.allow
+        // pointed at a models dir full of assets.
         if (!file.startsWith(dir) || !existsSync(file)) return next();
         const ext = file.split(".").pop()!.toLowerCase();
         res.setHeader("content-type",
@@ -57,13 +64,41 @@ function snapshotSink(): Plugin {
   };
 }
 
-// Serve /models from a LOCAL extraction when one is present, so the rig does not
+// Serve assets from a LOCAL mirror when one is present, so the rig does not
 // depend on the deployed backend being up. It went 503 mid-session and every
 // fixture failed with "no weapon inputs" — a real dependency, but not one a
-// shader test should have. Point MODELS_DIR at any extract-models.sh output.
-const MODELS_DIR = process.env.MODELS_DIR
-  ?? resolve(process.env.HOME ?? "", "Downloads/cs2-model-extract/models");
-const hasLocalModels = existsSync(MODELS_DIR);
+// shader test should have.
+//
+// `tools/shadertest/sync-assets.sh` populates the mirror; ASSETS_DIR is its root
+// and mirrors the mount's own layout (models/, paints/materials, paints/textures,
+// images/), so a path that works against the deployment works against the mirror
+// unchanged. The individual DIR vars still override for anything laid out
+// differently — MODELS_DIR predates this and keeps its old default.
+const ASSETS_DIR = process.env.ASSETS_DIR
+  ?? resolve(process.env.HOME ?? "", "Downloads/cs2-model-extract");
+const MODELS_DIR = process.env.MODELS_DIR ?? resolve(ASSETS_DIR, "models");
+const TEXTURES_DIR = process.env.TEXTURES_DIR ?? resolve(ASSETS_DIR, "paints/textures");
+const MATERIALS_DIR = process.env.MATERIALS_DIR ?? resolve(ASSETS_DIR, "paints/materials");
+const IMAGES_DIR = process.env.IMAGES_DIR ?? resolve(ASSETS_DIR, "images");
+
+const local: Plugin[] = [];
+const served: string[] = [];
+for (const [prefix, dir] of [
+  ["/models", MODELS_DIR],
+  ["/textures", TEXTURES_DIR],
+  ["/materials", MATERIALS_DIR],
+  ["/images", IMAGES_DIR],
+] as const) {
+  if (!existsSync(dir)) continue;
+  local.push(localDir(prefix, dir));
+  served.push(prefix);
+}
+if (served.length) {
+  // Say it out loud. A stale mirror serving last week's textures while you debug
+  // a shader is the same class of bug as a stale dist/, and silently preferring
+  // local files is exactly how you spend an afternoon on one.
+  console.log(`[shadertest] local assets for ${served.join(" ")} from ${ASSETS_DIR} (missing files fall through to the host)`);
+}
 
 const ASSET_HOST = process.env.ASSET_HOST ?? "https://inventory.5stack.gg";
 
@@ -73,11 +108,16 @@ const ASSET_HOST = process.env.ASSET_HOST ?? "https://inventory.5stack.gg";
 // to borrow from anymore. Point ASSET_HOST at another instance if needed.
 export default defineConfig({
   root: "tools/shadertest",
-  plugins: [snapshotSink(), ...(hasLocalModels ? [localModels(MODELS_DIR)] : [])],
+  plugins: [snapshotSink(), ...local],
   publicDir: false,
   server: {
     port: 5199,
-    fs: { allow: [resolve(HERE, "../.."), MODELS_DIR] },
+    fs: { allow: [resolve(HERE, "../.."), ASSETS_DIR, MODELS_DIR] },
+    // EVERY prefix keeps its proxy, including ones served locally. The local
+    // middleware runs first and calls next() on a miss, so a partial mirror
+    // degrades to the network instead of 404ing — see localDir. This used to
+    // drop the /models proxy whenever a local dir existed, which meant one
+    // missing GLB broke the rig with no clue as to why.
     proxy: {
       // The rig loads paint assets by their mirror-relative path
       // ("/materials/...", "/textures/..."), which our host serves under
@@ -85,9 +125,7 @@ export default defineConfig({
       "/materials": { target: ASSET_HOST, changeOrigin: true, rewrite: (p) => `/paints${p}` },
       "/textures": { target: ASSET_HOST, changeOrigin: true, rewrite: (p) => `/paints${p}` },
       "/images": { target: ASSET_HOST, changeOrigin: true },
-      // Only fall back to the deployed host for models when there is no local
-      // extraction to serve.
-      ...(hasLocalModels ? {} : { "/models": { target: ASSET_HOST, changeOrigin: true } }),
+      "/models": { target: ASSET_HOST, changeOrigin: true },
       "/paints": { target: ASSET_HOST, changeOrigin: true },
       "/api": { target: ASSET_HOST, changeOrigin: true },
     },

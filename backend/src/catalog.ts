@@ -1045,6 +1045,38 @@ export const STICKER_LIMITS = {
  */
 export const truncateToPrecision = (v: number, factor: number) => truncateToFactor(v, factor);
 
+/**
+ * A sticker's in-plane rotation, folded into the range the game stores.
+ *
+ * WRAPPED into ±180, not clamped. A rotation is an ANGLE: 286.5° and -73.5° are
+ * the same placement and only the second is representable. This used to clamp,
+ * which pinned everything past a half turn to a flat 180 — a sticker rotated to
+ * 286.5 in the viewer arrived in game at 180, and typing the negative did not
+ * help either, because -286.5 clamped to -180. cs2-lib does the same wrap in
+ * `healBaseInventoryItem` (`if (v > 180) v -= 360`), so this now agrees with the
+ * only other implementation of the rule.
+ *
+ * Truncated to ONE DECIMAL PLACE, which is what cs2-lib's 0.5 "step" actually
+ * means (see truncateToPrecision above). That single decimal is the whole reason
+ * the equipped feed is v5 rather than v4: upstream widened the plugin's rotation
+ * field from int to float for it, so rounding to a whole degree here would throw
+ * away the precision the version bump exists to carry.
+ *
+ * Here rather than in main.ts — which is where every other norm* lives — because
+ * main.ts boots a server on import, and this is the one of them with arithmetic
+ * worth testing directly. tools/inspect-roundtrip.ts imports it from here.
+ */
+export function normStickerRotation(r: number): number {
+  const { rotationMin: lo, rotationMax: hi, rotationStep } = STICKER_LIMITS;
+  const span = hi - lo;
+  // Only what is actually outside gets wrapped: an in-range value must come back
+  // untouched, or a legitimate 180 would fold to -180 on every single save.
+  const wrapped = r >= lo && r <= hi ? r : ((((r - lo) % span) + span) % span) + lo;
+  // Truncated AFTER the wrap, not before — the modulo lands on values like
+  // -159.70000000000005, and cs2-lib's isFactorPrecise rejects that outright.
+  return truncateToPrecision(wrapped, rotationStep);
+}
+
 // The loadout slot an item belongs to: a weapon model ("ak47"), or one of the
 // special slots for melee/gloves/agents. Returns null for non-loadout items.
 export function slotForItem(id: number): string | null {

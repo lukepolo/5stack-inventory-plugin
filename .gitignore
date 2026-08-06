@@ -9,3 +9,9 @@ dist
 
 # shader test rig output (regenerated on demand)
 tools/shadertest/snapshots/
+
+# extract-models.sh's work dir and tarball. Written INSIDE the container, and
+# 5.5GB of it — see the matching entries in codepier.yaml's `ignore`, which are
+# what actually stop it reaching this machine.
+/cs2-model-extract/
+/cs2-models-glb.tar.gz

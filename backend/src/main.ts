@@ -41,6 +41,7 @@ import {
   validateCraftAttrs,
   STICKER_LIMITS,
   truncateToPrecision,
+  normStickerRotation,
   getRenderTestCatalog,
   stickerMaterialFor,
 } from "./catalog.ts";
@@ -1108,20 +1109,12 @@ function normWear(w: unknown): number | null {
   return truncateToPrecision(Math.min(1, Math.max(0, w)), STICKER_LIMITS.wearFactor);
 }
 /**
- * A sticker's in-plane rotation, in degrees.
- *
- * Clamped to ±180 and truncated to ONE DECIMAL PLACE, which is what cs2-lib's
- * 0.5 "step" actually means (see truncateToPrecision — it counts decimals, it
- * does not snap to halves). That single decimal is the whole reason the equipped
- * feed is v5 rather than v4: upstream widened the plugin's rotation field from
- * int to float for it, so rounding to a whole degree here would throw away the
- * precision the version bump exists to carry.
+ * A sticker's in-plane rotation, in degrees. Lives in catalog.ts with the limits
+ * it enforces, so `tools/inspect-roundtrip.ts` can test it without booting a
+ * server — see the note there.
  */
-function normRotation(r: unknown): number | null {
-  if (typeof r !== "number" || !Number.isFinite(r)) return null;
-  const clamped = Math.min(STICKER_LIMITS.rotationMax, Math.max(STICKER_LIMITS.rotationMin, r));
-  return truncateToPrecision(clamped, STICKER_LIMITS.rotationStep);
-}
+const normRotation = (r: unknown): number | null =>
+  typeof r === "number" && Number.isFinite(r) ? normStickerRotation(r) : null;
 /**
  * A sticker's UV offset from its slot anchor.
  *

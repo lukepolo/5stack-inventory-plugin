@@ -55,6 +55,49 @@ Both pages set `window.__done` when finished and expose results on
 `window.__result` (single) or `window.__results` (batch), so a driver can poll
 and read them without scraping the DOM.
 
+## Running it without a browser, and without the network
+
+Two pieces, both optional and both independently useful.
+
+**Render headlessly** — no Chrome extension, no human:
+
+```bash
+node tools/shadertest/shoot.mjs \
+  'http://localhost:5199/item3d.html?image=/images/kc_db_lighter_d10214d2.webp&seed=1' \
+  /tmp/butane
+```
+
+It drives Chrome over CDP with node's built-in `WebSocket` (nothing to install),
+writes one PNG per `<img>` the page produced, and prints the page's own `#out`
+text. The SwiftShader flags it passes are **not optional**: a headless Chrome
+without them has no WebGL context, so every render is blank — which looks exactly
+like a broken shader.
+
+A blank page is almost never the shader. Run `npm run typecheck` first: a module
+that fails to transform renders *nothing*, and the usual cause is a backtick
+inside a GLSL comment terminating the TS template literal.
+
+**Mirror the assets locally** — stop paying a round trip per texture:
+
+```bash
+./tools/shadertest/sync-assets.sh            # sidecars + all 191 GLBs (~173MB)
+./tools/shadertest/sync-assets.sh core       # sidecars only, seconds
+./tools/shadertest/sync-assets.sh materials  # + every material JSON (~64MB)
+./tools/shadertest/sync-assets.sh tex kc_db_lighter   # + textures matching a glob
+```
+
+The mirror lands in `ASSETS_DIR` (default `~/Downloads/cs2-model-extract`) laid
+out exactly like the mount, and the rig picks it up with no flags. **It is a
+cache, not a replacement**: anything missing falls through to the proxy, so
+mirroring the useful ~240MB and leaving the other 21GB of paint textures on the
+deployment is the normal state, not a broken install. The rig prints which
+prefixes it is serving locally on startup — worth reading, because a stale mirror
+quietly serving last week's textures is the same class of bug as a stale `dist/`.
+
+The script refuses to run while an extraction holds `/cs2-models/extract.lock`:
+that step rewrites the models dir in place, and a half-copied GLB presents as a
+rendering bug rather than a truncated file. `FORCE=1` overrides.
+
 ## Reading the output
 
 ```

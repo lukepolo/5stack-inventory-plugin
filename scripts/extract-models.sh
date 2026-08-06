@@ -92,6 +92,33 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v27 (2026-08-05): `liquid.metalMap` — csgo_simple_liquid's METALNESS, which is
+# g_tColorA's ALPHA. The shader declares no metalness texture (which is why this
+# was twice written off as "this shader has no metalness"), but the decompile
+# splits metal from dielectric off g_tColorA.w the textbook way: the specular
+# colour is mix(vec3(g_flReflectance), albedo, alpha) and the diffuse is scaled by
+# (1 - alpha). VRF's glTF export writes the albedo RGB-only, so Charm | Butane
+# Buddy's polished lighter case and hinge pin rendered as flat matte plastic.
+# The albedo joins the paint chain as a bare texture so the alpha survives — and
+# is deliberately NOT reused as the material's `map`, because three multiplies
+# diffuseColor.a by it and every metal texel would go transparent in a snapshot.
+# Verified: alpha is a clean binary mask, median 0 / p90 254, matching the case.
+# v26 (2026-08-05): the liquid's REFRACTION and SPECULAR params —
+# g_flGlassRefraction / g_flLiquidRefraction / g_flLiquidSurfaceRefraction,
+# g_flRefractRoughnessMultiplier, g_flCubeRefract{Transparency,LiquidTransparency,
+# Brightness}, plus g_flReflectance, the two specular strengths, transmissive and
+# emissive (the last five extracted but not yet consumed — a param absent from the
+# JSON is indistinguishable from one authored at 0, which is exactly how the
+# roughness channel got written off for a whole session).
+# These had been recorded as unimplementable without "a scene colour buffer we do
+# not render", and that was simply WRONG: liquid_outer_combo12.glsl:707 samples
+# the refracted ray out of g_tEnvironmentMap, a CUBEMAP ARRAY, and :1462 builds
+# the liquid's own hard specular from the light constants. An environment map and
+# one directional light is the whole requirement. That one wrong sentence is what
+# four rounds of chasing smaller terms were downstream of — see BUTANE-BUDDY.md.
+# It also retires the "metallic casing is a dropped channel" lead: this shader
+# declares four textures (g_tColorA, g_tNormalA, g_tLiquidMask, g_tDroplets) and
+# no metalness input of any kind, so the metal read IS the env reflection.
 # v23 (2026-08-05): `liquid.roughMap` — csgo_simple_liquid's glass roughness,
 # which the vmat carries only inside g_tNormalA's spare channel and VRF's glTF
 # export drops (RGB only). Without it the vessel renders dead matte.
@@ -201,7 +228,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=25
+EXTRACT_VERSION=27
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -2269,6 +2296,37 @@ for block in BLOCKS:
             "roughness": num(block, "g_flLiquidRoughness", "m_flValue") or 0.0,
             "maskMin": num(block, "g_flMaskMinimum", "m_flValue") or 0.0,
             "maskMax": num(block, "g_flMaskMaximum", "m_flValue") or 0.0,
+            # REFRACTION, and it is not blocked on anything. This file's own notes
+            # and the handover doc both had it filed as "needs a scene colour
+            # buffer we do not render" — the decompile says otherwise:
+            # liquid_outer_combo12.glsl:707 samples the refracted ray out of
+            # g_tEnvironmentMap, a CUBEMAP array, and :1462 builds the liquid's own
+            # specular from the light constants. A prefiltered environment and one
+            # directional light is the whole requirement, and the viewer has had
+            # both since it was written.
+            #
+            # This is the missing CHARACTER of the reference render — the hard
+            # speculars and the reflections. It is also the "metallic casing":
+            # csgo_simple_liquid declares NO metalness texture at all (g_tColorA,
+            # g_tNormalA, g_tLiquidMask, g_tDroplets and nothing else), so the
+            # brass read on kc_db_lighter_02 cannot be a dropped channel — it is
+            # this env reflection, and there was never a channel to go looking for.
+            "glassRefraction": num(block, "g_flGlassRefraction", "m_flValue") or 0.0,
+            "liquidRefraction": num(block, "g_flLiquidRefraction", "m_flValue") or 0.0,
+            "surfaceRefraction": num(block, "g_flLiquidSurfaceRefraction", "m_flValue") or 0.0,
+            "refractRoughMul": num(block, "g_flRefractRoughnessMultiplier", "m_flValue") or 0.0,
+            "cubeTransparency": num(block, "g_flCubeRefractTransparency", "m_flValue") or 0.0,
+            "cubeLiquidTransparency": num(block, "g_flCubeRefractLiquidTransparency", "m_flValue") or 0.0,
+            "cubeBrightness": num(block, "g_flCubeRefractBrightness", "m_flValue") or 0.0,
+            # The rest of the shader's surface response, none of it consumed yet.
+            # Extracted together because they are one block in the vmat and a param
+            # that is absent from the JSON is indistinguishable from one authored
+            # at 0 — which is exactly how the roughness channel got written off.
+            "reflectance": num(block, "g_flReflectance", "m_flValue") or 0.0,
+            "specularStrength": num(block, "g_flLiquidSpecularStrength", "m_flValue") or 0.0,
+            "surfaceSpecularStrength": num(block, "g_flLiquidSurfaceSpecularStrength", "m_flValue") or 0.0,
+            "transmissive": num(block, "g_flTransmissiveStrength", "m_flValue") or 0.0,
+            "emissive": num(block, "g_flLiquidEmissiveStrength", "m_flValue") or 0.0,
             # Wobble, and the gravity the whole level test is taken along. Both
             # are STATIC here on purpose: the game drives g_vTestGravityDir and
             # g_flTestAgitation from a dynamic expression on render attribute
@@ -2322,6 +2380,28 @@ for block in BLOCKS:
             mask_textures[nrm.group(1) + "_c"] = tex_out_name(nrm.group(1))
         else:
             print(f"!!! {stem}: csgo_simple_liquid with no g_tNormalA — the glass will render matte")
+        # THE METALNESS, and it is in the ALBEDO'S ALPHA — same trap as the
+        # roughness above, one channel over.
+        #
+        # csgo_simple_liquid declares no metalness texture, which reads as "this
+        # shader has no metalness" and is wrong. The decompile splits metal from
+        # dielectric the textbook way, off g_tColorA.w:
+        #   _18392 = _22452.w                                  (g_tColorA alpha)
+        #   _24253 = mix(vec3(g_flReflectance), albedo, _18392) (specular colour)
+        #   ... mix(albedo * (1.0 - _18392), cubeRefract, ...)  (diffuse killed)
+        #
+        # VRF's glTF export writes the albedo as RGB, so the charm's polished
+        # lighter case and its hinge pin — both fully metal — arrived as flat matte
+        # plastic. Pulled onto the chain as a bare texture so the alpha survives;
+        # it is deliberately NOT reused as the material's `map`, because three
+        # multiplies diffuseColor.a by it and every metal texel would then render
+        # transparent in a snapshot.
+        col = re.search(r'm_name = "g_tColorA"\s*\n\s*m_pValue = resource:"([^"]+)"', block)
+        if col:
+            liquid["metalMap"] = f"/textures/{tex_out_name(col.group(1))}"
+            mask_textures[col.group(1) + "_c"] = tex_out_name(col.group(1))
+        else:
+            print(f"!!! {stem}: csgo_simple_liquid with no g_tColorA — metal parts will render matte")
         lmask = re.search(r'm_name = "g_tLiquidMask"\s*\n\s*m_pValue = resource:"([^"]+)"', block)
         if lmask:
             liquid["mask"] = f"/textures/{tex_out_name(lmask.group(1))}"

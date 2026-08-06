@@ -58,6 +58,10 @@ import {
   type StatTrakAnchor,
 } from "./stattrakModule";
 import { createViewerCursor, type CursorMode } from "./viewerCursor";
+// Bundled, not fetched from anyone's CDN: CC0 from Poly Haven, see
+// src/assets/README.md. `?url` so Vite emits it as an asset and hands back a
+// base-correct URL instead of trying to parse 1.4MB of Radiance HDR as a module.
+import HDR_URL from "./assets/venice_sunset_1k.hdr?url";
 
 export { loadPaintDef, type PaintDef } from "./paintComposite";
 
@@ -68,6 +72,8 @@ type ThreeBundle = {
   DecalGeometry: typeof import("three/examples/jsm/geometries/DecalGeometry.js").DecalGeometry;
   RoomEnvironment: typeof import("three/examples/jsm/environments/RoomEnvironment.js").RoomEnvironment;
   cloneSkeleton: typeof import("three/examples/jsm/utils/SkeletonUtils.js").clone;
+  /** The lighting environment, or null if it could not be fetched — see loadThree. */
+  hdr: import("three").DataTexture | null;
 };
 
 /**
@@ -176,13 +182,24 @@ function loadThree(): Promise<ThreeBundle> {
     import("three/examples/jsm/geometries/DecalGeometry.js"),
     import("three/examples/jsm/environments/RoomEnvironment.js"),
     import("three/examples/jsm/utils/SkeletonUtils.js"),
-  ]).then(([THREE, gltf, orbit, decal, env, skel]) => ({
+    import("three/examples/jsm/loaders/RGBELoader.js"),
+  ]).then(async ([THREE, gltf, orbit, decal, env, skel, rgbe]) => ({
     THREE,
     GLTFLoader: gltf.GLTFLoader,
     OrbitControls: orbit.OrbitControls,
     DecalGeometry: decal.DecalGeometry,
     RoomEnvironment: env.RoomEnvironment,
     cloneSkeleton: skel.clone,
+    // THE LIGHTING ENVIRONMENT. Loaded here because getSharedGL is synchronous
+    // and this is not — and it has to exist before the first PMREM, or the very
+    // first mount of a session would light against the fallback and every later
+    // one against the HDRI.
+    //
+    // NULL ON FAILURE, never a throw: the URL is resolved by the bundler and this
+    // ships as a FEDERATED REMOTE, so it is loaded from the panel's origin rather
+    // than its own. If that ever resolves wrong, the viewer must fall back to
+    // RoomEnvironment and keep working rather than refusing to render anything.
+    hdr: await new rgbe.RGBELoader().loadAsync(HDR_URL).catch(() => null),
   }));
   return threePromise;
 }
@@ -257,7 +274,11 @@ interface SharedGL {
   env: import("three").Texture;
 }
 let sharedGL: SharedGL | null = null;
-function getSharedGL(THREE: ThreeBundle["THREE"], RoomEnvironment: ThreeBundle["RoomEnvironment"]): SharedGL {
+function getSharedGL(
+  THREE: ThreeBundle["THREE"],
+  RoomEnvironment: ThreeBundle["RoomEnvironment"],
+  hdr?: ThreeBundle["hdr"],
+): SharedGL {
   if (sharedGL) return sharedGL;
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -269,7 +290,19 @@ function getSharedGL(THREE: ThreeBundle["THREE"], RoomEnvironment: ThreeBundle["
   // Image-based studio lighting carries the shading (composited metal/rough
   // maps need real reflections); directionals only shape highlights.
   const pmrem = new THREE.PMREMGenerator(renderer);
-  const env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  // venice_sunset_1k, which is what csgoskins light with — and METAL IS NOTHING
+  // BUT THIS. A metalness map only decides how much of the environment a surface
+  // mirrors; RoomEnvironment is a flat neutral box, so a correctly-metallic
+  // chrome case rendered against it still comes out flat grey. Recovering the
+  // metalness from g_tColorA.a did not make Butane Buddy's lighter look like
+  // steel until there was a sky and a ground for it to reflect.
+  //
+  // RoomEnvironment stays as the fallback: a failed fetch must degrade to the
+  // old look, not to a black scene.
+  const env = hdr
+    ? pmrem.fromEquirectangular(hdr).texture
+    : pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  hdr?.dispose();
   pmrem.dispose();
   // Losing the shared context takes every viewer with it rather than one, so it
   // is latched here and every live viewer is told. The next mount rebuilds it.
@@ -1424,6 +1457,16 @@ export interface StickerBounds {
 const DEFAULT_BOUNDS: StickerBounds = { x: [-0.4, 0.66], y: [-0.08, 0.24] };
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const round = (v: number, p: number) => Number(v.toFixed(p));
+/**
+ * A sticker rotation folded into the range the game stores, [-180, 180).
+ *
+ * WRAP, never clamp. cs2-lib's own heal does exactly this (`if (v > 180) v -= 360`),
+ * and the backend used to clamp instead — which turned every angle past a half
+ * turn into a flat 180 on its way to the game. Equivalent angles must stay
+ * equivalent: 286.5 and -73.5 are the same rotation and only one of them is
+ * representable.
+ */
+const wrapRotation = (deg: number) => ((((deg + 180) % 360) + 360) % 360) - 180;
 
 // Crop a snapshot PNG to its visible content (+small margin). The raw frame
 // is 640x480 with large transparent borders — next to tightly-cropped catalog
@@ -1581,8 +1624,8 @@ function releaseViewer() {
 export async function withSharedRenderer<T>(
   fn: (three: ThreeBundle["THREE"], renderer: import("three").WebGLRenderer) => Promise<T>,
 ): Promise<T> {
-  const { THREE, RoomEnvironment } = await loadThree();
-  const { renderer } = getSharedGL(THREE, RoomEnvironment);
+  const { THREE, RoomEnvironment, hdr } = await loadThree();
+  const { renderer } = getSharedGL(THREE, RoomEnvironment, hdr);
   try {
     return await fn(THREE, renderer);
   } finally {
@@ -2173,7 +2216,7 @@ export interface ViewerOpts {
   // INITIAL value only — flip it later with handle.setInteractive().
   interactive?: boolean;
   onStickerPlaced?: (slot: number, x: number, y: number) => void;
-  /** Shift-drag on a sticker — degrees, 0-360. */
+  /** Shift-drag on a sticker — degrees in the game's own range, ±180. */
   onStickerRotated?: (slot: number, r: number) => void;
   onCharmPlaced?: (x: number, y: number, z: number) => void;
   /** The GPU dropped this viewer's context. The handle is dead — remount to recover. */
@@ -2185,7 +2228,7 @@ export interface ViewerOpts {
    * MEASURED rather than eyeballed, which is how the last two rounds of
    * "it looks washed out" went wrong.
    */
-  lighting?: { env?: number; key?: number; rim?: number; ambient?: number };
+  lighting?: { env?: number; key?: number; rim?: number; ambient?: number; spot?: number };
   /** Orbit the camera by this many radians about Y. tools/shadertest only —
    *  lets a sweep measure the same decal from many angles deterministically. */
   viewAngle?: number;
@@ -2254,7 +2297,7 @@ async function buildViewer(
   mounted: { view?: HTMLCanvasElement } = {},
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
-  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton } = await loadThree();
+  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton, hdr } = await loadThree();
   mt.mark("three");
   throwIfAborted(signal);
   // Set by the paint build below when a texture the skin names wasn't on the
@@ -2310,7 +2353,7 @@ async function buildViewer(
   // download isn't wasted either way.
   throwIfAborted(signal);
 
-  const { renderer, env: envTex } = getSharedGL(THREE, RoomEnvironment);
+  const { renderer, env: envTex } = getSharedGL(THREE, RoomEnvironment, hdr);
   // This viewer's own visible surface. The shared renderer draws into its single
   // offscreen canvas; each frame is then blitted here. Keeping a real canvas per
   // viewer means layout, sizing, pointer events and OrbitControls all work
@@ -2362,15 +2405,74 @@ async function buildViewer(
   // CDN renders:
   //   AK-47 | Safari Mesh @0.265  reference (109,105,80) sat 29.9
   //   FAMAS | Byproduct   @0.408  reference (109,101,79) sat 30.6
+  //
+  // THE KEY LIGHT IS WARM, AND THAT IS THE WHOLE COLOUR CALIBRATION.
+  //
+  // It was 0xffffff and the environment 1.05. Every item rendered measurably too
+  // green and too blue, and a long hunt through csgo_simple_liquid for the cause
+  // found nothing because the cause was never in a shader: a white key light.
+  //
+  // These are csgoskins.gg's numbers, read out of their viewer bundle's scenery
+  // table — sunColor (1, 0.8, 0.7) = 0xffccb3, environmentIntensity 0.8. Their
+  // renders are the ones that match what CS2 actually shows. Measured on Charm |
+  // Butane Buddy's liquid against their own render, linear ratios:
+  //
+  //            G/R     B/R
+  //   theirs   0.074   0.113
+  //   white    0.106   0.142     <- what this used to produce
+  //   warm     0.075   0.113     <- exact
+  //
+  // The intensities are NOT theirs (sunIntensity 6, a venice_sunset HDRI); ours
+  // stay as calibrated above, because the ratios closed on colour alone. If this
+  // is ever re-tuned, re-check both: the CDN weapon targets AND a charm against
+  // csgoskins, because this rig now answers to both.
   const L = opts?.lighting ?? {};
-  scene.environmentIntensity = L.env ?? 1.05;
+  scene.environmentIntensity = L.env ?? 0.8;
+  // Theirs too: the HDRI is a real place, so which way it faces decides where the
+  // sun and the bright sky sit in every reflection. 3.8 rad is what csgoskins use.
+  scene.environmentRotation = new THREE.Euler(0, 3.8, 0);
   scene.add(new THREE.AmbientLight(0xffffff, L.ambient ?? 0.12));
-  const key = new THREE.DirectionalLight(0xffffff, L.key ?? 1.15);
+  const key = new THREE.DirectionalLight(0xffccb3, L.key ?? 1.15);
   key.position.set(2, 3, 4);
   scene.add(key);
   const rim = new THREE.DirectionalLight(0xdde6ff, L.rim ?? 0.35);
   rim.position.set(-3, 1, -2);
   scene.add(rim);
+  // THE OVERHEAD SPOT — the light we did not have at all.
+  //
+  // csgoskins hang one directly above every item and it is most of why theirs
+  // reads as a lit object rather than a lit texture: a directional light gives a
+  // flat wash, a close spot gives the falloff and the bright crown that a small
+  // glossy thing needs. Theirs, verbatim from their viewer:
+  //
+  //   new SpotLight(color(1, 0.7, 0.7), spotLightIntensity)   // 3 on the default
+  //   position (0.04, clamp(radius * 1.2, 0.5, 2), 0)
+  //   angle 0.8, penumbra 0.3
+  //
+  // The HEIGHT SCALES WITH THE ITEM and that is the part worth copying exactly —
+  // three's spot obeys inverse-square, so a fixed height would light a 3cm charm
+  // and a 90cm rifle completely differently. `sizeL` is our bounding length; the
+  // radius they scale by is half of it.
+  //
+  // Slightly pink (1, 0.7, 0.7), warmer even than the key. Not a mistake on their
+  // part — it is what stops the crown of a white item going blue against the
+  // environment.
+  //
+  // DECAY 0, AND THEIR INTENSITY DOES NOT TRANSFER. three's spot is
+  // inverse-square, so an intensity is only meaningful against a scene scale.
+  // Theirs sits ~0.5-2 units up in a scene whose units are not ours; our items
+  // are in METRES, and a 5cm charm puts the spot 3cm away, where their 3 lands at
+  // 3/0.03^2 = ~3300x irradiance. It blows the top of the charm to white — tried
+  // it, looked exactly like a bug.
+  //
+  // Zero decay makes the intensity scale-invariant, so one number is right for a
+  // charm and a rifle, and it is then tuned against their render rather than
+  // copied. Everything else about the light IS theirs.
+  // Positioned once the model has been measured — see `spot.position` below.
+  // The scene is built before the GLB resolves, so there is no size here yet.
+  const spot = new THREE.SpotLight(0xffb3b3, L.spot ?? 1.2, 0, 0.8, 0.3, 0);
+  scene.add(spot);
+  scene.add(spot.target);
   // Context allocation + the PMREM prefilter of RoomEnvironment. Both are per
   // mount today and neither depends on the item, so this stage is pure overhead.
   mt.mark("ctx");
@@ -3463,6 +3565,12 @@ async function buildViewer(
   const AXIS_H = AXIS_L === 1 ? (size.x >= size.z ? 0 : 2) : 1;
   const AXIS_S = 3 - AXIS_L - AXIS_H;
   const sizeL = dims[AXIS_L];
+  // The overhead spot, now that there is a size to hang it from. Their scaling
+  // rule: y = clamp(radius * 1.2, 0.5, 2) in THEIR units, i.e. proportional to the
+  // item with a floor and a ceiling so a tiny charm is not lit from inside itself
+  // and a rifle is not lit from orbit. Ours is expressed in units of the item's
+  // own length, which is the same idea without importing their scene scale.
+  spot.position.set(sizeL * 0.04, clamp(sizeL * 0.6, sizeL * 0.5, sizeL * 2), 0);
   const sizeH = dims[AXIS_H];
   const sizeS = dims[AXIS_S];
   const bounds = opts?.stickerBounds ?? DEFAULT_BOUNDS;
@@ -3895,6 +4003,22 @@ async function buildViewer(
    * still arrive in pieces.
    */
   const DECAL_MIN_COVERAGE = 0.66;
+
+  /**
+   * WHICH WAY A POSITIVE `rotation` TURNS A STICKER — the game's answer, not ours.
+   *
+   * A stored rotation is in CS2's convention: it rides the equipped v5 feed and
+   * `buildInspectHex` straight to the game, so it is not ours to redefine. Our UV
+   * cut turns the OPPOSITE way for the same number, so the viewer negates on the
+   * way in and the two agree.
+   *
+   * Confirmed against the game, not derived: a craft that looked right in the
+   * panel came back out of the in-game inspect turned the other way, and negating
+   * every rotation by hand made the GAME correct — i.e. the panel was the wrong
+   * one. The gesture negates to match (see applyDrag), so dragging still turns a
+   * sticker the way it always did on screen; only the number behind it changes.
+   */
+  const STICKER_ROT_SIGN = -1;
 
   // ---- Sticker geometry, cut in UV1 space --------------------------------------
   // THE GENERAL SOLUTION, replacing world-space projection wherever the model
@@ -4422,7 +4546,7 @@ async function buildViewer(
       // does not depend on it.
       const near = (liveMesh.get(st.slot)?.userData.stickerCenter as import("three").Vector3 | undefined) ?? null;
       hit = uv1ToSurface(u, v, near);
-      if (UV_DECAL) uvCut = { u, v, size: 1 / (mk.scale || 1), rot: ((st.r ?? 0) * Math.PI) / 180 };
+      if (UV_DECAL) uvCut = { u, v, size: 1 / (mk.scale || 1), rot: STICKER_ROT_SIGN * ((st.r ?? 0) * Math.PI) / 180 };
     } else {
       const l = slotBaseL(st.slot) + clamp(st.x ?? 0, bounds.x[0], bounds.x[1]) * OFFSET_SCALE;
       const h = baseH + clamp(st.y ?? 0, bounds.y[0], bounds.y[1]) * OFFSET_SCALE;
@@ -4465,7 +4589,7 @@ async function buildViewer(
       const orient = new THREE.Object3D();
       orient.position.copy(hit.point);
       orient.lookAt(hit.point.clone().add(hit.normal));
-      orient.rotation.z += ((st.r ?? 0) * Math.PI) / 180;
+      orient.rotation.z += (STICKER_ROT_SIGN * (st.r ?? 0) * Math.PI) / 180;
       const size = decalSizeFor(st.slot);
       const src = decalSource(hit.mesh, hit.point, size, hit.normal);
       const raw = new DecalGeometry(src.mesh, hit.point, orient.rotation, new THREE.Vector3(size, size, size * 0.35));
@@ -6900,8 +7024,17 @@ async function buildViewer(
       if (e.shiftKey && entryNow) {
         // ROTATE: horizontal sweep -> degrees. Half a degree per pixel is fine
         // for the eye and lands on the 0.5 steps the game quantizes to anyway.
+        //
+        // WRAPPED TO ±180, NOT 0..360. That is the range the game stores
+        // (CS2_MIN/MAX_STICKER_ROTATION), and the backend used to CLAMP anything
+        // past it — so a sweep that ran to 286.5 reached the game as a flat 180
+        // and the sticker stopped turning partway through the drag.
+        //
+        // The delta is negated so the gesture survives STICKER_ROT_SIGN: the
+        // stored number now runs the other way, and without this a rightward
+        // sweep would spin the sticker left.
         const parsed = JSON.parse(entryNow.key) as [string, number | null, number | null, number | null, number | null];
-        const deg = round(((rotateStartDeg + (e.clientX - rotateAnchorX) * 0.5) % 360 + 360) % 360, 1);
+        const deg = round(wrapRotation(rotateStartDeg - (e.clientX - rotateAnchorX) * 0.5), 1);
         if (parsed[3] === deg) return;
         const slot = drag.slot;
         void buildDecal({ slot, image: parsed[0], x: parsed[1], y: parsed[2], r: deg, w: parsed[4] }).then((r) => {
