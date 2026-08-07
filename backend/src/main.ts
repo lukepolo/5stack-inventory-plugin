@@ -39,6 +39,8 @@ import {
   isBaseWeapon,
   getStickerBounds,
   validateCraftAttrs,
+  itemStoresWear,
+  itemStoresSeed,
   STICKER_LIMITS,
   truncateToPrecision,
   normStickerRotation,
@@ -67,6 +69,50 @@ async function applySchema() {
     "utf8",
   );
   await pool.query(sql);
+}
+
+/**
+ * Null the float and pattern off rows that cannot have either.
+ *
+ * Not in schema.sql because the answer lives in cs2-lib, not in Postgres: only
+ * the economy knows that a Service Medal has no float and a Music Kit has no
+ * pattern. Everything else here is a `CREATE ... IF NOT EXISTS`; this is the
+ * one migration that needs the catalog loaded, so it runs next to them instead.
+ *
+ * The rows exist because the craft form posts all four scalars for every item
+ * and its neutral defaults are wear 0 / seed 1 — so every agent, music kit,
+ * graffiti, patch and pin ever crafted stored a float of 0, which reads as
+ * Factory New to anything that sorts or renders on the column. validateCraftAttrs
+ * drops them at the door now; this is the collection already on disk.
+ *
+ * Idempotent and cheap: after the first pass it matches nothing, and this table
+ * only ever holds the panel's own users' inventories.
+ */
+async function dropImpossibleScalars() {
+  // `col` is one of two literals below, never anything from a request — the
+  // parameterised half is the id list.
+  const columns = [
+    ["wear", itemStoresWear],
+    ["seed", itemStoresSeed],
+  ] as const;
+  for (const [col, stores] of columns) {
+    // Ask the TABLE which items it actually holds a value for, then judge those
+    // — 12.7k of the 27k catalog can hold a float, and shipping that list to
+    // Postgres on every boot to filter against is a 90KB parameter for a table
+    // that holds a handful of distinct ids.
+    const { rows } = await pool.query<{ item_id: number }>(
+      `SELECT DISTINCT item_id FROM inventory.owned_items WHERE ${col} IS NOT NULL`,
+    );
+    const impossible = rows.map((r) => r.item_id).filter((id) => !stores(id));
+    if (!impossible.length) continue;
+    const res = await pool.query(
+      `UPDATE inventory.owned_items SET ${col} = NULL WHERE item_id = ANY($1::int[])`,
+      [impossible],
+    );
+    app.log.info(
+      `[schema] cleared ${res.rowCount} impossible ${col} value(s) across ${impossible.length} item(s)`,
+    );
+  }
 }
 
 const TEAMS = new Set(["CT", "T"]);
@@ -2468,8 +2514,9 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     // `craftable`, not `slotForItem`: the old gate was "can it go in a loadout
     // slot", which answers no for a loose sticker or charm — so a player with a
     // drawer full of Katowice Crowns imported none of them and the picker's
-    // "stickers you own" was always empty. Cases, keys, medals and coins still
-    // fall out here, since they aren't things this app models.
+    // "stickers you own" was always empty. Cases and keys still fall out here,
+    // since they aren't things this app models; medals and coins DO import now
+    // that the collectible slot gives them somewhere to go.
     //
     // Each CS2 item is its own asset with its own assetid — they do NOT arrive
     // stacked with an `amount` — so owning fourteen Crowns imports as fourteen
@@ -2477,8 +2524,8 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     // handling anywhere.
     if (itemId == null || !craftable(itemId)) {
       skipped++;
-      // Resolved-but-unownable items (cases, keys, medals, coins) are expected
-      // and would drown the log — only unresolved names are anomalies.
+      // Resolved-but-unownable items (cases, keys) are expected and would
+      // drown the log — only unresolved names are anomalies.
       if (itemId == null) {
         unknown++;
         if (skippedNames.length < 20) skippedNames.push(name);
@@ -3983,6 +4030,7 @@ async function start() {
   const cors = (await import("@fastify/cors")).default;
   await app.register(cors, { origin: true, credentials: true });
   await applySchema();
+  await dropImpossibleScalars();
   await app.listen({ port, host: "0.0.0.0" });
   // Agent patch-slot counts, so the synchronous getItem() can answer. Fire and
   // forget: a cold cache reads as "unknown", the form falls back to five slots

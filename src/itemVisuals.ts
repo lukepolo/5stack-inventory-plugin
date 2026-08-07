@@ -137,9 +137,15 @@ export const supports3d = (item?: { type?: string | null } | null) => !!item?.ty
 
 // Which types actually HAVE a float and a pattern, mirroring cs2-lib's own
 // CS2_PAINTABLE_ITEMS / CS2_SEEDABLE_ITEMS. Everything else — graffiti, music
-// kits, agents, stickers, patches, pins — is stored with wear 0 / seed 1
-// because the columns aren't nullable, and rendering those reads as a real
-// reading: a spray was showing a factory-new ramp at "0.0000 · #1".
+// kits, agents, stickers, patches, pins — stores NULL for both, and drawing a
+// bar off a missing value reads as a real reading: a spray was showing a
+// factory-new ramp at "0.0000 · #1".
+//
+// Older rows hold a literal wear 0 / seed 1 instead, from when the craft form
+// posted its neutral defaults for every item — the backend nulls those on boot
+// (dropImpossibleScalars) and no longer accepts new ones, but this gate is what
+// kept them off the screen in the meantime, so it stays type-shaped rather than
+// becoming a `wear != null` test.
 const TYPES_WEAR = new Set(["weapon", "melee", "glove"]);
 const TYPES_SEED = new Set(["weapon", "melee", "glove", "keychain"]);
 export const hasWear = (item?: { type?: string | null } | null) => !!item?.type && TYPES_WEAR.has(item.type);

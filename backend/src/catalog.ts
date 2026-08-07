@@ -922,6 +922,11 @@ export function getItem(id: number) {
  *   - a vanilla (unpainted) weapon has no float, no pattern and no StatTrak at
  *     all — 68 items our type-level gates offered all three to.
  *
+ * REJECT AN IMPOSSIBLE VALUE, DROP AN IMPOSSIBLE ATTRIBUTE. Those are two
+ * different mistakes and only the first is the caller's; see the long note on
+ * the wear block for why treating them alike bricked crafting for every item
+ * without a float.
+ *
  * TRUNCATE BEFORE VALIDATING, which is the order upstream uses too. cs2-lib
  * requires the value to sit exactly on the attribute's quantization step, and
  * an 0.01 slider in a browser emits 0.30000000000000004 — rejecting that would
@@ -949,30 +954,44 @@ export function validateCraftAttrs(
   }
   const clean: CraftAttrs = {};
 
-  if (attrs.wear != null) {
+  // A sticker's scratch rides the same column as a weapon's float but is a
+  // different attribute with a coarser step — see hasScratch in itemVisuals.
+  const scratch = item.isSticker();
+
+  // An attribute the item CANNOT have is dropped, not rejected.
+  //
+  // The craft form is one shape for every item and posts all four scalars every
+  // time, starting at the form's neutral defaults — wear 0, seed 1. On a medal
+  // that 0 is the ABSENCE of a control, not the user asking for a float, and
+  // turning it into "2025 Service Medal has no float." made every non-paintable
+  // item uncraftable: collectibles, agents, music kits, graffiti and patches all
+  // come through here carrying the same neutral pair.
+  //
+  // Dropping means leaving the key UNSET rather than writing null, which is the
+  // update route's "the request never sent this" — see the COALESCE contract in
+  // main.ts. A craft stores NULL (the only thing the column can honestly hold
+  // for an item with no such attribute) and an edit leaves the column alone.
+  //
+  // The RANGE checks below stay strict, and that is the half that was worth
+  // having: those are values the user really did choose on an item that really
+  // does have the attribute, and they ride out to the game server.
+  if (attrs.wear != null && (item.hasWear() || scratch)) {
     if (!Number.isFinite(attrs.wear)) return { error: "That float isn't a number." };
-    // A sticker's scratch rides the same column as a weapon's float but is a
-    // different attribute with a coarser step — see hasScratch in itemVisuals.
-    const scratch = item.isSticker();
     const wear = truncateToFactor(attrs.wear, scratch ? CS2_STICKER_WEAR_FACTOR : CS2_WEAR_FACTOR);
     if (scratch) {
       if (wear < 0 || wear > 1) return { error: "A sticker's scratch runs from 0 to 1." };
     } else if (!CS2Economy.safeValidateWear(wear, item)) {
       return {
-        error: item.hasWear()
-          ? `${item.name} only exists between ${item.getMinimumWear()} and ${item.getMaximumWear()}.`
-          : `${item.name} has no float.`,
+        error: `${item.name} only exists between ${item.getMinimumWear()} and ${item.getMaximumWear()}.`,
       };
     }
     clean.wear = wear;
   }
 
-  if (attrs.seed != null) {
+  if (attrs.seed != null && item.hasSeed()) {
     if (!CS2Economy.safeValidateSeed(attrs.seed, item)) {
       return {
-        error: item.hasSeed()
-          ? `${item.name}'s pattern runs from ${item.getMinimumSeed()} to ${item.getMaximumSeed()}.`
-          : `${item.name} has no pattern.`,
+        error: `${item.name}'s pattern runs from ${item.getMinimumSeed()} to ${item.getMaximumSeed()}.`,
       };
     }
     clean.seed = attrs.seed;
@@ -1001,6 +1020,31 @@ export function validateCraftAttrs(
 
   return { clean };
 }
+
+/**
+ * Can a stored row for this item legitimately HOLD a float / a pattern?
+ *
+ * The same rule the drop above applies, exported for the rows written before it
+ * existed: crafting a medal, an agent, a graffiti or a music kit used to write
+ * the craft form's neutral wear 0 / seed 1 into columns those items have no
+ * attribute for, and a 0 float is not "no float" — it reads as Factory New to
+ * anything that sorts or renders on the column. See dropImpossibleScalars.
+ *
+ * A STICKER holds a wear: that column carries its SCRATCH, which is a real
+ * attribute with a real value (see the scratch branch in validateCraftAttrs).
+ *
+ * An id the economy doesn't know answers TRUE, which is the safe direction for
+ * the only caller: a row we cannot interpret is not a row to strip data off.
+ */
+function storedAttr(id: number, has: (i: (typeof items)[number]) => boolean): boolean {
+  try {
+    return has(CS2Economy.getById(id));
+  } catch {
+    return true;
+  }
+}
+export const itemStoresWear = (id: number) => storedAttr(id, (i) => i.hasWear() || i.isSticker());
+export const itemStoresSeed = (id: number) => storedAttr(id, (i) => i.hasSeed());
 
 /** StatTrak counts come back from the game server, so they get the same
  *  treatment as anything else crossing the wire. */

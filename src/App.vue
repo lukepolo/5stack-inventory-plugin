@@ -1859,10 +1859,16 @@ function toSpec(a: Attach | null): AttachSpec {
 function craftBody() {
   const c = craft.value!;
   return {
-    wear: c.wear,
-    seed: c.seed,
-    stattrak: c.stattrak,
-    nametag: c.nametag.trim() || null,
+    // Only the scalars this item can actually CARRY. The form is one shape for
+    // every item and its fields start at neutral defaults (wear 0, seed 1,
+    // StatTrak off), so an ungated body posted a float for a medal and a
+    // pattern for an agent — attributes those items have no honest value for.
+    // The gates here are the same ones that decide whether the control is drawn
+    // at all, so what is sent is exactly what was editable.
+    wear: craftHasWear.value || craftHasScratch.value ? c.wear : null,
+    seed: craftHasSeed.value ? c.seed : null,
+    stattrak: craftHasStatTrak.value ? c.stattrak : false,
+    nametag: craftHasNameTag.value ? c.nametag.trim() || null : null,
     stickers: c.stickers.map(toSpec),
     patches: c.patches.map(toSpec),
     charm_id: c.charm?.id ?? null,
