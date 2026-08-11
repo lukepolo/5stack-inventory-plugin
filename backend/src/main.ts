@@ -857,19 +857,30 @@ const numParam = (list: { m_name?: string; m_flValue?: unknown; m_nValue?: unkno
   const v = Number(raw?.m_flValue ?? raw?.m_nValue);
   return Number.isFinite(v) ? v : dflt;
 };
-const boolParam = (list: { m_name?: string; m_nValue?: unknown }[] | undefined, name: string) =>
-  Number(list?.find((p) => p.m_name === name)?.m_nValue) === 1;
+// `dflt` matters: the shader's variable table (dumped from the .vcs, 2026-08-10)
+// defaults g_bAutomaticPBRColorFittingSticker0 and g_bClampSpectrumVSticker0 to
+// TRUE — a material that authors neither still gets the PBR colour refit in
+// game, so an absent param must not read as false across the board.
+const boolParam = (list: { m_name?: string; m_nValue?: unknown; m_flValue?: unknown }[] | undefined, name: string, dflt = false) => {
+  const raw = list?.find((p) => p.m_name === name);
+  if (!raw) return dflt;
+  const v = Number(raw.m_nValue ?? raw.m_flValue);
+  return Number.isFinite(v) ? v === 1 : dflt;
+};
 const vecParam = (list: { m_name?: string; m_value?: unknown }[] | undefined, name: string, dflt: number[]) => {
   const raw = list?.find((p) => p.m_name === name)?.m_value;
   if (!Array.isArray(raw)) return dflt;
   return raw.map((v) => (Number.isFinite(Number(v)) ? Number(v) : 0));
 };
 
-const stickerArtCache = new Map<string, { art: string | null; sfx: StickerSfx | null; patchBacking: string | null }>();
+const stickerArtCache = new Map<
+  string,
+  { art: string | null; artKind: "sticker" | "patch" | null; sfx: StickerSfx | null; patchBacking: string | null }
+>();
 let stickerArtStamp = -1;
 app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (request) => {
   const image = imagePathParam(request.query.image);
-  if (!image) return { art: null, sfx: null };
+  if (!image) return { art: null, artKind: null, sfx: null };
   const stamp = await fs.stat(EXTRACT_VERSION_FILE).then((s) => s.mtimeMs, () => -1);
   if (stamp !== stickerArtStamp) {
     stickerArtCache.clear();
@@ -878,6 +889,12 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
   const hit = stickerArtCache.get(image);
   if (hit !== undefined) return hit;
   let art: string | null = null;
+  // Which param served `art`. A patch's albedo has ORDINARY alpha; a real
+  // g_tSticker0's alpha is dual-purpose (coverage ramp in 0-20, wear order
+  // above) and the client must expand it ×12.75 before display — but only
+  // when it knows this is what it got. "art is non-null" cannot carry that:
+  // the patch fallback below serves art too.
+  let artKind: "sticker" | "patch" | null = null;
   let sfx: StickerSfx | null = null;
   let patchBacking: string | null = null;
   try {
@@ -886,6 +903,7 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
       const doc = JSON.parse(
         await fs.readFile(path.join(PAINTS_DIR, "materials", path.basename(material)), "utf8"),
       ) as {
+        m_shaderName?: string;
         m_textureParams?: { m_name?: string; m_pValue?: string }[];
         m_intParams?: { m_name?: string; m_nValue?: unknown }[];
         m_floatParams?: { m_name?: string; m_flValue?: unknown }[];
@@ -906,6 +924,7 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
         }
       };
       art = await tex("g_tSticker0");
+      if (art) artKind = "sticker";
       // A PATCH IS NOT A STICKER MATERIAL. Its vmat is `csgo_character.vfx` —
       // the same shader an agent's body uses — so it has no `g_tSticker0` and
       // none of the sfx params below; its art is `g_tPatch0` and its stitched
@@ -914,7 +933,10 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
       // extraction, only the lookup.
       if (!art) {
         art = await tex("g_tPatch0");
-        if (art) patchBacking = await tex("g_tPatch0Backing");
+        if (art) {
+          artKind = "patch";
+          patchBacking = await tex("g_tPatch0Backing");
+        }
       }
       const [scratches, sfxMask, holoSpectrum, glitterNormal, normalRoughness, backing] = await Promise.all([
         tex("g_tStickerScratches"),
@@ -924,37 +946,52 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/sticker-art", async (
         tex("g_tNormalRoughnessSticker0"),
         tex("g_tColor"),
       ]);
+      // The sfx doc only means something on the sticker shader. A patch's
+      // vmat is csgo_character.vfx: it names NONE of these params, so every
+      // flag would read as its default — and the defaults are not inert
+      // (pbrFit defaults TRUE). Handing that to the client would run the
+      // sticker refit on patch art.
+      const isStickerMaterial = (doc.m_shaderName ?? "").includes("sticker");
       const tint = vecParam(doc.m_vectorParams, "g_vColorTintSticker0", [1, 1, 1]);
-      const bias = vecParam(doc.m_vectorParams, "g_vWearBiasSticker0", [1, 0]);
-      sfx = {
+      const bias = vecParam(doc.m_vectorParams, "g_vWearBiasSticker0", [1, 1]);
+      // ONE namespace, not two. Valve does not sort params by prefix — a
+      // g_f* scalar can be authored into m_intParams and a g_b* flag into
+      // m_floatParams (g_fPatternPaintRespectsTintMask already bit us this
+      // way; see GLOVES-GEN2). Splitting the lookup by list silently hands
+      // back the default for every param on the wrong side.
+      const scalarParams = [...(doc.m_intParams ?? []), ...(doc.m_floatParams ?? [])];
+      sfx = !isStickerMaterial ? null : {
         scratches, sfxMask, holoSpectrum, glitterNormal, normalRoughness, backing,
-        glitter: boolParam(doc.m_intParams, "g_bGlitterSticker0"),
-        holo: boolParam(doc.m_intParams, "g_bHolographicSticker0"),
-        metallic: boolParam(doc.m_intParams, "g_bMetallicSticker0"),
-        paperBacking: boolParam(doc.m_intParams, "g_bPaperBackingSticker0"),
-        pbrFit: boolParam(doc.m_intParams, "g_bAutomaticPBRColorFittingSticker0"),
-        legacyTint: boolParam(doc.m_intParams, "g_bLegacyTintMultiplySticker0"),
-        preserveRoughness: boolParam(doc.m_intParams, "g_bPreserveRoughnessSticker0"),
-        clampSpectrumV: boolParam(doc.m_intParams, "g_bClampSpectrumVSticker0"),
-        selfIllum: boolParam(doc.m_intParams, "g_bSelfIllumSticker0"),
-        wear: numParam(doc.m_floatParams, "g_flSticker0Wear", 0),
-        wearScratches: numParam(doc.m_floatParams, "g_fWearScratchesSticker0", 0),
-        colorBoost: numParam(doc.m_floatParams, "g_flColorBoostSticker0", 1),
-        sfxColorBoost: numParam(doc.m_floatParams, "g_flSfxColorBoostSticker0", 1),
-        tintSaturate: numParam(doc.m_floatParams, "g_flTintSaturateSticker0", 1),
-        glitterScale: numParam(doc.m_floatParams, "g_flGlitterScaleSticker0", 1),
+        glitter: boolParam(scalarParams, "g_bGlitterSticker0"),
+        holo: boolParam(scalarParams, "g_bHolographicSticker0"),
+        metallic: boolParam(scalarParams, "g_bMetallicSticker0"),
+        paperBacking: boolParam(scalarParams, "g_bPaperBackingSticker0"),
+        pbrFit: boolParam(scalarParams, "g_bAutomaticPBRColorFittingSticker0", true),
+        legacyTint: boolParam(scalarParams, "g_bLegacyTintMultiplySticker0"),
+        preserveRoughness: boolParam(scalarParams, "g_bPreserveRoughnessSticker0"),
+        clampSpectrumV: boolParam(scalarParams, "g_bClampSpectrumVSticker0", true),
+        selfIllum: boolParam(scalarParams, "g_bSelfIllumSticker0"),
+        wear: numParam(scalarParams, "g_flSticker0Wear", 0),
+        // Variable-table default is 1, not 0 — at 0 the scratch term reads
+        // 1 - min(0, tex) = 1 and the whole scratch mask is dead.
+        wearScratches: numParam(scalarParams, "g_fWearScratchesSticker0", 1),
+        colorBoost: numParam(scalarParams, "g_flColorBoostSticker0", 1),
+        sfxColorBoost: numParam(scalarParams, "g_flSfxColorBoostSticker0", 1),
+        tintSaturate: numParam(scalarParams, "g_flTintSaturateSticker0", 1),
+        glitterScale: numParam(scalarParams, "g_flGlitterScaleSticker0", 1),
         colorTint: [tint[0] ?? 1, tint[1] ?? 1, tint[2] ?? 1],
-        wearBias: [bias[0] ?? 1, bias[1] ?? 0],
+        wearBias: [bias[0] ?? 1, bias[1] ?? 1],
       };
     }
   } catch {
     art = null;
+    artKind = null;
     sfx = null;
   }
   // Only successes are cached. A null means "not on this mount yet", and the
   // very next thing that changes it is an extraction — which would otherwise be
   // invisible until the pod restarted, leaving every sticker on the icon.
-  const answer = { art, sfx, patchBacking };
+  const answer = { art, artKind, sfx, patchBacking };
   if (art) stickerArtCache.set(image, answer);
   return answer;
 });

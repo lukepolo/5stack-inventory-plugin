@@ -842,9 +842,9 @@ function loadCharmTexture(url: string) {
   return cached;
 }
 
-async function loadBitmap(url: string): Promise<ImageBitmap> {
+async function loadBitmap(url: string, opts?: ImageBitmapOptions): Promise<ImageBitmap> {
   const res = await fetch(url);
-  return createImageBitmap(await res.blob());
+  return opts ? createImageBitmap(await res.blob(), opts) : createImageBitmap(await res.blob());
 }
 
 /**
@@ -876,29 +876,43 @@ async function loadBitmap(url: string): Promise<ImageBitmap> {
 // One request carries BOTH the art and the effect material — see the route. Two
 // lookups reading the same document is how they end up disagreeing about which
 // sticker they resolved, and a decal needs them together anyway.
-const stickerArtCache = new Map<string, Promise<{ art: string | null; sfx: StickerSfx | null; patchBacking: string | null }>>();
-function stickerArtInfo(image: string): Promise<{ art: string | null; sfx: StickerSfx | null; patchBacking: string | null }> {
+interface StickerArtInfo {
+  art: string | null;
+  artKind: "sticker" | "patch" | null;
+  sfx: StickerSfx | null;
+  patchBacking: string | null;
+}
+const stickerArtCache = new Map<string, Promise<StickerArtInfo>>();
+function stickerArtInfo(image: string): Promise<StickerArtInfo> {
   let hit = stickerArtCache.get(image);
   if (!hit) {
     hit = fetch(`${API_ORIGIN}/api/catalog/sticker-art?image=${encodeURIComponent(image)}`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d: { art?: string; sfx?: StickerSfx; patchBacking?: string } | null) => ({
-        art: typeof d?.art === "string" ? d.art : null,
-        // The stitched fabric border behind a PATCH's art (g_tPatch0Backing).
-        // Only patches have one; a backend that predates it sends nothing, which
-        // has to read as "draw the art alone" rather than as an error.
-        patchBacking: typeof d?.patchBacking === "string" ? d.patchBacking : null,
-        // A backend that predates the effect work sends no `sfx` at all, and
-        // that has to read as "plain sticker" rather than as an error — the
-        // frontend and backend ship as separate images.
-        sfx: d?.sfx ?? null,
-      }))
-      .catch(() => ({ art: null, sfx: null, patchBacking: null }));
+      .then((d: { art?: string; artKind?: string; sfx?: StickerSfx; patchBacking?: string } | null): StickerArtInfo => {
+        // WHICH param served the art. "sticker" is the licence for the ×12.75
+        // alpha expansion — g_tSticker0's alpha is the coverage/wear dual
+        // channel; a patch's g_tPatch0 and the icon fallback carry ordinary
+        // alpha. A backend that predates the field sends nothing, which must
+        // read as "don't expand" — today's look, never a clipped patch.
+        const kind = d?.artKind;
+        return {
+          art: typeof d?.art === "string" ? d.art : null,
+          artKind: kind === "sticker" || kind === "patch" ? kind : null,
+          // The stitched fabric border behind a PATCH's art (g_tPatch0Backing).
+          // Only patches have one; a backend that predates it sends nothing, which
+          // has to read as "draw the art alone" rather than as an error.
+          patchBacking: typeof d?.patchBacking === "string" ? d.patchBacking : null,
+          // A backend that predates the effect work sends no `sfx` at all, and
+          // that has to read as "plain sticker" rather than as an error — the
+          // frontend and backend ship as separate images.
+          sfx: d?.sfx ?? null,
+        };
+      })
+      .catch((): StickerArtInfo => ({ art: null, artKind: null, sfx: null, patchBacking: null }));
     stickerArtCache.set(image, hit);
   }
   return hit;
 }
-const stickerArtUrl = (image: string) => stickerArtInfo(image).then((d) => d.art);
 
 /**
  * A texture loaded EXACTLY as authored — no crop, no re-square.
@@ -925,7 +939,10 @@ function loadPlainTexture(url: string): Promise<import("three").Texture | null> 
   return hit;
 }
 
-const stickerTexCache = new Map<string, Promise<{ tex: import("three").Texture; aspect: number } | null>>();
+const stickerTexCache = new Map<
+  string,
+  Promise<{ tex: import("three").Texture; aspect: number; realStickerArt: boolean } | null>
+>();
 /** Resolved half of stickerTexCache — see texReady for why the sync path matters. */
 const stickerReady = new Map<string, import("three").Texture>();
 function loadStickerTexture(url: string) {
@@ -938,10 +955,30 @@ function loadStickerTexture(url: string) {
         // and re-squared below, when it does not.
         // paintTextureUrl, not a bare join: the textures live under /paints and
         // are versioned with the extraction, exactly like every other one.
-        const art = await stickerArtUrl(url);
-        const img = await loadBitmap(art ? paintTextureUrl(art) : url).catch(() =>
-          art ? loadBitmap(url) : Promise.reject(new Error("no sticker art")),
-        );
+        const info = await stickerArtInfo(url);
+        const art = info.art;
+        // premultiplyAlpha "none" is load-bearing: the real sticker art's
+        // coverage alphas live in bytes 0-20, and a premultiplied decode
+        // quantises RGB under low alpha to ~alpha_byte levels — the greyed,
+        // banded ink the canvas pipeline used to produce.
+        const bmpOpts: ImageBitmapOptions = { premultiplyAlpha: "none", colorSpaceConversion: "none" };
+        let fromArt = !!art;
+        let img: ImageBitmap;
+        try {
+          img = await loadBitmap(art ? paintTextureUrl(art) : url, bmpOpts);
+        } catch {
+          if (!art) throw new Error("no sticker art");
+          fromArt = false;
+          img = await loadBitmap(url, bmpOpts);
+        }
+        // The expansion licence: the backend says WHAT it served (a patch's
+        // albedo also arrives as `art`), and fromArt says what actually loaded
+        // (the art can 404 mid-extraction and fall back to the icon above).
+        // Both must agree before anyone treats the alpha as the dual channel.
+        const realStickerArt = fromArt && info.artKind === "sticker";
+        // The canvas exists ONLY to read alpha for the ink bbox — alpha
+        // survives the premultiplied backing store exactly; RGB does not, so
+        // canvas pixels are never uploaded.
         const cv = document.createElement("canvas");
         cv.width = img.width;
         cv.height = img.height;
@@ -954,7 +991,9 @@ function loadStickerTexture(url: string) {
         let maxY = -1;
         // A lower threshold than the charm's 48: sticker art routinely fades to
         // a soft edge (holo bleed, drop shadows that are part of the design),
-        // and cutting those off crops into the artwork itself.
+        // and cutting those off crops into the artwork itself. It also sits
+        // below the real art's 20-byte wear-order floor, so no inked texel of
+        // g_tSticker0 is ever outside the box.
         for (let y = 0; y < cv.height; y++) {
           for (let x = 0; x < cv.width; x++) {
             if (d[(y * cv.width + x) * 4 + 3] > 8) {
@@ -968,21 +1007,42 @@ function loadStickerTexture(url: string) {
         if (maxX < 0) return null; // fully transparent — nothing to draw
         const w = maxX - minX + 1;
         const h = maxY - minY + 1;
-        // Re-centre the ink in a SQUARE canvas, letterboxed with real
+        // Re-centre the ink in a SQUARE image, letterboxed with real
         // transparency. Doing it in the image rather than in the uv mapping
-        // keeps every caller on a plain [0,1] square — and it is the only way to
-        // letterbox without sampling outside the texture, which under
-        // clamp-to-edge would smear the art's border across the bands.
+        // keeps every caller on a plain [0,1] square. The crop rect may hang
+        // past the source; createImageBitmap pads those pixels transparent
+        // black, which IS the letterbox.
         const side = Math.max(w, h);
-        const square = document.createElement("canvas");
-        square.width = side;
-        square.height = side;
-        square
-          .getContext("2d")!
-          .drawImage(cv, minX, minY, w, h, ((side - w) / 2) | 0, ((side - h) / 2) | 0, w, h);
-        const tex = new THREE.CanvasTexture(square);
+        const sx = minX - (((side - w) / 2) | 0);
+        const sy = minY - (((side - h) / 2) | 0);
+        let tex: import("three").Texture;
+        try {
+          // imageOrientation "flipY" bakes the flip the old CanvasTexture got
+          // from its default flipY=true — three IGNORES texture.flipY for
+          // ImageBitmap uploads, so omitting this renders every sticker
+          // upside down.
+          const square = await createImageBitmap(img, sx, sy, side, side, {
+            ...bmpOpts,
+            imageOrientation: "flipY",
+          });
+          tex = new THREE.Texture(square);
+          tex.needsUpdate = true;
+        } catch {
+          // Browsers without cropping ImageBitmapOptions: the old canvas path,
+          // premultiply loss and all.
+          const square = document.createElement("canvas");
+          square.width = side;
+          square.height = side;
+          square
+            .getContext("2d")!
+            .drawImage(cv, minX, minY, w, h, ((side - w) / 2) | 0, ((side - h) / 2) | 0, w, h);
+          tex = new THREE.CanvasTexture(square);
+        }
         tex.colorSpace = THREE.SRGBColorSpace;
-        return { tex, aspect: w / h };
+        // Rides the texture so the stickerReady sync path (a drag rebuild
+        // never re-awaits the loader) keeps the expansion flag with the map.
+        tex.userData.stkRealStickerArt = realStickerArt;
+        return { tex, aspect: w / h, realStickerArt };
       } catch {
         return null;
       }
@@ -2918,6 +2978,7 @@ async function buildViewer(
       info.sfx,
       wear ?? 0,
       paintTextureUrl,
+      { expandAlpha: loaded.realStickerArt },
     );
   }
   // Frees the glove composite's render targets on dispose — see below.
@@ -4735,7 +4796,9 @@ async function buildViewer(
       // the sticker's own normal/roughness, and glitter / holographic / gold.
       // Awaited so the decal never paints once unshaded and then pops — the
       // material is only ever seen with its final program.
-      await applyStickerSfx(THREE, mat, (await stickerArtInfo(st.image)).sfx, st.w ?? 0, paintTextureUrl);
+      await applyStickerSfx(THREE, mat, (await stickerArtInfo(st.image)).sfx, st.w ?? 0, paintTextureUrl, {
+        expandAlpha: tex.userData.stkRealStickerArt === true,
+      });
       mesh = new THREE.Mesh(geom, mat);
       mesh.userData.stickerSlot = st.slot;
       mesh.userData.stickerImage = st.image;

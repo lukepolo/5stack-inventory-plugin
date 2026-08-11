@@ -510,3 +510,55 @@ Glock-18 | AXIA, green-and-gold -> correct:
 
 Note the shape: every step was a measurement or a decompile, never a guess, and
 each one was verified against the suite before the next.
+
+---
+
+## Stickers: the dual-purpose alpha, and the constants that were "unreadable"
+
+Settled 2026-08-10 (the "stickers are faded/transparent" bug). Ground truth is
+`groundtruth/sticker.glsl` (`csgo_weapon_sticker_vulkan_50_ps.vcs`, VCS 71,
+archive 1 offset 80769456 length 112181 in the FULL tree — static combo 0
+carries every finish, the features are all dynamic bools).
+
+**`g_tSticker0.a` is NOT coverage.** Bytes 0–20 are the antialiased coverage
+ramp; 20–255 encode the wear-erosion ORDER. Display alpha is
+`saturate(a * 12.75)` (sticker.glsl:420) and the wear remap
+`saturate((a-0.078431)*1.0851)` (:703) eats the RAW byte. Draw the texture with
+its raw alpha and every sticker interior renders at its wear-order value —
+"almost transparent". The icon fallback and `g_tPatch0` have ORDINARY alpha, so
+the expansion is licensed per-load (`artKind` from `/api/catalog/sticker-art` +
+which bitmap actually loaded), never inferred from "art exists".
+
+**The engine-global albedo-levels ARE in the .vcs.** The docblock claim that
+`g_v*AlbedoLevels` were unreadable was wrong — they are `__Expression__`
+variables in the pixel shader's own variable table, DynExp-decoded (VfxEval in
+VRF) under `float3(-A.x, -1.4427*log(max(1e-4,1-A.y)), 2-A.z)`:
+`g_vAlbedoLevels` (.045,.4,1.15)→(0.045, 0.737, 0.85) — agreeing with
+paintComposite's independently-decoded OV_LEVELS, which validates the rule —
+`g_vHoloAlbedoLevels` (.05,.35,1.15)→(0.05, 0.62149, 0.85),
+`g_vMetallicAlbedoLevels` (.45,.4,1.08)→(0.45, 0.737, 0.92),
+`g_vDarkMetallicAlbedoLevels` (.1,.4,1.08)→(0.1, 0.737, 0.92),
+`g_fColorBoostFactor` = 64-1. With those, the `stkFoil` stand-in died and the
+real refit (sticker.glsl:548-623, :660-664) went in.
+
+**The variable table also carries the per-material DEFAULTS, and two are not
+false:** `g_bAutomaticPBRColorFittingSticker0` and `g_bClampSpectrumVSticker0`
+default TRUE, `g_fWearScratchesSticker0` defaults 1 (at the old 0 default the
+scratch term is `1-min(0,tex)=1`, dead), `g_vWearBiasSticker0` defaults (1,1).
+A boolParam that reads absent-as-false silently un-refits every sticker that
+doesn't author the flag — which is most of them.
+
+**three.js chunk-order trap:** `metalnessmap_fragment` runs BEFORE
+`normal_fragment_maps`. A value set in the normal-maps injection and consumed
+in the metalness injection is consumed at its initializer — the old foil term
+was dead code from day one. Write `metalnessFactor` at the END of the
+normal-maps injection instead; `lights_physical_fragment` is the real consumer
+and runs later.
+
+**Canvas round-trips corrupt low-alpha art.** A 2D canvas premultiplies its
+backing store; with coverage alphas ≤20 the un-premultiplied readback quantises
+RGB to ~alpha_byte levels — grey, banded ink. Decode with
+`createImageBitmap(blob, {premultiplyAlpha:"none"})`, keep the canvas only for
+alpha reads (alpha survives exactly), and remember three IGNORES
+`texture.flipY` for ImageBitmap uploads — bake `imageOrientation:"flipY"` at
+creation or everything renders upside down.
