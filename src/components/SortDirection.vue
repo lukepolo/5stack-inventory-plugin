@@ -22,7 +22,7 @@ const icon = computed(() => SORT_DIR_ICON[props.kind][props.modelValue]);
 
 <template>
   <button
-    class="flex h-8 w-8 flex-none items-center justify-center rounded-md border border-border bg-background text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+    class="tac-action flex h-8 w-8 flex-none items-center justify-center rounded-md border border-border bg-background text-muted-foreground"
     :title="hint ? `${hint} — click to reverse` : 'Reverse sort order'"
     :aria-label="hint ?? 'Reverse sort order'"
     @click="emit('update:modelValue', props.modelValue === 'desc' ? 'asc' : 'desc')"

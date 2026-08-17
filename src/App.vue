@@ -6108,9 +6108,8 @@ if (MDEBUG) {
       />
       <button
         v-if="view === 'grid' || view === 'focus'"
-        class="flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider transition-colors"
-        :class="[isCompact ? 'h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground hover:text-foreground']"
-        :style="view === 'focus' ? { background: accentSoft } : {}"
+        class="tac-action flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
+        :class="[isCompact ? 'h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'tac-on' : 'border-border text-muted-foreground']"
         :title="view === 'focus' ? 'Focused' : 'Focus'"
         @click="go(view === 'focus' ? '/' : '/focus')"
       >
@@ -6133,7 +6132,7 @@ if (MDEBUG) {
         <a
           v-if="embedMode && viewingSelf && !loading && !error"
           :href="router.href('/', {})"
-          class="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3.5 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+          class="flex h-9 items-center gap-1.5 rounded-lg border border-border px-3.5 text-f11 font-semibold uppercase tracking-wider text-muted-foreground tac-action"
           title="Edit your loadout in the full inventory page"
           @click="onEditClick"
         >
@@ -6159,7 +6158,7 @@ if (MDEBUG) {
               : 'Sync from Steam — read-only: mirrors your public Steam inventory. No passwords, keys, or trades, ever.'"
           >
             <button
-              class="relative grid place-items-center rounded-md border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:opacity-60"
+              class="relative grid place-items-center rounded-md border text-muted-foreground tac-action disabled:opacity-60"
               :class="[
                 isCompact ? 'h-8 w-8' : 'h-9 w-9',
                 needsSteamSync ? 'border-[#f97316]/60' : 'border-border',
@@ -6184,7 +6183,7 @@ if (MDEBUG) {
             :text="gearWarnings.length ? gearWarnings.join(' · ') : 'Game-server configuration'"
           >
             <button
-              class="relative grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="relative grid place-items-center rounded-md border border-border text-muted-foreground tac-action"
               :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
               @click="go('/admin')"
             >
@@ -6259,7 +6258,7 @@ if (MDEBUG) {
         {{ error }}
       </div>
       <button
-        class="flex items-center gap-2 rounded-md border border-border px-4 py-2 text-f13 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+        class="flex items-center gap-2 rounded-md border border-border px-4 py-2 text-f13 uppercase tracking-wider text-muted-foreground tac-action"
         @click="load"
       >
         <RefreshCw class="h-3.5 w-3.5" /> Try again
@@ -6351,7 +6350,7 @@ if (MDEBUG) {
           </span>
           <button
             v-if="inventory.length"
-            class="ml-auto grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            class="ml-auto grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action"
             title="Select multiple items"
             @click="selectMode = true"
           >
@@ -6588,7 +6587,7 @@ if (MDEBUG) {
           <div class="flex h-6 flex-none items-center">
             <button
               v-if="invModels.length || invTypes.length"
-              class="flex h-full w-full items-center justify-center gap-1 rounded-md border border-border text-f9 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="flex h-full w-full items-center justify-center gap-1 rounded-md border border-border text-f9 uppercase tracking-wider text-muted-foreground tac-action"
               @click="invModels = []; invTypes = []"
             >
               <X class="h-3 w-3" /> Clear {{ invModels.length + invTypes.length }}
@@ -6731,7 +6730,7 @@ if (MDEBUG) {
                  who owns nothing yet. -->
             <div class="text-f13">Open the <b class="text-foreground">Armory</b> and craft your first item.</div>
             <button
-              class="mt-2 flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="mt-2 flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
               @click="openArmory()"
             >
               <Hammer class="h-3.5 w-3.5" /> Browse the Armory
@@ -6746,7 +6745,7 @@ if (MDEBUG) {
             <div>Nothing matches those filters.</div>
             <button
               v-if="filtersActive"
-              class="rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider tac-action"
               @click="resetInvFilters"
             >
               Clear filters
@@ -7361,7 +7360,7 @@ if (MDEBUG) {
                      or a trip back to the grid. -->
                 <button
                   v-if="isSkinned(focusRow) && canEdit && focusInstance && isCustomizable(focusRow?.item)"
-                  :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
+                  :class="[FOCUS_STAGE, 'tac-action border-border text-muted-foreground']"
                   title="Edit this item — wear, pattern, stickers, charm"
                   @click="openEdit(focusInstance)"
                 >
@@ -7378,7 +7377,7 @@ if (MDEBUG) {
                      as a draft instead). -->
                 <button
                   v-if="canInspect(focusRow?.item)"
-                  :class="[FOCUS_STAGE, 'border-border text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']"
+                  :class="[FOCUS_STAGE, 'tac-action border-border text-muted-foreground']"
                   title="Launch CS2 and inspect this item in-game"
                   @click="inspectLoadoutRow(focusRow)"
                 >
@@ -7650,7 +7649,7 @@ if (MDEBUG) {
                other time. -->
           <button
             v-if="canLift"
-            class="grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            class="grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action"
             :title="sheetLift ? 'Lower the picker' : 'Raise the picker over the loadout'"
             :aria-expanded="sheetLift"
             @click="sheetLift = !sheetLift"
@@ -8271,7 +8270,7 @@ if (MDEBUG) {
                  "this has a defindex" is enough. -->
             <button
               v-if="canInspect(craft.skin) || canInspect(craftInst?.item)"
-              class="flex flex-none items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="flex flex-none items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground tac-action"
               :class="isCompact ? 'h-10 w-10' : 'px-2.5 py-1 text-f10'"
               :title="viewOnly ? 'Launch CS2 and inspect this item in-game' : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
               @click="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"
@@ -8294,7 +8293,7 @@ if (MDEBUG) {
                  the footer button, so it's one control in two places. -->
             <button
               v-if="viewOnly && canEdit && craftInst && isCustomizable(craftInst.item)"
-              class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="grid place-items-center rounded-md border border-border text-muted-foreground tac-action"
               :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
               :title="isReadOnly(craftInst) ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
               @click="craftViewEdit"
@@ -8315,7 +8314,7 @@ if (MDEBUG) {
             </button>
             <button
               v-if="!viewOnly"
-              class="flex items-center gap-1.5 rounded-md border border-border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+              class="flex items-center gap-1.5 rounded-md border border-border text-muted-foreground tac-action"
               :class="isCompact ? 'h-10 px-3 text-f11 uppercase tracking-wider' : 'px-2.5 py-1 text-f10 uppercase tracking-wider'"
               title="Reset all options"
               @click="resetCraft"
@@ -8812,7 +8811,7 @@ if (MDEBUG) {
                   type="number" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001"
                   class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
                 />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random wear" @click="randomWear">🎲</button>
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random wear" @click="randomWear">🎲</button>
               </div>
               <div class="mt-2 flex items-center gap-2">
                 <input v-model.number="craft.wear" type="range" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001" class="wear-range w-full" />
@@ -8841,7 +8840,7 @@ if (MDEBUG) {
                   type="number" min="0" max="1" step="0.01"
                   class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
                 />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground" title="Random wear" @click="randomWear">🎲</button>
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random wear" @click="randomWear">🎲</button>
               </div>
               <div class="mt-2 flex items-center gap-2">
                 <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
@@ -8945,7 +8944,7 @@ if (MDEBUG) {
                what you came to decide. -->
           <button
             v-if="viewOnly && canEdit && craftInst && isCustomizable(craftInst.item)"
-            class="flex h-9 items-center gap-1.5 rounded-md border border-border px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+            class="flex h-9 items-center gap-1.5 rounded-md border border-border px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground tac-action"
             :title="isReadOnly(craftInst) ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
             @click="craftViewEdit"
           >
@@ -8971,7 +8970,7 @@ if (MDEBUG) {
                a fresh craft is already new, and Save would overwrite. -->
           <button
             v-if="!viewOnly && editingId != null"
-            class="flex h-9 items-center gap-1.5 rounded-md border border-border px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+            class="flex h-9 items-center gap-1.5 rounded-md border border-border px-4 text-f11 font-semibold uppercase tracking-wider text-muted-foreground tac-action disabled:cursor-not-allowed disabled:opacity-40"
             :disabled="craftBusy || !signedIn"
             title="Save these changes as a new item, leaving the original untouched"
             @click="duplicateCraft"
@@ -9010,7 +9009,7 @@ if (MDEBUG) {
       <Trash2 class="h-3.5 w-3.5 flex-none text-muted-foreground" />
       <span class="max-w-[380px] truncate">{{ pendingDeleteLabel }}</span>
       <button
-        class="flex-none rounded-sm px-2 py-1 text-f11 font-bold uppercase tracking-cs1 text-[color:var(--acc)] transition-colors hover:bg-muted"
+        class="flex-none rounded-sm px-2 py-1 text-f11 font-bold uppercase tracking-cs1 text-[hsl(var(--tac-amber,33_94%_58%))] transition-colors hover:bg-muted"
         @click="undoDelete"
       >
         Undo
@@ -9113,7 +9112,7 @@ if (MDEBUG) {
                    openItemInspect. -->
               <button
                 v-if="loadout3d.id != null"
-                class="flex items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+                class="flex items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground tac-action"
                 :class="isCompact ? 'h-10 w-10' : 'px-2.5 py-1 text-f10'"
                 title="Launch CS2 and inspect this weapon in-game"
                 @click="openItemInspect(loadout3d.id)"
@@ -9198,7 +9197,7 @@ if (MDEBUG) {
              modal's own ✕ reads as "close everything", which is the one thing
              it must not do — the edit underneath is unsaved. -->
         <button
-          class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground"
+          class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground tac-action"
           title="Back to the editor — nothing is applied"
           @click="picker = null"
         >
@@ -9284,7 +9283,7 @@ if (MDEBUG) {
           <span
             role="button"
             tabindex="0"
-            class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-[color:var(--acc)] group-hover:flex"
+            class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground tac-action group-hover:flex"
             :title="`View ${it.name} in 3D`"
             @click.stop="openPreview3d(it, picker?.kind ?? 'sticker')"
             @keydown.enter.stop.prevent="openPreview3d(it, picker?.kind ?? 'sticker')"

@@ -407,7 +407,7 @@ watch(
            buttons made scrubbing — the thing that works — compete for attention
            with analysis nobody asked for yet. -->
       <button
-        class="ml-auto rounded border border-input px-1.5 py-0.5 text-f11 leading-none transition-colors hover:border-[color:var(--acc)] hover:bg-white/5"
+        class="tac-action ml-auto rounded border border-input px-1.5 py-0.5 text-f11 leading-none hover:bg-white/5"
         :title="`Random pattern between ${min} and ${max}`"
         @click="roll"
       >🎲</button>

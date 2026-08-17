@@ -60,9 +60,13 @@ const canEditItem = computed(() => !!props.inst && isCustomizable(props.inst.ite
 // canInspect. Hidden rather than left to fail with a toast on click.
 const canInspectItem = computed(() => !!props.inst && canInspect(props.inst.item));
 
+// `tac-action` carries the hover (tactical amber border + foreground icon) and
+// the transition — see style.css. It's the same treatment the header tools and
+// the modal actions wear, which is the point: an action looks like an action
+// wherever it turns up.
 const BTN = computed(
   () =>
-    `rounded border border-border/60 bg-background/70 text-muted-foreground hover:text-foreground ${props.compact ? "p-0.5" : "p-1"}`,
+    `tac-action rounded border border-border/60 bg-background/70 text-muted-foreground ${props.compact ? "p-0.5" : "p-1"}`,
 );
 const ICON = computed(() => (props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
 </script>
@@ -91,7 +95,7 @@ const ICON = computed(() => (props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
          the null check. -->
     <span
       v-if="inst"
-      :class="[BTN, 'hover:!text-[#ff7a6a]']"
+      :class="[BTN, 'hover:!border-[#e04a3a] hover:!text-[#ff7a6a]']"
       title="Delete from inventory"
       @click.stop="emit('remove')"
     ><Trash2 :class="ICON" /></span>

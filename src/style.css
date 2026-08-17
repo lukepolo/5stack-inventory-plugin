@@ -285,6 +285,52 @@
   --tac-ct-cta-to: color-mix(in hsl, hsl(var(--tac-ct)), black 12%);
 }
 
+/* ---- action buttons --------------------------------------------------------
+   THE treatment for the things you PRESS: the header tools (sync, share, gear),
+   the tile hover clusters, the focus-view and craft-modal actions, the empty-
+   state escapes. Distinct from the things that show STATE — selection rings,
+   slot highlights, filter chips — which stay on the team accent, because there
+   the colour IS the message ("this is your CT side").
+
+   Every one of these used to hover to var(--acc), i.e. whichever team was
+   showing: amber on T, CT blue on CT. Two problems, both visible in one glance
+   at the header — the blue sat next to the tab strip's amber pill, so the same
+   row carried two accent systems; and the colour of "you can press this" moved
+   when you flipped teams, which is not a fact about the button. --tac-amber is
+   the panel's own brand token, so an action now looks like an action on both
+   sides, and the team accent is left saying only the thing it means.
+
+   REST IS DELIBERATELY NOT SET HERE. Each site keeps its own resting border and
+   text (border-border, the never-synced sync button's orange, the tile
+   cluster's border-border/60); this owns hover, keyboard focus and "on" only.
+
+   Specificity is 0,4,0 (attribute + class + pseudo + :not) so it clears the
+   Tailwind utilities sitting on the same element — those are emitted after this
+   block, so at equal specificity a leftover `hover:text-foreground` would win
+   on source order alone. */
+@layer components {
+  [data-cs2-inventory] .tac-action {
+    transition-property: color, background-color, border-color, box-shadow;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 150ms;
+  }
+  [data-cs2-inventory] .tac-action:hover:not(:disabled),
+  [data-cs2-inventory] .tac-action:focus-visible:not(:disabled) {
+    border-color: hsl(var(--tac-amber, 33 94% 58%));
+    color: hsl(var(--foreground));
+  }
+  /* ON — the menu is open, the mode is engaged, the toggle is live. Same recipe
+     as the tab strip's sliding indicator (PillTabs), so "this one is active"
+     reads identically whether it's a tab or a button. Hover still lifts the
+     border to full strength on top of it. */
+  [data-cs2-inventory] .tac-action.tac-on {
+    border-color: hsl(var(--tac-amber, 33 94% 58%) / 0.45);
+    background: hsl(var(--tac-amber, 33 94% 58%) / 0.12);
+    box-shadow: 0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25);
+    color: hsl(var(--foreground));
+  }
+}
+
 /* Modal/menu motion is decoration, never the thing that makes state legible —
    so honouring the OS setting costs nothing. Overlays still appear and
    disappear, they just arrive instantly. */

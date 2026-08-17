@@ -34,7 +34,8 @@ import {
   getItemsByIds,
   getItem,
   getItemIdByName,
-  getItemIdBySteamName,
+  parseSteamMarketName,
+  isOwnable,
   slotForItem,
   isBaseWeapon,
   getStickerBounds,
@@ -1497,29 +1498,6 @@ app.get("/api/inventory", async (request, reply) => {
   }));
 });
 
-/**
- * What a user is allowed to OWN, which is not the same as what they can equip.
- *
- * This gate used to be `slotForItem`, i.e. "can it go in a loadout slot" — and
- * that answers null for stickers, patches and charms, so an attachment could
- * never become an owned instance at all. The consequence was quiet and wrong:
- * an attachment is stored on the weapon as a bare catalog id, so the sticker on
- * your AK was not a thing you owned, could not be edited on its own, and could
- * not carry its own scratch.
- *
- * EQUIPPING is still gated, independently and where it belongs — resolveEquip
- * type-checks the item against the slot, so a slotless instance simply has
- * nowhere to go. Nothing here can put a sticker in a rifle slot.
- *
- * Still a whitelist rather than "anything in the catalog": cases and keys
- * resolve to real items and are not things this app models. Pins and medals
- * came off that list when the collectible slot shipped — they own a slot now,
- * so slotForItem lets them through without an entry here.
- */
-const OWNABLE_TYPES = new Set(["sticker", "patch", "keychain"]);
-const craftable = (id: number) =>
-  !!slotForItem(id) || OWNABLE_TYPES.has(getItem(id)?.type as string);
-
 /** The attachment fields of a craft/update body, as they arrive and as they leave. */
 type AttachBody = {
   stickers?: unknown[] | null;
@@ -1700,7 +1678,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   if (typeof item_id !== "number" || !getItem(item_id)) {
     return reply.status(400).send({ error: "That item doesn't exist." });
   }
-  if (!craftable(item_id)) {
+  if (!isOwnable(item_id)) {
     return reply.status(400).send({ error: "That item can't be owned." });
   }
   const attachErr = checkAttachments(item_id, stickers, charm_id, patches);
@@ -2537,29 +2515,34 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
   const seen: string[] = [];
   const unresolved: string[] = [];
   const skippedNames: string[] = [];
+  // What came in, by cs2-lib type. "412 added" cannot answer the question
+  // anyone actually asks after a sync — did my stickers arrive, did my music
+  // kits, did the medals — and a whole family failing to resolve looks exactly
+  // like a whole family the player doesn't own. Counted per ASSET, so it says
+  // what the account holds, not what changed this run.
+  const owned = new Map<string, number>();
   const seedFrom = (assetid: string) => (Number(BigInt(assetid) % 999n) + 1);
   for (const asset of assets) {
     const desc = byClass.get(asset.classid);
-    let name = desc?.market_hash_name ?? "";
-    if (!name) continue;
-    const stattrak = name.startsWith("StatTrak™ ") || name.startsWith("★ StatTrak™ ");
-    name = name.replace(/^★ /, "").replace(/^StatTrak™ /, "").replace(/^Souvenir /, "");
-    const wearMatch = name.match(/ \((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/);
-    const wearTier = wearMatch?.[1];
-    if (wearTier) name = name.slice(0, -wearMatch![0].length);
-    const itemId = getItemIdBySteamName(name);
-    // `craftable`, not `slotForItem`: the old gate was "can it go in a loadout
+    const marketName = desc?.market_hash_name ?? "";
+    if (!marketName) continue;
+    // ★ / StatTrak™ / Souvenir / the wear bracket all come off in there — see
+    // parseSteamMarketName for what each decoration means and why only two of
+    // them are kept.
+    const { itemId, name, stattrak, wearTier } = parseSteamMarketName(marketName);
+    // `isOwnable`, not `slotForItem`: the old gate was "can it go in a loadout
     // slot", which answers no for a loose sticker or charm — so a player with a
     // drawer full of Katowice Crowns imported none of them and the picker's
-    // "stickers you own" was always empty. Cases and keys still fall out here,
-    // since they aren't things this app models; medals and coins DO import now
-    // that the collectible slot gives them somewhere to go.
+    // "stickers you own" was always empty. Cases, keys and tools still fall out
+    // here, since they aren't things this app models; music kits, graffiti,
+    // pins, medals and the Zeus all import, each through its loadout slot.
+    // tools/steam-sync-coverage.ts proves that family by family.
     //
     // Each CS2 item is its own asset with its own assetid — they do NOT arrive
     // stacked with an `amount` — so owning fourteen Crowns imports as fourteen
     // rows through the same per-asset upsert and prune below, with no quantity
     // handling anywhere.
-    if (itemId == null || !craftable(itemId)) {
+    if (itemId == null || !isOwnable(itemId)) {
       skipped++;
       // Resolved-but-unownable items (cases, keys) are expected and would
       // drown the log — only unresolved names are anomalies.
@@ -2570,6 +2553,8 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
       continue;
     }
     seen.push(asset.assetid);
+    const type = getItem(itemId)?.type ?? "unknown";
+    owned.set(type, (owned.get(type) ?? 0) + 1);
     const stickers = attachmentIds(desc, "Sticker", "Sticker", unresolved);
     const patches = attachmentIds(desc, "Patch", "Patch", unresolved);
     const charmId = attachmentIds(desc, "Charm", "Charm", unresolved)[0] ?? null;
@@ -2662,10 +2647,15 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
      ON CONFLICT (steam_id) DO UPDATE SET synced_at = now()`,
     [identity.steamId],
   );
+  const ownedBreakdown = [...owned.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([type, n]) => `${n} ${type}`)
+    .join(", ");
   app.log.info(
     `[steam-sync] ${identity.steamId}: ${assets.length} assets` +
       `${complete ? "" : " (PARTIAL read)"} — ${imported} added, ${updated} updated, ` +
       `${removed} removed, ${skipped} skipped (${unknown} unknown)` +
+      (ownedBreakdown ? ` | owned: ${ownedBreakdown}` : "") +
       (skippedNames.length ? ` | unknown names: ${[...new Set(skippedNames)].join("; ")}` : "") +
       (unresolved.length ? ` | UNRESOLVED attachments: ${[...new Set(unresolved)].join("; ")}` : ""),
   );

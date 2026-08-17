@@ -62,12 +62,13 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
     <Tooltip text="Copy a link to this">
       <button
         :class="[
+          'tac-action',
           props.icon
-            ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground'
+            ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground'
             : props.btnClass
-              ? [props.btnClass, 'text-muted-foreground hover:border-[color:var(--acc)] hover:text-foreground']
-              : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[color:var(--acc)] hover:text-foreground',
-          open ? 'border-[color:var(--acc)] text-foreground' : 'border-border',
+              ? [props.btnClass, 'text-muted-foreground']
+              : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground',
+          open ? 'tac-on' : 'border-border',
         ]"
         @click.stop="open = !open"
       >

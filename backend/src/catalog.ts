@@ -816,6 +816,91 @@ export function getItemIdBySteamName(name: string): number | null {
   return null;
 }
 
+/** The five wear brackets Steam prints after a market name. */
+const STEAM_WEAR_TIERS = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"] as const;
+export type SteamWearTier = (typeof STEAM_WEAR_TIERS)[number];
+const STEAM_WEAR_RE = new RegExp(` \\((${STEAM_WEAR_TIERS.join("|")})\\)$`);
+
+/**
+ * A Steam `market_hash_name`, taken apart into the catalog item plus the two
+ * facts the name itself carries.
+ *
+ * Steam's name is the item name with four decorations bolted on: `★` for a
+ * knife or glove, `StatTrak™ `/`Souvenir ` for the variant, and a wear bracket
+ * in trailing parentheses. cs2-lib carries none of those — StatTrak and float
+ * are attributes of the OWNED copy, not of the catalog entry — so all four have
+ * to come off before the lookup, and two of them are worth keeping.
+ *
+ * Here rather than inline in the import route because it is the whole answer to
+ * "does a Steam inventory of X actually land in ours", and that is a question
+ * worth being able to ask without booting a server — see
+ * tools/steam-sync-coverage.ts, which sweeps every family in the catalog
+ * through this and `isOwnable`.
+ */
+export function parseSteamMarketName(marketHashName: string): {
+  /** The catalog id, or null when nothing in the economy answers to this name. */
+  itemId: number | null;
+  /** The name after the decorations came off — what got looked up. */
+  name: string;
+  stattrak: boolean;
+  wearTier: SteamWearTier | null;
+} {
+  let name = marketHashName
+    .replace(/^★ /, "")
+    .replace(/^StatTrak™ /, "")
+    .replace(/^Souvenir /, "");
+  const wearMatch = STEAM_WEAR_RE.exec(name);
+  const wearTier = (wearMatch?.[1] as SteamWearTier | undefined) ?? null;
+  if (wearMatch) name = name.slice(0, -wearMatch[0].length);
+  return {
+    itemId: getItemIdBySteamName(name),
+    name,
+    // `★ StatTrak™ ` for knives and gloves — the star comes off first above, so
+    // one prefix test covers both forms.
+    stattrak: marketHashName.startsWith("StatTrak™ ") || marketHashName.startsWith("★ StatTrak™ "),
+    wearTier,
+  };
+}
+
+/**
+ * What a user is allowed to OWN, which is not the same as what they can equip.
+ *
+ * This gate used to be `slotForItem`, i.e. "can it go in a loadout slot" — and
+ * that answers null for stickers, patches and charms, so an attachment could
+ * never become an owned instance at all. The consequence was quiet and wrong:
+ * an attachment is stored on the weapon as a bare catalog id, so the sticker on
+ * your AK was not a thing you owned, could not be edited on its own, and could
+ * not carry its own scratch.
+ *
+ * EQUIPPING is still gated, independently and where it belongs — resolveEquip
+ * type-checks the item against the slot, so a slotless instance simply has
+ * nowhere to go. Nothing here can put a sticker in a rifle slot.
+ *
+ * Still a whitelist rather than "anything in the catalog": cases, keys and
+ * tools resolve to real items and are not things this app models. Pins and
+ * medals came off that list when the collectible slot shipped — they own a slot
+ * now, so slotForItem lets them through without an entry here.
+ *
+ * Lives beside parseSteamMarketName because together they ARE the Steam import
+ * gate, and one of the two moving without the other is exactly how a family
+ * goes missing silently.
+ */
+const OWNABLE_TYPES = new Set(["sticker", "patch", "keychain"]);
+export const isOwnable = (id: number) =>
+  !!slotForItem(id) || OWNABLE_TYPES.has(getItem(id)?.type as string);
+
+/**
+ * Every economy item, as the three fields an audit needs.
+ *
+ * Exists so tools/steam-sync-coverage.ts can sweep the whole catalog without
+ * importing cs2-lib itself. That matters for the same reason main.ts doesn't:
+ * a second reader of the economy is how the 9.0.0 field renames got half-applied
+ * and silently blanked the live textures. One reader, and everything else asks
+ * it — including the thing whose job is to notice when it breaks.
+ */
+export const catalogSummary = (): { id: number; name: string; type: string }[] =>
+  items.map((i) => ({ id: i.id, name: i.name, type: i.type as string }));
+
 const baseWeapon = (model: string) =>
   items.find((i) => i.type === "weapon" && i.modelKey === model && !i.variantIndex);
 
