@@ -143,6 +143,22 @@ export interface PricePoint {
   value: number;
   window: PriceWindow;
   marketHashName: string;
+  /**
+   * Set when the listing found is NOT the one asked for.
+   *
+   * Markets do not carry every variant of every skin: StatTrak exists for a
+   * fraction of finishes and sells far more thinly than plain, and the ends of
+   * the wear range often have nothing listed at all. Refusing to answer in those
+   * cases is what made a Battle-Scarred StatTrak weapon show no price no matter
+   * what its owner changed.
+   *
+   * So the lookup relaxes — plain instead of StatTrak, the nearest bracket
+   * instead of the exact one — and records what it actually matched here. It is
+   * never allowed to be silent: a substituted price MUST render differently from
+   * an exact one, because "$40" and "$40 for a different variant of this" are
+   * different claims.
+   */
+  approx?: { wearTier: number; stattrak: boolean };
 }
 
 const positive = (v: unknown): number | null =>

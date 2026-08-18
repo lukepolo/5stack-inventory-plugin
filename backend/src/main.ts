@@ -2870,8 +2870,10 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
   const { rows } = await pool.query<{
     item_id: number;
     wear: number | null;
-    stattrak: boolean;
+    stattrak_asked: boolean;
     market_hash_name: string;
+    wear_tier: number;
+    stattrak: boolean;
     last_24h: number | null;
     last_7d: number | null;
     last_30d: number | null;
@@ -2880,9 +2882,9 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
     median: number | null;
     lowest: number | null;
   }>(
-    `SELECT v.item_id, v.wear, v.stattrak,
-            p.market_hash_name, p.last_24h, p.last_7d, p.last_30d, p.last_90d,
-            p.suggested, p.median, p.lowest
+    `SELECT v.item_id, v.wear, v.stattrak AS stattrak_asked,
+            p.market_hash_name, p.wear_tier, p.stattrak, p.last_24h, p.last_7d, p.last_30d,
+            p.last_90d, p.suggested, p.median, p.lowest
        FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak)
        LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
        -- Two candidate rows, and the ORDER BY is the whole point: the item's OWN
@@ -2892,8 +2894,8 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
        -- than the shared "Doppler" price. When the source doesn't distinguish,
        -- there is no exact row and the alias answers, exactly as before.
        JOIN LATERAL (
-         SELECT pr.market_hash_name, pr.last_24h, pr.last_7d, pr.last_30d, pr.last_90d,
-                pr.suggested, pr.median, pr.lowest
+         SELECT pr.market_hash_name, pr.wear_tier, pr.stattrak, pr.last_24h, pr.last_7d,
+                pr.last_30d, pr.last_90d, pr.suggested, pr.median, pr.lowest
            FROM inventory.prices pr
           WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
             -- The item's own bracket, OR a listing that carries no bracket at
@@ -2902,14 +2904,25 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
             -- very much has a float. Asking only for the float's bracket missed
             -- every one of them — 22 melee items, and the most valuable things
             -- most inventories hold.
-            AND pr.wear_tier IN (${wearTierSql("v.wear")}, -1)
-            AND pr.stattrak = v.stattrak
             -- Nothing here mints souvenirs. The column exists so a Souvenir AWP's
             -- price is never filed on the plain one; this side just never asks.
             AND pr.souvenir = false
-          -- Exact item before its name-collapsed group, then the exact bracket
-          -- before the bracket-less fallback.
-          ORDER BY (pr.item_id = v.item_id) DESC, (pr.wear_tier = ${wearTierSql("v.wear")}) DESC
+          -- Preference, not filter. Markets do not carry every variant: StatTrak
+          -- exists for a fraction of finishes and trades thinly, and the ends of
+          -- the wear range are often unlisted — so a Battle-Scarred StatTrak
+          -- weapon could match nothing at all and showed no price no matter what
+          -- its owner changed. Now the closest listing answers, in this order:
+          --   the item's own row (a phase-priced source wrote one)
+          --   its StatTrak variant matching the ask
+          --   its exact wear bracket
+          --   a listing with no bracket at all (vanilla knives)
+          --   failing all that, the nearest bracket by distance
+          -- What actually matched rides back to the caller, which labels it.
+          ORDER BY (pr.item_id = v.item_id) DESC,
+                   (pr.stattrak = v.stattrak) DESC,
+                   (pr.wear_tier = ${wearTierSql("v.wear")}) DESC,
+                   (pr.wear_tier = -1) DESC,
+                   abs(pr.wear_tier - ${wearTierSql("v.wear")}) ASC
           LIMIT 1
        ) p ON true`,
     values,
@@ -2931,7 +2944,16 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
       },
       window,
     );
-    if (point) found.set(priceTargetKey(row.item_id, row.wear, row.stattrak), point);
+    if (!point) continue;
+    // Say so when the listing is not the one asked for. Compared here, where both
+    // halves are in hand: the client knows what it asked but not what the table
+    // held, and a substitution the UI cannot see is a substitution it will
+    // present as exact.
+    const askedTier = wearTierIndex(wearTierOf(row.wear));
+    if (row.wear_tier !== askedTier || row.stattrak !== row.stattrak_asked) {
+      point.approx = { wearTier: row.wear_tier, stattrak: row.stattrak };
+    }
+    found.set(priceTargetKey(row.item_id, row.wear, row.stattrak_asked), point);
   }
   return found;
 }
