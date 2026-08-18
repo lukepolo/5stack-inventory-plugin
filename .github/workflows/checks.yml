@@ -74,6 +74,22 @@ jobs:
       - name: StatTrak digits match the shader
         run: npm run check:stattrak
 
+      # The three below catch classes of break `npm run typecheck` is
+      # structurally blind to, which is the whole reason they exist:
+      #   prices — the name→catalog join fails SILENTLY, per item, forever
+      #   sfc    — vue-tsc recovers from template breaks that fail `vite build`
+      #   schema — schema.sql applies on EVERY boot, so a bad identifier is not
+      #            a failed migration, it is a backend that will not start
+      # All three have already caught real breaks in this tree.
+      - name: Prices reach the items people own
+        run: npm run check:prices
+
+      - name: Every .vue file parses
+        run: npm run check:sfc
+
+      - name: Schema has no reserved-word columns
+        run: npm run check:schema
+
   # NOT in the job above: tools/charmsim-check.ts needs a directory of
   # *.phys.json from the extracted CS2 assets, which no clean runner has. Run it
   # by hand against a mount with `npm run check:charmsim -- <dir>`. Splitting it

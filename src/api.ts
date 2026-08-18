@@ -17,6 +17,8 @@ function resolveApiBase(): string {
 const API_BASE = resolveApiBase();
 export const API_ORIGIN = API_BASE;
 
+import { WEAR_STOPS } from "./itemVisuals";
+
 export type Team = "CT" | "T";
 
 export interface CatalogWeapon {
@@ -170,12 +172,10 @@ export interface LoadoutEntry {
   stattrak_count: number;
   nametag: string | null;
   item: CatalogItem | null;
-  /** The skin alone, at its wear bracket. Null when the mirror has no listing —
-   *  never zero; "we don't know" and "worthless" are different claims. */
-  price?: PricePoint | null;
-  /** The whole slot: skin + every sticker, patch and charm on it. Safe to sum
-   *  across a team — an attachment lives on one weapon, in one slot. */
-  value?: number | null;
+  // NO price here. It rode on this type briefly and was never set: slot values
+  // come from /inventory/prices, keyed TEAM:slot, so the loadout paints before
+  // money arrives. A permanently-undefined field is worse than none — the next
+  // person to reach for `row.value` gets a silent zero.
   /**
    * Attachments, sent only by the PUBLIC player-loadout endpoint.
    *
@@ -958,11 +958,17 @@ export const WEAR_TIER_NAME = [
   "Battle-Scarred",
 ] as const;
 
-/** Which bracket a float falls in. Mirrors WEAR_STOPS in itemVisuals — the same
- *  four boundaries, kept here so the API layer doesn't import presentation. */
+/** Which bracket a float falls in.
+ *
+ *  Imports the boundaries rather than restating them. They had been written out
+ *  four separate times — catalog.ts (which feeds the SQL), itemVisuals (which
+ *  draws the ramp), here, and the test harness — and the failure mode of drift
+ *  is the one catalog.ts warns about in capitals: a tile captioned
+ *  "Field-Tested" beside a Well-Worn price. itemVisuals imports only a TYPE from
+ *  this module, so there is no cycle. */
 const wearTierIndexOf = (wear: number) => {
-  const i = [0.07, 0.15, 0.38, 0.45].findIndex((b) => wear < b);
-  return i === -1 ? 4 : i;
+  const i = WEAR_STOPS.findIndex((stop) => wear < stop.max);
+  return i === -1 ? WEAR_STOPS.length - 1 : i;
 };
 
 /** What was substituted, in words — for the caption beside an approximate
@@ -1123,9 +1129,6 @@ export interface PriceAdminStatus extends PriceStatus {
   custom: boolean;
   url: string;
   defaultBase: string;
-  /** Where the default mirror is built FROM, for an operator who would rather
-   *  point at the public source (or their own copy of it) directly. */
-  upstream: string;
   windows: PriceWindow[];
   syncing: boolean;
   intervalMinutes: number;
@@ -1317,48 +1320,6 @@ export const fetchDraftInspectLink = (body: {
 
 export const fetchInspectLink = (id: number) =>
   request<{ inspect: string; stattrak: boolean }>(`/inventory/${id}/inspect`);
-
-// ---- StatTrak history -------------------------------------------------------
-// The ledger behind the counter: where this gun has actually been. OWNER ONLY —
-// the endpoint is scoped to the caller and there is deliberately no public
-// equivalent, so nothing here is reachable from a shared loadout link or the
-// player-profile tab. Kill history says when somebody was playing and on which
-// server; a loadout says what colour their AK is.
-
-/** One match leg — a match on one map. A best-of-three is three of these. */
-export interface KillMatch {
-  /** Panel match id, or null for kills we could not attribute (pickup server,
-   *  panel tables unreachable, or the match had already ended). */
-  match_id: string | null;
-  match_map_id: string | null;
-  map: string | null;
-  kills: number;
-  first_at: string;
-  last_at: string;
-}
-
-export interface KillHistory {
-  /** owned_items.stattrak_count — the number on the module. */
-  counted: number;
-  /** Rows in the ledger. Lower than `counted` by however many kills landed
-   *  before the ledger existed; the UI shows both rather than pretending. */
-  logged: number;
-  first_at: string | null;
-  last_at: string | null;
-  /** Distinct panel matches, which is NOT `matches.length` — a best-of-three is
-   *  one match and three legs, and unattributed kills are legs with no match. */
-  match_count: number;
-  /** Match legs, most recent first. */
-  matches: KillMatch[];
-  maps: { map: string; kills: number }[];
-  /** Daily totals over the last 30 days, ascending, keyed `YYYY-MM-DD` in UTC.
-   *  Sparse — only days with kills are present, so the client fills the gaps
-   *  itself rather than the server sending thirty rows of mostly zero. */
-  days: { day: string; kills: number }[];
-}
-
-export const fetchKillHistory = (id: number) =>
-  request<KillHistory>(`/inventory/${id}/kills`);
 
 export const deleteInstance = (id: number) =>
   request<{ ok: true }>(`/inventory/${id}`, { method: "DELETE" });

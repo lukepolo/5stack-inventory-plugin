@@ -131,7 +131,8 @@ export type ControlIcon =
   | "spinTouch"
   | "zoomTouch"
   | "panTouch"
-  | "moveTouch";
+  | "moveTouch"
+  | "rotateTouch";
 
 /**
  * Transport glyphs, which deliberately break the grammar above.
@@ -159,4 +160,8 @@ export const CONTROL_ICON: Record<ControlIcon, string> = {
   zoomTouch: V_PINCH + TWO_FINGERS,
   panTouch: V_CROSS + TWO_FINGERS,
   moveTouch: V_CROSS_ITEM + ONE_FINGER,
+  // The twist. Same verb as the mouse's shift-drag — one sweep, the thing
+  // turning rather than the camera going round it — because it IS the same
+  // gesture; only the device half changes.
+  rotateTouch: V_TURN + TWO_FINGERS,
 };

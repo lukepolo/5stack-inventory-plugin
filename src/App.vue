@@ -21,8 +21,6 @@ import {
   updateInstance,
   deleteInstance,
   fetchInspectLink,
-  fetchKillHistory,
-  type KillHistory,
   fetchDraftInspectLink,
   fetchServerApiKey,
   fetchExtractStatus,
@@ -534,6 +532,9 @@ function cellFacts(pos: string, displayPos: string = pos) {
   // Weapon cells only show a float for a CRAFTED occupant; a default gun has
   // none. Gear reads its row directly, which is null for a stock knife anyway.
   const wearRow = weaponSlot ? cellWear(displayPos) : row ?? null;
+  // Once. This ran three times per cell — value, tip, missing — each re-walking
+  // the shared-slot branch, for every cell of a 15-slot loadout on every tick.
+  const value = cellValue(displayPos);
   return {
     item: weaponSlot ? cellItem(displayPos) : row?.item ?? null,
     inst,
@@ -541,11 +542,11 @@ function cellFacts(pos: string, displayPos: string = pos) {
     fallback: weaponSlot ? "Default" : specialFallback(pos),
     strip: weaponSlot,
     teams: cellTeams(displayPos),
-    value: cellValue(displayPos),
-    valueTip: inst && !cellValue(displayPos) ? noPriceTip.value : slotValueTip.value,
+    value,
+    valueTip: inst && value == null ? noPriceTip.value : slotValueTip.value,
     // A free default has no listing to be missing; only an OWNED occupant that
     // the mirror couldn't price gets the dash.
-    valueMissing: pricesOn.value && !!inst && cellValue(displayPos) == null,
+    valueMissing: pricesOn.value && !!inst && value == null,
     wear: wearRow?.wear ?? null,
     seed: wearRow?.seed ?? null,
     rarity: (weaponSlot ? rarityOf(displayPos) : row?.item?.rarity) ?? null,
@@ -2093,69 +2094,7 @@ const craftInst = computed(() =>
 // a scan of one item's kills rather than a column read, so it deliberately does
 // NOT ride along on /api/inventory the way stattrak_count does. A grid of two
 // hundred tiles has no use for it.
-const killHistory = ref<KillHistory | null>(null);
-const killHistoryBusy = ref(false);
-/**
- * Load the history for whatever StatTrak item the modal is VIEWING.
- *
- * Gated on view mode, not just on an item being open: the editor is where you
- * change the gun, and a record of where it has been belongs to the read-only
- * spec beside the float and the pattern. Non-StatTrak items resolve to null and
- * never ask.
- */
-watch(
-  () => (viewOnly.value && craftInst.value?.stattrak ? craftInst.value.id : null),
-  async (id) => {
-    killHistory.value = null;
-    if (id == null) return;
-    killHistoryBusy.value = true;
-    try {
-      const history = await fetchKillHistory(id);
-      // The modal can close, or move to another item, while this is in flight.
-      // Publishing unconditionally would paint one knife's record under
-      // another's name — the request is keyed by id but the panel is not.
-      if (viewOnly.value && craftInst.value?.id === id) killHistory.value = history;
-    } catch (error) {
-      // Deliberately silent in the UI. This is a bonus readout on an item that
-      // renders perfectly without it; an error banner over somebody's knife
-      // because an aggregate timed out is strictly worse than the panel simply
-      // not appearing. The console line is here for when someone asks why.
-      console.warn("[stattrak] kill history failed to load", error);
-    } finally {
-      killHistoryBusy.value = false;
-    }
-  },
-  { immediate: true },
-);
 
-/**
- * "This rack has 4,312 kills" — the equipped loadout's StatTrak total.
- *
- * Summed off the counters the loadout rows ALREADY carry rather than out of the
- * ledger. That costs no request and no index, it agrees with the number printed
- * on each module (the whole point of a showcase stat), and it counts the kills
- * that predate the ledger, which a `count(*)` never can.
- *
- * Deduped by instance, because knife and gloves are equipped on BOTH sides and
- * the shared row appears twice — a plain sum double-counts every kill on them.
- *
- * Own loadout only. The public player endpoint withholds stattrak_count
- * entirely (kill counts are the owner's business), so for a visitor this would
- * be a sum over undefined; `viewerId` keeps it off screen instead of showing
- * them a confident zero.
- */
-const rackKills = computed(() => {
-  if (viewerId.value) return 0;
-  const seen = new Set<number>();
-  let total = 0;
-  for (const row of loadout.value) {
-    if (row.team !== team.value || row.item_instance_id == null) continue;
-    if (seen.has(row.item_instance_id)) continue;
-    seen.add(row.item_instance_id);
-    total += row.stattrak_count ?? 0;
-  }
-  return total;
-});
 /**
  * Does the preview need the waist-crop feather (ART_FADE_B)? Three ways into
  * this modal and only two of them carry a type: an owned item and a shared
@@ -5563,6 +5502,10 @@ function scheduleCraftQuote() {
   clearTimeout(quoteTimer);
   if (!c || !pricesOn.value) {
     craftQuote.value = null;
+    // The cleared timer's `finally` will never run, so this is the only place
+    // the busy flag can be lowered — left set, the whole value block sits at 40%
+    // opacity for the rest of the editor session, looking permanently mid-load.
+    craftQuoting.value = false;
     return;
   }
   craftQuoting.value = true;
@@ -6988,6 +6931,7 @@ const sheetSearchEl = ref<HTMLInputElement | null>(null);
 // still drives `staleBuild`. Surfacing it in the admin gear dialog would be a
 // small follow-up, not a refactor.
 const { staleBuild, reloadPage } = useBuildCheck();
+
 onMounted(() => {
   window.addEventListener("keydown", onGlobalKey);
   load();
@@ -7579,23 +7523,6 @@ if (MDEBUG) {
           suffix="est"
         />
       </Tooltip>
-      <!-- "This rack has 4,312 kills." The loadout screens' one showcase stat:
-           the StatTrak counters on everything equipped on this side, added up,
-           so it moves the moment you swap a gun in. A readout, not a control —
-           hence a span, and hence no hover state.
-           Hidden at zero rather than shown as "0 kills": on a fresh account
-           that would be the loudest thing in the header and it would be saying
-           nothing. Hidden for a visitor too — see rackKills. -->
-      <span
-        v-if="(view === 'grid' || view === 'focus') && rackKills > 0"
-        class="flex flex-none items-center gap-1.5 rounded-lg border border-[#e0a92e]/40 bg-[#e0a92e]/10 px-2.5 text-f11 font-semibold uppercase tracking-wider text-[#f2c14e]"
-        :class="isCompact ? 'h-8' : 'h-9'"
-        :title="`StatTrak™ kills across everything equipped on ${team}`"
-      >
-        <Sparkles class="h-3.5 w-3.5" />
-        <span class="font-mono tabular-nums">{{ rackKills.toLocaleString() }}</span>
-        <span v-if="!isCompact" class="font-normal normal-case tracking-normal text-muted-foreground">kills</span>
-      </span>
 
       <!-- Utility actions sit LEFT of the tabs and are grouped tight, so the
            header reads as "tools | where you are" instead of three things
@@ -9713,7 +9640,6 @@ if (MDEBUG) {
     </Transition>
 
 
-
     <!-- Craft confirm modal (inventory-simulator style) -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
     <!-- z-999, one above the 3D overlay. The editor is opened FROM that overlay,
@@ -10486,8 +10412,6 @@ if (MDEBUG) {
               :inst="craftInst"
               :charm-albedo="charmAlbedo"
               :charm-loading="charmRailLoading"
-              :kill-history="killHistory"
-              :kill-history-busy="killHistoryBusy"
             />
 
           </div>

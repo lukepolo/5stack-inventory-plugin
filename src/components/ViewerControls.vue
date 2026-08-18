@@ -29,7 +29,7 @@ const props = withDefaults(
   defineProps<{
     /** Attachments can be dragged — adds the ITEM group. */
     edit?: boolean;
-    /** There is at least one sticker to rotate (shift-drag; fine pointers only). */
+    /** There is at least one sticker to rotate — shift-drag, or a two-finger twist. */
     rotate?: boolean;
     /** `overlay` floats over the canvas and recedes until hovered. */
     variant?: "overlay" | "plain";
@@ -164,15 +164,18 @@ const controls = computed<Control[]>(() => {
       hint: "Drag a sticker or charm to move it — zoom in for fine placement",
       group: true,
     });
-    // Touch has no shift key, so this gesture is unreachable there. Rotation is
-    // still available from the sticker's numeric field — only the hint is gone.
-    if (props.rotate && !coarse) {
+    // Touch has no shift key, so this cell used to be hidden there entirely and
+    // rotation was reachable only through the Advanced form's numeric ROT field
+    // — a placement gesture that ran out halfway through, on the device where
+    // typing a number is hardest. The viewer now takes a two-finger twist (see
+    // applyDrag), so both pointers get a real gesture and the same cell.
+    if (props.rotate) {
       out.push({
         key: "rotate",
-        icon: "rotate",
+        icon: coarse ? "rotateTouch" : "rotate",
         label: "Turn",
-        hint: "Shift-drag a sticker to rotate it",
-        mod: "shift",
+        hint: coarse ? "Twist two fingers on a sticker to rotate it" : "Shift-drag a sticker to rotate it",
+        mod: coarse ? undefined : "shift",
       });
     }
   }

@@ -55,10 +55,14 @@ const overflow = computed(() => Math.max(0, attachments.value.length - props.max
        is set by the tallest chip, so the badge floated relative to them — and
        the taller charm chip makes any such gap worse. -->
   <span v-if="stattrak || attachments.length" class="flex flex-none items-center gap-1.5">
+    <!-- One size in both modes, deliberately. `compact` shrinks the attachment
+         thumbnails, but f8 is the floor of the type scale (tailwind.config.js)
+         and there is nothing below it to shrink to — the binding that used to be
+         here picked f8 either way, which read as a size decision and was a
+         no-op. -->
     <span
       v-if="stattrak"
-      class="font-mono leading-none text-[hsl(var(--tac-stattrak))]"
-      :class="compact ? 'text-f8' : 'text-f8'"
+      class="font-mono text-f8 leading-none text-[hsl(var(--tac-stattrak))]"
       :title="count && kills ? `StatTrak™ — ${kills.toLocaleString()} kills` : 'StatTrak™'"
       >ST™<template v-if="count && kills"> {{ kills.toLocaleString() }}</template></span
     >

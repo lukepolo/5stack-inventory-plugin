@@ -16,6 +16,7 @@
  * panel already means something else, so the emphasis inside the figure (full
  * white digits, 55% "$", quieter suffix) carries what a colour was carrying.
  */
+import { computed } from "vue";
 import { priceParts, formatPrice } from "../api";
 
 const props = withDefaults(
@@ -85,6 +86,11 @@ const props = withDefaults(
 
 const FIGURE = { xs: "text-f9", sm: "text-f10", md: "text-f12", lg: "text-f13" } as const;
 
+/** Split once. The template called priceParts() twice — symbol, then digits — so
+ *  formatPrice and its toLocaleString ran twice for every price on screen: 400
+ *  formats for a 200-tile inventory, per render. */
+const parts = computed(() => priceParts(props.value ?? 0));
+
 /** Frame chrome on the outer element; the inner wrapper always owns the
  *  label/figure layout, so a spine can sit beside a stacked pair without the two
  *  directions fighting. */
@@ -108,9 +114,20 @@ const SPINE =
         <!-- The "$" set back so the figure leads. These sit among instrument
              readouts — floats, seeds, kill counts — and a full-weight symbol
              competes with the number it belongs to. -->
-        <span :class="['font-mono leading-none tabular-nums text-[hsl(var(--tac-value))]', FIGURE[size]]">
-          <span class="text-[hsl(var(--tac-value))]/55">{{ priceParts(value).symbol }}</span
-          >{{ priceParts(value).digits }}
+        <span
+          :class="[
+            'font-mono leading-none tabular-nums',
+            approx ? 'text-[hsl(var(--tac-value))]/60' : 'text-[hsl(var(--tac-value))]',
+            FIGURE[size],
+          ]"
+        >
+          <!-- "~" and a dimmed figure when the listing found was not the one
+               asked for. Without it a stand-in renders pixel-identical to an
+               exact price — a wrong answer with a confident face — and the
+               tooltip that explains it does not exist on touch. -->
+          <span v-if="approx" class="text-[hsl(var(--tac-value))]/40">~</span
+          ><span class="text-[hsl(var(--tac-value))]/55">{{ parts.symbol }}</span
+          >{{ parts.digits }}
         </span>
         <span
           v-if="extra != null && extra > 0"

@@ -7871,6 +7871,35 @@ async function buildViewer(
   let drag: { type: "sticker"; slot: number } | { type: "charm" } | null = null;
   let rotateAnchorX = 0;
   let rotateStartDeg = 0;
+  /**
+   * The pointer that OWNS the current drag.
+   *
+   * Every handler below is bound to the canvas, and pointer capture is per-id,
+   * so a second finger's moves and releases arrive here exactly like the first
+   * one's. Without this the second finger teleported the sticker to itself and
+   * lifting it ended a drag the other finger was still holding.
+   */
+  let dragPointerId = -1;
+  /**
+   * Two-finger twist: the running state of the touch equivalent of shift-drag.
+   *
+   * `twisting` LATCHES for the rest of the drag, because a twist moves both
+   * fingers — without it, lifting the second one would hand the sticker back to
+   * the translate path and slide it to wherever the first finger had travelled
+   * while turning.
+   *
+   * `twistAngle` is the last angle measured between the contacts, and null means
+   * "re-seat me": it is dropped whenever the pair is broken, so a finger that
+   * lifts and comes back resumes from where it is rather than applying the whole
+   * gap as one jump. `twistTurned` accumulates the signed degrees swept since
+   * `twistStartDeg`, per frame and each step wrapped — measuring against the
+   * opening angle instead would snap a half-turn every time the gesture crossed
+   * atan2's ±180 seam, which any twist through vertical does.
+   */
+  let twisting = false;
+  let twistAngle: number | null = null;
+  let twistTurned = 0;
+  let twistStartDeg = 0;
   let lastCharmX: number | null = null;
   let lastCharmY: number | null = null;
   let lastCharmZ: number | null = null;
@@ -7972,6 +8001,17 @@ async function buildViewer(
     // Bound on the container (see below), so presses that land on something
     // else stacked in there — the perf HUD, a future overlay — are not ours.
     if (!placeable || e.button !== 0 || e.target !== el) return;
+    // A second finger landing mid-drag is the START OF A TWIST, never a second
+    // grab. Re-running the pick here re-anchored the rotation, and — if that
+    // finger happened to land on the charm — swapped a sticker drag for a charm
+    // drag halfway through the gesture.
+    //
+    // Tested through the CAPTURE rather than on `drag` alone: a drag whose
+    // pointerup never arrived (the canvas reclaimed out from under a gesture —
+    // see the mountViewer note) would otherwise leave `drag` set forever and
+    // this line would refuse every press after it. Capture is released with the
+    // element, so it is the honest answer to "is that finger still down".
+    if (drag && el.hasPointerCapture?.(dragPointerId)) return;
     updatePointer(e);
     // Restored before every camera pick, not just the one that narrowed it.
     // The raycaster is shared with the surface probes (stepCharm, liftOutOfBody,
@@ -7988,6 +8028,7 @@ async function buildViewer(
       const hitCharm = raycaster.intersectObject(charm.sprite, true)[0];
       if (hitCharm) {
         drag = { type: "charm" };
+        dragPointerId = e.pointerId;
         wakeCharm();
         charmDragging = true;
         dragPrev.set(0, 0, 0);
@@ -8007,6 +8048,10 @@ async function buildViewer(
     }
     if (slot != null) {
       drag = { type: "sticker", slot };
+      dragPointerId = e.pointerId;
+      twisting = false;
+      twistAngle = null;
+      twistTurned = 0;
       // Shift turns the same drag into a rotate — no extra handle to hit, and
       // it can be decided mid-gesture. Anchor the sweep where the press landed.
       rotateAnchorX = e.clientX;
@@ -8138,6 +8183,51 @@ async function buildViewer(
     raycaster.setFromCamera(pointerNdc, camera);
     if (drag.type === "sticker") {
       const entryNow = decals.get(drag.slot);
+      // TWIST: the touch equivalent of the shift-drag below, and the only way to
+      // rotate a sticker on a phone. There is no shift key on glass, so until
+      // this existed the Advanced form's numeric ROT field was the whole of it —
+      // a placement gesture that ran out halfway through, on the one device
+      // where the numeric field is hardest to use.
+      //
+      // Two fingers rather than an on-screen handle because a handle has to be
+      // drawn somewhere, and the somewhere is a 44px target on top of the thing
+      // you are aiming at. The pinch-to-zoom this shadows is already suppressed
+      // for the length of a drag (`controls.enabled = false`), so the gesture
+      // costs nothing that was reachable.
+      if (entryNow && (twisting || touchPoints.size >= 2)) {
+        const angle = twoFingerAngle();
+        // Latched, but the pair is broken: HOLD, and forget the reference angle
+        // so the next frame with two fingers re-seats instead of applying the
+        // gap. Falling through to the translate path here would slide the
+        // sticker to wherever the remaining finger had travelled.
+        if (angle === null) {
+          twistAngle = null;
+          return;
+        }
+        const parsed = JSON.parse(entryNow.key) as [string, number | null, number | null, number | null, number | null];
+        if (!twisting) {
+          twisting = true;
+          twistTurned = 0;
+          twistStartDeg = parsed[3] ?? 0;
+        }
+        if (twistAngle === null) {
+          twistAngle = angle;
+          return;
+        }
+        twistTurned += wrapRotation(angle - twistAngle);
+        twistAngle = angle;
+        // Negated for the same reason the shift sweep below is — see its note on
+        // STICKER_ROT_SIGN. Screen angles grow clockwise (y is down), and the
+        // stored rotation runs the other way, so without this the sticker turns
+        // against the fingers.
+        const deg = round(wrapRotation(twistStartDeg - twistTurned), 1);
+        if (parsed[3] === deg) return;
+        const slot = drag.slot;
+        void buildDecal({ slot, image: parsed[0], x: parsed[1], y: parsed[2], r: deg, w: parsed[4] }).then((r) => {
+          if (r.status === "built") opts?.onStickerRotated?.(slot, deg);
+        });
+        return;
+      }
       if (e.shiftKey && entryNow) {
         // ROTATE: horizontal sweep -> degrees. Half a degree per pixel is fine
         // for the eye and lands on the 0.5 steps the game quantizes to anyway.
@@ -8159,6 +8249,10 @@ async function buildViewer(
         });
         return;
       }
+      // Only the finger that took hold may MOVE it. Every other pointer on the
+      // canvas is part of a twist (above) or a stray contact, and both used to
+      // arrive here and place the sticker under themselves.
+      if (e.pointerId !== dragPointerId) return;
       // Aim at the sticker-mapped surfaces only — see uv1Meshes.
       const { mk } = slotMarkup(drag.slot);
       const targets = mk && uv1Meshes.length ? uv1Meshes : weaponMeshes;
@@ -8244,6 +8338,9 @@ async function buildViewer(
         });
       }
     } else if (charm) {
+      // Same ownership rule as the sticker translate above — a charm has no
+      // two-finger gesture of its own, so a second contact is simply not its.
+      if (e.pointerId !== dragPointerId) return;
       // Dragging moves the ATTACHMENT POINT along the body — the charm keeps
       // previewing its true final hang (anchored, chain taut) the whole time,
       // so where you see it is exactly where it stays when you drop it.
@@ -8360,6 +8457,11 @@ async function buildViewer(
 
   function onPointerUp(e: PointerEvent) {
     if (!drag) return;
+    // Lifting the SECOND finger of a twist does not end the gesture — the hand
+    // that grabbed the sticker is still on the glass. Without this the drag
+    // ended on whichever finger came off first, which on a twist is usually not
+    // the one holding anything.
+    if (e.pointerId !== dragPointerId) return;
     // The release lands where the pointer ACTUALLY ended, not where the last
     // frame happened to sample it — a coalesced move still pending at pointerup
     // is the difference between dropping the sticker where you let go and
@@ -8413,6 +8515,10 @@ async function buildViewer(
       }
     }
     drag = null;
+    dragPointerId = -1;
+    twisting = false;
+    twistAngle = null;
+    twistTurned = 0;
     charmDragging = false;
     controls.enabled = true;
     try {
@@ -8473,6 +8579,19 @@ async function buildViewer(
     return { x: x / touchPoints.size, y: y / touchPoints.size };
   };
   let panLast: { x: number; y: number } | null = null;
+  /**
+   * The screen angle of the line between the two contacts, in degrees, or null
+   * when there are not two of them. Feeds the sticker twist in applyDrag.
+   *
+   * The FIRST TWO entries, not all of them: a third finger landing mid-gesture
+   * would otherwise redefine the pair and jump the rotation. Map iteration is
+   * insertion-ordered, so those two are the ones that started the twist.
+   */
+  const twoFingerAngle = (): number | null => {
+    if (touchPoints.size < 2) return null;
+    const [a, b] = [...touchPoints.values()];
+    return (Math.atan2(b!.y - a!.y, b!.x - a!.x) * 180) / Math.PI;
+  };
 
   function onCursorDown(e: PointerEvent) {
     shiftHeld = e.shiftKey;

@@ -67,6 +67,11 @@
     "armory": {
       "search": "Search…",
       "drill": "Browse finishes"
+    },
+    "viewer": {
+      "hint_place": "Drag a sticker or the charm across the model to place it, and shift-drag a sticker to turn it.",
+      "hint_place_touch": "Drag a sticker or the charm across the model to place it, and twist two fingers on a sticker to turn it.",
+      "hint_dismiss": "Dismiss"
     }
   }
 }

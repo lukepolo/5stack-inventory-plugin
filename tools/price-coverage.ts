@@ -43,7 +43,7 @@ import {
   priceKey,
   priceFeedUrl,
   quoteItem,
-  PRICE_FEED_UPSTREAM,
+  PRICE_FEED_BASE,
   type PriceRow,
 } from "../backend/src/prices.ts";
 
@@ -408,7 +408,7 @@ if (live || feedFile) {
   }
 } else {
   console.log(
-    `\n(offline pass only — --live sweeps ${PRICE_PROVIDERS.skinport.url!}, --live --feed sweeps ${priceFeedUrl(PRICE_FEED_UPSTREAM)})`,
+    `\n(offline pass only — --live sweeps ${PRICE_PROVIDERS.skinport.url!}, --live --feed sweeps ${priceFeedUrl(PRICE_FEED_BASE)})`,
   );
 }
 

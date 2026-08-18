@@ -11,7 +11,6 @@ import type { PoolClient } from "pg";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
-import { recordKill, killHistory } from "./killLedger.ts";
 import {
   getStickerMarkup,
   slotCount,
@@ -28,7 +27,6 @@ import {
   quoteItem,
   wearTierSql,
   PRICE_FEED_BASE,
-  PRICE_FEED_UPSTREAM,
   PRICE_PROVIDERS,
   PRICE_SOURCES,
   PRICE_WINDOWS,
@@ -2006,35 +2004,6 @@ app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request
 
 // Where this gun has actually been: the ledger behind the StatTrak counter.
 //
-// OWNER ONLY, and deliberately with no public counterpart. A loadout says what
-// colour somebody's AK is; a kill history says when they were playing, how
-// often, and on which maps — a different order of disclosure, and theirs to
-// hand out rather than ours. `/api/loadout/:steamId` and the equipped feed stay
-// exactly as they were: neither has ever carried a kill count and neither
-// should start.
-app.get<{ Params: { id: string } }>("/api/inventory/:id/kills", async (request, reply) => {
-  const identity = await getIdentity(request);
-  if (!identity) {
-    return reply.status(401).send({ error: "unauthorized" });
-  }
-  const id = Number(request.params.id);
-  // The ownership check and the counter come off the same row, so "no such
-  // item" and "not yours" are one branch and look identical from outside —
-  // which is what they should look like.
-  const { rows } = await pool.query<{ counted: number }>(
-    `SELECT COALESCE(stattrak_count, 0) AS counted
-     FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
-    [id, identity.steamId],
-  );
-  if (!rows.length) {
-    return reply.status(404).send({ error: "That item isn't in your inventory." });
-  }
-  // `counted` is passed down rather than re-read: the number the history is
-  // measured against has to be the one this request already proved the caller
-  // owns, not a second read that could disagree with it.
-  return killHistory(id, identity.steamId, rows[0].counted);
-});
-
 app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
@@ -2167,13 +2136,9 @@ app.get("/api/loadout", async (request, reply) => {
     stattrak: boolean;
     stattrak_count: number;
     nametag: string | null;
-    stickers: unknown[] | null;
-    patches: unknown[] | null;
-    charm_id: number | null;
   }>(
     `SELECT l.team, l.slot, l.item_instance_id,
        (l.item_instance_id IS NOT NULL) AS skinned,
-       i.stickers, i.patches, i.charm_id,
        COALESCE(i.item_id, l.item_id)   AS item_id,
        COALESCE(i.wear, l.wear)         AS wear,
        COALESCE(i.seed, l.seed)         AS seed,
@@ -2886,8 +2851,29 @@ app.post<{ Params: { steamId: string } }>(
        WHERE l.steam_id = $1`,
       [source],
     );
+    // Resolve the source's attachment links BEFORE copying anything.
+    //
+    // The specs in a weapon's jsonb are a CACHE of each attachment's wear/seed,
+    // and the authoritative copy lives on the attachment's own owned_items row —
+    // which is why resolveAttachments exists and why its doc calls itself "one
+    // resolve at read time instead of four consumers each remembering to check".
+    // Editing an applied charm's pattern writes the new seed to that row and
+    // deliberately does NOT rewrite every weapon referencing it, so the blob can
+    // be arbitrarily out of date.
+    //
+    // Copying read the blob. linkAttachments then minted the new owner's charm
+    // with `charmOffset.seed` and their stickers with `s.w` — the stale values —
+    // so a copied loadout could come out a different COLOUR from the one on
+    // screen, and copied stickers could carry the wrong scratch. This route was
+    // the fifth consumer, and the one that didn't check.
+    //
+    // Scoped to `source`, not the caller: the instances belong to them, and
+    // instFactsFor is steam_id-scoped precisely so a spec can't name a stranger's
+    // row. Nothing new is exposed — the public loadout endpoint already shows
+    // these items' wear and seed, and the copy clones them regardless.
+    const resolved = await withAttachments(source, rows);
     let copied = 0;
-    for (const row of rows) {
+    for (const row of resolved) {
       if (row.item_id != null) {
         // Through linkAttachments, exactly like a craft — NOT straight into the
         // column. The specs being copied carry the SOURCE user's `inst` ids, and
@@ -3276,10 +3262,12 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
 // job, the cache and the endpoints.
 //
 // OPT-IN and off by default, exactly like the shared asset CDN and for the same
-// reason: the fetch leaves the operator's network. The URL is theirs too — it
-// defaults to a 5stack host rather than the upstream project's raw GitHub, so no
-// deployment quietly depends on a third party's repository. Whichever host it
-// names, only the SERVER talks to it; a browser never does.
+// reason: the fetch leaves the operator's network. There is no 5stack price CDN
+// — every source here is one the operator picked, and the default (Skinport)
+// needs no URL at all. The JSON-feed source falls back to the public
+// cs2-prices-tracker project, which the panel names rather than dressing up as
+// ours. Whichever host is in play, only the SERVER talks to it; a browser never
+// does.
 
 const PRICE_SYNC_INTERVAL_MS = 60 * 60_000;
 
@@ -3406,6 +3394,11 @@ interface PriceTarget {
  * Duplicates collapse before the query: an inventory with forty of the same
  * sticker asks about it once.
  */
+/** float4 round-trip tolerance: a JS double bound as ::real comes back rounded,
+ *  so identity has to be "the same number to within float4 precision". */
+const nearlyEqual = (a: number | null, b: number | null) =>
+  a === b || (a != null && b != null && Math.abs(a - b) < 1e-6);
+
 async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promise<Map<string, PricePoint>> {
   const unique = new Map<string, PriceTarget>();
   for (const target of targets) {
@@ -3481,6 +3474,11 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
        ) p ON true`,
     values,
   );
+  // Keyed off what was ASKED, never off what came back. Targets bind as $n::real
+  // (float4), so a wear of 0.14999999 returns as 0.15000000596 — the caller keys
+  // it as Minimal Wear and the row would key as Field-Tested, the get() misses,
+  // and a tile renders "no listing" for an item the query actually priced.
+  const asked = [...unique.entries()];
   for (const row of rows) {
     // The window fallback stays in prices.ts — one implementation, already
     // covered by tools/price-coverage.ts. Writing it a second time as SQL
@@ -3503,11 +3501,17 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
     // halves are in hand: the client knows what it asked but not what the table
     // held, and a substitution the UI cannot see is a substitution it will
     // present as exact.
-    const askedTier = wearTierIndex(wearTierOf(row.wear));
+    // The target this row answers, by identity rather than by re-deriving the
+    // key from a rounded float.
+    const target = asked.find(
+      ([, t]) => t.itemId === row.item_id && t.stattrak === row.stattrak_asked && nearlyEqual(t.wear, row.wear),
+    );
+    if (!target) continue;
+    const askedTier = wearTierIndex(wearTierOf(target[1].wear));
     if (row.wear_tier !== askedTier || row.stattrak !== row.stattrak_asked) {
       point.approx = { wearTier: row.wear_tier, stattrak: row.stattrak };
     }
-    found.set(priceTargetKey(row.item_id, row.wear, row.stattrak_asked), point);
+    found.set(target[0], point);
   }
   return found;
 }
@@ -3715,11 +3719,24 @@ app.post<{ Body: Partial<ItemRow> }>("/api/prices/quote", async (request, reply)
   if (!identity) return reply.status(401).send({ error: "unauthorized" });
   const body = request.body ?? {};
   const itemId = body.item_id;
-  if (typeof itemId !== "number") {
-    return reply.status(400).send({ error: "item_id is required." });
+  // Validated like the craft endpoint, not merely type-checked. This body is
+  // user-supplied and expands into one SQL statement with three bind parameters
+  // per attachment, so an unbounded sticker array is a cheap way to blow past
+  // Postgres's 65535-parameter ceiling and 500 the pool.
+  if (typeof itemId !== "number" || !getItem(itemId)) {
+    return reply.status(400).send({ error: "Unknown item." });
   }
+  const cap = <T,>(arr: T[] | null | undefined, max: number) => (Array.isArray(arr) ? arr.slice(0, max) : arr);
   const { window } = await priceSettings();
-  return await quoteFor({ ...body, item_id: itemId }, window);
+  return await quoteFor(
+    {
+      ...body,
+      item_id: itemId,
+      stickers: cap(body.stickers, STICKER_LIMITS.maxStickers),
+      patches: cap(body.patches, STICKER_LIMITS.maxPatches),
+    },
+    window,
+  );
 });
 
 /**
@@ -4127,7 +4144,6 @@ app.get("/api/admin/prices", async (request, reply) => {
     defaultBase: PRICE_FEED_BASE,
     /** Where the default mirror is built FROM. Shown so an operator who would
      *  rather not depend on the 5stack host knows what to point at instead. */
-    upstream: PRICE_FEED_UPSTREAM,
     window,
     windows: PRICE_WINDOWS,
     listings: meta?.rows ?? 0,
@@ -5626,36 +5642,12 @@ app.post<{ Body: { apiKey?: string; targetUid?: number; userId?: string } }>(
     if (targetUid == null || !userId || !/^\d{17}$/.test(userId)) {
       return reply.status(400).send({ error: "targetUid and userId required" });
     }
-    // ORDER IS THE CONTRACT HERE, and it is the reason there is no transaction
-    // around these two statements.
-    //
-    // The counter goes up first, on its own, and is committed before the ledger
-    // is touched at all. That number is what a player watches tick over on
-    // their gun and what the equipped feed carries; the ledger is the story
-    // behind it, and a story is worth strictly less than the number. Wrapping
-    // the pair in a transaction would let a full disk or a missing table roll
-    // back a kill that has already happened — and this endpoint is
-    // fire-and-forget from the game server's side, so nothing would ever
-    // notice, let alone retry it.
     const { rowCount } = await pool.query(
       `UPDATE inventory.owned_items
        SET stattrak_count = stattrak_count + 1
        WHERE id = $1 AND steam_id = $2 AND stattrak`,
       [targetUid, userId],
     );
-    // No row updated means the item is gone, isn't theirs, or isn't StatTrak.
-    // Nothing was counted, so there is nothing to record: a ledger row here
-    // would invent a kill the counter never moved for.
-    if (rowCount) {
-      // Awaited rather than fired and forgotten. It cannot cost the increment
-      // either way — that has already committed, and recordKill swallows and
-      // logs its own failures, so this can never become a 500 for the game
-      // server. What the await buys is backpressure: an un-awaited insert per
-      // kill would have us answer instantly while queueing writes into the pool
-      // behind a struggling database until the process ran out of memory, with
-      // nothing anywhere reporting it.
-      await recordKill(Number(targetUid), userId, app.log);
-    }
     return {};
   },
 );

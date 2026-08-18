@@ -205,7 +205,6 @@ if you're looking for it in git history, this section is what it became.
   - `GET /api/loadout` → the user's equipped slots (enriched with item name/image)
   - `POST /api/loadout` `{team, slot, item_id}` → equip
   - `DELETE /api/loadout?team=&slot=` → unequip
-  - `GET /api/inventory/:id/kills` → one item's StatTrak history (owner only)
   - `GET /api/loadout/presets` → the caller's named builds (mints their first)
   - `POST /api/loadout/presets` `{name?, copy?}` → create; `copy` seeds it from
     the build you are wearing
@@ -215,36 +214,6 @@ if you're looking for it in git history, this section is what it became.
     last one is not deletable)
 - The UI has a CT/T toggle, special-equipment slots, weapon sections by category,
   and a skin picker. Knife/gloves apply to both teams; agents are per-team.
-
-### StatTrak history
-
-Every inventory simulator can fake a StatTrak number. This one counts real kills
-from real matches — and because the plugin shares the panel's database, the
-match those kills happened in is a join rather than an integration. That is the
-half nobody else has, so the counter stores more than a number:
-
-- `inventory.stattrak_kills` is an **append-only ledger**, one row per counted
-  kill: the item instance, when, and the match/map it resolved to.
-  `owned_items.stattrak_count` stays the source of truth for the *number* — the
-  ledger is the story behind it, never the count itself.
-- **Match context is resolved at write time**, in `backend/src/killLedger.ts`.
-  The game plugin's payload carries no match id, so the only cheap moment to
-  answer "which match?" is while it is still `Live` and the player is still in
-  its lineup. The join runs against `public.matches` / `match_lineup_players` /
-  `match_maps` / `maps` and is cached per player for 30s; what it stores is a
-  **snapshot** (`match_id`/`match_map_id` as text, plus the map name), not a
-  foreign key — those tables belong to the panel, and a deployment pointed at a
-  bare Postgres has none of them. The first `42P01` turns the join off for the
-  life of the process and kills keep being logged with a null match.
-- **A failed ledger insert can never cost the counter.** The `UPDATE` is its own
-  committed statement and the insert happens after it, outside any transaction,
-  in a function that does not throw. See the comment on the endpoint.
-- `count(*)` in the ledger is normally **lower** than `stattrak_count`, and that
-  is correct rather than drift: kills counted before the ledger existed have no
-  row and never will. The item view says "N of M" instead of pretending.
-- Kill history is more revealing than a loadout — it says when somebody was
-  playing and how often — so it is **owner only**. `GET /api/loadout/:steamId`
-  and the equipped feed carry no kill data and must not start.
 
 ## Game-server API
 

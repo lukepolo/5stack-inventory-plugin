@@ -54,12 +54,20 @@ export const PRICE_SOURCES = ["skinport", "csfloat", "waxpeer", "bitskins", "fee
 export type PriceSource = (typeof PRICE_SOURCES)[number];
 export const DEFAULT_PRICE_SOURCE: PriceSource = "skinport";
 
-/** The public JSON feed the `feed` source defaults to. Fetched only if an
- *  operator selects that source and does not name their own URL. */
+/**
+ * The JSON feed the `feed` source uses when the operator names no URL of their
+ * own — the public cs2-prices-tracker project.
+ *
+ * It IS a third party's repository, and the panel says so rather than implying
+ * otherwise: this default exists because the alternative was a 5stack-hosted
+ * mirror, which is a third party too, just ours. What the operator gets either
+ * way is a source they can replace with one line, and a default that is at least
+ * honest about whose it is. `skinport` — the actual default source — needs no URL
+ * at all, so most instances never reach this constant.
+ */
 export const PRICE_FEED_BASE =
   process.env.INVENTORY_PRICE_FEED ??
   "https://raw.githubusercontent.com/LukeX404/cs2-prices-tracker/main/static/prices";
-export const PRICE_FEED_UPSTREAM = PRICE_FEED_BASE;
 
 /** `latest.json` rather than a dated file: the source decides what "latest"
  *  means, and a date computed here would be wrong the moment it publishes on a

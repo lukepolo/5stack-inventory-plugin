@@ -702,7 +702,11 @@ async function setPriceSource(source: PriceSource) {
   try {
     await savePriceAdmin({ source });
     await refreshPrices();
-    if (prices.value?.enabled) void doSyncPrices();
+    // NOT a sync here. Switching source empties the table, and the PUT handler
+    // sees that and starts one itself — asking for a second immediately after
+    // hits the "already running" guard and shows the operator a red error on the
+    // ordinary path of picking a provider. Poll for the one already in flight.
+    if (prices.value?.enabled) void pollPricesUntilSynced();
   } catch (e) {
     fail(e);
   } finally {
@@ -1335,9 +1339,10 @@ const BTN_DANGER =
                     </button>
                   </div>
                   <p class="text-xs text-muted-foreground">
-                    Blank uses <span class="font-mono break-all">{{ prices.defaultBase }}</span>, the public
-                    cs2-prices-tracker project. <code class="font-mono">/latest.json</code> is appended to whatever you
-                    set, so point this at your own mirror if you'd rather not depend on someone else's repository.
+                    Blank uses <span class="font-mono break-all">{{ prices.defaultBase }}</span> — the public
+                    cs2-prices-tracker project, which is somebody else's repository.
+                    <code class="font-mono">/latest.json</code> is appended to whatever you set, so point this at your
+                    own mirror if you'd rather not depend on it.
                   </p>
                 </div>
               </div>
