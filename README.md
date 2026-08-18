@@ -128,6 +128,21 @@ is hard-scoped to the caller, and the only public per-player endpoints are
 full collection would need a new endpoint *and* a decision about whether an
 owned-item list should be public at all.
 
+The public loadout carries its **attachments** — stickers, patches and the charm,
+enriched exactly as `/api/inventory` enriches an owned item. It has to: your own
+loadout rows resolve their stickers out of the inventory list they point at, and
+a visitor holds no inventory for the player they are looking at, so a row with
+nothing but an item id renders a bare gun. What it withholds is every row
+*handle* — `item_instance_id` and the `inst` on each attachment both go out null.
+Those name rows in the owner's inventory and the only thing anyone does with one
+is act on it; the placement, the scratch wear and the charm's pattern are all
+inline by then, so nothing on screen needs them.
+
+From that view, **Copy loadout** (`POST /api/loadout/copy-from/:steamId`) mints a
+copy of every equipped skin into your own inventory with `origin='copied'` and
+equips it in the same slot. It confirms first: it does not spend anything, but it
+does overwrite the slots of your own loadout.
+
 The navigation contract is unchanged, but the host wires it differently:
 `navigate` writes **local state** instead of doing a `router.push`. That's the
 whole trick — a push would send the viewer to `/apps/<slug>` the moment they

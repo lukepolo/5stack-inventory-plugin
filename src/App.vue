@@ -25,6 +25,7 @@ import {
   fetchExtractStatus,
   type ExtractStatus,
   fetchPlayerLoadout,
+  copyLoadoutFrom,
   importSteamInventory,
   fetchSteamSync,
   API_ORIGIN,
@@ -5216,7 +5217,10 @@ function issue3dHref(o: {
 // Focus stage.
 const focusReportHref = computed(() => {
   const row = focusRow.value;
-  const inst = focusInstance.value;
+  // The attachment source, not the instance: a report filed from someone else's
+  // loadout has to count the stickers that are on the stage, and in viewer mode
+  // there is no instance behind them.
+  const inst = focusAttachments.value;
   return issue3dHref({
     weapon: sheetWeaponName.value,
     finish: isSkinned(row) ? [row?.item?.name, row?.item?.altName].filter(Boolean).join(" · ") : null,
@@ -5283,11 +5287,31 @@ watch([focusModelKey, focusPaint], async ([key]) => {
     if (focus3d.value && wasOn) await mount3d();
   }
 });
-// The equipped instance behind the focused slot (own loadout only — public
-// viewer mode has no inventory list, so attachments just don't render there).
+/**
+ * Anything that can dress a model: an owned inventory item, or a public loadout
+ * row. Both carry the same enriched `stickers`/`patches`/`charm` and the same
+ * StatTrak pair, which is all instPlacements ever reads off either.
+ */
+type AttachSource = InventoryItem | LoadoutEntry;
+// The equipped instance behind the focused slot. Own loadout only: viewer mode
+// withholds the instance id (it is the owner's row handle), so nothing here can
+// resolve — see focusAttachments for where a visitor's stickers come from.
 const focusInstance = computed(() => {
   return instanceById(focusRow.value?.item_instance_id) ?? null;
 });
+/**
+ * Where the focused slot's attachments come from, whichever loadout it is.
+ *
+ * Your own resolves the owned instance out of the inventory list; a visitor has
+ * no inventory for the player they are looking at, so the PUBLIC loadout row
+ * carries the same enriched stickers/patches/charm and stands in for it. That
+ * fallback is the whole of "render attachments in viewer mode" — before it, a
+ * shared loadout showed the right finish, wear and pattern on a gun with none of
+ * the work on it, which is the part people actually spend their time placing.
+ */
+const focusAttachments = computed<AttachSource | null>(
+  () => focusInstance.value ?? focusRow.value ?? null,
+);
 // InventoryItem → viewer placement shapes (Focus + loadout 3D overlay).
 /**
  * "Applied to AK-47 | Redline", for an attachment that is currently on a gun.
@@ -5305,7 +5329,7 @@ function attachedName(inst?: InventoryItem | null): string | null {
   const host = inventory.value.find((i) => String(i.id) === String(to));
   return host ? itemName(host.item) : null;
 }
-function instPlacements(inst?: InventoryItem | null) {
+function instPlacements(inst?: AttachSource | null) {
   return {
     stickers: (inst?.stickers ?? []).flatMap((st, i) =>
       st?.image ? [{ slot: i, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null }] : [],
@@ -5355,19 +5379,19 @@ async function mount3d() {
       wear: focusRow.value?.wear ?? focusInstance.value?.wear,
       seed: focusRow.value?.seed ?? focusInstance.value?.seed,
       ...(isWeapon ? await stickerGeom(key) : {}),
-      ...(isWeapon ? instPlacements(focusInstance.value) : {}),
+      ...(isWeapon ? instPlacements(focusAttachments.value) : {}),
       // See the craft modal for why patches are their own option rather than
       // part of instPlacements.
       patches:
         focusTarget.value?.kind === "agent"
-          ? (focusInstance.value?.patches ?? []).map((p) => p?.image ?? null)
+          ? (focusAttachments.value?.patches ?? []).map((p) => p?.image ?? null)
           : undefined,
       // Focus can be showing a loadout DEFAULT rather than an owned item, and
       // a default can be StatTrak too — instPlacements sees no instance there
       // and would drop the module, so fall back to the row.
       stattrak:
-        focusInstance.value?.stattrak || focusRow.value?.stattrak
-          ? { count: focusInstance.value?.stattrak_count ?? focusRow.value?.stattrak_count ?? 0 }
+        focusAttachments.value?.stattrak || focusRow.value?.stattrak
+          ? { count: focusAttachments.value?.stattrak_count ?? focusRow.value?.stattrak_count ?? 0 }
           : null,
     };
   });
@@ -5883,6 +5907,59 @@ async function runSteamImport() {
   }
 }
 
+// ---- copy the loadout you're looking at -------------------------------------
+// /loadout/copy-from has existed since player profiles shipped and nothing in
+// the UI ever pointed at it, so the one action a visitor actually wants from
+// someone else's loadout was reachable only by hand-rolling a POST.
+//
+// It is not a "follow" or a bookmark: it mints a real copy of every equipped
+// skin into your inventory (origin 'copied') and equips each one in the same
+// slot, overwriting what you had there. That's worth a sentence BEFORE the
+// click rather than a surprise after it — hence the confirm, in the neutral
+// tone: nothing is lost, but your own loadout is rearranged.
+const copyBusy = ref(false);
+function askCopyLoadout() {
+  const source = viewerId.value;
+  if (!source || copyBusy.value) return;
+  confirmAsk.value = {
+    title: "Copy this loadout?",
+    body:
+      "Every skin equipped here is copied into your inventory and equipped in" +
+      " the same slot of your own loadout, replacing whatever you have in those" +
+      " slots. Nothing of theirs changes, and nothing of yours is deleted — the" +
+      " items you had stay in your inventory.",
+    confirmLabel: "Copy loadout",
+    tone: "neutral",
+    onConfirm: () => void copyViewedLoadout(source),
+  };
+}
+async function copyViewedLoadout(source: string) {
+  copyBusy.value = true;
+  try {
+    const { copied } = await copyLoadoutFrom(source);
+    // Deliberately NO refreshAll(): in viewer mode `loadout` holds THEIR rows
+    // and `inventory` is empty by design, so refreshing would swap the screen
+    // for yours — the copy would look like it had teleported you somewhere.
+    // The toast says where the items went; the loadout you came to look at
+    // stays on screen.
+    const summary = copied === 1 ? "1 item" : `${copied} items`;
+    notify(
+      copied
+        ? tr(
+            "inventory.notify.loadout_copied",
+            `Copied ${summary} into your inventory and equipped them on your own loadout.`,
+            { summary },
+          )
+        : tr("inventory.notify.loadout_copy_empty", "Nothing to copy — that loadout is empty."),
+      "success",
+    );
+  } catch (e) {
+    fail(e);
+  } finally {
+    copyBusy.value = false;
+  }
+}
+
 // ---- bulk select/delete (inventory view) ----
 const selectMode = ref(false);
 
@@ -6139,8 +6216,31 @@ if (MDEBUG) {
           <Pencil class="h-3.5 w-3.5" />
           <span v-if="!isCompact">Edit</span>
         </a>
-        <!-- Nothing here for someone else's loadout: it is a read-only look at
-             their profile, not a starting point for your own. -->
+        <!-- Someone else's loadout is read-only, with exactly one way to act on
+             it: take it home. This is the only entry point to
+             /loadout/copy-from, which the backend has had all along — and the
+             corner it sits in is the one every other surface puts its actions
+             in, so it reads as "the thing to do here" rather than an offer.
+             Hidden on your own profile tab (copying yourself onto yourself),
+             signed out (nowhere to copy TO) and on an empty loadout (nothing to
+             copy), because a button that can only disappoint is worse than no
+             button. The dialog behind it says what it will do first. -->
+        <button
+          v-if="viewerId && !viewingSelf && signedIn && loadout.length && !loading && !error"
+          class="tac-action flex items-center gap-1.5 rounded-lg border border-border text-f11 font-semibold uppercase tracking-wider text-muted-foreground disabled:opacity-60"
+          :class="isCompact ? 'h-8 px-2' : 'h-9 px-3.5'"
+          :disabled="copyBusy"
+          title="Copy every skin in this loadout into your own inventory"
+          @click="askCopyLoadout"
+        >
+          <Loader2 v-if="copyBusy" class="h-3.5 w-3.5 animate-spin" />
+          <Copy v-else class="h-3.5 w-3.5" />
+          <!-- Compact keeps the label. The icon alone is the same two sheets
+               of paper the inventory uses for "duplicate an item", and here it
+               would be the only header control whose meaning depends on
+               knowing whose loadout you are on. -->
+          <span>Copy loadout</span>
+        </button>
 
         <div v-if="user && !embedMode" class="flex items-center gap-1.5">
           <!-- Steam sync lives up here with the other account-level tools

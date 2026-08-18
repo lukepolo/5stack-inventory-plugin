@@ -2242,8 +2242,26 @@ app.delete<{ Querystring: { team?: string; slot?: string } }>(
 
 // ---- Public loadout view + copy (player profiles / sharing) -----------------
 
-// Read-only view of any player's loadout (enriched like /api/loadout, but
-// without inventory instance ids). Public: loadouts are cosmetic + shareable.
+/**
+ * Take the owner's row handle off one enriched attachment.
+ *
+ * Same reasoning as the null instance id below, one level deeper: `inst` names a
+ * row in the OWNER's inventory, and the only thing anyone does with one is act
+ * on it. Nothing a viewer renders needs it — the placement, the scratch wear and
+ * the charm's pattern are all inline by the time enrichAttachments is done — so
+ * it goes out null rather than being a handle a stranger holds. Missing this is
+ * the quiet way a "read-only" endpoint stops being read-only.
+ */
+function withoutInstanceHandle<T extends { inst?: string | null } | null>(a: T): T {
+  return a ? { ...a, inst: null } : a;
+}
+
+// Read-only view of any player's loadout (enriched like /api/inventory, but
+// without inventory instance ids). Unauthenticated on purpose: an equipped
+// loadout is already public — /api/equipped/v5 hands the same items to any game
+// server that asks, with no credential — and this is the shareable, human-facing
+// form of it. What is NOT public is anything a player merely owns; see the
+// README for why an owned-item list needs a decision before it gets a route.
 app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request, reply) => {
   const steamId = request.params.steamId;
   if (!/^\d{17}$/.test(steamId)) {
@@ -2251,26 +2269,54 @@ app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request
   }
   const { rows } = await pool.query<{
     team: string; slot: string; item_id: number | null; skinned: boolean;
-    wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+    wear: number | null; seed: number | null; stattrak: boolean; stattrak_count: number;
+    nametag: string | null; stickers: unknown[] | null; patches: unknown[] | null;
+    charm_id: number | null; charm_offset: ItemRow["charm_offset"];
   }>(
     `SELECT l.team, l.slot,
        COALESCE(i.item_id, l.item_id) AS item_id,
        (l.item_instance_id IS NOT NULL) AS skinned,
        COALESCE(i.wear, l.wear) AS wear, COALESCE(i.seed, l.seed) AS seed,
-       COALESCE(i.stattrak, l.stattrak) AS stattrak, COALESCE(i.nametag, l.nametag) AS nametag
+       COALESCE(i.stattrak, l.stattrak) AS stattrak,
+       -- Same as /api/loadout: only owned instances carry a count.
+       COALESCE(i.stattrak_count, 0) AS stattrak_count,
+       COALESCE(i.nametag, l.nametag) AS nametag,
+       -- Attachments are i.* with no COALESCE: inventory.loadout has no columns
+       -- for them, so a free default weapon simply has none. Selecting these at
+       -- all is the fix for a viewer seeing a bare gun where the owner had five
+       -- stickers and a charm — the part of a loadout people actually spend
+       -- their time on, and the part this endpoint used to drop on the floor
+       -- while copy-from happily cloned it.
+       i.stickers, i.patches, i.charm_id, i.charm_offset
      FROM inventory.loadout l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
      WHERE l.steam_id = $1`,
     [steamId],
   );
+  // Dereference the attachment links against the OWNER's rows — this is their
+  // loadout, so their instances are the ones a linked spec points at. Same read
+  // at the same place as every other consumer; see resolveAttachments for why
+  // that lives at read time rather than in each caller.
+  const resolved = await withAttachments(steamId, rows.filter((row) => row.item_id != null));
   // The instance id stays null — it is someone else's row handle and a viewer
   // has no business acting on it. `skinned` carries the one bit the client
   // actually needed from it: crafted skin vs. free default weapon. Without it a
   // viewer saw every cell as unskinned, so names read "Default" and the focus
   // view fell back to the base model even though the art was right.
-  return rows
-    .filter((row) => row.item_id != null)
-    .map((row) => ({ ...row, item_instance_id: null, item: getItem(row.item_id as number) }));
+  return resolved.map((row) => {
+    // charm_offset is dropped rather than sanitised: enrichAttachments has
+    // already folded its x/y/z/seed into `charm`, so all that would survive the
+    // trip is the `inst` we are deliberately withholding.
+    const { charm_offset, ...enriched } = enrichAttachments(row);
+    return {
+      ...enriched,
+      item_instance_id: null,
+      stickers: enriched.stickers.map(withoutInstanceHandle),
+      patches: enriched.patches.map(withoutInstanceHandle),
+      charm: withoutInstanceHandle(enriched.charm),
+      item: getItem(row.item_id as number),
+    };
+  });
 });
 
 // Clone another player's loadout: copies each equipped skin into the caller's

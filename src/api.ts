@@ -162,6 +162,21 @@ export interface LoadoutEntry {
   stattrak_count: number;
   nametag: string | null;
   item: CatalogItem | null;
+  /**
+   * Attachments, sent only by the PUBLIC player-loadout endpoint.
+   *
+   * Your own loadout doesn't carry them and doesn't need to: every skinned row
+   * there points at something in your inventory, and that item is where the
+   * screen reads stickers from. A visitor holds no inventory for the player
+   * they are looking at, so nothing could resolve — which is why viewing
+   * someone's loadout used to show a bare gun where they had five stickers and
+   * a charm. The row brings its own, enriched exactly like an owned item's,
+   * minus the `inst` handles: those name rows in the owner's inventory and
+   * never leave their account.
+   */
+  stickers?: PlacedItem[];
+  patches?: PlacedItem[];
+  charm?: PlacedCharm;
 }
 
 // An owned, crafted item instance in the user's inventory.
@@ -172,6 +187,10 @@ export interface LoadoutEntry {
 // It must survive the round trip — see the Attach type in App.vue.
 export type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null } | null;
 export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null }) | null;
+/** An attached charm: catalog item, its offset on the gun, and the pattern that
+ *  grades its material. Named rather than inlined because two shapes carry one
+ *  — an owned item and a public loadout row — and they must not drift. */
+export type PlacedCharm = (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
 
 export interface InventoryItem {
   id: number;
@@ -185,7 +204,7 @@ export interface InventoryItem {
   nametag: string | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
-  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
+  charm?: PlacedCharm;
   slot: string | null;
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];

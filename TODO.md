@@ -60,6 +60,33 @@ and in the panel, same slot.
 
 ---
 
+## `copy-from` copies the sticker, not the placement
+
+**Status: newly reachable, and the two defects below predate it.**
+
+`POST /api/loadout/copy-from/:steamId` had no UI until the Copy loadout button
+landed in the viewer header, so nothing exercised it. Two things it gets wrong,
+both in the `INSERT INTO inventory.owned_items` at `backend/src/main.ts`:
+
+1. **`charm_offset` is not in the column list.** `charm_id` is, so a copied gun
+   gets the charm — hanging at the default offset, at the default pattern. The
+   seed rides in that same jsonb (see the `ItemRow.charm_offset` comment), so a
+   Butane Buddy copies across as a differently-graded one.
+2. **The source user's `inst` handles are copied verbatim** inside the
+   `stickers`/`patches` jsonb. They resolve to nothing on the copier's side —
+   `instFactsFor` scopes its lookup to the owner, which is what stops it being a
+   read of someone else's rows — so the sticker falls back to its inline wear.
+   But the dead handle is now stored, and `enrichAttachments` hands it to the
+   copier's UI, which sends it straight back on the next save.
+
+Deferred rather than folded into the public-showcase work: the fix belongs with
+the wider attachment-fidelity pass, and copying a placement correctly wants the
+same "what does the copy own?" answer as minting one does. The confirm dialog is
+written to what the copy actually delivers today — the skins and the stickers on
+them — and promises nothing about the charm's placement.
+
+---
+
 ## Charm | Butane Buddy
 
 Not parked — see `tools/shadertest/BUTANE-BUDDY.md`, which carries the full
