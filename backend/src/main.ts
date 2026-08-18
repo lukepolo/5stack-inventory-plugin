@@ -26,6 +26,8 @@ import {
   getGloves,
   getMusicKits,
   getCollectibles,
+  getCollections,
+  getCollection,
   searchAttachments,
   type AttachKind,
   type AttachQuery,
@@ -1077,6 +1079,19 @@ app.get<{ Querystring: { slot?: string } }>(
     return getWeaponSkins(slot);
   },
 );
+
+// The collections index — every skin set in the game, with the ids of what is in
+// it. Small enough to hand over whole (94 rows, ~1.6k ids) and deliberately so:
+// the client intersects those ids with the inventory it already has to answer
+// "you own 4 of 17", which is a set operation, not an endpoint.
+app.get("/api/catalog/collections", async () => getCollections());
+
+// One collection's finishes. A key nothing answers to is a stale link, not a
+// client error — 404 rather than 400, and the armory shows its empty state.
+app.get<{ Querystring: { key?: string } }>("/api/catalog/collection", async (request, reply) => {
+  const page = getCollection(request.query.key ?? "");
+  return page ?? reply.status(404).send({ error: "unknown collection" });
+});
 
 // Attachment pickers: one page of matches, the match total so the grid can scroll
 // on into a 10k-item catalog instead of stopping at an arbitrary cap, and the

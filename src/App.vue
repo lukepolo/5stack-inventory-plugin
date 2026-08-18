@@ -773,12 +773,39 @@ const sheetSortCtl = useSortControl<SortMode>({
 const { mode: sheetSort, dir: sheetDir, setMode: setSheetSort, kind: sheetSortKind, hint: sheetSortHint } = sheetSortCtl;
 
 const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
+/**
+ * Collection order, with the uncollected pinned to the BOTTOM in both
+ * directions.
+ *
+ * Half of what anyone owns has no collection — every vanilla weapon, every music
+ * kit, and all but 96 knife finishes (the classic knife pool is the rare special
+ * of eleven cases at once, so no single one is true; see collectionOf in
+ * catalog.ts). Sorted as an empty string they lead the grid, so picking
+ * "Collection" scrolled the collections off the bottom and showed a wall of
+ * things that have none. Flipping the direction pins them the same way, for the
+ * same reason the name tiebreak stays A → Z either way.
+ */
+const byCollection = (a?: string | null, b?: string | null, flip = 1) => {
+  if (!a || !b) return a === b ? 0 : a ? -1 : 1;
+  return flip * a.localeCompare(b);
+};
 function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): InventoryItem[] {
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(itemName(a.item), itemName(b.item)));
   if (mode === "wear") return arr.sort((a, b) => flip * ((a.wear ?? 1) - (b.wear ?? 1)) || byName(itemName(a.item), itemName(b.item)));
+  if (mode === "collection") {
+    // Rarity, not name, as the tiebreak WITHIN a collection: a case reads the
+    // way it reads in game, covert first, which is the whole point of grouping
+    // by one.
+    return arr.sort(
+      (a, b) =>
+        byCollection(a.item?.collection, b.item?.collection, flip) ||
+        sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity) ||
+        byName(itemName(a.item), itemName(b.item)),
+    );
+  }
   return arr.sort((a, b) => flip * (sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
 }
 function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
@@ -787,6 +814,14 @@ function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(a.name, b.name));
+  if (mode === "collection") {
+    return arr.sort(
+      (a, b) =>
+        byCollection(a.collection, b.collection, flip) ||
+        sortRarityRank(b.rarity) - sortRarityRank(a.rarity) ||
+        byName(a.name, b.name),
+    );
+  }
   return arr.sort((a, b) => flip * (sortRarityRank(b.rarity) - sortRarityRank(a.rarity)) || byName(a.name, b.name));
 }
 
@@ -5980,6 +6015,15 @@ const selectMode = ref(false);
 function openArmory() {
   go(buildPath({ name: "armory" }));
 }
+/**
+ * Which catalog ids the viewer already has, as a set.
+ *
+ * The armory's ownership progress ("you own 4 of 17 in this collection") is this
+ * intersected with a collection's members — no endpoint, and no second source of
+ * truth about what is owned. Derived from the inventory already in memory, so it
+ * follows a craft or a delete the moment the grid does.
+ */
+const ownedItemIds = computed(() => new Set(inventory.value.map((i) => i.item_id)));
 /** A finish chosen in the armory: straight into the editor, over the armory. */
 function armoryPick(skin: Skin) {
   modalBackdrop.value = "armory";
@@ -6382,6 +6426,7 @@ if (MDEBUG) {
         v-if="view === 'armory'"
         key="armory"
         :weapons="weapons"
+        :owned="ownedItemIds"
         :compact="isCompact"
         @pick="armoryPick"
       />

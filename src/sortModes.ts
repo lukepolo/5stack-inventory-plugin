@@ -16,13 +16,18 @@ import type { AttachSort } from "./api";
 
 // ---- items you own ----------------------------------------------------------
 
-export type SortMode = "default" | "rarity" | "name" | "wear";
+export type SortMode = "default" | "rarity" | "name" | "wear" | "collection";
 
 export const SORTS: [SortMode, string][] = [
   ["default", "Default"],
   ["rarity", "Rarity"],
   ["name", "Name"],
   ["wear", "Wear"],
+  // Last, and after Wear, because it is the only mode that leaves part of the
+  // grid unsorted: an item with no collection (a vanilla weapon, a music kit,
+  // most knives) has nothing to rank by, and those all land together at the end
+  // rather than under a blank heading at the top.
+  ["collection", "Collection"],
 ];
 
 /**
@@ -42,6 +47,7 @@ export const SORT_NATURAL: Record<SortMode, SortDir> = {
   rarity: "desc",
   name: "asc",
   wear: "asc",
+  collection: "asc",
 };
 
 export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
@@ -49,6 +55,10 @@ export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
   rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
   name: { asc: "A → Z", desc: "Z → A" },
   wear: { asc: "Lowest float first", desc: "Highest float first" },
+  // Spelled out rather than reusing the name hint's "A → Z": next to a grid the
+  // two modes sort visibly differently, and the hint is the only thing that says
+  // WHICH name is being ordered.
+  collection: { asc: "Collection A → Z", desc: "Collection Z → A" },
 };
 
 export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
@@ -56,6 +66,7 @@ export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
   rarity: "amount",
   name: "alpha",
   wear: "numeric",
+  collection: "alpha",
 };
 
 // ---- catalog attachments ----------------------------------------------------

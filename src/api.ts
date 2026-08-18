@@ -80,12 +80,16 @@ export interface Skin {
   wearMax?: number | null;
   seedMin?: number | null;
   seedMax?: number | null;
-  // ---- sheet facets. Only graffiti carries these today; the sheet's filter bar
-  // is driven entirely by which of them appear on the list it loaded, so a
-  // catalog without them renders exactly as it did before.
+  // ---- sheet facets. The sheet's filter bar is driven entirely by which of
+  // them appear on the list it loaded, so a catalog without them renders exactly
+  // as it did before — which is what let `collection` spread from graffiti to
+  // every weapon, knife, glove and agent finish without touching the bar.
   /** Coarse "what IS this" split — the sheet's tab strip. */
   group?: string;
-  /** Capsule / box / tournament it came in. Absent when it came in none. */
+  /** The set it came in — a capsule for graffiti, a case, map or drop pool for a
+   *  finish. Absent when it came in none: M4A4 | Howl's collection was withdrawn
+   *  with the skin, and the classic knife pool is the special of eleven cases at
+   *  once, so no single one is true. */
   collection?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
@@ -142,6 +146,10 @@ export interface CatalogItem {
   design?: number;
   /** That variant's colourway ("Cash Green"). */
   tintName?: string;
+  /** The set it came in — see `Skin.collection`. Present on an OWNED instance
+   *  too (the backend resolver fills it), which is what lets the inventory grid
+   *  and the loadout sheet sort by collection. */
+  collection?: string;
 }
 
 export interface LoadoutEntry {
@@ -500,6 +508,45 @@ export const fetchSkins = (slot: string) =>
     skins: r.skins ?? [],
     groups: Array.isArray(r.groups) ? r.groups : [],
     tints: Array.isArray(r.tints) ? r.tints : [],
+  }));
+
+// ---- Collections ------------------------------------------------------------
+//
+// The case, map or drop pool a finish came out of. The index is small enough to
+// hold whole, and it carries the member ids on purpose: "you own 4 of 17" is
+// then an intersection with the inventory already in memory, so the badge on a
+// tile and the page behind it can never disagree.
+
+/** How you get a collection — the tab strip on the collections index, and what
+ *  decides whether its skins can be StatTrak (case) or Souvenir (souvenir). */
+export type CollectionSource = "case" | "souvenir" | "drop";
+
+export interface Collection {
+  /** cs2-lib's own key ("set_bravo_i") — the handle, not the display name. */
+  key: string;
+  name: string;
+  /** The set's best finish — its art and its rarity colour, so a collection
+   *  tile lights the same way an item tile does. */
+  image: string | null;
+  rarity: string | null;
+  source: CollectionSource;
+  itemIds: number[];
+}
+
+// Normalised here for the same reason every other catalog fetch is: frontend and
+// backend ship as SEPARATE images, so a bundle that knows about collections runs
+// against a backend that doesn't for as long as it takes both to roll. An empty
+// list is what "this backend has no collections" has to look like — the armory
+// hides the section rather than showing one that opens onto nothing.
+export const fetchCollections = () =>
+  request<Collection[]>("/catalog/collections")
+    .then((r) => (Array.isArray(r) ? r : []))
+    .catch(() => [] as Collection[]);
+
+export const fetchCollection = (key: string) =>
+  request<Collection & { skins: Skin[] }>(`/catalog/collection?key=${encodeURIComponent(key)}`).then((r) => ({
+    ...r,
+    skins: r.skins ?? [],
   }));
 
 export const fetchLoadout = () => request<LoadoutEntry[]>("/loadout");
