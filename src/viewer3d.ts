@@ -1567,6 +1567,27 @@ export interface StickerSlot {
    *  StickerSlot.region in backend/src/stickerMarkup.ts. Absent on old mounts. */
   region?: number[];
 }
+/**
+ * One quad the game authored as a place a charm may hang — its `KeychainMarkup`,
+ * out of the same model DATA block as the sticker anchors.
+ *
+ * The charm equivalent of StickerSlot, and it exists for the same reason: the
+ * model knows where an attachment goes and we do not have to infer it. What it
+ * replaces is the inference — the `keychain` ATTACHMENT is a clip point, not a
+ * surface, and it sits 70mm off an AK-47, 44mm off a MAG-7, 32mm off a USP-S.
+ * These sit 1-3mm off the rendered mesh on every weapon measured, both bodies
+ * and every bone, which is what makes them usable as a surface to snap to.
+ */
+export interface CharmSurface {
+  /** "body_hd" | "body_legacy" — must match the body the finish renders on, the
+   *  same rule sticker anchors follow. */
+  mesh: string;
+  /** The bone that MOVES this quad, not the frame it is written in. */
+  bone: string;
+  /** 4 corners x XYZ, flat, GLB space. Two edges, not a ring: (0,1) is one end
+   *  of the strip and (2,3) the other, so the triangles are 0-1-2 and 2-1-3. */
+  corners: number[];
+}
 export interface StickerBounds {
   x: [number, number];
   y: [number, number];
@@ -2015,6 +2036,9 @@ export interface ViewerHandle {
   probePlacement: () => PlacementProbe;
   /** Where the name plate landed, measured against the weapon. See NameplateProbe. */
   probeNameplate: () => NameplateProbe;
+  /** Where the mounted charm's HOOK landed, measured against the weapon. Null
+   *  when no charm is mounted or it is flat art with no rig. See CharmSeatProbe. */
+  probeCharmSeat: () => CharmSeatProbe | null;
 }
 
 export interface PlacementProbe {
@@ -2029,6 +2053,95 @@ export interface PlacementProbe {
   roundTripErr: number | null;
   posed: boolean;
   offsetBox: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } };
+  /** Where a placement's charm CLIPS, and its distance to the weapon surface.
+   *  `gapMm > 0 && !buried` is a charm hanging in air. */
+  attachment: (c?: Partial<CharmPlacement>) => {
+    pivot: { x: number; y: number; z: number };
+    gapMm: number | null;
+    buried: boolean | null;
+    lengthMm: number;
+    reReadMm: number;
+    reReadDelta: { x: number; y: number; z: number };
+    emitted: { x: number; y: number; z: number };
+    snapMoveMm: number;
+    authoredCostMm: number | null;
+    /** Distance to the nearest AUTHORED charm surface, in mm — null when the
+     *  model ships none. A charm can be flush against the weapon (`gapMm` ~ 0)
+     *  and still be somewhere the game would never hang one, which is what this
+     *  separates. */
+    authoredMm: number | null;
+  };
+  /**
+   * Do the model's own charm surfaces line up with the mesh we render?
+   *
+   * The one thing that could invalidate seating a charm on them: the quads are
+   * authored in the GLB's own frame while the viewer renders a POSED body, and
+   * every previous charm bug has been a space that looked right. Corner-to-mesh
+   * distance, so it is measured against the triangles actually on screen.
+   * Null when the model ships no markup.
+   */
+  charmSurfaceFit: () => {
+    quads: number;
+    medianMm: number;
+    p90Mm: number;
+    maxMm: number;
+    /** Fraction of the weapon's own surface that the map accepts, 0..1. */
+    coverage: number;
+    /** Median fit for each candidate reading of the quad frame — see
+     *  charmSurfaceCandidates. The winner is a measurement, not a claim. */
+    candidates: Record<string, number> | null;
+  } | null;
+}
+
+/**
+ * Where a charm's HOOK sits relative to the weapon it is clipped to.
+ *
+ * The pivot being on the surface is not the same claim as the hook touching it:
+ * the pivot is the charm's origin, and the ring is authored AROUND that origin,
+ * so a pivot lifted clear of the body carries the whole ring with it and the
+ * charm reads as hanging in the air beside the gun rather than clipped to it.
+ * Measured off the PINNED nodes, which is where the rig actually holds the ring.
+ */
+export interface CharmSeatProbe {
+  /** Pinned nodes — the ring. */
+  hookNodes: number;
+  /** Closest approach of any pinned node to the weapon surface, in mm.
+   *  Negative means that node is inside the shell, which is what "clipped on"
+   *  looks like. Positive is a gap you can see. */
+  hookGapMm: number;
+  /** Closest approach of the charm's DRAWN BULK to the weapon, in mm. The hook
+   *  can bite while the body of the charm stands off in the air — that gap is
+   *  the one anybody looking at the render actually sees. */
+  bulkGapMm: number | null;
+  /** The same measurement off the SETTLED positions — the ring as drawn. The
+   *  anchor being seated does not make this zero: the cloth is free to pull the
+   *  pinned nodes off their targets, and what you see is this one. */
+  hookDrawnMm: number;
+  /** The pivot's own distance to the surface, for comparison. */
+  pivotGapMm: number;
+  /** Ring radius in mm — how far the pinned nodes spread from the origin. */
+  ringMm: number;
+  /** Bounding size of what is actually DRAWN, in mm. All zeroes means the mesh
+   *  is empty — a rig with nothing on it. */
+  spriteMm: { x: number; y: number; z: number };
+  /** How far the drawn bulk sits from the pivot it hangs on, in mm. Null when
+   *  there is nothing drawn. A charm at rest reads as roughly its own length;
+   *  a metre means the mesh is somewhere the rig is not. */
+  spriteToPivotMm: number | null;
+  /** Is the sprite actually parented into the rendered scene? */
+  inScene: boolean;
+  /** …and is every node of it visible? */
+  visible: boolean;
+  /** Where the charm hangs FROM, in world units. */
+  pivotWorld: { x: number; y: number; z: number };
+  /** …and where its drawn bulk sits. */
+  bulkWorld: { x: number; y: number; z: number } | null;
+  /** The weapon's own rendered bounds, to read those two against. */
+  weaponBox: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null;
+  /** The drawn bulk's centre in normalised device coords. */
+  ndc: { x: number; y: number; z: number } | null;
+  /** Is that centre inside the photographed frame at all? */
+  inFrame: boolean;
 }
 
 /** What tools/shadertest/nameplate.ts measures. Every field is relative to the
@@ -2330,6 +2443,10 @@ export interface ViewerOpts {
   /** Per-slot UV anchors from the model. Without them placement falls back to
    *  the old silhouette guess, which does NOT match the game. */
   stickerSlots?: StickerSlot[];
+  /** The model's own charm surfaces. Without them a charm is seated on whatever
+   *  triangle happens to be nearest, which finds A surface rather than one the
+   *  game would hang a charm on. See CharmSurface. */
+  charmSurfaces?: CharmSurface[];
   // Interactive placement: drag stickers across the surface, grab the charm.
   // INITIAL value only — flip it later with handle.setInteractive().
   interactive?: boolean;
@@ -4043,9 +4160,36 @@ async function buildViewer(
   // A slot's UV anchor plus the user's offset, in the game's own space.
   // uv1 = slotOffset + userOffset + 0.5 (the shader declares the offset range
   // as Range2(-0.5,-0.5, 0.5,0.5), i.e. UV recentred on 0.5).
-  const slotMarkup = (slot: number) =>
-    (opts?.stickerSlots ?? []).find((sm) => sm.index === slot && sm.mesh === bodyVariant) ??
-    (opts?.stickerSlots ?? []).find((sm) => sm.index === slot);
+  //
+  // ANCHORS ARE FEWER THAN SLOTS, AND THEY GET SHARED. An item carries five
+  // stickers on every weapon; the body declares 4, 5 or 6 anchors — so on an
+  // AK-47 the fifth sticker has no anchor of its own. That is not an error, it is
+  // the game's own rule (cs2-lib: "a model with fewer schemas than stickers
+  // shares anchors", and its getNextStickerSchema falls back to the first one).
+  //
+  // Returning `undefined` for those slots dropped them onto slotBaseL's
+  // silhouette guess — a made-up world position AND a made-up size, on a weapon
+  // whose real markup was sitting right here. `shared` is reported so the caller
+  // can move a shared sticker off the one it would otherwise hide.
+  //
+  // Filtered to ONE body first: a legacy paint must never borrow an HD anchor,
+  // because the two unwraps disagree and 14 of the 35 weapons do not even declare
+  // the same number of anchors. The cross-variant fallback survives only for a
+  // mount whose markup names neither body we are rendering.
+  const anchors = (() => {
+    const all = opts?.stickerSlots ?? [];
+    const mine = all.filter((sm) => sm.mesh === bodyVariant);
+    return mine.length ? mine : all;
+  })();
+  const firstAnchor = anchors.reduce<StickerSlot | undefined>(
+    (lo, sm) => (!lo || sm.index < lo.index ? sm : lo),
+    undefined,
+  );
+  const slotMarkup = (slot: number): { mk: StickerSlot | undefined; shared: boolean } => {
+    const exact = anchors.find((sm) => sm.index === slot);
+    if (exact) return { mk: exact, shared: false };
+    return { mk: firstAnchor, shared: !!firstAnchor };
+  };
 
   // ---- Sticker decals ----------------------------------------------------------
   // How many world units one TEXCOORD_1 unit spans, taken as the median over
@@ -4085,7 +4229,7 @@ async function buildViewer(
   // Fallback only — a guess, and it looks like one next to the real thing.
   const DECAL_SIZE = sizeL * 0.11;
   const decalSizeFor = (slot: number) => {
-    const mk = slotMarkup(slot);
+    const { mk } = slotMarkup(slot);
     return mk && uv1Density && mk.scale > 0 ? uv1Density / mk.scale : DECAL_SIZE;
   };
   type DecalEntry = { key: string; seq: number };
@@ -4648,7 +4792,7 @@ async function buildViewer(
     const t0 = STICKER_LOG ? performance.now() : 0;
     // Real anchor when we have the model's markup; the old silhouette guess
     // only as a fallback for weapons we couldn't fetch markup for.
-    const mk = slotMarkup(st.slot);
+    const { mk, shared } = slotMarkup(st.slot);
     let hit: { mesh: import("three").Mesh; point: import("three").Vector3; normal: import("three").Vector3 } | null;
     // Set on the markup path: the sticker's rectangle in the unwrap. Its presence
     // is what selects the UV cut over the legacy world-space projection.
@@ -4659,13 +4803,31 @@ async function buildViewer(
     // and the pixels must never disagree.
     let usedX = st.x ?? null;
     let usedY = st.y ?? null;
+    // A SHARED anchor with no offset of its own hides one sticker under another:
+    // same anchor, same size, same rectangle in the unwrap, and the fifth sticker
+    // on an AK-47 reads as having done nothing at all. Seat it one sticker width
+    // along +u instead, pulled back inside the authored region so it lands
+    // somewhere the game will also accept — and let it commit like any other
+    // placement, because the panel and the game must not disagree about where
+    // sticker five is.
+    //
+    // Only when the user has expressed no preference. Once either offset is set
+    // the placement is theirs, overlap included.
+    if (mk && shared && st.x == null && st.y == null) {
+      let pu = mk.offset[0] + 1 / (mk.scale || 1);
+      let pv = mk.offset[1];
+      if (mk.region) [pu, pv] = clampToRegion(mk.region, pu, pv);
+      usedX = round(clamp(pu - mk.offset[0], bounds.x[0], bounds.x[1]), 4);
+      usedY = round(clamp(pv - mk.offset[1], bounds.y[0], bounds.y[1]), 4);
+      if (STICKER_LOG) slog(`slot ${st.slot} SHARES anchor ${mk.index} — seeded ${usedX},${usedY}`);
+    }
     if (mk) {
-      const cx = clamp(st.x ?? 0, bounds.x[0], bounds.x[1]);
-      const cy = clamp(st.y ?? 0, bounds.y[0], bounds.y[1]);
+      const cx = clamp(usedX ?? 0, bounds.x[0], bounds.x[1]);
+      const cy = clamp(usedY ?? 0, bounds.y[0], bounds.y[1]);
       const u = mk.offset[0] + cx + 0.5;
       const v = mk.offset[1] + cy + 0.5;
       if (STICKER_LOG) {
-        const clamped = cx !== (st.x ?? 0) || cy !== (st.y ?? 0);
+        const clamped = cx !== (usedX ?? 0) || cy !== (usedY ?? 0);
         asked =
           `uv1 ${u.toFixed(4)},${v.toFixed(4)}  x=${st.x} y=${st.y}` +
           `  anchor ${mk.offset[0].toFixed(4)},${mk.offset[1].toFixed(4)}` +
@@ -5166,7 +5328,19 @@ async function buildViewer(
     for (const slot of [...decals.keys()]) {
       if (!wanted.has(slot)) removeDecal(slot);
     }
-    stickers.forEach((st) => void buildDecal(st));
+    // A build may resolve a placement the caller did not ask for — a sticker on a
+    // SHARED anchor gets nudged off the one it would otherwise hide (see
+    // buildDecal). Report it exactly as a drag would, so the craft form and the
+    // inspect link carry the offset that is actually on screen. Only when it
+    // CHANGED: reporting an unchanged placement would mark a clean craft dirty
+    // every time the viewer mounts.
+    stickers.forEach((st) => {
+      void buildDecal(st).then((r) => {
+        if (r.status !== "built") return;
+        if (r.x === (st.x ?? null) && r.y === (st.y ?? null)) return;
+        opts?.onStickerPlaced?.(st.slot, r.x ?? 0, r.y ?? 0);
+      });
+    });
   }
 
   /**
@@ -5246,7 +5420,6 @@ async function buildViewer(
   }
 
   /**
-   * Which way a charm's flat art faces  /**
    * Which way a charm's flat art faces: horizontal, square across the weapon's
    * flank. Cross the world up with the model's own long axis, so it holds for a
    * rifle lying along X and for a knife the framing has already rotated.
@@ -5283,6 +5456,10 @@ async function buildViewer(
     pos: import("three").Vector3;
     prev: import("three").Vector3;
     key: string;
+    /** Which flank the charm is turned toward: +1 along charmFacing, -1 against.
+     *  Held so a re-orient only happens on a real side change — see
+     *  orientCharmToFlank. */
+    side: number;
     cy: number;
     cz: number;
     w: number; // sprite base scale (aspect-correct, from cropped art)
@@ -5696,6 +5873,20 @@ async function buildViewer(
    *  every anchor move since. The one point on a charm that is not allowed to
    *  drift on its own, so anything that rescales the rig re-pins against it. */
   const charmClipLocal = new THREE.Vector3();
+  /** How much of an anchor move the charm's body takes with it — see
+   *  moveCharmAnchor. 1 would pin it rigidly to the pointer; 0 is the flail. */
+  const CHARM_DRAG_CARRY = 0.85;
+  /** How far the pivot moves toward the pointer's answer each frame of a drag.
+   *  1 is the old behaviour (exact, and every discontinuity upstream shows). */
+  const CHARM_DRAG_SMOOTH = 0.5;
+  /** …and how much of the hook's seating correction is applied per frame while
+   *  dragging. It re-runs every frame, so a fraction still converges. */
+  const CHARM_DRAG_SEAT_EASE = 0.35;
+  /** The last UNSMOOTHED answer a drag frame computed. The release lands on this
+   *  rather than on the eased pivot, so easing costs a little lag during the
+   *  gesture and nothing at all in where the charm ends up. */
+  const dragRawAnchor = new THREE.Vector3();
+  let dragRawSet = false;
   function moveCharmSimAnchor(c: Charm, anchor: import("three").Vector3) {
     const sim = c.sim;
     if (!sim?.space) return;
@@ -5714,9 +5905,91 @@ async function buildViewer(
     sim.space.worldToLocal(anchorDelta.copy(anchor)).sub(anchorFrom);
     c.pivot.copy(anchor);
     if (anchorDelta.lengthSq() < 1e-20) return;
+    // Carry the body with the hook. See moveCharmAnchor: without this every
+    // pointermove is an impulse the length of the step, and the charm spends the
+    // whole drag catching up in a swing that never settles because the next step
+    // arrives first. 0.85 keeps it under the cursor while still trailing enough
+    // to read as an object on a string rather than a sticker on the pointer.
     charmClipLocal.add(anchorDelta);
-    moveCharmAnchor(sim, anchorDelta.x, anchorDelta.y, anchorDelta.z);
+    moveCharmAnchor(sim, anchorDelta.x, anchorDelta.y, anchorDelta.z, CHARM_DRAG_CARRY);
     wakeCharm();
+  }
+
+  /**
+   * The closest the charm's RING gets to the weapon, and the move that would put
+   * it in contact.
+   *
+   * Measured off `sim.anchor` — where the pinned nodes are HELD — not off
+   * `sim.pos`, which only catches up on the next step and so reads a frame stale
+   * exactly when something has just moved the anchor.
+   *
+   * `gap` is signed: negative means a node is inside the shell. That is not a
+   * fault to correct. A charm's ring is a loop and it is meant to go AROUND
+   * something, so the game's own placements bury it — the AWP's anchor puts it
+   * 12.8mm in. Only daylight is a defect.
+   */
+  const hookNode = new THREE.Vector3();
+  /**
+   * `from` picks WHICH ring is measured, and the two are not the same object.
+   *
+   * `anchor` is where the pinned nodes are being HELD — the seat's own input,
+   * and stable the instant it is written. `pos` is where they actually ARE after
+   * the cloth has run, which is what the renderer draws. Seating works on the
+   * anchor because a target that lags a frame cannot be solved against; but a
+   * gap the user can see is a gap in `pos`, so that is what has to be checked.
+   */
+  function hookContact(c: Charm, from: "anchor" | "pos" = "anchor") {
+    const sim = c.sim;
+    if (!sim?.space) return null;
+    sim.space.updateWorldMatrix(true, false);
+    const src = from === "pos" ? sim.pos : sim.anchor;
+    let best: { gap: number; delta: import("three").Vector3 } | null = null;
+    for (let n = 0; n < sim.model.static; n++) {
+      hookNode.set(src[n * 3], src[n * 3 + 1], src[n * 3 + 2]);
+      sim.space.localToWorld(hookNode);
+      const near = nearestOnWeapon(hookNode);
+      if (!near) continue;
+      const inside = hookNode.clone().sub(near.point).dot(near.normal) < 0;
+      const gap = inside ? -near.dist : near.dist;
+      if (best && gap >= best.gap) continue;
+      best = { gap, delta: near.point.clone().sub(hookNode) };
+    }
+    return best;
+  }
+
+  /**
+   * Put the charm's hook ON the weapon.
+   *
+   * attachToBody guarantees the PIVOT is on the surface, and that is not the same
+   * claim: the pivot is the charm's origin and the ring is authored around it, so
+   * a pivot sitting the standard 0.3%-of-length clear of the body holds the whole
+   * ring clear too. Measured on an AK-47 that is 2.8mm of daylight under the hook
+   * — small in millimetres, and the thing you actually look at when you zoom in
+   * on a charm, because the hook is the part that is supposed to be touching.
+   *
+   * Moves the ANCHOR, not the group: the sim runs in the charm's own space and
+   * the pinned nodes are what hold the ring, so this is the same operation a drag
+   * performs and the cloth follows it the same way.
+   *
+   * One-directional on purpose — it closes daylight and never pulls a buried ring
+   * out. See hookContact.
+   */
+  function seatCharmHook(c: Charm, ease = 1) {
+    const near = hookContact(c);
+    if (!near || near.gap <= 0) return;
+    // A hair past contact rather than exactly on it: a ring resting at precisely
+    // zero shares a plane with the surface under it, and the seam z-fights.
+    const bite = Math.min(0.0003, near.gap * 0.5);
+    const delta = near.delta.clone();
+    // `ease` under 1 applies the correction over several frames instead of in
+    // one. It runs every frame of a drag, and its input is the nearest triangle
+    // to the ring — which changes identity as the charm slides across an edge, a
+    // rail or a screw, so the full correction is a different vector from one
+    // frame to the next. Applied whole that reads as the charm ticking along the
+    // model; eased, it converges to the same place a few frames later and the
+    // path there is smooth. Nothing outside a drag passes anything but 1.
+    delta.setLength((near.gap + bite) * ease);
+    moveCharmSimAnchor(c, c.pivot.clone().add(delta));
   }
 
   /**
@@ -6098,6 +6371,289 @@ async function buildViewer(
   }
 
   /**
+   * The closest point on the weapon's own surface to `p`, with the normal of the
+   * face it landed on. Null only on a model with no triangles at all.
+   *
+   * Rays cannot answer this. A ray asks "what is along this line", and a point
+   * floating beside the weapon is not along any of the six axes we happen to
+   * probe — which is exactly why liftOutOfBody, built out of rays, can only fix
+   * a point that is already INSIDE the shell. Closest-point-on-triangle is the
+   * question "where is the nearest surface", and it has an answer from anywhere.
+   *
+   * Runs off weaponTriangleCache — the same world-space triangle soup the cloth
+   * collider is baked from, built once — with the same centroid+radius rejection
+   * charmColliderFor uses, so a full scan of an 18k-triangle weapon is a flat
+   * pass over two Float32Arrays. Called when a placement CHANGES, never per
+   * frame; the cloth keeps its bucketed grid for the per-frame work.
+   */
+  const nearTri = new THREE.Triangle();
+  const nearA = new THREE.Vector3();
+  const nearB = new THREE.Vector3();
+  const nearC = new THREE.Vector3();
+  const nearPt = new THREE.Vector3();
+  function nearestOnWeapon(p: import("three").Vector3) {
+    const { xyz, mid, rad } = weaponTriangleCache();
+    // Unbounded on purpose. A cutoff would leave the worst placements — the ones
+    // furthest off the model — as the only ones still floating, which is the
+    // opposite of a guarantee. It costs nothing either: the seeding pass below
+    // tightens the bound on the first triangle regardless of where it starts.
+    let best = Infinity;
+    let hit: { point: import("three").Vector3; dist: number; normal: import("three").Vector3 } | null = null;
+    const solve = (t: number) => {
+      const o = t * 9;
+      nearA.set(xyz[o], xyz[o + 1], xyz[o + 2]);
+      nearB.set(xyz[o + 3], xyz[o + 4], xyz[o + 5]);
+      nearC.set(xyz[o + 6], xyz[o + 7], xyz[o + 8]);
+      nearTri.set(nearA, nearB, nearC);
+      nearTri.closestPointToPoint(p, nearPt);
+      const d = nearPt.distanceTo(p);
+      if (d >= best) return;
+      best = d;
+      hit = hit ?? { point: new THREE.Vector3(), dist: 0, normal: new THREE.Vector3() };
+      hit.point.copy(nearPt);
+      hit.dist = d;
+      nearTri.getNormal(hit.normal);
+    };
+    // Seed the bound off the nearest CENTROID before solving anything. The
+    // rejection below only bites once `best` is small, so an unseeded scan pays
+    // a full closest-point solve on most of an 18k-triangle weapon — and a drag
+    // lands here on every pointermove. One cheap pass over the centroids buys a
+    // real bound, after which the second pass is a flat scan of two Float32Arrays
+    // that solves a handful of triangles. Measured at 0.1-0.2ms against the
+    // 0.7-11.8ms the surrounding raycasts already cost.
+    let seed = -1;
+    let seedD = Infinity;
+    for (let t = 0; t < rad.length; t++) {
+      const m3 = t * 3;
+      const dx = mid[m3] - p.x, dy = mid[m3 + 1] - p.y, dz = mid[m3 + 2] - p.z;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < seedD) { seedD = d2; seed = t; }
+    }
+    if (seed >= 0) solve(seed);
+    for (let t = 0; t < rad.length; t++) {
+      if (t === seed) continue;
+      const m3 = t * 3;
+      const dx = mid[m3] - p.x, dy = mid[m3 + 1] - p.y, dz = mid[m3 + 2] - p.z;
+      // Nothing on this triangle can beat `best` if its bounding sphere doesn't
+      // reach that far. Tightens as better candidates land.
+      const lim = best + rad[t];
+      if (dx * dx + dy * dy + dz * dz > lim * lim) continue;
+      solve(t);
+    }
+    return hit as { point: import("three").Vector3; dist: number; normal: import("three").Vector3 } | null;
+  }
+
+  /**
+   * The game's own charm surfaces for the body being rendered, as world-space
+   * triangles — two per authored quad.
+   *
+   * THE POINT OF THIS: `nearestOnWeapon` finds A surface, not one the game would
+   * hang a charm on. Started from an anchor 70mm out in the air, its answer is
+   * whatever triangle happens to be closest — the side of a magazine, the inside
+   * of a trigger guard — and that is what a charm "floating beside the gun"
+   * actually is. These quads are Valve's answer to the same question, and they
+   * are exactly the data stickers have had all along (StickerMarkup and
+   * KeychainMarkup come out of one DATA block).
+   *
+   * MEASURED before it was used, because the whole history of charm placement is
+   * spaces that looked right: corner-to-mesh distance is a 1-3mm median on every
+   * weapon sampled (ak47 1.2, m4a1 2.0, awp 2.5, mac10 2.9, mag7 2.3, p90 2.5,
+   * usp_silencer 1.6, glock 2.4, deagle 2.7), both bodies. So they need no base,
+   * no `cal` and no pose — only the swizzle and scale every GLB coordinate here
+   * takes, plus the recentre. That is the same conversion `charmAnchors.json`
+   * ships pre-applied, which is why the anchor is read raw a few lines up.
+   *
+   * EVERY BONE, not just the static body. The moving-part quads (slide, bolt,
+   * silencer, pump) travel with an animation in game — but nothing here
+   * animates, and measured in the pose we render they are as flush as the rest.
+   * Dropping them would cost most of the surface on a pistol: the USP-S declares
+   * 28 slide corners against 16 on `weapon_offset`.
+   *
+   * Filtered to ONE body first, exactly like the sticker anchors: HD and legacy
+   * are different meshes and 14 of 35 weapons disagree about them. The
+   * cross-variant fallback survives only for a mount naming neither.
+   */
+  const charmSurfaceTris = (() => {
+    const all = opts?.charmSurfaces ?? [];
+    if (!all.length || !debugFlag("charmquads", true)) return null;
+    const mine = all.filter((q) => q.mesh === bodyVariant);
+    const body = mine.length ? mine : all;
+    // THE STATIC BODY ONLY. Every bone's quads sit flush on the mesh in the pose
+    // we render, which is why they were all used at first — but flush is not the
+    // question a placement asks. A magazine drops, a slide cycles, a pump racks:
+    // a charm clipped to one of those is clipped to a part that moves out from
+    // under it, and on an M4A1-S the magazine is exactly where a charm kept
+    // landing. The game's own data says which bone carries a quad, so this is a
+    // filter rather than a guess.
+    //
+    // Falls back to every bone when the model declares no `weapon_offset` at all
+    // — the Dual Berettas, whose halves are `weapon_r`/`weapon_l` and are as
+    // static as any body. Reported by ?quads=1 so a model losing its surfaces
+    // this way is visible rather than mysterious.
+    const staticQuads = body.filter((q) => q.bone === "weapon_offset");
+    const use = staticQuads.length ? staticQuads : body;
+    const xyz = new Float32Array(use.length * 18);
+    const c = new THREE.Vector3();
+    let n = 0;
+    const put = (q: CharmSurface, i: number) => {
+      // THE POSE, and it is measured rather than argued: a quad corner is a
+      // point in the GLB's bind frame exactly like a vertex, so it goes through
+      // the same bind->posed transform bakePose applied to the vertices, and
+      // then through mountViewer's recentre. Scored against the rendered
+      // triangles on an AK: this reads 0.0mm, while the swizzle+scale below
+      // reads 10.8mm median and 134mm at p90 — the residual of a rotation, which
+      // is what a pose is.
+      //
+      // Do not read this as contradicting the "never apply poseXform to the
+      // ANCHOR" note on offsetToWorld. That anchor is an ATTACHMENT in the
+      // game's model space, exported unposed and consumed by the game unposed;
+      // these are geometry, in the same frame as the vertices they were authored
+      // against. Different data, different frame, and the only way to tell them
+      // apart is to measure against the mesh — which ?quads=1 does.
+      //
+      // Per BONE first, the same `byName ?? poseXform` fallback placeAttachedModule
+      // uses. It matters twice: a slide/silencer/pump quad rides a part the body
+      // transform does not describe, and on the Dual Berettas poseXform is
+      // whichever pistol won the weight count while the quads name weapon_r and
+      // weapon_l explicitly.
+      const pose = poseBones.byName.get(q.bone) ?? poseXform;
+      c.set(q.corners[i * 3], q.corners[i * 3 + 1], q.corners[i * 3 + 2]);
+      if (pose) c.applyMatrix4(pose).sub(center);
+      // No pose baked (nothing in this catalogue, but a model could): the
+      // vertices are then in the bind frame, and the conversion is the swizzle
+      // and scale charmAnchors.json ships pre-applied.
+      else c.set(c.y, c.z, c.x).multiplyScalar(SRC_TO_M).sub(center);
+      xyz[n++] = c.x;
+      xyz[n++] = c.y;
+      xyz[n++] = c.z;
+    };
+    for (const q of use) {
+      if (q.corners.length !== 12) continue; // a partial quad is a surface that isn't there
+      // Strip order, not a ring — see CharmSurface.corners.
+      put(q, 0); put(q, 1); put(q, 2);
+      put(q, 2); put(q, 1); put(q, 3);
+    }
+    return n ? xyz.subarray(0, n) : null;
+  })();
+
+  /**
+   * Every plausible way of reading a quad corner into world space, scored
+   * against the rendered mesh.
+   *
+   * Not a debugging leftover. The corners are authored in the GLB's frame, the
+   * viewer renders a POSED body, and which transform closes that gap is exactly
+   * the question that has been answered wrongly-but-plausibly at every previous
+   * step of charm placement — including by me, offline, against the file's own
+   * vertices, where the raw swizzle looked perfect and is 10x off once the pose
+   * is applied. So the rig asks the model rather than the author:
+   *
+   *   swz       swizzle + scale + recentre, the conversion charmAnchors.json
+   *             ships pre-applied. Correct only if the body is not posed.
+   *   mesh      the corner as if it were already a posed mesh-local vertex.
+   *   pose      bind -> posed via poseXform, which the comment on bakePose says
+   *             maps model INCHES to world METRES.
+   *   posemesh  poseXform then the mesh's own world matrix, for the reading
+   *             where poseXform is mesh-local.
+   *
+   * Reported as median corner-to-triangle distance in mm; the smallest wins and
+   * `?quads=1` prints them side by side.
+   */
+  function charmSurfaceCandidates(): Record<string, number> | null {
+    const all = opts?.charmSurfaces ?? [];
+    const mine = all.filter((q) => q.mesh === bodyVariant);
+    const use = mine.length ? mine : all;
+    if (!use.length) return null;
+    const body = weaponMeshes[0];
+    const ways: Record<string, (c: import("three").Vector3, q: CharmSurface) => import("three").Vector3> = {
+      swz: (c) => new THREE.Vector3(c.y, c.z, c.x).multiplyScalar(SRC_TO_M).sub(center),
+      mesh: (c) => (body ? c.clone().applyMatrix4(body.matrixWorld) : c.clone()),
+      pose: (c) => (poseXform ? c.clone().applyMatrix4(poseXform).sub(center) : c.clone()),
+      poseNoCenter: (c) => (poseXform ? c.clone().applyMatrix4(poseXform) : c.clone()),
+      posemesh: (c) =>
+        poseXform && body ? c.clone().applyMatrix4(poseXform).applyMatrix4(body.matrixWorld) : c.clone(),
+      // What the soup actually uses: the quad's OWN bone where the clip names
+      // one, the body's transform otherwise.
+      bone: (c, q) => {
+        const pose = poseBones.byName.get(q.bone) ?? poseXform;
+        return pose
+          ? c.clone().applyMatrix4(pose).sub(center)
+          : new THREE.Vector3(c.y, c.z, c.x).multiplyScalar(SRC_TO_M).sub(center);
+      },
+    };
+    const out: Record<string, number> = {};
+    const c = new THREE.Vector3();
+    for (const [name, fn] of Object.entries(ways)) {
+      const ds: number[] = [];
+      for (const q of use) {
+        if (q.corners.length !== 12) continue;
+        for (let i = 0; i < 4; i++) {
+          c.set(q.corners[i * 3], q.corners[i * 3 + 1], q.corners[i * 3 + 2]);
+          const n = nearestOnWeapon(fn(c, q));
+          if (n) ds.push(n.dist * 1000);
+        }
+      }
+      if (!ds.length) continue;
+      ds.sort((a, b) => a - b);
+      out[name] = ds[Math.floor(ds.length / 2)];
+    }
+    return out;
+  }
+
+  /**
+   * Closest point on an authored charm surface, or null when the model has none
+   * (a knife, or a mount extracted before the markup existed).
+   *
+   * A flat scan: ~110 quads is 220 triangles, three orders of magnitude under
+   * the weapon's own soup, so none of nearestOnWeapon's seeding and rejection
+   * machinery earns its keep here.
+   */
+  function nearestCharmSurfacePoints(p: import("three").Vector3, k = 1) {
+    const xyz = charmSurfaceTris;
+    if (!xyz) return [];
+    const out: { point: import("three").Vector3; dist: number }[] = [];
+    // One candidate per QUAD, not per triangle: the two triangles of a quad are
+    // coplanar and adjacent, so keeping both would fill the shortlist with the
+    // same surface twice and the alternatives below would never be reached.
+    for (let q = 0; q + 17 < xyz.length; q += 18) {
+      let best: { point: import("three").Vector3; dist: number } | null = null;
+      for (const o of [q, q + 9]) {
+        nearA.set(xyz[o], xyz[o + 1], xyz[o + 2]);
+        nearB.set(xyz[o + 3], xyz[o + 4], xyz[o + 5]);
+        nearC.set(xyz[o + 6], xyz[o + 7], xyz[o + 8]);
+        nearTri.set(nearA, nearB, nearC);
+        nearTri.closestPointToPoint(p, nearPt);
+        const d = nearPt.distanceTo(p);
+        if (!best || d < best.dist) best = { point: nearPt.clone(), dist: d };
+      }
+      if (best) out.push(best);
+    }
+    out.sort((a, b) => a.dist - b.dist);
+    return out.slice(0, k);
+  }
+  const nearestOnCharmSurface = (p: import("three").Vector3) =>
+    nearestCharmSurfacePoints(p, 1)[0] ?? null;
+
+  /**
+   * Would a charm hung here have room to hang, or does it sink into the gun?
+   *
+   * The pivot touching the weapon is not the same claim as the charm being
+   * visible, and the Dual Berettas are what proved it: with the pivot seated
+   * 1.5mm off the surface and the hook measured ON the gun, the charm drew ZERO
+   * pixels — 40mm of it hanging straight down inside a slide. Every probe said
+   * the placement was perfect because every probe asked about the pivot.
+   *
+   * So ask about the BULK: drop a nominal charm's height from the seat and see
+   * whether that lands inside the shell. CHARM_HEIGHT_M rather than the mounted
+   * charm's own size, because a placement resolves before there is a charm to
+   * measure and the answer must not depend on which one gets hung.
+   */
+  function hangsFree(seat: import("three").Vector3) {
+    const bulk = seat.clone().addScaledVector(WORLD_Y, -CHARM_HEIGHT_M * 0.6);
+    const n = nearestOnWeapon(bulk);
+    return !n || bulk.clone().sub(n.point).dot(n.normal) >= 0;
+  }
+
+  /**
    * A raycast hit turned into a charm anchor, or null if it landed on a face
    * turned AWAY from the camera.
    *
@@ -6120,7 +6676,7 @@ async function buildViewer(
     const nrm = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
     if (nrm.dot(facingEye.copy(camera.position).sub(hit.point)) <= 0) return null;
     anchorNormal.copy(nrm);
-    return hit.point.clone().addScaledVector(nrm, sizeL * 0.003);
+    return hit.point.clone().addScaledVector(nrm, CHARM_CLEARANCE);
   }
 
   /** The visible surface between the camera and a point — what the user is
@@ -6307,10 +6863,210 @@ async function buildViewer(
     // A sample right on the silhouette edge can be missed by the ray aimed at
     // it. It is a point on the surface itself, and out at the edge the near and
     // far faces are the same place, so take it as it stands.
-    return near.clone().addScaledVector(facingEye.copy(camera.position).sub(near).normalize(), sizeL * 0.003);
+    return near.clone().addScaledVector(facingEye.copy(camera.position).sub(near).normalize(), CHARM_CLEARANCE);
+  }
+
+  /**
+   * THE GUARANTEE: a charm hangs ON the weapon.
+   *
+   * Every path below resolves a point that SHOULD be on the body, and measured
+   * against the rendered triangles most of them are not. The model's own
+   * `keychain` attachment — the spot an unplaced charm previews at, the one
+   * piece of data here that comes from Valve — sits 70mm off an AK-47's surface,
+   * 44mm off a MAG-7, 32mm off a USP-S; only the AWP's lands on the gun. It is
+   * an authored CLIP point in the game's rig, and the game clamps a charm to the
+   * surface from there (see the charm-anchor notes on offsetToWorld). Our GLB is
+   * a posed export of a different body, so the residual is per-weapon and no
+   * transform removes it — bind-space, pose-space and game-space candidates were
+   * each measured against every weapon and none is better than the raw anchor on
+   * more than a couple of them.
+   *
+   * So stop trying to derive the surface and just measure it: nearest point on
+   * the weapon, no camera term (a pivot that moved as you orbited would drift
+   * the charm while you looked at it), minimal movement from wherever the
+   * placement asked for.
+   *
+   * RENDER ONLY, exactly like liftOutOfBody: the offsets we store and transmit
+   * are untouched, so this cannot desync the preview from the game. It moves the
+   * preview TOWARD the game, which clamps to the surface for the same reason.
+   *
+   * Buried points are left alone. Being inside the shell is a smaller error than
+   * being in the air — the charm still reads as attached — and ejecting them is
+   * liftOutOfBody's job, which caps how far it will move an anchor precisely
+   * because relocating one across a pistol grip was worse than the burial.
+   */
+  /** How many authored surfaces to consider before giving up on finding one the
+   *  charm can hang clear of. Small on purpose: past the first few the surface
+   *  is no longer the one the placement asked for. */
+  const CHARM_SEAT_CANDIDATES = 6;
+  /**
+   * How far a seated charm is held off the surface it clips to.
+   *
+   * ABSOLUTE, not a fraction of the weapon, and that is the whole point. It used
+   * to be `sizeL * 0.003` — 2.7mm on an AK, 3.0mm on an M4A1-S — which reads as
+   * a fraction of nothing anyone is looking at: a charm is a real object about
+   * 40mm tall, so three millimetres of daylight under it is a visible gap, and
+   * on a longer gun the gap got BIGGER. The number only has to clear z-fighting
+   * between two coincident surfaces, which is what `seatCharmHook`'s own 0.3mm
+   * bite has always been sized for. Same value here, same reason.
+   */
+  const CHARM_CLEARANCE = 0.0003;
+  /** A point on an authored quad, put on the mesh under it — the quads are flat
+   *  and the shell is not, so this is what turns a quad point into a seat with a
+   *  real outward normal. */
+  const seatOn = (
+    q: import("three").Vector3,
+    fallback: { point: import("three").Vector3; normal: import("three").Vector3 },
+  ) => nearestOnWeapon(q) ?? fallback;
+
+  /**
+   * Turn the charm to face OUT of the flank it hangs on.
+   *
+   * A charm's mesh is authored facing one way and nothing rotated it, so the
+   * same charm dragged across to the other side of the weapon kept pointing at
+   * the gun: its front went into the metal, and the parts of it that lean away
+   * from the hook — which is most of a charm — leaned INTO the body. That is the
+   * clipping through the receiver and the StatTrak module in the reports.
+   *
+   * A half turn about world up, applied ABOUT THE PIVOT so the clip point does
+   * not move. There are only ever two states, so this is a flip and not a
+   * continuous rotation — a charm can never end up at some angle in between,
+   * which is the other half of the same complaint.
+   *
+   * DEAD BAND on purpose. Near the top or the bottom of a weapon the surface
+   * normal has almost no lateral component, so the sign of the test is noise —
+   * and flipping on noise during a drag is exactly the jitter this is supposed
+   * to prevent. Under a clear third of a side, whatever it is facing stands.
+   */
+  function orientCharmToFlank(c: Charm) {
+    const n = nearestOnWeapon(c.pivot);
+    if (!n) return;
+    const lateral = n.normal.dot(charmFacing);
+    if (Math.abs(lateral) < 0.3) return;
+    const want = lateral < 0 ? -1 : 1;
+    if (c.side === want) return;
+    c.side = want;
+    const half = new THREE.Quaternion().setFromAxisAngle(WORLD_Y, Math.PI);
+    c.sprite.position.sub(c.pivot).applyQuaternion(half).add(c.pivot);
+    c.sprite.quaternion.premultiply(half);
+    c.sprite.updateMatrixWorld(true);
+  }
+
+  function attachToBody(p: import("three").Vector3) {
+    // A dragged anchor already sits CHARM_CLEARANCE off the surface it was
+    // picked from, so the tolerance has to clear that or every drag would be
+    // re-snapped to a point it is already on. It stays a fraction of the weapon
+    // because it also absorbs the difference between a flat authored quad and
+    // the curved shell under it, which does scale with the model.
+    const tol = sizeL * 0.005;
+    const near = nearestOnWeapon(p);
+    if (!near) return p;
+    // Buried points are left alone whichever surface answers — being inside the
+    // shell still reads as attached, and ejecting one is liftOutOfBody's job.
+    // Tested before the tolerance now, because the authored branch below has its
+    // own reason to move a point that the mesh branch does not.
+    if (p.clone().sub(near.point).dot(near.normal) < 0) return p;
+    // THE AUTHORED SURFACE WINS. `nearestOnWeapon` answers "where is the closest
+    // triangle", which from a point out in the air is whatever the silhouette
+    // happens to present — the flank of a magazine, the outside of a trigger
+    // guard. The model's own KeychainMarkup answers the question actually being
+    // asked, "where does this weapon take a charm", so when it is available a
+    // pivot is seated on it and not merely on the nearest geometry.
+    //
+    // Landing on the quad is not the last step: the quads are flat and the shell
+    // is not, so the quad point is up to a few mm off the real surface. Seating
+    // it through nearestOnWeapon puts it on the mesh and — the part that matters
+    // — hands back that face's outward normal, so the standing clearance is
+    // measured against the body rather than against the quad's own winding.
+    // Searched from the point ON THE WEAPON, not from `p`. Same answer almost
+    // everywhere and a strictly better-behaved one: a global nearest-quad search
+    // is discontinuous across the ridge between two authored patches, and a
+    // placement sitting on that ridge oscillates between them on every
+    // read-back — 17mm per pass on the Dual Berettas, whose two halves are
+    // separate bodies with separate quads. Starting from the local surface makes
+    // the choice a property of the geometry under the charm rather than of a
+    // global minimum, so a point beside the left pistol resolves to the left
+    // pistol's surfaces.
+    const cands = nearestCharmSurfacePoints(near.point, CHARM_SEAT_CANDIDATES);
+    if (cands.length) {
+      // The nearest authored surface the charm can actually hang from, not
+      // simply the nearest one. They are the same answer on every single-body
+      // weapon measured; where they differ is a surface with the gun underneath
+      // it, and taking that one is how a charm ends up drawn entirely inside a
+      // pistol. Falls back to the nearest when none of them is free — a charm
+      // inside the shell is still better than one out in the air, which is the
+      // same trade liftOutOfBody makes.
+      const auth = cands.find((c) => hangsFree(seatOn(c.point, near).point)) ?? cands[0];
+      const seat = seatOn(auth.point, near);
+      const target = seat.point.clone().addScaledVector(seat.normal, CHARM_CLEARANCE);
+      // IDEMPOTENT BY CONSTRUCTION, and it has to be: a drag re-resolves the
+      // pivot on every pointermove, so a correction that keeps correcting is a
+      // charm that crawls out from under the pointer. The test is on the
+      // OUTPUT — "would seating move it" — not on the input's distance to a
+      // quad, which is a different number: the seat holds the pivot a hair off
+      // the shell along the mesh normal, and the flat quad it came from is up
+      // to a few mm inside a curved one, so a seated pivot can read as off-quad
+      // and be re-seated forever. Measured as CREEP by placement.html?attach=1.
+      //
+      // BOTH halves, because "the seat would not move it much" is not the same
+      // claim as "it is on the gun": a pivot can sit a tolerance away from the
+      // seat AND a tolerance off the surface at once, and keeping it there left
+      // the bizon and the scar20 with a visible 5-8mm of daylight while every
+      // number here said the placement had barely moved. A seated pivot passes
+      // both by construction (its gap IS the standing clearance), so this stays
+      // a fixed point.
+      return target.distanceTo(p) <= tol && near.dist <= tol ? p : target;
+    }
+    if (near.dist <= tol) return p;
+    return near.point.clone().addScaledVector(near.normal, CHARM_CLEARANCE);
   }
 
   function charmPivot(c: CharmPlacement) {
+    return attachToBody(resolveCharmPivot(c));
+  }
+
+  /**
+   * The inverse of charmPivot: a world point as the placement we would store.
+   *
+   * Lives next to the resolver rather than inside the drag because the two must
+   * agree about which SPACE a placement is written in, and they only agree by
+   * construction if there is one place that decides. Where we know the real
+   * attachment, report the drag in the game's own units, so the number we store
+   * is the number the inspect link carries; without an anchor there is nothing
+   * to be relative to and it falls back to normalised body fractions — matching
+   * resolveCharmPivot's own two branches.
+   */
+  function placementFor(p: import("three").Vector3) {
+    if (charmAnchor) {
+      // Absolute, to match what the game consumes — undo the recentering to get
+      // back into model space rather than measuring from the anchor.
+      const off = worldToOffset(p.clone().add(center));
+      return { x: round(off.x, 3), y: round(off.y, 3), z: round(off.z, 3) };
+    }
+    // The length fraction spans the WHOLE usable body (t 0.05..0.95), not the
+    // middle 70% it used to. A placement outside what the encoding can express
+    // comes back clamped — fine as a one-off correction, and the read-back check
+    // allows for exactly one — but the clamp lands the pivot somewhere the seat
+    // then moves it away from again, and those two disagree forever: measured as
+    // 1.7mm of CREEP per pass on the Dual Berettas with `x` pinned at its -1
+    // limit. Widening the range is what stops the two corrections fighting.
+    // Fractions are only ever emitted for a weapon with no keychain anchor (the
+    // elite is the only one), so nothing else stores or reads these numbers.
+    const t = (p.getComponent(AXIS_L) - cbox.min.getComponent(AXIS_L)) / sizeL;
+    // FOUR decimals, not two. These fractions span the whole body, so 0.01 of
+    // one is about a millimetre on a pistol — coarser than the tolerance the
+    // seat works to, which means a read-back could land the pivot on a
+    // different patch of authored surface than the one it was seated on.
+    // Worth 0.7mm of measured CREEP on the Dual Berettas (placement.html
+    // ?attach=1), and it costs nothing: this encoding is ours, not the game's.
+    return {
+      x: round(clamp((t - 0.5) / 0.45, -1, 1), 4),
+      y: round(clamp((p.getComponent(AXIS_H) - centerH) / (sizeH * 0.5), -1.2, 1.2), 4),
+      z: round(clamp((p.getComponent(AXIS_S) - centerS) / (sizeS * 0.5), -1.2, 1.2), 4),
+    };
+  }
+
+  function resolveCharmPivot(c: CharmPlacement) {
     // Keychain offsets are ABSOLUTE positions in the weapon's model space, in
     // Source inches — not deltas from the attachment. (Sending zeros drops the
     // charm at the model origin near the grip, which is what settled it.) With
@@ -6320,14 +7076,25 @@ async function buildViewer(
       const placed = c.x != null || c.y != null || c.z != null;
       return liftOutOfBody(placed ? offsetToWorld(c).sub(center) : charmAnchor.clone());
     }
-    const t = clamp(0.55 + (c.x ?? 0) * 0.35, 0.05, 0.95);
+    const t = clamp(0.5 + (c.x ?? 0) * 0.45, 0.05, 0.95);
     const l = cbox.min.getComponent(AXIS_L) + t * sizeL;
-    // y (when set) is a real anchor height — reattach at that spot on the
-    // surface via a side ray; fall back to the underside, then to a formula.
-    if (c.y != null && c.y !== 0) {
-      const h = centerH + clamp(c.y, -1.2, 1.2) * sizeH * 0.5;
-      const side = castAt(l, h);
-      if (side) return side.point.clone().addScaledVector(side.normal, sizeL * 0.003);
+    // A STORED placement is read straight back as the three fractions
+    // placementFor wrote, and attachToBody seats it on the surface.
+    //
+    // This used to re-derive the pivot with a side ray at (l, h), which threw
+    // away whatever the placement said about the third axis and returned
+    // wherever the ray happened to land — so the position that came back was not
+    // the position that went in. Measured on the Dual Berettas (the one weapon
+    // with no anchor, hence the only one that takes this path): 21-57mm of
+    // movement per read-back, i.e. a charm that crawls while you drag it. The
+    // ray was there to keep the charm on the body, and that is now guaranteed
+    // for every path at once.
+    if (c.x != null || c.y != null || c.z != null) {
+      const p = new THREE.Vector3();
+      p.setComponent(AXIS_L, l);
+      p.setComponent(AXIS_H, centerH + clamp(c.y ?? 0, -1.2, 1.2) * sizeH * 0.5);
+      p.setComponent(AXIS_S, centerS + clamp(c.z ?? 0, -1.2, 1.2) * sizeS * 0.5);
+      return p;
     }
     let hit = castUnderside(l, (c.z ?? 0) * sizeS * 0.5);
     // Nothing under this exact spot (past the muzzle, inside an opening):
@@ -6339,7 +7106,7 @@ async function buildViewer(
     }
     if (hit?.face) {
       const nrm = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
-      return hit.point.clone().addScaledVector(nrm, sizeL * 0.003);
+      return hit.point.clone().addScaledVector(nrm, CHARM_CLEARANCE);
     }
     if (hit) return hit.point.clone();
     const pivot = new THREE.Vector3();
@@ -6391,9 +7158,21 @@ async function buildViewer(
     const movedAnchor = !!prev && JSON.stringify(prev.slice(1, 4)) !== JSON.stringify([c.x, c.y, c.z]);
     function reanchor(to: CharmPlacement) {
       if (!charm) return;
+      // THE DRAG OWNS THE POSITION WHILE IT LASTS. Every pointermove reports its
+      // placement outward, the form stores it, and the form change comes back
+      // here as a fresh setCharm — so this ran on every frame of a drag and
+      // re-resolved the very placement the drag had just emitted, seat and all.
+      // The pointer had already put the charm exactly where it belonged; this
+      // then moved it somewhere else, which is half of why dragging jittered.
+      // The key is still updated by the caller, so the next real change is not
+      // mistaken for a no-op.
+      if (drag?.type === "charm") return;
       wakeCharm();
-      if (charm.sim) moveCharmSimAnchor(charm, charmPivot(to));
-      else charm.pivot.copy(charmPivot(to));
+      if (charm.sim) {
+        moveCharmSimAnchor(charm, charmPivot(to));
+        orientCharmToFlank(charm);
+        seatCharmHook(charm);
+      } else charm.pivot.copy(charmPivot(to));
       charm.cy = to.y ?? 0;
       charm.cz = to.z ?? 0;
     }
@@ -6601,8 +7380,14 @@ async function buildViewer(
     );
     line.visible = false;
     scene.add(line);
-    charm = { sprite, line, pivot, pos, prev: pos.clone(), key, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd, off: cOff, sim, shading: found?.shading ?? null, masks: found?.masks ?? null };
+    charm = { sprite, line, pivot, pos, prev: pos.clone(), key, side: 1, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd, off: cOff, sim, shading: found?.shading ?? null, masks: found?.masks ?? null };
+    // Face the flank it is actually clipped to, before the first frame draws.
+    orientCharmToFlank(charm);
     if (sim) {
+      // Seat BEFORE settling: the anchor is where the cloth hangs from, so moving
+      // it afterwards would drag a settled charm and it would have to converge a
+      // second time.
+      seatCharmHook(charm);
       // Settle it before the first frame. A charm that popped into view mid-swing
       // read as a glitch rather than as physics, and a still viewer (a card bake)
       // never runs enough frames to converge on its own.
@@ -7175,7 +7960,7 @@ async function buildViewer(
         return;
       }
       // Aim at the sticker-mapped surfaces only — see uv1Meshes.
-      const mk = slotMarkup(drag.slot);
+      const { mk } = slotMarkup(drag.slot);
       const targets = mk && uv1Meshes.length ? uv1Meshes : weaponMeshes;
       // Off the model, slide to the nearest sticker-mapped surface instead of
       // stopping dead — the same courtesy the charm drag already extends. A
@@ -7302,6 +8087,13 @@ async function buildViewer(
       // enclosedSpot; this guards BOTH ways of choosing an anchor, and the
       // direct pointer ray is the one that reaches the magwell.
       if (enclosedSpot(anchor)) return;
+      // NOT constrained to the placement map, deliberately. The map covers 1-17%
+      // of a weapon's surface (measured by ?quads=1 — a USP-S is 1%, an AK 17%),
+      // so refusing every frame that lands outside it would refuse almost every
+      // frame, and a control that ignores most of the gesture reads as broken
+      // rather than as a rule. The drag follows the pointer across the whole
+      // body; the map is applied ONCE, when the placement is resolved on
+      // release. See attachToBody.
       if (surf) {
         dragVel.copy(anchor).sub(dragPrev.lengthSq() ? dragPrev : anchor);
         dragPrev.copy(anchor);
@@ -7310,8 +8102,26 @@ async function buildViewer(
       // moved, so moveCharmSimAnchor does the copy itself. Overwriting the pivot
       // here first leaves it a no-op: the pivot tracks the pointer (and the
       // collider dutifully rebuilds) while the charm stays exactly where it was.
+      // GLIDE, don't step. Everything upstream of here is exact but not
+      // continuous: the ray crosses a triangle edge and the face normal turns,
+      // a frame over a hole is held rather than placed, the hook's own seat
+      // corrects by a different vector each time the surface under the ring
+      // changes. Each is small and none of them is smooth, and together they are
+      // the ticking. Easing the pivot toward the pointer's answer turns all of
+      // them at once into a glide, at the cost of a few tens of milliseconds of
+      // lag that reads as the charm having weight.
+      dragRawAnchor.copy(anchor);
+      dragRawSet = true;
+      anchor = charm.pivot.clone().lerp(anchor, CHARM_DRAG_SMOOTH);
       if (charm.sim) {
         moveCharmSimAnchor(charm, anchor);
+        // Crossing to the other flank mid-drag turns the charm with it.
+        orientCharmToFlank(charm);
+        // The pointer names a point on the SURFACE, and the ring is authored
+        // around the charm's origin — so without this the hook lifts clear of
+        // the gun for the whole drag and lands back on it only when the
+        // placement is re-read on the next mount.
+        seatCharmHook(charm, CHARM_DRAG_SEAT_EASE);
         reseatIfBehind(charm);
       } else charm.pivot.copy(anchor);
       // Where we know the real attachment, report the drag as an offset FROM
@@ -7322,25 +8132,9 @@ async function buildViewer(
       // (x = along the weapon, y = lateral, z = vertical), so dragging up and
       // down moves z — send only (x, y) and vertical drags are silently
       // dropped, which reads as "the charm can only move horizontally".
-      let x: number, y: number, z: number;
-      if (charmAnchor) {
-        // Absolute, to match what the game consumes — undo the recentering to
-        // get back into model space rather than measuring from the anchor.
-        //
-        const off = worldToOffset(anchor.clone().add(center));
-        x = round(off.x, 3);
-        y = round(off.y, 3);
-        z = round(off.z, 3);
-        charm.cy = y;
-        charm.cz = z;
-      } else {
-        const t = (anchor.getComponent(AXIS_L) - cbox.min.getComponent(AXIS_L)) / sizeL;
-        x = round(clamp((t - 0.55) / 0.35, -1, 1), 2);
-        y = round(clamp((anchor.getComponent(AXIS_H) - centerH) / (sizeH * 0.5), -1.2, 1.2), 2);
-        z = round(clamp((anchor.getComponent(AXIS_S) - centerS) / (sizeS * 0.5), -1.2, 1.2), 2);
-        charm.cy = y;
-        charm.cz = z;
-      }
+      const { x, y, z } = placementFor(anchor);
+      charm.cy = y;
+      charm.cz = z;
       if (!charm.sim) {
         const rest = charm.pivot.clone();
         rest.y -= CORD_LEN;
@@ -7370,6 +8164,24 @@ async function buildViewer(
     }
     if (STICKER_LOG && drag.type === "sticker") logGesture();
     if (drag.type === "charm" && charm) {
+      // Land on the pointer's own last answer, not on the eased pivot trailing
+      // behind it — "where you let go is where it goes" is the one property the
+      // smoothing must not cost. Seated at full strength here for the same
+      // reason: this is the placement that gets stored.
+      if (dragRawSet && charm.sim) {
+        moveCharmSimAnchor(charm, dragRawAnchor);
+        orientCharmToFlank(charm);
+        seatCharmHook(charm);
+        reseatIfBehind(charm);
+        const { x, y, z } = placementFor(charm.pivot);
+        if (x !== lastCharmX || y !== lastCharmY || z !== lastCharmZ) {
+          lastCharmX = x;
+          lastCharmY = y;
+          lastCharmZ = z;
+          opts?.onCharmPlaced?.(x, y, z);
+        }
+      }
+      dragRawSet = false;
       // Before the kick: dropping the pop puts the rig back at its resting world
       // scale, and the kick below is converted through exactly that.
       setCharmGrabbed(charm, false);
@@ -8922,6 +9734,89 @@ async function buildViewer(
         gapMm: gap,
       };
     },
+    probeCharmSeat(): CharmSeatProbe | null {
+      const sim = charm?.sim;
+      if (!charm || !sim?.space) return null;
+      // The PINNED nodes, not the whole rig: they are what holds the ring, and
+      // unlike the free nodes they do not depend on the cloth having settled, so
+      // this measures the same thing whether it is called on the first frame or
+      // the hundredth.
+      const near = hookContact(charm);
+      const drawn = hookContact(charm, "pos");
+      const v = new THREE.Vector3();
+      let ring = 0;
+      for (let n = 0; n < sim.model.static; n++) {
+        v.set(sim.anchor[n * 3], sim.anchor[n * 3 + 1], sim.anchor[n * 3 + 2]).sub(charmClipLocal);
+        ring = Math.max(ring, v.length() * charmWorldScale);
+      }
+      const pivotNear = nearestOnWeapon(charm.pivot);
+      // Where the charm's MESH is, as opposed to where its rig is. The two are
+      // the same claim right up until they are not: the seat can be measured
+      // perfect off the pinned nodes while nothing is drawn, which is exactly
+      // what the Dual Berettas did in the side-by-side layout. So report the
+      // rendered bounds and whether they are in the scene at all.
+      const box = new THREE.Box3().setFromObject(charm.sprite);
+      const empty = box.isEmpty();
+      const size = empty ? new THREE.Vector3() : box.getSize(new THREE.Vector3());
+      const mid = empty ? new THREE.Vector3() : box.getCenter(new THREE.Vector3());
+      let inScene = false;
+      for (let o: import("three").Object3D | null = charm.sprite; o; o = o.parent) {
+        if (o === scene) inScene = true;
+      }
+      let visible = true;
+      charm.sprite.traverse((n) => {
+        if (!n.visible) visible = false;
+      });
+      // WHERE ON SCREEN. "In the scene, visible, correctly sized, seated on the
+      // gun" is every claim this probe could make and still describe a charm
+      // nobody can see — the frame is solved from the weapon's bounds, and
+      // anything hanging outside them is simply not photographed. NDC, so it
+      // needs no canvas size: inside [-1,1] on both axes is in frame, and z past
+      // 1 is behind the far plane.
+      // THE GAP YOU CAN SEE. The hook biting the surface is a claim about four
+      // pinned nodes at the top of the ring; the charm is a 30mm-thick object
+      // hanging off them, and "does the BODY touch the gun" is a different
+      // question that nothing here was asking. Measured off the drawn bounding
+      // box's corners, so it needs nothing from the cloth model.
+      let bulkGap = Infinity;
+      if (!empty) {
+        const c8 = new THREE.Vector3();
+        for (const sx of [box.min.x, box.max.x]) {
+          for (const sy of [box.min.y, box.max.y]) {
+            for (const sz of [box.min.z, box.max.z]) {
+              const n2 = nearestOnWeapon(c8.set(sx, sy, sz));
+              if (n2) bulkGap = Math.min(bulkGap, n2.dist);
+            }
+          }
+        }
+      }
+      const ndc = empty ? null : mid.clone().project(camera);
+      return {
+        hookNodes: sim.model.static,
+        hookGapMm: near ? near.gap * 1000 : 0,
+        hookDrawnMm: drawn ? drawn.gap * 1000 : 0,
+        bulkGapMm: Number.isFinite(bulkGap) ? bulkGap * 1000 : null,
+        pivotGapMm: pivotNear ? pivotNear.dist * 1000 : 0,
+        ringMm: ring * 1000,
+        spriteMm: { x: size.x * 1000, y: size.y * 1000, z: size.z * 1000 },
+        /** Distance from the charm's drawn bulk to its own pivot, in mm. The
+         *  number that catches a mesh left behind while the rig moved on. */
+        spriteToPivotMm: empty ? null : mid.distanceTo(charm.pivot) * 1000,
+        inScene,
+        visible,
+        pivotWorld: { x: charm.pivot.x, y: charm.pivot.y, z: charm.pivot.z },
+        bulkWorld: empty ? null : { x: mid.x, y: mid.y, z: mid.z },
+        weaponBox: (() => {
+          const b = new THREE.Box3();
+          for (const m of weaponMeshes) b.expandByObject(m);
+          return b.isEmpty()
+            ? null
+            : { min: { x: b.min.x, y: b.min.y, z: b.min.z }, max: { x: b.max.x, y: b.max.y, z: b.max.z } };
+        })(),
+        ndc: ndc ? { x: ndc.x, y: ndc.y, z: ndc.z } : null,
+        inFrame: !!ndc && Math.abs(ndc.x) <= 1 && Math.abs(ndc.y) <= 1 && ndc.z <= 1,
+      };
+    },
     probePlacement() {
       const anchorJson = (CHARM_ANCHORS as Record<string, { keychain: number[] } | undefined>)[model];
       return {
@@ -9005,6 +9900,127 @@ async function buildViewer(
           poseXform.decompose(new THREE.Vector3(), new THREE.Quaternion(), s);
           return { x: s.x, y: s.y, z: s.z };
         })(),
+        /**
+         * Where a charm with this placement actually CLIPS, and how far that
+         * spot is from the weapon's own surface.
+         *
+         * `gapMm > 0` is a charm hanging in air — the failure this whole file
+         * has hit from three directions (a formula pivot past the muzzle, an
+         * anchor read in the wrong space, an offset that came from the game
+         * rather than from a drag). It is measured against the rendered
+         * triangles, so it needs no ground truth to be trustworthy: either the
+         * clip point is on the gun or it isn't.
+         */
+        attachment(c: Partial<CharmPlacement> = {}) {
+          const raw = resolveCharmPivot({ image: "", x: null, y: null, z: null, ...c });
+          const p = charmPivot({ image: "", x: null, y: null, z: null, ...c });
+          const n = nearestOnWeapon(p);
+          const auth = nearestOnCharmSurface(p);
+          const rawMesh = nearestOnWeapon(raw);
+          const rawAuth = nearestOnCharmSurface(raw);
+          return {
+            pivot: { x: p.x, y: p.y, z: p.z },
+            gapMm: n ? n.dist * 1000 : null,
+            authoredMm: auth ? auth.dist * 1000 : null,
+            /** How far seating MOVED this placement. The cost side of the trade:
+             *  the authored surface is the right place for a charm, and getting
+             *  there is a relocation the user did not ask for. */
+            snapMoveMm: raw.distanceTo(p) * 1000,
+            /** …and how much of that the authored surface added over the nearest
+             *  triangle. This is the number a relocation cap has to admit. */
+            authoredCostMm: rawMesh && rawAuth ? (rawAuth.dist - rawMesh.dist) * 1000 : null,
+            /** Behind the nearest face = buried in the shell, not floating. */
+            buried: n ? p.clone().sub(n.point).dot(n.normal) < 0 : null,
+            /** Model length in mm, so a gap can be read as a fraction of it. */
+            lengthMm: sizeL * 1000,
+            /**
+             * How far the charm moves when its own placement is read back —
+             * emit the offset for this pivot, then resolve that offset again.
+             *
+             * A drag does exactly this on every pointermove: it reports a world
+             * point as an offset and the viewer immediately re-resolves it. Any
+             * correction that is not idempotent creeps the charm a little
+             * further on each pass, and a snap is a correction. Must be ~0.
+             */
+            /** What a drag would STORE for this pivot. A component sitting
+             *  exactly on its clamp is an encoding that cannot express where the
+             *  seat put the charm, which is a creep no amount of precision
+             *  fixes. */
+            emitted: placementFor(p),
+            /** WHICH WAY it creeps, in mm. A magnitude says a placement moves;
+             *  the axes say what moved it — a single axis is a clamp or an
+             *  encoding step, three is a different surface being chosen. */
+            reReadDelta: (() => {
+              const once = charmPivot({ image: "", ...placementFor(p) });
+              const twice = charmPivot({ image: "", ...placementFor(once) });
+              const d = twice.clone().sub(once).multiplyScalar(1000);
+              return { x: d.x, y: d.y, z: d.z };
+            })(),
+            reReadMm: (() => {
+              // Through placementFor, which IS what the drag stores — not
+              // worldToOffset directly. A weapon with no anchor writes body
+              // fractions, and emitting inches at it would measure a mismatch
+              // this rig invented rather than the one a drag would hit.
+              //
+              // The SECOND pass is the one that counts. The first can legitimately
+              // move the charm: a placement outside what the encoding can express
+              // comes back clamped, once. What must not happen is that it keeps
+              // moving — that is a drag you cannot land.
+              const once = charmPivot({ image: "", ...placementFor(p) });
+              return charmPivot({ image: "", ...placementFor(once) }).distanceTo(once) * 1000;
+            })(),
+          };
+        },
+        /**
+         * Corner-to-mesh distance for every authored charm quad on the body
+         * being rendered — the check that has to pass before seating anything on
+         * them, and the reason attachToBody trusts them.
+         *
+         * The four UNIQUE corners per quad: the soup is a triangle strip, so the
+         * 5th and 6th vertices of each 18-float block repeat two of the first
+         * three. Counting the repeats would weight two corners double for no
+         * reason.
+         */
+        charmSurfaceFit() {
+          const xyz = charmSurfaceTris;
+          if (!xyz) return null;
+          const p = new THREE.Vector3();
+          const ds: number[] = [];
+          for (let q = 0; q + 17 < xyz.length; q += 18) {
+            for (const o of [q, q + 3, q + 6, q + 15]) {
+              p.set(xyz[o], xyz[o + 1], xyz[o + 2]);
+              const n = nearestOnWeapon(p);
+              if (n) ds.push(n.dist * 1000);
+            }
+          }
+          if (!ds.length) return null;
+          ds.sort((a, b) => a - b);
+          // HOW MUCH OF THE GUN ACCEPTS A CHARM. The map is what a drag is now
+          // allowed to move within, so its coverage is a usability number, not
+          // a curiosity: a map covering a few percent of the body is a drag that
+          // refuses almost everywhere, which reads as a broken control rather
+          // than as a rule. Sampled off the rendered triangles' centroids, with
+          // the same slack the drag itself allows.
+          const { mid, rad } = weaponTriangleCache();
+          const probe = new THREE.Vector3();
+          let inside = 0;
+          let sampled = 0;
+          const stride = Math.max(1, Math.floor(rad.length / 2000));
+          for (let t = 0; t < rad.length; t += stride) {
+            probe.set(mid[t * 3], mid[t * 3 + 1], mid[t * 3 + 2]);
+            sampled++;
+            const n = nearestOnCharmSurface(probe);
+            if (n && n.dist <= sizeL * 0.004) inside++;
+          }
+          return {
+            quads: Math.floor(xyz.length / 18),
+            medianMm: ds[Math.floor(ds.length / 2)],
+            p90Mm: ds[Math.floor(ds.length * 0.9)],
+            maxMm: ds[ds.length - 1],
+            coverage: sampled ? inside / sampled : 0,
+            candidates: charmSurfaceCandidates(),
+          };
+        },
         /** Anchor + body box in raw world units, to compare without conversion. */
         anchorWorld: charmAnchor ? { x: charmAnchor.x, y: charmAnchor.y, z: charmAnchor.z } : null,
         worldBox: {

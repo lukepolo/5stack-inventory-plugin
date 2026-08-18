@@ -50,6 +50,15 @@ export interface DevFlag {
 
 export const FLAGS: DevFlag[] = [
   {
+    name: "charmquads",
+    label: "Authored charm surfaces",
+    hint: "Seat a charm on the model's own KeychainMarkup quads. Off falls back to the nearest triangle anywhere on the weapon, which is where charms used to float.",
+    dflt: true,
+    remount: true,
+    group: "3D viewer",
+    audience: "developer",
+  },
+  {
     name: "patchboxes",
     label: "Patch footprints",
     hint: "Paint every patch position as a flat colour instead of its art — slot 1 red, 2 green, 3 blue.",

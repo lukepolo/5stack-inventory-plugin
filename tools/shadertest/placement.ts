@@ -144,11 +144,377 @@ const REPRESENTATIVE = [
   "awp", "mag7", "m249", "mp5sd",
 ];
 
+/**
+ * ?attach=1 — does the charm actually touch the gun?
+ *
+ * Separate from the suite above because it asks a different KIND of question.
+ * Everything else here is about the offset SPACE: is the conversion linear, does
+ * it round-trip, does the model measure the length a real one does. Those can
+ * all be right while the thing on screen hangs in mid-air, because the offset a
+ * placement carries need not correspond to any point on the weapon — the game
+ * clamps a charm to the surface, and until now we did not.
+ *
+ * So this measures the rendered result and nothing else: resolve the pivot the
+ * viewer would use, then take the distance to the nearest weapon triangle. No
+ * conversion is trusted, no invariant of ours is asserted. A gap is a gap.
+ *
+ *   unplaced       what you get the moment a charm is added (the `keychain`
+ *                  attachment) — must land ON the weapon or every new charm
+ *                  floats
+ *   from the game  offsets authored elsewhere: a Steam-synced item, an inspect
+ *                  link, our own emitted offset re-read through a `cal` that is
+ *                  derived rather than measured. Probed by walking away from the
+ *                  anchor in each axis, which is what a real placement does.
+ */
+const ATTACH_CASES: { label: string; d?: [number, number, number] }[] = [
+  { label: "unplaced" },
+  { label: "anchor" , d: [0, 0, 0] },
+  { label: "+2in fwd", d: [2, 0, 0] },
+  { label: "-2in aft", d: [-2, 0, 0] },
+  { label: "+1in left", d: [0, 1, 0] },
+  { label: "+2in up", d: [0, 0, 2] },
+  { label: "-2in down", d: [0, 0, -2] },
+  { label: "+6in fwd", d: [6, 0, 0] },
+  // Off the model entirely. Nothing should produce this, which is the point:
+  // the guarantee has to hold for the placement we did not anticipate, not only
+  // for the ones we generate ourselves.
+  { label: "40in away", d: [40, 20, 20] },
+];
+
+/**
+ * The model's authored charm surfaces, the way the app gets them.
+ *
+ * Straight off the real endpoint through the rig's /api proxy — not a fixture.
+ * A fixture would let the extraction regress (or the field get dropped in the
+ * client mapper, which is exactly where these sat unused) while every number
+ * below stayed green.
+ */
+async function charmSurfacesFor(model: string) {
+  try {
+    const r = await fetch(`/api/catalog/sticker-bounds/${encodeURIComponent(model)}`);
+    if (!r.ok) return [];
+    return ((await r.json()) as { charmQuads?: unknown[] }).charmQuads ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * ?quads=1 — do the authored charm surfaces line up with the mesh we render?
+ *
+ * The prerequisite for every other number here. The quads are authored in the
+ * GLB's own frame while the viewer renders a POSED body, and the entire history
+ * of charm placement is spaces that looked right until they were measured
+ * against something outside our own code. So: distance from each quad corner to
+ * the nearest rendered triangle, which no convention of ours can flatter.
+ *
+ * `seated` is the other half: where the previewed charm actually ends up, as a
+ * distance to the nearest authored surface. It reads as the standing clearance
+ * (sizeL * 0.003) rather than as zero, because the seat deliberately holds the
+ * pivot a hair off the shell — a charm sunk into the metal is its own bug.
+ */
+async function quadSweep(models: string[]) {
+  const host = document.createElement("div");
+  host.style.cssText = "width:320px;height:220px;position:fixed;left:-9999px;top:0";
+  document.body.appendChild(host);
+  const progress = document.createElement("div");
+  progress.className = "dim";
+  el.appendChild(progress);
+  line("fit = authored quad corner -> nearest rendered triangle. Small means the quads are on the gun.", "dim");
+  line("anchor = the keychain attachment's own distance to the nearest authored surface.", "dim");
+  line("");
+  let ok = 0, seen = 0;
+  for (const model of models) {
+    progress.textContent = `… ${model}`;
+    try {
+      const charmSurfaces = await charmSurfacesFor(model);
+      const handle = await Promise.race([
+        mountViewer(host, model, { paintMaterial: null, interactive: false, still: true, charmSurfaces } as any),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("mount timed out after 20s")), 20000)),
+      ]);
+      const probe = handle.probePlacement();
+      const fit = probe.charmSurfaceFit();
+      const a = probe.attachment();
+      handle.dispose();
+      seen++;
+      if (!fit) {
+        line(`${model.padEnd(16)} no authored surfaces (quads=${charmSurfaces.length})`, "warn");
+        continue;
+      }
+      // A quad is a flat patch on a curved shell, so its corners overhang by a
+      // little by construction. The MEDIAN is the claim; a fat p90 is a shape
+      // difference, not a space error, and a space error moves the median.
+      const good = fit.medianMm < 6;
+      if (good) ok++;
+      line(`${model.padEnd(16)} quads=${String(fit.quads).padStart(3)} fit median=${fit.medianMm.toFixed(2)}mm ` +
+        `p90=${fit.p90Mm.toFixed(2)}mm max=${fit.maxMm.toFixed(2)}mm  ` +
+        `cover=${(fit.coverage * 100).toFixed(0)}% ` +
+        `seated=${a.authoredMm == null ? "?" : a.authoredMm.toFixed(1) + "mm"}`,
+        good ? "pass" : "fail");
+      // Which reading of the quad frame actually lands. Printed always, not only
+      // on a failure: the one that wins has to keep winning across the catalogue,
+      // and a silent second place is how a transform gets "fixed" on one weapon.
+      if (fit.candidates) {
+        const ranked = Object.entries(fit.candidates).sort((x, y) => x[1] - y[1]);
+        line(`${"".padEnd(16)} ` + ranked.map(([k, v]) => `${k}=${v.toFixed(1)}`).join("  "), "dim");
+      }
+    } catch (e: any) {
+      line(`${model.padEnd(16)} ERROR ${String(e?.message ?? e).slice(0, 90)}`, "warn");
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  progress.remove();
+  host.remove();
+  line("");
+  line(`${ok}/${seen} models have authored surfaces sitting on the mesh`, ok === seen ? "pass" : "fail");
+}
+
+async function attachSweep(models: string[]) {
+  const host = document.createElement("div");
+  host.style.cssText = "width:320px;height:220px;position:fixed;left:-9999px;top:0";
+  document.body.appendChild(host);
+  const progress = document.createElement("div");
+  progress.className = "dim";
+  el.appendChild(progress);
+  line("gap = distance from the charm's clip point to the nearest weapon triangle.", "dim");
+  line("AIR = hanging off the model. in = buried inside the shell (fine — it is still on the gun).", "dim");
+  line("");
+  let air = 0, crept = 0, cases = 0;
+  for (const model of models) {
+    progress.textContent = `… ${model}`;
+    try {
+      // WITH the authored surfaces, because that is what the app mounts — the
+      // gap this sweep measures is only the shipped one if the seat has the same
+      // data to seat against.
+      const charmSurfaces = await charmSurfacesFor(model);
+      const handle = await Promise.race([
+        mountViewer(host, model, { paintMaterial: null, interactive: false, still: true, charmSurfaces } as any),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("mount timed out after 20s")), 20000)),
+      ]);
+      const probe = handle.probePlacement();
+      const cands = (probe as any).anchorCandidates?.();
+      if (cands) {
+        line(`${model.padEnd(16)} ` + Object.entries(cands)
+          .map(([k, c]: any) => `${k}=${c.gapMm == null ? "?" : c.gapMm.toFixed(1)}`).join("  "), "dim");
+      }
+      const anchor = probe.anchorAsOffset;
+      const parts: string[] = [];
+      let worst = 0;
+      for (const c of ATTACH_CASES) {
+        const off = !c.d
+          ? {}
+          : anchor
+            ? { x: anchor.x + c.d[0], y: anchor.y + c.d[1], z: anchor.z + c.d[2] }
+            : { x: c.d[0], y: c.d[1], z: c.d[2] };
+        const a = probe.attachment(off);
+        cases++;
+        const g = a.gapMm ?? Infinity;
+        // Contact is judged as a FRACTION of the weapon, not in millimetres: 4mm
+        // is invisible on an AWP and obvious on a Glock. The bar is twice the
+        // lift a snapped anchor is deliberately given (sizeL * 0.003), so a
+        // correctly attached charm reads as contact with margin to spare.
+        const floating = !a.buried && g > Math.max(1, a.lengthMm * 0.006);
+        if (floating) { air++; worst = Math.max(worst, g); }
+        // A snap that is not idempotent creeps the charm on every pointermove.
+        const creeps = a.reReadMm > Math.max(0.5, a.lengthMm * 0.002);
+        if (creeps) { crept++; worst = Math.max(worst, a.reReadMm); }
+        parts.push(`${c.label}=${g === Infinity ? "?" : g.toFixed(1)}${a.buried ? "in" : floating ? "AIR" : ""}` +
+          (creeps ? `/CREEP${a.reReadMm.toFixed(1)}` : ""));
+        // What seating COST this placement: how far it moved, and how much of
+        // that the authored surface added over the nearest triangle. The second
+        // number is what any relocation cap has to admit, so it is measured
+        // rather than guessed at.
+        if (creeps) {
+          const d = a.reReadDelta;
+          line(`${"".padEnd(16)} ${c.label} creep axes = ` +
+            `${d.x.toFixed(2)}, ${d.y.toFixed(2)}, ${d.z.toFixed(2)} mm  ` +
+            `emitted = ${a.emitted.x}, ${a.emitted.y}, ${a.emitted.z}`, "warn");
+        }
+        if (c.label === "unplaced") {
+          line(`${"".padEnd(16)} seat moved ${a.snapMoveMm.toFixed(1)}mm` +
+            (a.authoredCostMm == null ? "" : `, authored cost ${a.authoredCostMm.toFixed(1)}mm`), "dim");
+        }
+      }
+      // Cost matters: a drag re-resolves the pivot on every pointermove, and the
+      // snap is a closest-point query over the whole weapon.
+      const t0 = performance.now();
+      for (let i = 0; i < 20; i++) probe.attachment({ x: (anchor?.x ?? 0) + i * 0.01 });
+      // Nearly all of it is liftOutOfBody's six full-mesh raycasts, which
+      // predate the snap — measured at 0.7-11.8ms of it against 0.1-0.2ms for
+      // the closest-point query. Worth watching: it is paid per pointermove.
+      const us = ((performance.now() - t0) / 20) * 1000;
+      handle.dispose();
+      line(`${model.padEnd(16)} ${parts.join("  ")}  [${us.toFixed(0)}µs/placement]`, worst > 1 ? "fail" : "pass");
+    } catch (e: any) {
+      line(`${model.padEnd(16)} ERROR ${String(e?.message ?? e).slice(0, 90)}`, "warn");
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  progress.remove();
+  host.remove();
+  line("");
+  line(`${cases - air}/${cases} placements touch the weapon`, air ? "fail" : "pass");
+  line(`${cases - crept}/${cases} survive a read-back without moving`, crept ? "fail" : "pass");
+}
+
+/**
+ * ?hook=1 — is the charm's HOOK on the weapon, or only its pivot?
+ *
+ * A separate question from ?attach=1 and the one you can actually SEE. The pivot
+ * is the charm's origin and the ring is authored AROUND that origin, so lifting
+ * the pivot clear of the surface lifts the ring with it: the gap shows up at the
+ * hook, which is the part touching the gun in every screenshot anyone looks at.
+ *
+ * Reported as a SIGNED distance. Negative is the ring biting into the shell,
+ * which is what a clip looks like; positive is daylight.
+ */
+const HOOK_CHARMS = [
+  "/images/kc_missinglink_ava_36bc006a.webp",       // owns its own model
+  "/images/kc_wpn_ak_jelly_7b0873e2.webp",          // Die-cast AK
+  "/images/kc_wpn_usp_jewel_3595a16c.webp",         // Glamour Shot
+  "/images/kc_missinglink_ancientcurse_5d7da72d.webp",
+];
+const HOOK_WEAPONS = ["ak47", "awp", "glock", "m4a1", "mac10", "deagle"];
+
+/**
+ * `live` mounts the way the interactive viewer does (`still: false`), which on
+ * the Dual Berettas is a DIFFERENT MODEL: the side-by-side layout is synthesised
+ * in bakePose by giving every `*_l` bone its `*_r` twin's pose, so the geometry
+ * the charm has to sit on is not the geometry the card bake shows. Everything
+ * here ran `still: true` and reported the elite seated 4/4 — while the layout
+ * the modal actually renders had no charm on it at all.
+ */
+async function hookSweep(models: string[], charms: string[], live = false, cases = false) {
+  const host = document.createElement("div");
+  host.style.cssText = "width:320px;height:220px;position:fixed;left:-9999px;top:0";
+  document.body.appendChild(host);
+  const progress = document.createElement("div");
+  progress.className = "dim";
+  el.appendChild(progress);
+  line("hook = signed distance from the RING (the pinned nodes) to the weapon surface.");
+  line("negative = biting into the shell, which is what clipped-on looks like. positive = daylight.", "dim");
+  line("");
+  let seated = 0, total = 0;
+  for (const model of models) {
+    for (const image of charms) {
+      progress.textContent = `… ${model} / ${image.split("/").pop()}`;
+      try {
+        const handle = await Promise.race([
+          mountViewer(host, model, {
+            kind: "weapon", interactive: false, still: !live,
+            charmSurfaces: await charmSurfacesFor(model),
+            charm: { image, x: null, y: null, z: null, seed: 1 },
+          } as any),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("mount timed out")), 25000)),
+        ]);
+        // The charm is fetched AFTER the weapon mounts and is deliberately not
+        // awaited by mountViewer — probing before it lands measures nothing.
+        await (handle as any).charmReady?.();
+        // WALK THE PLACEMENTS, not just the default one. Hook seating had only
+        // ever been measured where an unplaced charm lands, and that is the one
+        // placement the user never sees: they drag it somewhere. Re-anchoring
+        // through setCharm rather than remounting is both faster and the path a
+        // drag actually takes.
+        if (cases) {
+          const anchor = handle.probePlacement().anchorAsOffset;
+          for (const c of ATTACH_CASES) {
+            const off = !c.d
+              ? { x: null, y: null, z: null }
+              : anchor
+                ? { x: anchor.x + c.d[0], y: anchor.y + c.d[1], z: anchor.z + c.d[2] }
+                : { x: c.d[0], y: c.d[1], z: c.d[2] };
+            await handle.setCharm({ image, seed: 1, ...off });
+            // The cloth needs frames to settle onto a moved anchor.
+            await new Promise((r) => setTimeout(r, 260));
+            const s2 = handle.probeCharmSeat();
+            total++;
+            if (!s2) { line(`${model.padEnd(8)} ${c.label.padEnd(12)} no rig`, "warn"); continue; }
+            const ok2 = s2.hookDrawnMm <= 0.5;
+            if (ok2) seated++;
+            line(`${model.padEnd(8)} ${c.label.padEnd(12)} drawn=${s2.hookDrawnMm.toFixed(2)}mm ` +
+              `anchor=${s2.hookGapMm.toFixed(2)}mm pivot=${s2.pivotGapMm.toFixed(2)}mm ` +
+              `BULK=${s2.bulkGapMm == null ? "-" : s2.bulkGapMm.toFixed(2) + "mm"}`,
+              ok2 ? "pass" : "fail");
+          }
+          handle.dispose();
+          continue;
+        }
+        const seat = handle.probeCharmSeat();
+        handle.dispose();
+        total++;
+        if (!seat) { line(`${model.padEnd(8)} ${image.split("/").pop()!.padEnd(38)} no rig`, "warn"); continue; }
+        // Touching or biting is seated. The bar is a hair of daylight, in mm,
+        // because a hook is a real object of a fixed size — unlike the pivot
+        // check, this one does not scale with the weapon.
+        // Judged on what is DRAWN. The anchor-based number is kept beside it
+        // because the two disagreeing is the whole diagnosis: a seat that holds
+        // and a cloth that pulls away from it look identical in every other
+        // measurement here.
+        const ok = seat.hookDrawnMm <= 0.5;
+        if (ok) seated++;
+        line(`${model.padEnd(8)} ${image.split("/").pop()!.padEnd(38)} drawn=${seat.hookDrawnMm.toFixed(2)}mm ` +
+          `anchor=${seat.hookGapMm.toFixed(2)}mm ` +
+          `pivot=${seat.pivotGapMm.toFixed(2)}mm ring=${seat.ringMm.toFixed(2)}mm nodes=${seat.hookNodes}`,
+          ok ? "pass" : "fail");
+        // The rig being seated is not the charm being VISIBLE — see the note on
+        // CharmSeatProbe.spriteMm. Reported every run so "seated 4/4" can never
+        // again be printed about a weapon that draws no charm.
+        line(`${"".padEnd(8)} ${"".padEnd(38)} drawn=${seat.spriteMm.x.toFixed(0)}x${seat.spriteMm.y.toFixed(0)}x${seat.spriteMm.z.toFixed(0)}mm ` +
+          `offPivot=${seat.spriteToPivotMm == null ? "EMPTY" : seat.spriteToPivotMm.toFixed(1) + "mm"} ` +
+          `scene=${seat.inScene} visible=${seat.visible} ` +
+          `ndc=${seat.ndc ? `${seat.ndc.x.toFixed(2)},${seat.ndc.y.toFixed(2)},${seat.ndc.z.toFixed(2)}` : "-"} ` +
+          `inFrame=${seat.inFrame}`, seat.inFrame ? "dim" : "warn");
+        const mm = (v: number) => (v * 1000).toFixed(0);
+        if (seat.weaponBox && seat.bulkWorld) {
+          line(`${"".padEnd(8)} ${"".padEnd(38)} pivot=(${mm(seat.pivotWorld.x)},${mm(seat.pivotWorld.y)},${mm(seat.pivotWorld.z)}) ` +
+            `bulk=(${mm(seat.bulkWorld.x)},${mm(seat.bulkWorld.y)},${mm(seat.bulkWorld.z)}) ` +
+            `weapon=(${mm(seat.weaponBox.min.x)}..${mm(seat.weaponBox.max.x)}, ` +
+            `${mm(seat.weaponBox.min.y)}..${mm(seat.weaponBox.max.y)}, ` +
+            `${mm(seat.weaponBox.min.z)}..${mm(seat.weaponBox.max.z)})mm`, "dim");
+        }
+      } catch (e: any) {
+        total++;
+        line(`${model.padEnd(8)} ${image.split("/").pop()!.padEnd(38)} ERROR ${String(e?.message ?? e).slice(0, 60)}`, "fail");
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  progress.remove();
+  host.remove();
+  line("");
+  line(`${seated}/${total} charms have their hook ON the weapon`, seated === total ? "pass" : "fail");
+}
+
 (async () => {
   const qs = new URLSearchParams(location.search);
   const all = Object.keys(CHARM_ANCHORS as Record<string, unknown>).sort();
   const one = qs.get("model");
   const models = one ? [one] : qs.get("all") ? all : REPRESENTATIVE.filter((m) => all.includes(m));
+  if (qs.get("hook")) {
+    line("charm hook seating — is the RING touching the gun?");
+    line("");
+    await hookSweep(
+      one ? [one] : HOOK_WEAPONS,
+      qs.get("charm") ? [qs.get("charm")!] : HOOK_CHARMS,
+      !!qs.get("live"),
+      !!qs.get("cases"),
+    );
+    return;
+  }
+  if (qs.get("quads")) {
+    line("authored charm surfaces — are the model's own quads ON the rendered mesh?");
+    line("");
+    await quadSweep(one ? [one] : models);
+    return;
+  }
+  if (qs.get("attach")) {
+    // `elite` has no anchor at all, so it is the case the fallback path exists
+    // for — include it unless a single model was asked for.
+    line("charm attachment sweep — is the previewed charm ON the weapon?");
+    line("");
+    await attachSweep(one ? [one] : [...models, "elite"]);
+    return;
+  }
   line(`probing ${models.length}${one || qs.get("all") ? "" : ` of ${all.length}`} models with keychain anchors…`);
   if (!one && !qs.get("all")) line("(representative subset — add ?all=1 for every model)", "dim");
   line("");

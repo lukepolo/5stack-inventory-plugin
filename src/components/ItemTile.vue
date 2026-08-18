@@ -8,14 +8,18 @@
 // Steam-synced items are read-only server-side, so they get a Duplicate action
 // where crafted items get Edit — never both.
 import { computed, inject } from "vue";
-import { Check, Clock, Link2, Loader2, RefreshCw } from "lucide-vue-next";
+import { Check, Clock, Loader2 } from "lucide-vue-next";
 import type { InventoryItem } from "../api";
 import ItemArt from "./ItemArt.vue";
-import { ART_FADE_B, attachmentsOf, CARD_ART, glowStyle, isAgentArt, isReadOnly, STEAM_BLUE, weaponName } from "../itemVisuals";
-import TeamDots from "./TeamDots.vue";
+import { ART_FADE_B, CARD_ART, glowStyle, isAgentArt, weaponName } from "../itemVisuals";
 import ItemName from "./ItemName.vue";
 import TileActions from "./TileActions.vue";
 import WearBar from "./WearBar.vue";
+import PriceTag from "./PriceTag.vue";
+import ItemBadges from "./ItemBadges.vue";
+import SlotStatus from "./SlotStatus.vue";
+import { PRICE_WINDOW_LABEL } from "../api";
+import { wearTier } from "../itemVisuals";
 
 const props = withDefaults(
   defineProps<{
@@ -53,9 +57,39 @@ const props = withDefaults(
      * third existed. A 68px row shows six, and the name stops truncating.
      */
     row?: boolean;
+    /**
+     * Draw this item's estimated value.
+     *
+     * A prop rather than "render it whenever `inst.price` exists": money is a
+     * mode the player switches on in the header, and a tile has no business
+     * reading that preference itself. The price rides along on every item
+     * regardless — the toggle decides whether it is shown, not whether it is
+     * fetched.
+     */
+    showPrice?: boolean;
+    /** Prices are still on their way. Distinct from "this item has no price":
+     *  one is temporary and worth a placeholder, the other is permanent and
+     *  worth nothing at all. */
+    pricePending?: boolean;
+    /** Which market the prices came from, for the "why is this blank" caption.
+     *  A name, not a lookup: the tile has no business knowing the settings. */
+    priceSource?: string;
   }>(),
-  { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false, row: false },
+  { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false, row: false, showPrice: false, pricePending: false, priceSource: "the price feed" },
 );
+
+/** Always "est." and always says which window it came from. A bare "$41" on a
+ *  skin implies a precision a whole-wear-bracket average does not have. */
+const priceTitle = computed(() => {
+  if (props.inst.price) {
+    return `Rough estimate — ${PRICE_WINDOW_LABEL[props.inst.price.window]} for ${props.inst.price.marketHashName}. Not a sale price.`;
+  }
+  // Say WHY it is blank. "No price" and "pricing is broken" look identical on a
+  // card, and the wear bracket is usually the answer: a market lists a finish
+  // per bracket, and the beaten-up end of the range often has no listing at all.
+  const bracket = props.inst.wear != null ? ` (${wearTier(props.inst.wear)})` : "";
+  return `No ${props.priceSource} listing for this item${bracket}.`;
+});
 
 const emit = defineEmits<{
   (e: "view3d" | "inspect" | "edit" | "duplicate" | "remove"): void;
@@ -113,8 +147,6 @@ const queued = computed(() => !!art?.queuedIds.value.has(props.inst.id));
 // because the skin's textures aren't extracted yet. Says so rather than
 // implying the queue is merely slow.
 const preparing = computed(() => !!art?.assetsPending.value && !baking.value);
-const readOnly = computed(() => isReadOnly(props.inst));
-const attachments = computed(() => attachmentsOf(props.inst));
 const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.team));
 </script>
 
@@ -184,91 +216,57 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
         </div>
         <div class="flex items-center gap-1.5">
           <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
-          <!-- ST™ and the chips are ONE centred group. Apart, each aligned
-               itself against a row whose height is set by the tallest chip, so
-               the badge floated relative to them — and the taller charm chip
-               below makes any such gap worse. -->
-          <span v-if="inst.stattrak || attachments.length" class="flex flex-none items-center gap-1.5">
-            <span v-if="inst.stattrak" class="font-mono text-f8 leading-none text-[#f2c14e]">ST™</span>
-            <!-- The charm is drawn LARGER and last, behind a hairline: there is
-                 only ever one, it is picked on its own, and at sticker size in a
-                 row of four it read as a fifth sticker. -->
-            <span v-if="attachments.length" class="flex items-center gap-0.5">
-              <img
-                v-for="(a, k) in attachments.slice(0, 4)"
-                :key="k"
-                :src="a.image ?? undefined"
-                :title="a.name"
-                alt=""
-                :class="a.kind === 'charm'
-                  ? 'ml-0.5 h-5 w-5 flex-none border-l border-border/60 pl-1 object-contain'
-                  : 'h-3.5 w-3.5 flex-none object-contain'"
-              />
-            </span>
-          </span>
+          <ItemBadges :inst="inst" :max="4" />
         </div>
         <!-- Inline, not stacked: the stacked variant spends a second line on
              the float/seed readout, which is the difference between a row that
              fits the budget below and one that doesn't. -->
-        <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" inline compact class="mt-1" />
+        <!-- The row has one line under the name and the wear bar owns it, so the
+             price shares that line rather than claiming a third: at 68px tall
+             there is no room for another, and the two facts belong together. -->
+        <div class="mt-1 flex items-center gap-2">
+          <PriceTag
+            v-if="showPrice"
+            class="flex-none"
+            size="xs"
+            :value="inst.price?.value"
+            :pending="pricePending"
+            :missing="!inst.price"
+            :title="priceTitle"
+          />
+          <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" inline compact class="min-w-0 flex-1" />
+        </div>
       </div>
-      <span class="relative z-[2] flex flex-none items-center gap-1.5">
-        <TeamDots :teams="equippedTeams" />
-        <Link2
-          v-if="attachedName"
-          class="h-3 w-3 flex-none text-[color:var(--acc)]"
-          :title="'Applied to ' + attachedName"
-        />
-        <RefreshCw
-          v-if="readOnly"
-          class="h-3 w-3 flex-none"
-          :style="{ color: STEAM_BLUE }"
-          title="Synced from your Steam inventory (read-only)"
-        />
-      </span>
+      <SlotStatus inline :teams="equippedTeams" :inst="inst" :attached-name="attachedName" />
     </template>
 
     <!-- ============ CARD ============ -->
     <template v-else>
     <!-- Model + status dots: steam-synced (steam blue), equipped per team
          (CT blue / T amber) — hover any dot for the label. -->
-    <div v-if="showHeader" class="relative z-[2] flex items-center justify-between gap-2">
-      <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ weaponName(inst.item) || inst.slot }}</span>
-      <span class="flex flex-none items-center gap-1.5">
-        <TeamDots :teams="equippedTeams" />
-        <!-- Applied to something. A sticker can only be on one weapon at a
-             time, so this is the difference between "I own this" and "this is
-             already spoken for" — without it, a drawer of owned stickers gives
-             no clue which are spare. -->
-        <Link2
-          v-if="attachedName"
-          class="h-3 w-3 flex-none text-[color:var(--acc)]"
-          :title="'Applied to ' + attachedName"
-        />
-        <RefreshCw
-          v-if="readOnly"
-          class="h-3 w-3 flex-none"
-          :style="{ color: STEAM_BLUE }"
-          title="Synced from your Steam inventory (read-only)"
+    <div v-if="showHeader" class="relative z-[2] flex items-start justify-between gap-2">
+      <!-- Model, then the price under it. The top-left corner is the card's
+           quietest real estate — a label nobody reads twice — and hanging the
+           value off it costs the art nothing that a footer line wouldn't, while
+           keeping the name row to the name. Reads top-down as "what it is, what
+           it's worth". -->
+      <span class="min-w-0 flex-1">
+        <span class="block truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ weaponName(inst.item) || inst.slot }}</span>
+        <PriceTag
+          v-if="showPrice"
+          class="mt-0.5"
+          :value="inst.price?.value"
+          :pending="pricePending"
+          :missing="!inst.price"
+          suffix="est"
+          :title="priceTitle"
         />
       </span>
+      <SlotStatus inline :teams="equippedTeams" :inst="inst" :attached-name="attachedName" />
     </div>
     <!-- Headerless tiles (the sheet) park the same cluster where the header
          would have put it — top right, under the hover actions. -->
-    <span v-if="!showHeader" class="absolute right-2 top-2 z-[2] flex items-center gap-1.5">
-      <TeamDots :teams="equippedTeams" />
-      <Link2
-        v-if="attachedName"
-        class="h-3 w-3 text-[color:var(--acc)]"
-        :title="'Applied to ' + attachedName"
-      />
-      <RefreshCw
-        v-if="readOnly"
-        class="h-3 w-3"
-        :style="{ color: STEAM_BLUE }"
-        title="Synced from your Steam inventory (read-only)"
-      />
-    </span>
+    <SlotStatus v-if="!showHeader" :teams="equippedTeams" :inst="inst" :attached-name="attachedName" />
 
     <div :class="CARD_ART">
       <ItemArt
@@ -288,21 +286,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
       <!-- ST™ and the chips are ONE centred group: apart, the badge floated
            against a row whose height is set by the tallest chip. -->
-      <span v-if="inst.stattrak || attachments.length" class="ml-auto flex flex-none items-center gap-1.5">
-        <span v-if="inst.stattrak" class="font-mono text-f8 leading-none text-[#f2c14e]">ST™</span>
-        <span v-if="attachments.length" class="flex items-center gap-0.5">
-          <img
-            v-for="(a, k) in attachments.slice(0, 6)"
-            :key="k"
-            :src="a.image ?? undefined"
-            :title="a.name"
-            alt=""
-            :class="a.kind === 'charm'
-              ? 'ml-0.5 h-6 w-6 flex-none border-l border-border/60 pl-1 object-contain'
-              : 'h-4 w-4 flex-none object-contain'"
-          />
-        </span>
-      </span>
+      <ItemBadges :inst="inst" :max="6" class="ml-auto" />
     </div>
 
     <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />

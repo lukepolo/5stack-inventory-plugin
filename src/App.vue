@@ -4,7 +4,7 @@ import { cn } from "@5stack/ui";
 import { useI18n } from "./composables/useI18n";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
-  Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
+  Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock, CircleDollarSign,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
 } from "lucide-vue-next";
 import {
@@ -27,6 +27,20 @@ import {
   fetchPlayerLoadout,
   importSteamInventory,
   fetchSteamSync,
+  fetchPriceStatus,
+  fetchInventoryPrices,
+  fetchStockPrices,
+  fetchPriceDetail,
+  bestSaleWindow,
+  HISTORY_WINDOW_LABEL,
+  type PriceDetail,
+  WEAR_TIER_NAME,
+  quoteCraft,
+  formatPrice,
+  PRICE_WINDOW_LABEL,
+  PRICE_SOURCE_LABEL,
+  type PriceStatus,
+  type Quote,
   API_ORIGIN,
   equip,
   swapLoadout,
@@ -41,6 +55,8 @@ import {
   type InventoryItem,
   type AttachSpec,
   fetchStickerGeometry,
+  MAX_STICKERS,
+  MAX_PATCHES,
   uploadRender,
   renderUrlFor,
   type CfgSyncResult,
@@ -78,6 +94,10 @@ import FilterDropdown from "./components/FilterDropdown.vue";
 import InfiniteSentinel from "./components/InfiniteSentinel.vue";
 import SortDirection from "./components/SortDirection.vue";
 import PatternRail from "./components/PatternRail.vue";
+import PriceTag from "./components/PriceTag.vue";
+import LoadoutCell from "./components/LoadoutCell.vue";
+import ItemSpecs from "./components/ItemSpecs.vue";
+import ItemBadges from "./components/ItemBadges.vue";
 import PatternScoreRail from "./components/PatternScoreRail.vue";
 import { SCAN_READ_SIZE } from "./patternScan";
 import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
@@ -90,7 +110,7 @@ import FilterSheet from "./components/FilterSheet.vue";
 import { Z } from "./zLayers";
 import { SORT_DIR_ICON, type SortDir } from "./sortIcons";
 import {
-  SORTS, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, type SortMode,
+  SORTS, SORTS_WITHOUT_VALUE, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, type SortMode,
   ATTACH_SORTS, DEFAULT_ATTACH_SORT, ATTACH_SORT_NATURAL, ATTACH_DIR_HINT, ATTACH_SORT_KIND, type AttachSortMode,
 } from "./sortModes";
 import {
@@ -106,7 +126,7 @@ import { useBuildCheck } from "./composables/useBuildCheck";
 import { useViewerMount } from "./composables/useViewerMount";
 import { useDebouncedSearch, SEARCH_DEBOUNCE_MS } from "./composables/useDebouncedSearch";
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
-import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, STEAM_BLUE, stripName, wearTier } from "./itemVisuals";
+import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, PRICE_ROW_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
@@ -467,6 +487,84 @@ function cellImage(pos: string): string | undefined {
 function instanceById(id: unknown): InventoryItem | undefined {
   return id != null ? inventory.value.find((i) => String(i.id) === String(id)) : undefined;
 }
+/** What's in this slot, in money — the skin plus every sticker, patch and charm
+ *  on it (the server's per-slot `value`). Null when prices are off or the slot
+ *  holds a free default, which is most of them and correctly worth nothing. */
+function cellValue(pos: string): number | null {
+  if (!pricesOn.value) return null;
+  // Shared slots (knife, gloves) can be stored under either side, same rule as
+  // rowFor — otherwise a knife equipped from the T side prices as nothing on CT.
+  const value = isShared(pos)
+    ? slotValues.value[`CT:${pos}`] ?? slotValues.value[`T:${pos}`]
+    : slotValues.value[`${team.value}:${pos}`];
+  return value && value > 0 ? value : null;
+}
+
+/**
+ * Everything a loadout cell needs to DRAW, for one slot.
+ *
+ * One builder because there is now one cell (LoadoutCell.vue) where there were
+ * six copies. The per-family differences that used to justify the copies are all
+ * here, in one readable branch: weapon slots strip the model from the finish
+ * name and fall back to the default gun's art, gear slots keep the full name and
+ * fall back to the stock item.
+ *
+ * `displayPos` is what to SHOW; `pos` is what the cell IS. They differ only
+ * during a reorder hover, where two cells render each other's contents so the
+ * drop confirms what you see — see previewPos().
+ */
+function cellFacts(pos: string, displayPos: string = pos) {
+  const weaponSlot = isWeaponPos(pos);
+  const row = rowFor(displayPos);
+  const inst = cellInstance(displayPos) ?? null;
+  // Weapon cells only show a float for a CRAFTED occupant; a default gun has
+  // none. Gear reads its row directly, which is null for a stock knife anyway.
+  const wearRow = weaponSlot ? cellWear(displayPos) : row ?? null;
+  return {
+    item: weaponSlot ? cellItem(displayPos) : row?.item ?? null,
+    inst,
+    image: (weaponSlot ? cellImage(displayPos) : specialImage(displayPos)) ?? null,
+    fallback: weaponSlot ? "Default" : specialFallback(pos),
+    strip: weaponSlot,
+    teams: cellTeams(displayPos),
+    value: cellValue(displayPos),
+    valueTip: inst && !cellValue(displayPos) ? noPriceTip.value : slotValueTip.value,
+    // A free default has no listing to be missing; only an OWNED occupant that
+    // the mirror couldn't price gets the dash.
+    valueMissing: pricesOn.value && !!inst && cellValue(displayPos) == null,
+    wear: wearRow?.wear ?? null,
+    seed: wearRow?.seed ?? null,
+    rarity: (weaponSlot ? rarityOf(displayPos) : row?.item?.rarity) ?? null,
+    dim: weaponSlot ? !isSkinned(rowFor(displayPos)) : !row,
+    baking: !!inst && renderingIds.value.has(inst.id),
+    queued: !!inst && queuedIds.value.has(inst.id),
+  };
+}
+
+/** The hover-cluster actions, which are identical for every cell and were
+ *  hand-wired six times. `focus` is bound at the call site — only weapon cells
+ *  have somewhere to focus to. */
+function cellActions(pos: string) {
+  const inst = () => cellInstance(pos);
+  return {
+    focus: () => {
+      selectPos(pos);
+      go("/focus");
+    },
+    view3d: () => inst() && view3dForInstance(inst()!),
+    inspect: () => inst() && openInspectLink(inst()!.id),
+    edit: () => {
+      selectPos(pos);
+      if (inst()) openEdit(inst()!);
+    },
+    duplicate: () => {
+      selectPos(pos);
+      if (inst()) openEdit(inst()!);
+    },
+    remove: () => inst() && deleteOwned(inst()!),
+  };
+}
+
 function cellInstance(pos: string): InventoryItem | undefined {
   return instanceById(rowFor(pos)?.item_instance_id);
 }
@@ -545,6 +643,8 @@ async function loadSkins(key: string) {
       skinsCache.set(key, data);
     }
     if (sheetKey.value !== key) return; // a newer selection won
+    // After, never with: the picker must paint as soon as the catalog lands.
+    void loadStockPrices(key);
     sheetSkins.value = data.skins;
     sheetFacets.value = { groups: data.groups, tints: data.tints };
     sheetGroup.value = sheetDefaultGroup.value;
@@ -771,6 +871,11 @@ const sheetSortCtl = useSortControl<SortMode>({
 });
 const { mode: sheetSort, dir: sheetDir, setMode: setSheetSort, kind: sheetSortKind, hint: sheetSortHint } = sheetSortCtl;
 
+/** The sort list this session offers. "Value" appears only when there are values
+ *  — a mode that leaves the list in source order looks like a broken sort, not a
+ *  missing feature. */
+const invSorts = computed(() => (pricesOn.value ? SORTS : SORTS_WITHOUT_VALUE));
+
 const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
 function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): InventoryItem[] {
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
@@ -778,10 +883,34 @@ function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): Inv
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(itemName(a.item), itemName(b.item)));
   if (mode === "wear") return arr.sort((a, b) => flip * ((a.wear ?? 1) - (b.wear ?? 1)) || byName(itemName(a.item), itemName(b.item)));
+  // Unpriced items sink to the bottom in BOTH directions — treated as -1 rather
+  // than 0, so "least valuable first" still leads with the cheap things we can
+  // actually price instead of a wall of items we know nothing about.
+  if (mode === "value") {
+    return arr.sort(
+      (a, b) =>
+        (b.price ? 0 : 1) - (a.price ? 0 : 1) ||
+        flip * ((b.price?.value ?? -1) - (a.price?.value ?? -1)) ||
+        byName(itemName(a.item), itemName(b.item)),
+    );
+  }
   return arr.sort((a, b) => flip * (sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
 }
 function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
-  if (mode === "wear") return list; // catalog skins have no wear
+  if (mode === "wear") return list; // catalog skins have no float of their own
+  // Catalog entries have no price of their own either — what they have is a
+  // STOCK cost, which is a different question ("what would making one cost")
+  // answered by a different map. Unpriced finishes sink in both directions, same
+  // rule as the inventory's value sort.
+  if (mode === "value") {
+    const flip = dir === SORT_NATURAL.value ? 1 : -1;
+    return [...list].sort(
+      (a, b) =>
+        (stockPriceOf(b.id) ? 0 : 1) - (stockPriceOf(a.id) ? 0 : 1) ||
+        flip * ((stockPriceOf(b.id)?.value ?? -1) - (stockPriceOf(a.id)?.value ?? -1)) ||
+        byName(a.name, b.name),
+    );
+  }
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
@@ -1004,6 +1133,9 @@ const { tr, notify, fail } = useI18n(props);
 
 async function refreshAll() {
   [loadout.value, inventory.value] = await Promise.all([fetchLoadout(), fetchInventory()]);
+  // After, not with: a craft or an equip should land on screen immediately and
+  // have its price catch up.
+  void loadPrices();
   // Items staged for deletion are already gone from the UI but not yet from
   // the server — a refresh mid-grace must not resurrect them.
   const pend = pendingDelete.value;
@@ -1271,6 +1403,10 @@ function reorderStyle(pos: string): Record<string, string> {
  * for someone building their own copy of a craft.
  */
 type Attach = { id: number; name: string; image: string | null; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null };
+/** A full-length attachment row, every slot present and empty. Full length
+ *  because the slot INDEX is what the game keys a sticker or patch on, so a
+ *  short array is not "fewer stickers", it is a hole the form cannot address. */
+const emptySlots = (n: number): (Attach | null)[] => Array.from({ length: n }, () => null);
 const craft = ref<{
   skin: Skin;
   wear: number;
@@ -1593,7 +1729,7 @@ function openCraft(skin: Skin) {
   const skinIsWeapon = !skin.type || skin.type === "weapon" || skin.type === "melee";
   craftModel.value =
     skin.model ?? (skinIsWeapon && isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
-  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: [null, null, null, null, null], patches: [null, null, null, null, null], charm: null };
+  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null };
   craftBaseline = ""; // new craft — no stored render to reuse
   // A brand-new craft gets a URL too: /craft/<skinId>, with the draft itself in
   // the query. Without it the one state worth sharing before you commit to it
@@ -1633,9 +1769,9 @@ async function restoreDraftRoute(skinId: number) {
         stattrak: d.stattrak,
         nametag: d.nametag,
         stickers: d.stickers
-          .slice(0, 5)
+          .slice(0, MAX_STICKERS)
           .map((s) => attach(s, { x: s?.x ?? null, y: s?.y ?? null, r: s?.r ?? null, w: s?.w ?? null })),
-        patches: d.patches.slice(0, 5).map((p) => attach(p ? { id: p } : null)),
+        patches: d.patches.slice(0, MAX_PATCHES).map((p) => attach(p ? { id: p } : null)),
         charm: attach(d.charm, {
           x: d.charm?.x ?? null,
           y: d.charm?.y ?? null,
@@ -1658,13 +1794,13 @@ function openEdit(inst: InventoryItem) {
   craftInstId.value = inst.id;
   duplicating.value = inst.origin === "steam";
   editingId.value = duplicating.value ? null : inst.id;
-  const stickers: (Attach | null)[] = [null, null, null, null, null];
+  const stickers = emptySlots(MAX_STICKERS);
   (inst.stickers ?? []).forEach((st, i) => {
-    if (st && i < 5) stickers[i] = { id: st.id, name: st.name, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null, inst: st.inst ?? null };
+    if (st && i < MAX_STICKERS) stickers[i] = { id: st.id, name: st.name, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null, inst: st.inst ?? null };
   });
-  const patches: (Attach | null)[] = [null, null, null, null, null];
+  const patches = emptySlots(MAX_PATCHES);
   (inst.patches ?? []).forEach((pt, i) => {
-    if (pt && i < 5) patches[i] = { id: pt.id, name: pt.name, image: pt.image, inst: pt.inst ?? null };
+    if (pt && i < MAX_PATCHES) patches[i] = { id: pt.id, name: pt.name, image: pt.image, inst: pt.inst ?? null };
   });
   craft.value = {
     // `type` and `model` ride along because they are what decides WHAT the 3D
@@ -1691,6 +1827,10 @@ function openEdit(inst: InventoryItem) {
   // Until something changes, show the render we already have for this item.
   craftBaseline = craftStateJson();
   craftPreview.value = renderSrc(inst);
+  // A stored card bake IS a render (weapons and charms have one), but the flag
+  // is read solely by the agent fade — and an agent never bakes — so "not ours"
+  // is the honest answer here.
+  craftPreviewRendered.value = false;
   // Opened by a click, not by the URL — put it in the URL so the state is
   // linkable. Skipped when the route watcher is what called us.
   // Opened by a click, not by the URL — put it in the URL so the state is
@@ -1845,7 +1985,7 @@ function resetCraft() {
   if (craft.value)
     Object.assign(craft.value, {
       wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "",
-      stickers: [null, null, null, null, null], patches: [null, null, null, null, null], charm: null,
+      stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null,
     });
 }
 // The craft form as the API wants it. Shared by save and by draft-inspect so
@@ -2080,23 +2220,51 @@ const renderServes = (url: string) =>
     probe.onerror = () => resolve(false);
     probe.src = url;
   });
+/**
+ * Kinds whose grid card is a RENDER of the item rather than its stock icon.
+ *
+ * `hasModel` alone used to be the whole gate, which was fine while weapons and
+ * knives were the only two types with a GLB. The moment gloves and agents landed
+ * on the mount they started baking too — and a glove baked through the weapon
+ * path has no compositor, so every painted glove card became a pair of blank
+ * white hands, cached under a key that says it is finished.
+ *
+ * CHARMS ARE IN because their icon can never be right. A charm's whole look is
+ * its pattern — Semi-Precious sweeps green to purple across its range — and the
+ * stock icon is one frozen sample of that, so every Semi-Precious in the grid
+ * showed the same blue crystal whatever pattern it was built with, and changing
+ * the pattern re-labelled the tile "#1" while leaving the art alone. That is the
+ * same "can the icon be wrong" test craftPreviewNeeded already applies to decide
+ * whether the 2D still has to be rendered; this is the grid answering it the
+ * same way. The seed is already in renderKeyFor, so a pattern change invalidates
+ * the card by itself.
+ *
+ * GLOVES ARE IN for the same reason, and their exclusion was never really about
+ * the test: it was the blank-white-hands bug above. That bug was weapon opts on
+ * a glove, not gloves being unbakeable, and the fix is to pass the kind — which
+ * this now does.
+ *
+ * Agents and stickers pass the test only CONDITIONALLY — an agent's icon stops
+ * being true once a patch is on it, a sticker's once it is scuffed — so they
+ * want a per-instance test rather than membership of a set, and neither is here.
+ * A patch has no pattern and no wear, so its icon is always the truth.
+ *
+ * Anything added here must also be added to RENDERED_IN_3D in
+ * build-asset-manifest.mjs, which encodes the same decision for the extractor's
+ * missing-icon report.
+ */
+const CARD_BAKE_KINDS = new Set<ViewerKind>(["weapon", "charm", "glove"]);
 async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
-  const model = inst.item?.model;
-  if (!model || renderedIds.has(inst.id) || !(await hasModel(model))) return false;
-  // WEAPONS AND KNIVES ONLY.
-  //
-  // `hasModel` alone used to be the whole gate, which was fine while those were
-  // the only two types with a GLB. The moment gloves and agents landed on the
-  // mount they started baking too — and a glove baked through the weapon path
-  // has no compositor, so every painted glove card became a pair of blank white
-  // hands, cached under a key that says it is finished.
-  //
-  // Beyond the bug: 3D for the new types is ON DEMAND by design. Their grid card
-  // IS the flat icon, so there is nothing here to bake even once gloves
-  // composite correctly. Anything that changes must also change
-  // RENDERED_IN_3D in build-asset-manifest.mjs, which encodes the same decision
-  // for the extractor's missing-icon report.
-  if ((resolveViewerModelSync(inst.item)?.kind ?? null) !== "weapon") return false;
+  if (renderedIds.has(inst.id)) return false;
+  // Resolved, not read off `item.model`. A charm names no model of its own —
+  // the econ schema names its mesh and 23 of them share one blank — so the sync
+  // answer is `undefined` ("ask the backend"), and the old `item.model` gate
+  // dropped every charm before the kind was even consulted.
+  const sync = resolveViewerModelSync(inst.item);
+  const target = (sync === undefined ? await resolveViewerModel(inst.item) : sync) ?? null;
+  if (!target || !CARD_BAKE_KINDS.has(target.kind)) return false;
+  const model = target.model;
+  if (!(await hasModel(model))) return false;
   // Already stored server-side? Nothing to bake. Carries the buster: after a
   // cache clear the browser still holds the deleted image, so an un-busted
   // probe loads it, concludes the server is fine and skips the re-bake — which
@@ -2114,19 +2282,44 @@ async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
   await viewersIdle();
   renderingIds.value = new Set([...renderingIds.value, inst.id]);
   try {
+    // Gated by KIND, not by "did the lookup come back empty" — the same split
+    // craftVisualOpts makes. Sticker slots, a hanging charm and a StatTrak
+    // module are all meaningless on a charm that IS the model, and stickerGeom
+    // would go and fetch markup for a key no weapon has.
+    const isWeapon = target.kind === "weapon";
     const blob = await snapshotModel(
       model,
       {
+        kind: target.kind,
+        // Where a charm's material and pattern shading come from. Without it the
+        // charm renders undressed — a featureless grey shape, which does not
+        // throw and does not read as broken in a thumbnail.
+        charmSpec: target.charm ?? null,
+        // NOT weapon-gated, deliberately. The paint chain is composited for
+        // gloves too, so gating this on `isWeapon` would be a trap set for
+        // whoever adds "glove" to CARD_BAKE_KINDS: a glove with no
+        // paintMaterial composites to blank white hands, which is precisely the
+        // bug that got its whole kind excluded in the first place. A charm has
+        // none to pass (its material comes from charmSpec), so unconditional
+        // costs nothing and matches craftVisualOpts.
         paintMaterial: inst.item?.paintMaterial ?? null,
         legacyPaint: !!inst.item?.legacyPaint,
         wear: inst.wear != null ? Number(inst.wear) : null,
+        // A charm's `seed` is its own PATTERN and the standalone viewer grades
+        // its material by it; on a weapon the same field is the float pattern.
         seed: inst.seed != null ? Number(inst.seed) : null,
-        ...(await stickerGeom(model)),
-        ...instPlacements(inst),
+        // NOT the live `gloveArms` toggle, and that is the point: a card is
+        // keyed on id+wear+seed+stattrak, so anything else it renders from has
+        // to be a constant. Reading a UI switch here would bake two different
+        // pictures under one key, whichever the last viewer happened to leave
+        // on. Bare hands is what the icon shows.
+        gloveArms: false,
+        ...(isWeapon ? await stickerGeom(model) : {}),
+        ...(isWeapon ? instPlacements(inst) : {}),
         // Module yes, readout no. The count is deliberately absent from
         // renderKeyFor — a baked card must stay valid as kills land, and it
         // can only do that if the digits were never in the picture.
-        stattrak: inst.stattrak ? { count: null } : null,
+        stattrak: isWeapon && inst.stattrak ? { count: null } : null,
       },
       undefined,
       // Card art backfill — nobody is waiting on it, so let it stand down
@@ -2253,6 +2446,14 @@ watch(craft, async (open) => {
   modal3d.value = false;
   modal3dAvailable.value = false;
   craftTarget.value = null;
+  // The albedo belongs to the charm that WAS mounted, and nothing else clears
+  // it — so it outlived its item. Held over, the pattern rail resolves the new
+  // charm's shading against the old charm's material name, and a wrong match
+  // and no match do not look different: both paint a plausible ramp, and the
+  // swatch is now a read-only claim about an item on two screens rather than a
+  // hint beside a control. Mounting refills it (see mountModalViewer), and
+  // until it does the rail says so instead of guessing.
+  charmAlbedo.value = null;
   if (open) {
     // What to MOUNT is not always the weapon model: a charm has no `model` at
     // all (the econ schema names its mesh, and 23 of them share one blank), so
@@ -2281,6 +2482,24 @@ watch(craft, async (open) => {
     // form when the weapon has no extracted model, or when the link said ?d=2.
     if (modal3dAvailable.value && craft.value && !routeWants2d.value) modal3d.value = true;
   }
+  // Kick the 2D still for the items whose fallback is the stock icon.
+  //
+  // The still normally only re-renders when the FORM changes, which is right
+  // when the fallback is that item's own stored card — but a draft has no
+  // instance and so no card, whatever its kind, and the kinds outside
+  // CARD_BAKE_KINDS never have one at all. There the icon is the item as the
+  // game ships it rather than as it was built, and it takes a render before 2D
+  // tells the truth: a charm's pattern, a glove's wear, the patches on an agent.
+  //
+  // Skipped where a stored card IS standing in (openEdit seeded it), because
+  // this would bake a second identical copy of it. If that card turns out not to
+  // be there the <img> 404s, and craftPreviewFailed kicks the render from the
+  // error instead — so the missing case is covered without paying for it here.
+  //
+  // Cheap either way: scheduleCraftPreview parks it while 3D is on (which is the
+  // default), so nothing bakes until the 2D tab is actually asked for.
+  const still = craftTarget.value;
+  if (open && still && craftPreviewNeeded(still) && !craftStillIsStored(still)) scheduleCraftPreview(0);
   // After the flush, so the watcher jobs these assignments queued have run.
   await nextTick();
   modal3dResetting = false;
@@ -2482,9 +2701,7 @@ watch(
 // bounds envelope. Spread straight into ViewerOpts so every mount site gets
 // both — a mount missing `stickerSlots` silently falls back to the old
 // silhouette guess, which does not match the game.
-// How many sticker slots this weapon actually has — 4, 5 or 6 depending on the
-// weapon, never a flat 5. Offering more than exist means the extra ones have no
-// markup index, so the game drops those stickers silently.
+// It does NOT size the form — see stickerSlotCount below.
 /**
  * Patch slots the CURRENT agent actually has.
  *
@@ -2516,16 +2733,28 @@ watch(patchSlotCount, (n) => {
   if (!list) return;
   for (let i = n; i < list.length; i++) list[i] = null;
 });
-const stickerSlotCount = ref(5);
-watch([craft, craftModel], async () => {
-  if (!craft.value || !craftModel.value) return;
-  const g = await fetchStickerGeometry(craftModel.value);
-  const hd = g.slots.filter((sl) => sl.mesh === "body_hd");
-  if (hd.length) stickerSlotCount.value = hd.length;
-});
+/**
+ * Sticker wells the form offers: five, on every weapon.
+ *
+ * Constant on purpose. This used to be the model's HD anchor count, which is 4
+ * on sixteen weapons — so the fifth sticker the game accepts had nowhere to be
+ * typed. Three things were wrong with that: the anchor count is not a sticker
+ * cap (the stack shares anchors when it outnumbers them), the HD count is the
+ * wrong one for a legacy-model paint (14 of 35 weapons disagree between bodies),
+ * and the five 6-anchor weapons drew a sixth column over a five-element array.
+ *
+ * Placement is where the anchors belong, and the viewer already does that per
+ * body variant — see slotMarkup in viewer3d.ts.
+ */
+const stickerSlotCount = MAX_STICKERS;
 async function stickerGeom(model: string) {
   const g = await fetchStickerGeometry(model);
-  return { stickerBounds: g.bounds, stickerSlots: g.slots };
+  // `charmSurfaces` rides along because it comes out of the same request — and
+  // because every site that mounts a weapon needs it for the same reason it
+  // needs the sticker anchors: it is the model's own answer to where an
+  // attachment goes. Spread into ViewerOpts, so adding it here reaches the live
+  // stage, the 2D still and the card bake at once.
+  return { stickerBounds: g.bounds, stickerSlots: g.slots, charmSurfaces: g.charmQuads };
 }
 // Craft state → viewer placement shapes.
 function craftStickerPlacements(): StickerPlacement[] {
@@ -2546,6 +2775,64 @@ function craftCharmPlacement(): CharmPlacement | null {
   // 89 keychain materials.
   return c?.image ? { image: c.image, x: c.x ?? null, y: c.y ?? null, z: c.z ?? null, seed: c.seed ?? null } : null;
 }
+/**
+ * Everything about the craft state that decides how the item LOOKS, as the
+ * viewer wants it.
+ *
+ * Shared by the live 3D stage and the 2D still on purpose: those are one
+ * picture in two renderers, and they only stay one picture if there is a single
+ * place that says what is on the model. They were built separately, and the 2D
+ * half never grew past the weapon it was written for — it passed a model key and
+ * a paint and nothing else, so a STANDALONE item was snapshotted with `kind`
+ * defaulted to "weapon": no charm material, no decal art, no agent patches. For
+ * a charm that meant the one attribute it has, its pattern, was mounted with
+ * nothing to apply it to, and the 2D tab quietly showed the stock icon while the
+ * rail beside it painted the colour that was picked.
+ *
+ * What is NOT here is per-renderer by nature: interactivity and the drag
+ * callbacks, the StatTrak readout (live count on the stage, dark on a bake — see
+ * renderKeyFor), and the name plate, which no bake carries because the render
+ * key has no room for it.
+ */
+async function craftVisualOpts(target: ViewerTarget) {
+  const c = craft.value;
+  // Weapon-only machinery, skipped by kind rather than by "did the lookup
+  // happen to come back empty": sticker slots and the charm attachment are
+  // meaningless on a charm that IS the model, and stickerGeom would fetch
+  // markup for a key no weapon has.
+  const isWeapon = target.kind === "weapon";
+  return {
+    kind: target.kind,
+    charmSpec: target.charm ?? null,
+    gloveArms: gloveArms.value,
+    // A sticker or patch has no model to name, so it is addressed by its art.
+    // The sticker IS the item here, so its scratch is the item's own `wear` —
+    // the same field a weapon spends on its float. A patch has no scratch, so it
+    // stays at 0.
+    decal:
+      target.kind === "sticker" || target.kind === "patch"
+        ? { image: c?.skin.image ?? "", wear: (craftHasScratch.value ? c?.wear : 0) ?? 0 }
+        : null,
+    paintMaterial: c?.skin.paintMaterial ?? null,
+    legacyPaint: !!c?.skin.legacyPaint,
+    // Coerced rather than passed through: `v-model.number` on a field the user
+    // has emptied yields "", and a string reaching the compositor comes out as
+    // NaN texcoords rather than as a visible mistake.
+    wear: Number(c?.wear ?? 0),
+    // A charm's `seed` is its own PATTERN, and the standalone viewer grades its
+    // material by it — so this is the charm's seed when the charm is the model,
+    // and the weapon's float pattern otherwise.
+    seed: Number(c?.seed ?? 0),
+    ...(isWeapon ? await stickerGeom(target.model) : {}),
+    stickers: isWeapon ? craftStickerPlacements() : [],
+    // Patches are the AGENT's equivalent of stickers, but they are not decals
+    // and share none of that machinery: the viewer stamps them into the body
+    // texture at UV rects the model itself declares. Just the art, in slot
+    // order — there is no geometry and nothing to place.
+    patches: target.kind === "agent" ? (c?.patches ?? []).map((p) => p?.image ?? null) : undefined,
+    charm: isWeapon ? craftCharmPlacement() : null,
+  };
+}
 async function mountModalViewer() {
   const target = craftTarget.value;
   if (!target) return;
@@ -2556,45 +2843,13 @@ async function mountModalViewer() {
   charmPending.value = target.kind === "weapon" && !!craft.value?.charm;
   await modalViewer.mount(
     model,
-    async () => {
-      // Weapon-only machinery, skipped by kind rather than by "did the lookup
-      // happen to come back empty": sticker slots and the charm attachment are
-      // meaningless on a charm that IS the model, and stickerGeom would fetch
-      // markup for a key no weapon has.
-      const isWeapon = target.kind === "weapon";
-      return {
-      kind: target.kind,
-      charmSpec: target.charm ?? null,
-      gloveArms: gloveArms.value,
-      // A sticker or patch has no model to name, so it is addressed by its art.
-      // The sticker IS the item here, so its scratch is the item's own `wear` —
-      // the same field a weapon spends on its float. Hardcoded 0 before, which
-      // meant the one screen dedicated to a sticker was the one screen that
-      // could not show it scuffed. A patch has no scratch, so it stays at 0.
-      decal:
-        target.kind === "sticker" || target.kind === "patch"
-          ? { image: craft.value?.skin.image ?? "", wear: (craftHasScratch.value ? craft.value?.wear : 0) ?? 0 }
-          : null,
-      paintMaterial: craft.value?.skin.paintMaterial ?? null,
-      legacyPaint: !!craft.value?.skin.legacyPaint,
-      wear: craft.value?.wear,
-      // A charm's `seed` is its own PATTERN, and the standalone viewer grades
-      // its material by it — so this is the charm's seed when the charm is the
-      // model, and the weapon's float pattern otherwise.
-      seed: craft.value?.seed,
+    async () => ({
+      ...(await craftVisualOpts(target)),
       // View mode isn't interactive in the viewer's sense: no attachment
       // dragging, and the model idles on a slow auto-rotate the way the old
       // standalone overlay did. Orbit/pan/zoom are gated on `still`, not this,
       // so they stay available either way.
       interactive: !viewOnly.value,
-      ...(isWeapon ? await stickerGeom(model) : {}),
-      stickers: isWeapon ? craftStickerPlacements() : [],
-      // Patches are the AGENT's equivalent of stickers, but they are not decals
-      // and share none of that machinery: the viewer stamps them into the body
-      // texture at UV rects the model itself declares. Just the art, in slot
-      // order — there is no geometry and nothing to place.
-      patches: target.kind === "agent" ? (craft.value?.patches ?? []).map((p) => p?.image ?? null) : undefined,
-      charm: isWeapon ? craftCharmPlacement() : null,
       // Live 3D, so a real readout — the owned item's count when the modal is
       // showing one (craftInstId covers editing AND duplicating, which
       // editingId does not), and 0 for a brand-new craft that has no kills.
@@ -2604,25 +2859,25 @@ async function mountModalViewer() {
       nametag: craft.value?.nametag ?? null,
       // Drags write straight into the craft form — the numeric inputs follow
       // live, and confirm sends the same offsets to the game server.
-      onStickerPlaced(slot, x, y) {
+      onStickerPlaced(slot: number, x: number, y: number) {
         const st = craft.value?.stickers[slot];
         if (st) {
           st.x = x;
           st.y = y;
         }
       },
-      onStickerRotated(slot, r) {
+      onStickerRotated(slot: number, r: number) {
         const st = craft.value?.stickers[slot];
         if (st) st.r = r;
       },
-      onCharmPlaced(x, y, z) {
+      onCharmPlaced(x: number, y: number, z: number) {
         if (craft.value?.charm) {
           craft.value.charm.x = x;
           craft.value.charm.y = y;
           craft.value.charm.z = z; // vertical — dropping this pinned drags to a plane
         }
-      },      };
-    },
+      },
+    }),
     (handle) => {
       // Re-apply the chosen pose: the 2D/3D toggle remounts, and a viewer that
       // came back in the default stance after the user picked "Open" would look
@@ -2941,6 +3196,14 @@ watch(
 // stickers / charm re-renders the preview image itself (client-side snapshot,
 // no server involved). What you see is exactly what gets baked on Save.
 const craftPreview = ref<string | null>(null);
+/**
+ * Is what `craftPreview` holds a RENDER of this item, rather than catalog art?
+ *
+ * Only the agent fade reads it, and it has to: ART_FADE_B feathers the bottom
+ * of an agent's icon because that icon is cropped at the waist, and a render is
+ * a whole standing figure — so applying it there cuts the legs off instead.
+ */
+const craftPreviewRendered = ref(false);
 const craftPreviewBusy = ref(false);
 let craftPreviewTimer: ReturnType<typeof setTimeout> | undefined;
 let craftPreviewToken = 0;
@@ -2951,28 +3214,97 @@ const craftStateJson = () =>
   craft.value
     ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm, craft.value.stattrak])
     : "";
+/**
+ * The still's image didn't load — a stored card bake that was never made (or a
+ * 404 from the mount). Back to the catalog art, fade and all.
+ *
+ * And then, for the kinds where that art cannot be right, straight into
+ * rendering one: this is the case the `craft` watcher deliberately does not pay
+ * for up front. An owned charm reached by a deep link has usually never had its
+ * card baked — nothing put its tile on screen — so without this the one screen
+ * dedicated to that charm is the one that shows it at the wrong pattern.
+ */
+function craftPreviewFailed() {
+  craftPreview.value = null;
+  craftPreviewRendered.value = false;
+  const t = craftPreviewTarget();
+  if (t && craftPreviewNeeded(t)) scheduleCraftPreview(0);
+}
+/**
+ * Is the still already showing a stored card bake for this item?
+ *
+ * Owned (`craftInstId`) and of a kind that bakes cards — the two halves of what
+ * openEdit's `renderSrc` seeds. A draft has no instance and so no card however
+ * card-worthy its kind is, which is exactly the distinction craftPreviewNeeded
+ * cannot make on its own.
+ */
+const craftStillIsStored = (target: ViewerTarget): boolean =>
+  craftInstId.value != null && CARD_BAKE_KINDS.has(target.kind);
+/**
+ * What the still is a picture OF — the same target the 3D stage mounts.
+ *
+ * The fallback is not belt-and-braces: /catalog/skins does not send `type`, so
+ * a plain finish opened from the sheet resolves to no target at all, and
+ * without it every weapon in there would lose its preview (see the same
+ * fallback in the `craft` watcher).
+ */
+const craftPreviewTarget = (): ViewerTarget | null =>
+  craftTarget.value ?? (craftModel.value ? { model: craftModel.value, kind: "weapon" } : null);
+/**
+ * Does this item's 2D still have to be RENDERED, rather than left as the icon?
+ *
+ * Asked of the DRAFT, so it is not the same question CARD_BAKE_KINDS answers: a
+ * craft that has never been saved has no instance and so no card bake to fall
+ * back on, whatever its kind. The fallback is then the stock Steam icon — the
+ * item as the game ships it, not as it was built.
+ * Whether that matters is per kind, and the test is "can the icon be wrong":
+ * a charm's whole look is its pattern and a glove's is its pattern and its wear,
+ * so those two are always worth rendering; a sticker's icon only stops being
+ * true once it is scuffed, and an agent's once a patch is on it. A patch itself
+ * has neither, so its icon is always the truth.
+ */
+function craftPreviewNeeded(target: ViewerTarget): boolean {
+  const c = craft.value;
+  if (!c) return false;
+  switch (target.kind) {
+    case "charm":
+    case "glove":
+      return true;
+    case "sticker":
+      return (c.wear ?? 0) > 0;
+    case "agent":
+      return (c.patches ?? []).some(Boolean);
+    default:
+      return false; // weapon (its own card bake stands in) and patch
+  }
+}
 async function refreshCraftPreview() {
   const c = craft.value;
-  const model = craftModel.value;
-  if (!c || !model) return;
+  const target = craftPreviewTarget();
+  if (!c || !target) return;
   // A brand-new craft with no customization has nothing worth baking — the
   // base catalog art is the truth until stickers/charm/wear get touched
   // (the template already falls back to craft.skin.image while null).
-  if (editingId.value == null && craftBaseline === "" && !c.stickers.some(Boolean) && !c.charm && !c.stattrak) return;
-  if (!(await hasModel(model))) return;
+  //
+  // WEAPONS ONLY. Every other kind's catalog art is a stock icon that cannot
+  // show the pattern or the wear this item was built with, so there the render
+  // is the only honest picture and there is no untouched state to defer to.
+  if (
+    target.kind === "weapon" &&
+    editingId.value == null &&
+    craftBaseline === "" &&
+    !c.stickers.some(Boolean) &&
+    !c.charm &&
+    !c.stattrak
+  ) return;
+  if (!(await hasModel(target.model))) return;
   const token = ++craftPreviewToken;
   craftPreviewBusy.value = true;
   try {
     const blob = await snapshotModel(
-      model,
+      target.model,
       {
-        paintMaterial: c.skin.paintMaterial ?? null,
-        legacyPaint: !!c.skin.legacyPaint,
-        wear: Number(c.wear ?? 0),
-        seed: Number(c.seed ?? 0),
-        ...(await stickerGeom(model)),
-        stickers: craftStickerPlacements(),
-        charm: craftCharmPlacement(),
+        ...(await craftVisualOpts(target)),
         // Dark readout, matching the card this preview stands in for rather
         // than the live 3D viewer. A draft has no kills to show anyway.
         stattrak: c.stattrak ? { count: null } : null,
@@ -2986,6 +3318,7 @@ async function refreshCraftPreview() {
     if (!blob || blob === INCOMPLETE || token !== craftPreviewToken) return;
     if (craftPreview.value) URL.revokeObjectURL(craftPreview.value);
     craftPreview.value = URL.createObjectURL(blob);
+    craftPreviewRendered.value = true;
   } finally {
     if (token === craftPreviewToken) craftPreviewBusy.value = false;
   }
@@ -3025,6 +3358,7 @@ watch(
       craftPreviewToken++;
       if (craftPreview.value) URL.revokeObjectURL(craftPreview.value);
       craftPreview.value = null;
+      craftPreviewRendered.value = false;
       craftPreviewBusy.value = false;
       return;
     }
@@ -3531,7 +3865,13 @@ const preview3dSeed = computed({
 // Declared HERE, not with its ref: hiding the pattern strip unmounts the rail
 // that reported the verdict, so the flag has to be dropped whenever the subject
 // changes or the next charm inherits it. See craftCharmInert for the full note.
-watch(preview3d, () => (previewCharmInert.value = false));
+watch(preview3d, () => {
+  previewCharmInert.value = false;
+  // Same sentence, same reason: the albedo belongs to the charm that was
+  // mounted, so until the next one's GLB lands its rail would grade the last
+  // charm's texture against the last charm's material name.
+  previewAlbedo.value = null;
+});
 /** Picker kind -> cs2-lib type. The picker says "charm"; the economy calls it a
  *  "keychain", and the resolver switches on the economy's name. Without this the
  *  charm preview resolved to null and the panel opened on nothing. */
@@ -4799,6 +5139,450 @@ function clearInvFilters() {
   invModels.value = [];
   invTypes.value = [];
 }
+// ---- money ------------------------------------------------------------------
+// Estimated values, off by default until an operator turns the price feed on
+// (Admin → Prices) — and off for each PLAYER until they ask for it, because a
+// dollar figure beside every gun changes what the screen is about. The toggle
+// lives in the header beside Steam sync: both are account-level, both act on
+// everything rather than on what a filter is showing.
+//
+// Never presented as a sale price. Every number here is a whole-wear-bracket
+// market estimate that cannot know about float, pattern or phase, so the label
+// is always "est." and the tooltip says so in words.
+const priceStatus = ref<PriceStatus | null>(null);
+const PRICES_SHOWN_KEY = "inventory.prices.shown";
+const showPrices = ref(localStorage.getItem(PRICES_SHOWN_KEY) !== "0");
+/** Prices exist AND this player wants to see them. Every money surface reads
+ *  this one flag, so turning it off cannot leave a stray total behind. */
+const pricesOn = computed(() => !!priceStatus.value?.ready && showPrices.value);
+/** Which market the figures came from, in words — for the caption that explains
+ *  a BLANK price. Declared here, with the rest of the money state, because the
+ *  tips below read it during setup. */
+const priceSourceLabel = computed(() =>
+  priceStatus.value ? PRICE_SOURCE_LABEL[priceStatus.value.source] : "the price feed",
+);
+function togglePrices() {
+  showPrices.value = !showPrices.value;
+  // Turning money off while sorted by it would leave the grid in an order
+  // nothing on screen explains.
+  if (!showPrices.value && invSort.value === "value") setInvSort(DEFAULT_SORT);
+  localStorage.setItem(PRICES_SHOWN_KEY, showPrices.value ? "1" : "0");
+  // Someone turning it on for the first time this session has no numbers yet.
+  if (showPrices.value && !pricesLoaded.value) void loadPrices();
+}
+/** Re-read the status on the way OUT of the admin screen.
+ *
+ * The admin console is the same SPA, so an operator who has just switched the
+ * price feed on lands back on the loadout with a `priceStatus` fetched before
+ * pricing existed — the header toggle would stay missing until a hard reload,
+ * which reads exactly like the setting not working. One cheap request on a
+ * screen change nobody makes in a loop. */
+watch(
+  () => route.value.name === "admin",
+  (inAdmin, wasInAdmin) => {
+    if (wasInAdmin && !inAdmin) void loadPriceStatus().then(() => loadPrices());
+  },
+);
+
+/**
+ * A live estimate for whatever the editor is currently holding.
+ *
+ * Quoted server-side (POST /api/prices/quote) rather than summed here, so the
+ * breakdown obeys exactly the rules the rest of the app does: the skin at ITS
+ * wear bracket and StatTrak variant, then each sticker, patch and charm at its
+ * own bare-name price, with the ones that couldn't be priced counted rather than
+ * quietly dropped.
+ *
+ * Debounced because the things that move it are dragged, not typed: a sticker
+ * slid across a gun fires a change per frame, and every one of those would be a
+ * request. 250ms after the hand stops is indistinguishable from live.
+ */
+const craftQuote = ref<Quote | null>(null);
+const craftQuoting = ref(false);
+let quoteTimer: ReturnType<typeof setTimeout> | undefined;
+
+function quoteKeyOf(c: NonNullable<typeof craft.value>) {
+  // Only the inputs a PRICE depends on. Deliberately not the placement — moving
+  // a sticker across the gun changes the render, never the bill — so dragging
+  // one costs nothing here.
+  return [
+    c.skin.id,
+    c.wear,
+    c.stattrak ? 1 : 0,
+    c.stickers.map((x) => x?.id ?? "-").join(","),
+    c.patches.map((x) => x?.id ?? "-").join(","),
+    c.charm?.id ?? "-",
+  ].join("|");
+}
+
+function scheduleCraftQuote() {
+  const c = craft.value;
+  clearTimeout(quoteTimer);
+  if (!c || !pricesOn.value) {
+    craftQuote.value = null;
+    return;
+  }
+  craftQuoting.value = true;
+  quoteTimer = setTimeout(async () => {
+    const key = quoteKeyOf(c);
+    try {
+      const quote = await quoteCraft({
+        item_id: c.skin.id,
+        wear: c.wear,
+        stattrak: c.stattrak,
+        stickers: c.stickers.map((x) => (x ? { id: x.id } : null)),
+        patches: c.patches.map((x) => (x ? { id: x.id } : null)),
+        charm_id: c.charm?.id ?? null,
+      });
+      // The form may have moved on while that was in flight; a late answer for a
+      // gun that no longer exists on screen is worse than none.
+      if (craft.value && quoteKeyOf(craft.value) === key) craftQuote.value = quote;
+    } catch {
+      craftQuote.value = null;
+    } finally {
+      craftQuoting.value = false;
+    }
+  }, 250);
+}
+
+// The bill, not the render: watches only what a PRICE depends on, so sliding a
+// sticker around the gun never triggers a quote. Closing the editor clears it,
+// or the next open flashes the last craft's total.
+watch(
+  () => (craft.value ? quoteKeyOf(craft.value) : null),
+  (key) => {
+    if (key === null) {
+      craftQuote.value = null;
+      return;
+    }
+    scheduleCraftQuote();
+    scheduleCraftDetail();
+  },
+);
+// Turning values on mid-edit should fill the line in, not wait for the next
+// sticker change.
+watch(pricesOn, () => {
+  if (craft.value) {
+    scheduleCraftQuote();
+    scheduleCraftDetail();
+  } else {
+    craftQuote.value = null;
+    craftDetail.value = null;
+  }
+});
+
+/** The quote, spelled out. Line by line so it is obvious what the total is made
+ *  of, and explicit about what could not be priced — an estimate silently
+ *  missing the expensive sticker is worse than no estimate. */
+const craftQuoteTip = computed(() => {
+  const quote = craftQuote.value;
+  if (!quote) return "";
+  // Nothing priced at all. The most useful thing to say is WHAT was looked for:
+  // an item with no listing and a feed that never synced look identical from
+  // here, and the bracket is usually the answer — markets list per bracket, and
+  // the ends of the range often have no copies for sale at all.
+  if (quote.total === 0) {
+    const bracket = craftHasWear.value && craft.value?.wear != null ? ` (${wearTier(craft.value.wear)})` : "";
+    const st = craft.value?.stattrak ? "StatTrak™ " : "";
+    return (
+      `No ${priceSourceLabel.value} listing for ${st}${quote.base.name ?? "this item"}${bracket}.\n` +
+      (quote.attachments.length
+        ? `${quote.attachments.filter((a) => a.price).length} of ${quote.attachments.length} applied items could be priced.\n`
+        : "") +
+      "Try another source in Admin → Prices, or a different wear — thinly traded brackets often have none."
+    );
+  }
+  const lines = [
+    `${quote.base.name ?? "Skin"} — ${quote.base.price ? formatPrice(quote.base.price.value) : "no price"}`,
+    ...quote.attachments.map((a) => `${a.name ?? a.kind} — ${a.price ? formatPrice(a.price.value) : "no price"}`),
+  ];
+  return (
+    `Rough cost to buy this build:\n${lines.join("\n")}\n` +
+    `Total ${formatPrice(quote.total)}` +
+    (quote.unpriced ? ` (${quote.unpriced} of ${quote.lines} couldn't be priced)` : "") +
+    ". Each piece at its own market price — not what the finished craft would resell for."
+  );
+});
+
+/**
+ * What the finishes in the OPEN craft list would cost brand new.
+ *
+ * Keyed by catalog id, fetched per slot alongside the skins themselves, and
+ * cached the same way — a picker that has already loaded its 1,400 AK finishes
+ * should not re-ask for their prices every time it opens.
+ */
+const stockPrices = ref<Record<string, { value: number; window: string; marketHashName: string; wearTier: number }>>({});
+const stockCache = new Map<string, Record<string, { value: number; window: string; marketHashName: string; wearTier: number }>>();
+
+async function loadStockPrices(key: string) {
+  if (!priceStatus.value?.ready) return;
+  const cached = stockCache.get(key);
+  if (cached) {
+    stockPrices.value = cached;
+    return;
+  }
+  try {
+    const { prices } = await fetchStockPrices(key);
+    stockCache.set(key, prices);
+    // A newer slot may have won while this was out; the skins loader guards the
+    // same way for the same reason.
+    if (sheetKey.value === key) stockPrices.value = prices;
+  } catch {
+    // No prices is the normal state on an instance with the feed off.
+  }
+}
+
+/** A craft card's cost, and the caption that keeps it honest about which wear
+ *  bracket answered — "brand new" is Factory New only where FN exists. */
+const stockPriceOf = (id?: number | null) => (id != null ? stockPrices.value[String(id)] ?? null : null);
+function stockPriceTip(id?: number | null) {
+  const hit = stockPriceOf(id);
+  if (!hit) return `No ${priceSourceLabel.value} listing for this finish, in any wear bracket.`;
+  const tier = WEAR_TIER_NAME[hit.wearTier] ?? null;
+  return (
+    `Rough cost to craft this brand new${tier ? ` — cheapest listing is ${tier}` : ""}. ` +
+    "Not a sale price, and it doesn't include stickers, a charm or StatTrak."
+  );
+}
+
+/**
+ * The spread behind the editor's single figure, and where THIS copy sits in it.
+ *
+ * A flat bracket price is the wrong shape for a knife: Factory New spans 0.00 to
+ * 0.07, and a market's one figure for it covers both ends. So two facts, kept
+ * apart on purpose —
+ *
+ *   the SPREAD: what copies actually sold for recently, min to max, with the
+ *     count behind it. Measured, from real sales.
+ *   the POSITION: where this float sits inside its own bracket. Also measured,
+ *     from the float itself.
+ *
+ * The inference joining them ("yours is low in the bracket, so nearer the top of
+ * that range") is stated in words and never as a number. Producing a
+ * float-adjusted price would need per-listing floats, and no public feed exposes
+ * them — CSFloat and Waxpeer both require an account. A fabricated figure on a
+ * $1,400 knife is worse than an honest range.
+ */
+const craftDetail = ref<PriceDetail | null>(null);
+let detailTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleCraftDetail() {
+  const c = craft.value;
+  clearTimeout(detailTimer);
+  if (!c || !pricesOn.value) {
+    craftDetail.value = null;
+    return;
+  }
+  const key = `${c.skin.id}:${wearTier(c.wear ?? 0)}:${c.stattrak ? 1 : 0}`;
+  detailTimer = setTimeout(async () => {
+    try {
+      const detail = await fetchPriceDetail(c.skin.id, c.wear ?? null, c.stattrak);
+      const still = craft.value;
+      if (still && `${still.skin.id}:${wearTier(still.wear ?? 0)}:${still.stattrak ? 1 : 0}` === key) {
+        craftDetail.value = detail.available ? detail : null;
+      }
+    } catch {
+      craftDetail.value = null;
+    }
+  }, 400);
+}
+
+/** The window worth quoting, once. */
+const craftSales = computed(() => (craftDetail.value ? bestSaleWindow(craftDetail.value.history) : null));
+
+/** Where the edited float sits in its own bracket, and what that means in words.
+ *  Only for items that HAVE a float — a charm has no bracket to be at the end of. */
+const craftWearStanding = computed(() => {
+  const c = craft.value;
+  if (!c || !craftHasWear.value || c.wear == null) return null;
+  const { tier, pct } = wearPositionInTier(c.wear);
+  const rank = Math.max(1, Math.round(pct * 100));
+  return {
+    tier,
+    pct,
+    // "Top 4% of Factory New" reads as a rank, which is what people compare on.
+    caption: pct <= 0.5 ? `top ${rank}% of ${tier}` : `bottom ${101 - rank}% of ${tier}`,
+    verdict: pct <= 0.2 ? "better" : pct >= 0.8 ? "worse" : "typical",
+  };
+});
+
+/** One sentence tying the two together, and one saying what it can't see. */
+const craftValueTip = computed(() => {
+  const sales = craftSales.value;
+  const standing = craftWearStanding.value;
+  if (!sales) return "";
+  const range =
+    sales.min != null && sales.max != null && sales.max > sales.min
+      ? `${formatPrice(sales.min)}–${formatPrice(sales.max)}`
+      : formatPrice(sales.median ?? sales.avg ?? sales.min ?? 0);
+  const lines = [
+    `${sales.volume} recent sale${sales.volume === 1 ? "" : "s"} (${HISTORY_WINDOW_LABEL[sales.window]}) ranged ${range}.`,
+  ];
+  if (standing) {
+    lines.push(
+      standing.verdict === "better"
+        ? `This float is ${standing.caption} — low floats trade toward the upper end of that range.`
+        : standing.verdict === "worse"
+          ? `This float is ${standing.caption} — high floats trade toward the lower end.`
+          : `This float sits mid-bracket (${standing.caption}).`,
+    );
+  }
+  lines.push("The spread also carries stickers and patterns, which this can't see — treat it as a bracket, not a quote.");
+  return lines.join("\n");
+});
+
+/** Slot values, keyed TEAM:slot, straight off the server. */
+const slotValues = ref<Record<string, number>>({});
+/** A fetch is in flight AND we have nothing yet — the only state worth showing a
+ *  player. A refresh over prices already on screen is silent: numbers that
+ *  flicker to "loading" every time something is crafted are worse than numbers
+ *  that update a beat late. */
+const pricesLoading = ref(false);
+const pricesPending = computed(() => pricesLoading.value && !pricesLoaded.value);
+const pricesLoaded = ref(false);
+
+/**
+ * Fetch prices and fold them into the items already on screen.
+ *
+ * Merged onto the existing rows rather than kept in a parallel map: everything
+ * that reads a price — tiles, totals, sorting — then reads it off the item it
+ * belongs to, which is the shape it would have had if the payload carried it.
+ * The difference is only in WHEN, which is the whole point.
+ */
+async function loadPrices() {
+  if (!priceStatus.value?.enabled) return;
+  pricesLoading.value = true;
+  try {
+    const { items, slots, ready } = await fetchInventoryPrices();
+    for (const inst of inventory.value) inst.price = items[String(inst.id)] ?? null;
+    slotValues.value = slots;
+    pricesLoaded.value = ready;
+  } catch {
+    // Prices failing is not worth a toast on top of someone's inventory. The
+    // numbers simply don't appear, which is the same as pricing being off.
+  } finally {
+    pricesLoading.value = false;
+  }
+}
+
+async function loadPriceStatus() {
+  try {
+    priceStatus.value = await fetchPriceStatus();
+  } catch {
+    // A panel with no pricing is the normal state, not an error worth a toast.
+    priceStatus.value = null;
+  }
+}
+
+/** Sum of what's on screen right now — filters, search and all. The number that
+ *  answers "what are my knives worth", which no total can. */
+const inventoryValueInView = computed(() =>
+  filteredInventory.value.reduce((sum, i) => sum + (i.price?.value ?? 0), 0),
+);
+/** Everything owned, unfiltered. Every owned row carries its OWN price, so an
+ *  applied sticker counts once here and not again through its weapon. */
+const inventoryValueTotal = computed(() =>
+  inventory.value.reduce((sum, i) => sum + (i.price?.value ?? 0), 0),
+);
+/**
+ * Real versus simulated, in money.
+ *
+ * Keyed by the origin filter's own values so the figures and the tabs can never
+ * disagree about what "Synced" means — `matchesOrigin` is the same predicate the
+ * grid filters on, so a tab's number is exactly the sum of what that tab shows.
+ *
+ * Client-side on purpose. Every owned row already carries its own price by the
+ * time this runs, and each row is counted once — an applied sticker is a row
+ * here as well as a line on its weapon. A server endpoint doing the same sum
+ * would be a second implementation of one number, and the two would drift.
+ */
+const valueByOrigin = computed(() => {
+  const totals: Record<OriginFilter, number> = { all: 0, steam: 0, crafted: 0 };
+  for (const item of inventory.value) {
+    const value = item.price?.value ?? 0;
+    if (!value) continue;
+    totals.all += value;
+    totals[matchesOrigin(item, "steam") ? "steam" : "crafted"] += value;
+  }
+  return totals;
+});
+
+/** Show the in-view figure only when the view is actually narrowed, and only
+ *  when it has something to say. */
+const filteredValueShown = computed(
+  () => inventoryValueInView.value > 0 && filteredInventory.value.length !== inventory.value.length,
+);
+
+/** Owned rows the mirror couldn't price. Shown as "+N unpriced" rather than
+ *  folded into the total: a total built from 180 of 201 items is a different
+ *  claim from one built from all of them. */
+const inventoryUnpriced = computed(() => inventory.value.filter((i) => !i.price).length);
+
+/** What the equipped loadout for a side would cost — guns plus everything on
+ *  them. `value` is the server's per-slot figure and already includes stickers,
+ *  patches and charms, which is why this sums that and not `price`. */
+const loadoutValue = computed(() => {
+  const totals: Record<string, number> = { CT: 0, T: 0 };
+  for (const [key, value] of Object.entries(slotValues.value)) {
+    const side = key.split(":")[0];
+    totals[side] = (totals[side] ?? 0) + value;
+  }
+  return totals;
+});
+const teamLoadoutValue = computed(() => loadoutValue.value[team.value] ?? 0);
+
+/** "$41" / "$4.55" / "$18k" — see formatPrice. Blank rather than "$0" when
+ *  nothing in the set could be priced, so an empty state reads as unknown. */
+const money = (value: number) => (value > 0 ? formatPrice(value) : "—");
+
+/** Which figure the header shows, by screen. The loadout screens answer "what
+ *  is this side wearing"; the inventory answers "what do I own". Same object,
+ *  two questions — and nothing at all on the armory, where nothing is yours. */
+const headerValue = computed(() =>
+  view.value === "inventory"
+    ? inventoryValueTotal.value
+    : view.value === "grid" || view.value === "focus"
+      ? teamLoadoutValue.value
+      : 0,
+);
+const headerValueLabel = computed(() => (view.value === "inventory" ? "Inventory" : `${team.value} value`));
+const headerValueTip = computed(() => {
+  const window = priceStatus.value ? PRICE_WINDOW_LABEL[priceStatus.value.window] : "market estimate";
+  return view.value === "inventory"
+    ? invValueTip.value
+    : `Rough estimate for everything equipped on ${team.value} — skins plus the stickers, patches and charms on them. Based on ${window}s; not a sale price.`;
+});
+
+/** And the caption for a slot whose occupant the mirror had nothing for. */
+const noPriceTip = computed(
+  () => `No ${priceSourceLabel.value} listing for what's in this slot, at its wear bracket.`,
+);
+
+/** One caption for every per-slot figure in the loadout grid. */
+const slotValueTip = computed(
+  () =>
+    `Rough estimate for this slot — the skin plus anything applied to it. Based on ${
+      priceStatus.value ? PRICE_WINDOW_LABEL[priceStatus.value.window] : "market estimate"
+    }s; not a sale price.`,
+);
+
+/** The caption that keeps the number honest — which window it came from, and how
+ *  many owned rows the mirror had nothing for. A total silently missing a fifth
+ *  of an inventory is worse than no total. */
+const invValueTip = computed(() => {
+  const window = priceStatus.value ? PRICE_WINDOW_LABEL[priceStatus.value.window] : "market estimate";
+  const missing = inventoryUnpriced.value;
+  const split = valueByOrigin.value;
+  return (
+    `Rough estimate — ${window}s across ${inventory.value.length - missing} of ${inventory.value.length} items` +
+    (missing ? `; ${missing} couldn't be priced` : "") +
+    (split.steam && split.crafted
+      ? `.\nSynced from Steam ${formatPrice(split.steam)} · crafted here ${formatPrice(split.crafted)}`
+      : "") +
+    ". Not a sale price: it can't know about float, pattern or Doppler phase."
+  );
+});
+
 // ---- compact: the inventory filter sheet ------------------------------------
 // Same treatment the picker got. The desktop toolbar is a search field, an
 // origin pill, two dropdowns and a sort-direction toggle on one line — it needs
@@ -5566,6 +6350,12 @@ async function load() {
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = current;
       inventory.value = inv;
+      // Status, THEN prices, and both after the rows they attach to — the whole
+      // sequence spelled out because every shortcut here is a race: fired early
+      // it merges onto an empty array, and fired in parallel it can run before
+      // the status that decides whether to run at all. Not awaited, so the
+      // screen is interactive while the numbers are still coming.
+      void loadPriceStatus().then(() => loadPrices());
       loadSkins(sheetKey.value);
       queueLoadoutRenders();
       // Off to the side: the nag dot is the least important thing on screen and
@@ -6118,6 +6908,27 @@ if (MDEBUG) {
         <Crosshair class="h-3.5 w-3.5" />
         <span v-if="!isCompact">{{ view === 'focus' ? 'Focused' : 'Focus' }}</span>
       </button>
+      <!-- The headline figure for whatever screen you're on: the side's loadout
+           on the loadout screens, the whole collection on the inventory. ONE
+           chip rather than two, so the two screens cannot drift apart — the
+           label changes, the object doesn't.
+           Not a button. It reads as a readout: a hairline rule, the value in
+           the same tabular mono the floats use, and the "$" set back so the
+           number leads. -->
+      <!-- Pending: the chip's own outline with a pulsing dash inside it, so the
+           number lands in a place the eye is already looking instead of shifting
+           the header when it arrives. -->
+      <Tooltip v-if="pricesOn && (headerValue > 0 || pricesPending)" :text="headerValueTip">
+        <PriceTag
+          class="items-center"
+          frame="spine"
+          size="md"
+          :label="isCompact ? null : headerValueLabel"
+          :value="headerValue"
+          :pending="pricesPending"
+          suffix="est"
+        />
+      </Tooltip>
 
       <!-- Utility actions sit LEFT of the tabs and are grouped tight, so the
            header reads as "tools | where you are" instead of three things
@@ -6175,6 +6986,35 @@ if (MDEBUG) {
                 class="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full"
                 style="background: #f97316; box-shadow: 0 0 6px #f9731699"
               ></span>
+            </button>
+          </Tooltip>
+          <!-- Money is a MODE, not a decoration: a dollar figure beside every
+               gun changes what the screen is about, and plenty of people want
+               the collection and not the appraisal. Sits beside Steam sync
+               because both are account-level and both act on everything rather
+               than on what a filter is showing. Absent entirely when the
+               operator hasn't turned pricing on — a dead switch is worse than
+               no switch. -->
+          <Tooltip
+            v-if="priceStatus?.ready"
+            :text="showPrices
+              ? `Hide estimated values (${PRICE_WINDOW_LABEL[priceStatus.window]}s — rough estimates, not sale prices)`
+              : 'Show estimated values — rough market estimates, not sale prices'"
+          >
+            <!-- State by PRESENCE, not by hue: on, it is an ordinary action
+                 button like sync and share beside it; off, it wears the disabled
+                 look — dimmed border, faded glyph — so "values are hidden" reads
+                 as the control being stood down rather than as a second accent
+                 colour in a row that already has amber. -->
+            <button
+              class="relative grid place-items-center rounded-md border tac-action"
+              :class="[
+                isCompact ? 'h-8 w-8' : 'h-9 w-9',
+                showPrices ? 'border-border text-foreground' : 'border-border/40 text-muted-foreground/40',
+              ]"
+              @click="togglePrices"
+            >
+              <CircleDollarSign class="h-3.5 w-3.5" />
             </button>
           </Tooltip>
           <ShareMenu icon :links="viewShareLinks" />
@@ -6348,6 +7188,20 @@ if (MDEBUG) {
           <span v-if="inventory.length" class="min-w-0 truncate font-mono text-f10 text-muted-foreground/60">
             {{ filteredInventory.length }}<template v-if="filteredInventory.length !== inventory.length">/{{ inventory.length }}</template>
           </span>
+          <!-- Only when a filter actually narrows the view. The full total lives
+               in the header now, so repeating it here would be two identical
+               numbers a few pixels apart; what this adds is "…and the twelve on
+               screen are worth this much". Bordered rather than bare mono, because
+               beside the item count in the same weight and colour it read as more
+               of the counter instead of a different fact. -->
+          <Tooltip v-if="pricesOn && filteredValueShown" :text="invValueTip">
+            <PriceTag
+              :class="'flex-none'"
+              frame="spine"
+              :value="inventoryValueInView"
+              suffix="in view"
+            />
+          </Tooltip>
           <button
             v-if="inventory.length"
             class="ml-auto grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action"
@@ -6385,7 +7239,22 @@ if (MDEBUG) {
             button-class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
             @select="(v) => (invOrigin = v as OriginFilter)"
           >
-            <template #default="{ item: f }">{{ f[1] }}</template>
+            <!-- The money rides on the ORIGIN TABS rather than in a readout of
+                 its own, because the tabs already are the question: "Synced" is
+                 what you actually own on Steam, "Crafted" is what you built
+                 here. Attaching the figure to the switch makes the comparison
+                 structural instead of another number to correlate.
+                 Desktop only — at compact width the pills are 54px and a
+                 second figure inside one would truncate the label it belongs
+                 to. -->
+            <template #default="{ item: f }"
+              >{{ f[1]
+              }}<span
+                v-if="pricesOn && !isCompact && valueByOrigin[f[0] as OriginFilter]"
+                class="ml-1.5 font-mono text-f9 normal-case tracking-normal text-[hsl(var(--tac-value))]/70"
+                >{{ formatPrice(valueByOrigin[f[0] as OriginFilter]) }}</span
+              ></template
+            >
           </PillTabs>
           <FilterDropdown
             v-if="invRarityFacets.length"
@@ -6398,7 +7267,7 @@ if (MDEBUG) {
             :model-value="invSort"
             prefix="Sort"
             class="shrink-0"
-            :options="SORTS.map((s) => ({ value: s[0], label: s[0] === 'default' ? 'Newest' : s[1] }))"
+            :options="invSorts.map((s) => ({ value: s[0], label: s[0] === 'default' ? 'Newest' : s[1] }))"
             @update:model-value="setInvSort"
           />
           <SortDirection v-model="invDir" :kind="invSortKind" :hint="invSortHint" />
@@ -6413,6 +7282,15 @@ if (MDEBUG) {
           <span v-if="inventory.length" class="shrink-0 font-mono text-f10 text-muted-foreground/60">
             {{ filteredInventory.length }}<template v-if="filteredInventory.length !== inventory.length">/{{ inventory.length }}</template>
           </span>
+          <!-- Same object as the compact toolbar's, same reasoning. -->
+          <Tooltip v-if="pricesOn && filteredValueShown" :text="invValueTip">
+            <PriceTag
+              :class="'shrink-0'"
+              frame="spine"
+              :value="inventoryValueInView"
+              suffix="in view"
+            />
+          </Tooltip>
 
           <div class="ml-auto flex shrink-0 items-center gap-2">
             <!-- Card size is the first thing to go when the row gets tight:
@@ -6496,7 +7374,7 @@ if (MDEBUG) {
                 </div>
                 <div class="flex flex-wrap gap-2">
                   <button
-                    v-for="s in SORTS"
+                    v-for="s in invSorts"
                     :key="s[0]"
                     :class="[INV_CHIP, invSort === s[0] ? INV_CHIP_ON : INV_CHIP_OFF]"
                     @click="setInvSort(s[0])"
@@ -6763,7 +7641,7 @@ if (MDEBUG) {
             <DeckCard
               v-if="st.variants.length > 1"
               class="cv-tile"
-              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
+              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + (pricesOn ? PRICE_ROW_PX : 0) + 'px' }"
               :face="st.face"
               :behind="st.behind"
               :count="st.variants.length"
@@ -6774,9 +7652,12 @@ if (MDEBUG) {
             <ItemTile
               v-else
               class="cv-tile"
-              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
+              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + (pricesOn ? PRICE_ROW_PX : 0) + 'px' }"
               :inst="st.face"
               :attached-name="attachedName(st.face)"
+              :show-price="pricesOn"
+              :price-pending="pricesPending"
+              :price-source="priceSourceLabel"
               show-header
               :selected="selectMode && selectedIds.has(st.face.id)"
               :hide-actions="selectMode"
@@ -6919,11 +7800,10 @@ if (MDEBUG) {
           <div class="min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3">
             <!-- Equipment: agent spans both columns as the identity piece. -->
             <div v-if="compactCat === 'equipment'" class="grid grid-cols-2 gap-2">
-              <button
+              <LoadoutCell
                 v-for="(s, si) in compactEquipment"
                 :key="s.slot"
                 :data-slot="s.slot" data-role="rail"
-                class="group relative flex flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
                 :class="[
                   s.slot === 'agent' ? 'col-span-2 min-h-[132px]' : 'min-h-[96px]',
                   // Agent already eats two cells, so the row parity flips on an
@@ -6934,54 +7814,32 @@ if (MDEBUG) {
                   pulsePos === s.slot && 'animate-equip-pulse',
                 ]"
                 :style="[selRing(selected === s.slot), rowFor(s.slot)?.item?.rarity ? { borderLeft: `3px solid ${rowFor(s.slot)!.item!.rarity}` } : {}, dropStyle(s.slot)]"
+                :label="s.slot === 'agent' ? `Agent · ${team}` : s.name"
+                :index="si"
+                :art-key="team"
+                :fade-art="s.slot === 'agent'"
+                pad-art
+                v-bind="cellFacts(s.slot)"
                 @click="selectPos(s.slot)"
                 @contextmenu.prevent="openCtx(s.slot, $event)"
                 @dragover="onSlotDragOver(s.slot, $event)"
                 @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
                 @drop.prevent="onSlotDrop(s.slot)"
-              >
-                <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
-                <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" />
-                <TileActions
-                  v-if="cellInstance(s.slot)"
-                  :inst="cellInstance(s.slot)!"
-                  @view3d="view3dForInstance(cellInstance(s.slot)!)"
-                  @inspect="openInspectLink(cellInstance(s.slot)!.id)"
-                  @edit="openEdit(cellInstance(s.slot)!)"
-                  @duplicate="openEdit(cellInstance(s.slot)!)"
-                  @remove="deleteOwned(cellInstance(s.slot)!)"
-                />
-                <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">
-                  {{ s.slot === 'agent' ? `Agent · ${team}` : s.name }}
-                </div>
-                <div :key="team" :class="['animate-cell-in py-1', CARD_ART]" :style="{ '--i': si }">
-                  <ItemArt
-                    v-if="specialImage(s.slot)"
-                    :inst="cellInstance(s.slot)"
-                    :image="specialImage(s.slot)"
-                    :class="cn('max-h-full max-w-full object-contain', s.slot === 'agent' && ART_FADE_B, !rowFor(s.slot) && 'opacity-60')"
-                  />
-                  <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
-                </div>
-                <div class="relative z-[2] flex items-end justify-between gap-2">
-                  <ItemName
-                    :item="rowFor(s.slot)?.item"
-                    :fallback="specialFallback(s.slot)"
-                    name-class="text-f11 font-medium"
-                    class="min-w-0 flex-1"
-                  />
-                  <WearBar :item="rowFor(s.slot)?.item" :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
-                </div>
-              </button>
+                @view3d="cellActions(s.slot).view3d()"
+                @inspect="cellActions(s.slot).inspect()"
+                @edit="cellActions(s.slot).edit()"
+                @duplicate="cellActions(s.slot).duplicate()"
+                @remove="cellActions(s.slot).remove()"
+              />
             </div>
 
             <!-- Weapon categories: a flat 2-up of the group's five slots. -->
             <div v-else class="grid grid-cols-2 gap-2">
-              <button
+              <LoadoutCell
                 v-for="(cell, ci) in compactCells"
                 :key="cell.pos"
                 :data-slot="cell.pos" data-role="weapon"
-                class="group relative flex min-h-[118px] flex-col overflow-hidden rounded-lg border p-2 text-left transition-colors"
+                class="min-h-[118px] !p-2"
                 :class="[
                   selected === cell.pos ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
                   pulsePos === cell.pos && 'animate-equip-pulse',
@@ -6991,51 +7849,23 @@ if (MDEBUG) {
                   rarityOf(cell.pos) ? { borderLeft: `3px solid ${rarityOf(cell.pos)}` } : {},
                   dropStyle(cell.pos),
                 ]"
+                :label="cell.weapon?.name ?? cell.pos"
+                :index="ci"
+                :art-key="team + ':' + occupantModel(cell.pos)"
+                focus-action
+                v-bind="cellFacts(cell.pos)"
                 @click="selectPos(cell.pos)"
                 @contextmenu.prevent="openCtx(cell.pos, $event)"
                 @dragover="onSlotDragOver(cell.pos, $event)"
                 @dragleave="dragOverPos === cell.pos && (dragOverPos = null)"
                 @drop.prevent="onSlotDrop(cell.pos)"
-              >
-                <span class="pointer-events-none absolute inset-0" :style="glowStyle(rarityOf(cell.pos), 0.35)"></span>
-                <div class="relative z-[2] truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
-                  {{ cell.weapon?.name ?? cell.pos }}
-                </div>
-                <SlotStatus :teams="cellTeams(cell.pos)" :inst="cellInstance(cell.pos)" />
-                <!-- These cells had NO actions at all, while the equipment cells
-                     beside them in the same compact layout had the full cluster.
-                     Hidden on touch by TileActions itself, so in practice this
-                     only lights up on a narrow desktop window. -->
-                <TileActions
-                  :inst="cellInstance(cell.pos) ?? null"
-                  focus
-                  @focus="selectPos(cell.pos); go('/focus')"
-                  @view3d="view3dForInstance(cellInstance(cell.pos)!)"
-                  @inspect="openInspectLink(cellInstance(cell.pos)!.id)"
-                  @edit="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
-                  @duplicate="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
-                  @remove="deleteOwned(cellInstance(cell.pos)!)"
-                />
-                <div
-                  :key="team + ':' + occupantModel(cell.pos)"
-                  :class="['animate-cell-in', CARD_ART]"
-                  :style="{ '--i': ci }"
-                >
-                  <ItemArt
-                    :inst="cellInstance(cell.pos)"
-                    :image="cellImage(cell.pos)"
-                    :class="cn('max-h-full max-w-full object-contain', !isSkinned(cell.row) && 'opacity-60')"
-                  />
-                  <span
-                    v-if="cellInstance(cell.pos) && (renderingIds.has(cellInstance(cell.pos)!.id) || queuedIds.has(cellInstance(cell.pos)!.id))"
-                    class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
-                  ><Loader2 v-if="renderingIds.has(cellInstance(cell.pos)!.id)" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" /></span>
-                </div>
-                <div class="relative z-[2] flex items-end justify-between gap-2">
-                  <ItemName :item="cellItem(cell.pos)" strip fallback="Default" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
-                  <WearBar :item="cellWear(cell.pos)?.item" :wear="cellWear(cell.pos)?.wear" :seed="cellWear(cell.pos)?.seed" mini class="mb-1" />
-                </div>
-              </button>
+                @focus="cellActions(cell.pos).focus()"
+                @view3d="cellActions(cell.pos).view3d()"
+                @inspect="cellActions(cell.pos).inspect()"
+                @edit="cellActions(cell.pos).edit()"
+                @duplicate="cellActions(cell.pos).duplicate()"
+                @remove="cellActions(cell.pos).remove()"
+              />
             </div>
 
             <!-- Permanent, not retired-after-first-use. It used to hide itself
@@ -7061,98 +7891,61 @@ if (MDEBUG) {
           <aside class="animate-grid-in flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col overflow-y-auto py-3 pl-4 pr-1" :style="liftScrollStyle">
             <div class="flex min-h-full flex-col gap-2.5">
             <div class="px-1 text-f9 uppercase tracking-cs3 text-muted-foreground/70">Equipment</div>
-            <button
+            <LoadoutCell
               v-for="(s, si) in [RAIL[2], RAIL[1]]"
               :key="s.slot"
-              class="group relative flex min-h-[96px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
+              class="min-h-[96px] flex-1"
               :class="[
                 selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                 pulsePos === s.slot && 'animate-equip-pulse',
               ]"
               :style="[selRing(selected === s.slot), rowFor(s.slot)?.item?.rarity ? { borderLeft: `3px solid ${rowFor(s.slot)!.item!.rarity}` } : {}, dropStyle(s.slot)]"
               :data-slot="s.slot" data-role="rail"
+              :label="s.name"
+              :index="si"
+              :art-key="team"
+              v-bind="cellFacts(s.slot)"
               @click="selectPos(s.slot)"
               @contextmenu.prevent="openCtx(s.slot, $event)"
               @dragover="onSlotDragOver(s.slot, $event)"
               @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
               @drop.prevent="onSlotDrop(s.slot)"
-            >
-              <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
-              <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" />
-              <!-- Same actions the Inventory grid's tiles carry. Only when the
-                   slot actually holds an owned item — a default knife has no
-                   instance to edit, inspect or delete. -->
-              <TileActions
-                v-if="cellInstance(s.slot)"
-                :inst="cellInstance(s.slot)!"
-                @view3d="view3dForInstance(cellInstance(s.slot)!)"
-                @inspect="openInspectLink(cellInstance(s.slot)!.id)"
-                @edit="openEdit(cellInstance(s.slot)!)"
-                @duplicate="openEdit(cellInstance(s.slot)!)"
-                @remove="deleteOwned(cellInstance(s.slot)!)"
-              />
-              <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ s.name }}</div>
-              <!-- Keyed on team: switching sides re-runs the entrance so the
-                   rail joins the same cascade as the weapon columns. -->
-              <div :key="team" :class="['animate-cell-in', CARD_ART]" :style="{ '--i': si }">
-                <ItemArt v-if="specialImage(s.slot)" :inst="cellInstance(s.slot)" :image="specialImage(s.slot)" :class="cn('max-h-full max-w-full object-contain', !rowFor(s.slot) && 'opacity-60')" />
-                <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
-              </div>
-              <div class="relative z-[2] flex items-end justify-between gap-2">
-                <ItemName
-                  :item="rowFor(s.slot)?.item"
-                  :fallback="specialFallback(s.slot)"
-                  name-class="text-f11 font-medium"
-                  class="min-w-0 flex-1"
-                />
-                <WearBar :item="rowFor(s.slot)?.item" :wear="rowFor(s.slot)?.wear" :seed="rowFor(s.slot)?.seed" mini class="mb-1" />
-              </div>
-            </button>
-            <button
-              class="group relative flex min-h-[132px] flex-[1.6] cursor-pointer flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
+              @view3d="cellActions(s.slot).view3d()"
+              @inspect="cellActions(s.slot).inspect()"
+              @edit="cellActions(s.slot).edit()"
+              @duplicate="cellActions(s.slot).duplicate()"
+              @remove="cellActions(s.slot).remove()"
+            />
+            <LoadoutCell
+              class="min-h-[132px] flex-[1.6]"
               :class="[
                 selected === 'agent' ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                 pulsePos === 'agent' && 'animate-equip-pulse',
               ]"
               :style="[selRing(selected === 'agent'), dropStyle('agent')]"
               data-slot="agent" data-role="agent"
+              :label="`Agent · ${team}`"
+              :index="2"
+              :art-key="team"
+              fade-art
+              pad-art
+              v-bind="cellFacts('agent')"
               @click="selectPos('agent')"
               @contextmenu.prevent="openCtx('agent', $event)"
               @dragover="onSlotDragOver('agent', $event)"
               @dragleave="dragOverPos === 'agent' && (dragOverPos = null)"
               @drop.prevent="onSlotDrop('agent')"
-            >
-              <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor('agent')?.item?.rarity, 0.3)"></span>
-              <SlotStatus :teams="cellTeams('agent')" :inst="cellInstance('agent')" />
-              <TileActions
-                v-if="cellInstance('agent')"
-                :inst="cellInstance('agent')!"
-                @view3d="view3dForInstance(cellInstance('agent')!)"
-                @inspect="openInspectLink(cellInstance('agent')!.id)"
-                @edit="openEdit(cellInstance('agent')!)"
-                @duplicate="openEdit(cellInstance('agent')!)"
-                @remove="deleteOwned(cellInstance('agent')!)"
-              />
-              <div class="relative z-[2] text-f9 uppercase tracking-cs1 text-muted-foreground/70">Agent · {{ team }}</div>
-              <div :key="team" :class="['animate-cell-in py-1', CARD_ART]" :style="{ '--i': 2 }">
-                <ItemArt
-                  v-if="specialImage('agent')"
-                  :inst="cellInstance('agent')"
-                  :image="specialImage('agent')"
-                  :class="cn('max-h-full max-w-full object-contain', ART_FADE_B, !rowFor('agent') && 'opacity-70')"
-                  style="filter: drop-shadow(0 10px 16px rgba(0,0,0,0.5))"
-                />
-                <span v-else class="text-f10 uppercase text-muted-foreground/50">Default</span>
-              </div>
-              <div class="relative z-[2] truncate text-f11 font-medium" :class="!rowFor('agent') && 'text-muted-foreground'">
-                {{ specialLabel('agent') }}
-              </div>
-            </button>
+              @view3d="cellActions('agent').view3d()"
+              @inspect="cellActions('agent').inspect()"
+              @edit="cellActions('agent').edit()"
+              @duplicate="cellActions('agent').duplicate()"
+              @remove="cellActions('agent').remove()"
+            />
             <div class="grid flex-none grid-cols-2 gap-2">
-              <button
+              <LoadoutCell
                 v-for="(s, si) in EXTRAS"
                 :key="s.slot"
-                class="group relative flex h-[70px] flex-col items-center justify-between overflow-hidden rounded-lg border p-1.5 transition-colors"
+                class="h-[70px] items-center justify-between !p-1.5"
                 :class="[
                   selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
                   pulsePos === s.slot && 'animate-equip-pulse',
@@ -7163,30 +7956,23 @@ if (MDEBUG) {
                 :style="[selRing(selected === s.slot), dropStyle(s.slot)]"
                 :data-slot="s.slot" data-role="rail"
                 :title="s.name + (rowFor(s.slot)?.item ? ' · ' + itemName(rowFor(s.slot)!.item) : '')"
+                :label="s.name"
+                :index="3 + si"
+                :art-key="team"
+                compact
+                v-bind="cellFacts(s.slot)"
+                fallback="—"
                 @click="selectPos(s.slot)"
                 @contextmenu.prevent="openCtx(s.slot, $event)"
                 @dragover="onSlotDragOver(s.slot, $event)"
                 @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
                 @drop.prevent="onSlotDrop(s.slot)"
-              >
-                <span class="pointer-events-none absolute inset-0" :style="glowStyle(rowFor(s.slot)?.item?.rarity, 0.35)"></span>
-                <SlotStatus :teams="cellTeams(s.slot)" :inst="cellInstance(s.slot)" compact />
-                <TileActions
-                  v-if="cellInstance(s.slot)"
-                  :inst="cellInstance(s.slot)!"
-                  compact
-                  @view3d="view3dForInstance(cellInstance(s.slot)!)"
-                  @inspect="openInspectLink(cellInstance(s.slot)!.id)"
-                  @edit="openEdit(cellInstance(s.slot)!)"
-                  @duplicate="openEdit(cellInstance(s.slot)!)"
-                  @remove="deleteOwned(cellInstance(s.slot)!)"
-                />
-                <div :key="team" :class="['animate-cell-in', CARD_ART]" :style="{ '--i': 3 + si }">
-                  <ItemArt v-if="specialImage(s.slot)" :inst="cellInstance(s.slot)" :image="specialImage(s.slot)" :class="cn('max-h-full max-w-full object-contain', !rowFor(s.slot) && 'opacity-60')" />
-                  <span v-else class="text-f8 uppercase text-muted-foreground/50">—</span>
-                </div>
-                <div class="relative z-[2] w-full truncate text-center text-f8 uppercase tracking-cs1 text-muted-foreground/70">{{ s.name }}</div>
-              </button>
+                @view3d="cellActions(s.slot).view3d()"
+                @inspect="cellActions(s.slot).inspect()"
+                @edit="cellActions(s.slot).edit()"
+                @duplicate="cellActions(s.slot).duplicate()"
+                @remove="cellActions(s.slot).remove()"
+              />
             </div>
             </div>
             <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
@@ -7213,10 +7999,10 @@ if (MDEBUG) {
                 <!-- Every pos-derived display below reads through
                      previewPos(): during a reorder hover the two cells render
                      each other's contents — the drop confirms what you see. -->
-                <button
+                <LoadoutCell
                   v-for="(cell, ci) in g.cells"
                   :key="cell.pos"
-                  class="group relative flex min-h-[96px] flex-1 flex-col overflow-hidden rounded-lg border p-2.5 text-left transition-colors"
+                  class="min-h-[96px] flex-1"
                   :data-slot="cell.pos" data-role="weapon"
                   :draggable="canEdit"
                   :class="[
@@ -7229,6 +8015,12 @@ if (MDEBUG) {
                     dropStyle(cell.pos),
                     reorderStyle(cell.pos),
                   ]"
+                  :label="occupantWeapon(previewPos(cell.pos))?.name ?? cell.pos"
+                  :index="ci * 3 + gi"
+                  :art-key="team + ':' + occupantModel(cell.pos)"
+                  focus-action
+                  fade-status-on-hover
+                  v-bind="cellFacts(cell.pos, previewPos(cell.pos))"
                   @click="selectPos(cell.pos)"
                   @contextmenu.prevent="openCtx(cell.pos, $event)"
                   @dragstart="onCellDragStart(cell.pos, $event)"
@@ -7236,68 +8028,13 @@ if (MDEBUG) {
                   @dragover="onCellDragOver(cell.pos, $event)"
                   @dragleave="onCellDragLeave(cell.pos)"
                   @drop.prevent="onCellDrop(cell.pos)"
-                >
-                  <span class="pointer-events-none absolute inset-0" :style="glowStyle(rarityOf(previewPos(cell.pos)), 0.35)"></span>
-                  <div class="relative z-[2] flex items-center justify-between gap-2">
-                    <span class="truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ occupantWeapon(previewPos(cell.pos))?.name ?? cell.pos }}</span>
-                  </div>
-                  <!-- The same cluster every other slot and tile carries. This
-                       used to be five hand-rolled spans that had drifted: no
-                       read-only branch (a Steam item offered Edit), no model
-                       check (3D on things with no model), and no touch hide. -->
-                  <TileActions
-                    :inst="cellInstance(cell.pos) ?? null"
-                    focus
-                    @focus="selectPos(cell.pos); go('/focus')"
-                    @view3d="view3dForInstance(cellInstance(cell.pos)!)"
-                    @inspect="openInspectLink(cellInstance(cell.pos)!.id)"
-                    @edit="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
-                    @duplicate="selectPos(cell.pos); openEdit(cellInstance(cell.pos)!)"
-                    @remove="deleteOwned(cellInstance(cell.pos)!)"
-                  />
-                  <!-- Fades for the hover actions, which occupy this corner. -->
-                  <SlotStatus
-                    :teams="cellTeams(previewPos(cell.pos))"
-                    :inst="cellInstance(previewPos(cell.pos))"
-                    class="!right-2.5 !top-2.5 transition-opacity group-hover:opacity-0"
-                  />
-                  <!-- Keyed on team + occupant: switching sides (or replacing
-                       the weapon) re-runs the entrance, staggered row-by-row
-                       across the three columns — a wave, not a teleport.
-                       Equipping a different finish keeps the key, so the
-                       pulse ring is the only feedback there. -->
-                  <div
-                    :key="team + ':' + occupantModel(cell.pos)"
-                    :class="['animate-cell-in', CARD_ART]"
-                    :style="{ '--i': ci * 3 + gi }"
-                  >
-                    <ItemArt
-                      :inst="cellInstance(previewPos(cell.pos))"
-                      :image="cellImage(previewPos(cell.pos))"
-                      :class="cn('max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105', !isSkinned(rowFor(previewPos(cell.pos))) && 'opacity-60')"
-                    />
-                    <span
-                      v-if="cellInstance(cell.pos) && (renderingIds.has(cellInstance(cell.pos)!.id) || queuedIds.has(cellInstance(cell.pos)!.id))"
-                      class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
-                    ><Loader2 v-if="renderingIds.has(cellInstance(cell.pos)!.id)" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" /> {{ renderingIds.has(cellInstance(cell.pos)!.id) ? 'baking' : 'queued' }}</span>
-                  </div>
-                  <div class="relative z-[2] flex items-end justify-between gap-2">
-                    <ItemName
-                      :item="cellItem(previewPos(cell.pos))"
-                      strip
-                      fallback="Default"
-                      name-class="text-f11 font-medium"
-                      class="min-w-0 flex-1"
-                    />
-                    <WearBar
-                      :item="cellWear(previewPos(cell.pos))?.item"
-                      :wear="cellWear(previewPos(cell.pos))?.wear"
-                      :seed="cellWear(previewPos(cell.pos))?.seed"
-                      mini
-                      class="mb-1"
-                    />
-                  </div>
-                </button>
+                  @focus="cellActions(cell.pos).focus()"
+                  @view3d="cellActions(cell.pos).view3d()"
+                  @inspect="cellActions(cell.pos).inspect()"
+                  @edit="cellActions(cell.pos).edit()"
+                  @duplicate="cellActions(cell.pos).duplicate()"
+                  @remove="cellActions(cell.pos).remove()"
+                />
                 </div>
                 <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
               </div>
@@ -7322,8 +8059,12 @@ if (MDEBUG) {
                 <div class="mt-1.5 flex min-w-0 flex-wrap items-center gap-2">
                   <span class="truncate font-medium" :class="isCompact ? 'text-f13' : 'text-base'" style="color: var(--acc)">
                     {{ isSkinned(focusRow) ? focusRow!.item!.name : '— default finish —' }}
-                    <span v-if="focusRow?.stattrak" class="text-[#f2c14e]">· StatTrak™</span>
                   </span>
+                  <!-- StatTrak and what's applied, from the same component the
+                       tiles and the loadout cells use. This line used to spell
+                       "· StatTrak™" by hand and show nothing at all about the
+                       stickers or the charm. -->
+                  <ItemBadges :inst="focusInstance" :max="6" count />
                   <!-- Rarity rides with the name it describes, not the stage
                        controls on the far side of the panel. -->
                   <span
@@ -7333,11 +8074,27 @@ if (MDEBUG) {
                   >
                     <span class="h-1.5 w-1.5 rounded-[1px]" :style="{ background: rarityOf(selected) }"></span>{{ rarityName(rarityOf(selected)) }}
                   </span>
+                  <!-- Focus was the one screen with no price on it, which made the
+                       header total look like it was counting something the screen
+                       wasn't showing. It rides with the name and the rarity chip for
+                       the same reason they do: this is a fact about the ITEM, not
+                       about the stage. Spine rather than chip — the rarity chip
+                       beside it is already a bordered pill, and two of those read as
+                       a pair of buttons. -->
+                  <Tooltip v-if="pricesOn && cellValue(selected)" :text="slotValueTip">
+                    <PriceTag frame="spine" size="md" :value="cellValue(selected)" suffix="est" />
+                  </Tooltip>
                 </div>
               </div>
               <!-- Stage controls live in the header, on the same baseline as the
                    rarity chip. The 3D toggle used to float over the artwork
-                   anchored to nothing. -->
+                   anchored to nothing.
+                   The spec boxes hang UNDER them, which is where the editor puts
+                   the same panel — top right, in a column. Focus and the modal
+                   are the two screens you open to study one item, and laying its
+                   facts out differently in each is how people learn to distrust
+                   both. -->
+              <div class="flex flex-none flex-col items-end gap-2.5">
               <div class="flex flex-none items-center gap-2.5">
                 <!-- Same sliding-pill animated tabs as every other tab group. -->
                 <PillTabs
@@ -7389,6 +8146,13 @@ if (MDEBUG) {
                   :note="ITEM_LINK_NOTE"
                   :btn-class="FOCUS_STAGE"
                 />
+              </div>
+              <ItemSpecs
+                v-if="focusInstance && !isCompact"
+                :inst="focusInstance"
+                still
+                class="w-[210px] gap-1.5"
+              />
               </div>
             </div>
 
@@ -7443,24 +8207,29 @@ if (MDEBUG) {
             </div>
 
             <div class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5">
-              <!-- Hidden, not dashed out, for the types that have no such
+              <!-- Float and pattern used to be spelled out here by hand, and
+                   after the spec column landed they were being printed TWICE,
+                   three inches apart. They live in that column now, with
+                   everything else about the item. Compact keeps them: the column
+                   is desktop-only, so on a phone this is the only place a float
+                   appears at all.
+                   Hidden, not dashed out, for the types that have no such
                    reading: a spray has no float and no pattern, and "—" under a
                    Float heading still says the item HAS one and we don't know
                    it. -->
-              <div v-if="hasWear(focusRow?.item)" class="flex flex-col gap-1">
-                <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Float</span>
-                <span class="font-mono text-f13">{{ focusRow?.wear != null ? focusRow.wear.toFixed(4) : '—' }}</span>
-                <!-- Was a hand-rolled track: full-saturation ramp, no tier
-                     boundaries, no lit zone. It was the one wear readout in the
-                     app that didn't look like the others. WearBar is THE way
-                     wear renders — bare drops its numbers, since "Float" above
-                     already prints the value. -->
-                <WearBar v-if="focusRow?.wear != null" :item="focusRow?.item" :wear="focusRow.wear" bare class="mt-1.5 w-[180px]" />
-              </div>
-              <div v-if="hasSeed(focusRow?.item)" class="flex flex-col gap-1">
-                <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Pattern</span>
-                <span class="font-mono text-f13">{{ focusRow?.seed != null ? '#' + focusRow.seed : '—' }}</span>
-              </div>
+              <template v-if="isCompact || !focusInstance">
+                <div v-if="hasWear(focusRow?.item)" class="flex flex-col gap-1">
+                  <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Float</span>
+                  <span class="font-mono text-f13">{{ focusRow?.wear != null ? focusRow.wear.toFixed(4) : '—' }}</span>
+                  <!-- WearBar is THE way wear renders — bare drops its numbers,
+                       since "Float" above already prints the value. -->
+                  <WearBar v-if="focusRow?.wear != null" :item="focusRow?.item" :wear="focusRow.wear" bare class="mt-1.5 w-[180px]" />
+                </div>
+                <div v-if="hasSeed(focusRow?.item)" class="flex flex-col gap-1">
+                  <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Pattern</span>
+                  <span class="font-mono text-f13">{{ focusRow?.seed != null ? '#' + focusRow.seed : '—' }}</span>
+                </div>
+              </template>
               <div v-if="isSkinned(focusRow) && canEdit" class="ml-auto flex items-center gap-2">
                 <!-- Active StatTrak carried a full-strength gold border while
                      Unequip's sat at border-border, and the contrast made the
@@ -7469,7 +8238,7 @@ if (MDEBUG) {
                      needs to hint at it. -->
                 <button
                   :class="[FOCUS_ACTION, focusRow?.stattrak
-                    ? 'border-[#e0a92e]/55 bg-[#e0a92e]/10 text-[#f2c14e]'
+                    ? 'border-[#e0a92e]/55 bg-[#e0a92e]/10 text-[hsl(var(--tac-stattrak))]'
                     : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground']"
                   @click="toggleStatTrak"
                 >
@@ -7600,7 +8369,7 @@ if (MDEBUG) {
             <FilterDropdown
               :model-value="sheetSort"
               prefix="Sort"
-              :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
+              :options="invSorts.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
               @update:model-value="setSheetSort"
             />
             <SortDirection v-model="sheetDir" :kind="sheetSortKind" :hint="sheetSortHint" />
@@ -7992,6 +8761,9 @@ if (MDEBUG) {
               <ItemTile
                 v-else
                 :inst="st.face"
+                :show-price="pricesOn"
+                :price-pending="pricesPending"
+                :price-source="priceSourceLabel"
                 :class="sheetCellClass(idx)"
                 :style="{ '--i': idx + 2 }"
                 draggable="true"
@@ -8081,6 +8853,17 @@ if (MDEBUG) {
                     />
                   </div>
                   <ItemName :item="st.card" strip class="relative z-[2]" />
+                  <!-- What it would cost to craft this brand new. Under the name
+                       for the same reason the owned tiles put it there, and the
+                       one number that makes the craft list sortable by price. -->
+                  <PriceTag
+                    v-if="pricesOn"
+                    class="relative z-[2] mt-0.5"
+                    size="xs"
+                    :value="stockPriceOf(st.card.id)?.value"
+                    :missing="!stockPriceOf(st.card.id)"
+                    :title="stockPriceTip(st.card.id)"
+                  />
                 </button>
               </div>
               <InfiniteSentinel
@@ -8132,7 +8915,7 @@ if (MDEBUG) {
               </div>
               <div :class="[SHEET_LABEL, 'relative z-[2] flex items-center gap-1.5']">
                 <span class="truncate text-f13 font-medium">{{ itemName(i.item) }}</span>
-                <span v-if="i.stattrak" class="flex-none font-mono text-f8 text-[#f2c14e]">ST™</span>
+                <span v-if="i.stattrak" class="flex-none font-mono text-f8 text-[hsl(var(--tac-stattrak))]">ST™</span>
               </div>
             </button>
             <div
@@ -8346,12 +9129,15 @@ if (MDEBUG) {
                    both, so wear/pattern/name tag/StatTrak are always reachable
                    — the old fullscreen 3D overlay hid all of them. -->
               <div v-show="!modal3d" class="relative z-[2] flex h-full w-full items-center justify-center">
+                <!-- The waist feather belongs to the ICON, which is cropped at
+                     the waist. A rendered agent is a whole standing figure, so
+                     the same mask takes its legs instead. -->
                 <img
                   :src="craftPreview ?? craft.skin.image ?? undefined"
                   alt=""
                   class="max-h-full max-w-full object-contain drop-shadow-[0_28px_30px_rgba(0,0,0,0.45)]"
-                  :class="craftIsAgent && ART_FADE_B"
-                  @error="craftPreview = null"
+                  :class="craftIsAgent && !craftPreviewRendered && ART_FADE_B"
+                  @error="craftPreviewFailed"
                 />
               </div>
               <!-- absolute, not h-full: the canvas is height:100%, so against a
@@ -8482,6 +9268,61 @@ if (MDEBUG) {
                 button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
                 @select="(s) => (modal3d = s === '3D')"
               />
+              <!-- Live cost, stacked under the 2D/3D + cog row so it reads as part
+                   of the same top-left column of chrome — the same corner the
+                   inventory card puts it in, under the model label. It was up in
+                   the modal header competing with the item's name and the action
+                   buttons; here it sits beside the thing it is a fact about, with
+                   room for the label to say "est." out loud.
+                   Falls back to `top-0` when there is no 2D/3D toggle to sit
+                   beneath (items with no 3D model) rather than hanging in a gap. -->
+              <Tooltip v-if="pricesOn && craftQuote" :text="craftQuoteTip">
+                <span
+                  class="absolute left-0 z-[4] flex flex-col gap-1 transition-opacity"
+                  :class="[modal3dAvailable ? 'top-9' : 'top-0', craftQuoting && 'opacity-40']"
+                >
+                  <PriceTag
+                    frame="spine"
+                    stack
+                    size="lg"
+                    label="est. cost"
+                    :value="craftQuote.total"
+                    :extra="craftQuote.attachmentTotal"
+                    :missing="craftQuote.total === 0"
+                  />
+                  <!-- The spread behind that figure, and where THIS copy sits in
+                       it. Two measured facts; the sentence joining them lives in
+                       the tooltip, because "yours is probably worth more" is an
+                       inference and printing it as a number would dress a guess
+                       as a measurement. Knives are the reason this exists — one
+                       bracket price covers a 0.0001 Karambit and a 0.069 one. -->
+                  <span
+                    v-if="craftSales"
+                    class="flex flex-col gap-0.5 pl-2.5 text-f9 leading-tight"
+                    :title="craftValueTip"
+                  >
+                    <span class="font-mono tabular-nums text-muted-foreground">
+                      <template v-if="craftSales.min != null && craftSales.max != null && craftSales.max > craftSales.min">
+                        {{ formatPrice(craftSales.min) }}–{{ formatPrice(craftSales.max) }}
+                      </template>
+                      <template v-else>{{ formatPrice(craftSales.median ?? craftSales.avg ?? craftSales.min ?? 0) }}</template>
+                      <span class="text-muted-foreground/50">
+                        · {{ craftSales.volume }} sold {{ HISTORY_WINDOW_LABEL[craftSales.window] }}</span
+                      >
+                    </span>
+                    <span
+                      v-if="craftWearStanding"
+                      class="uppercase tracking-cs4"
+                      :class="craftWearStanding.verdict === 'better'
+                        ? 'text-[#37c46a]'
+                        : craftWearStanding.verdict === 'worse'
+                          ? 'text-[#e0a24a]'
+                          : 'text-muted-foreground/60'"
+                      >{{ craftWearStanding.caption }}</span
+                    >
+                  </span>
+                </span>
+              </Tooltip>
             </div>
             <!-- Footer. The report link used to hold a column of its own on the
                  same baseline as the name and the controls legend, which meant
@@ -8852,7 +9693,7 @@ if (MDEBUG) {
               class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5"
               :style="{ '--i': 5 }"
             >
-              <span class="text-f10 uppercase tracking-cs1" :class="craft.stattrak ? 'text-[#f2c14e]' : 'text-muted-foreground'">StatTrak™</span>
+              <span class="text-f10 uppercase tracking-cs1" :class="craft.stattrak ? 'text-[hsl(var(--tac-stattrak))]' : 'text-muted-foreground'">StatTrak™</span>
               <button
                 role="switch"
                 :aria-checked="craft.stattrak"
@@ -8872,54 +9713,16 @@ if (MDEBUG) {
                  above rather than a prettier bespoke panel: switching to Edit
                  should feel like the numbers became typable, not like the page
                  changed. -->
-            <template v-else>
-              <!-- Name tag leads here too — the read-only spec has to list the
-                   same things in the same order as the form, or switching modes
-                   reshuffles the panel under the cursor. -->
-              <div v-if="craft.nametag" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 0 }">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
-                <span class="min-w-0 flex-1 truncate text-f13 italic">“{{ craft.nametag }}”</span>
-              </div>
-              <div v-if="craftInst && attachmentsOf(craftInst).length" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
-                <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Applied</div>
-                <div class="flex flex-col gap-1.5">
-                  <span
-                    v-for="(a, k) in attachmentsOf(craftInst)"
-                    :key="k"
-                    class="flex items-center gap-2"
-                    :title="a.name"
-                  >
-                    <img :src="a.image ?? undefined" alt="" class="h-7 w-7 flex-none object-contain" />
-                    <span class="min-w-0 flex-1 truncate text-f10 text-foreground/85">{{ a.name }}</span>
-                  </span>
-                </div>
-              </div>
-              <div v-if="craftInst?.seed != null" class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-                <span class="font-mono text-f13">#{{ craftInst.seed }}</span>
-              </div>
-              <!-- Type-gated, not just null-gated. A sticker spends the same
-                   `wear` column on its SCRATCH, so the moment one could be set
-                   this box started captioning a sticker "Factory New" over an
-                   empty track (WearBar drops the ramp itself, the tier caption
-                   was left saying it anyway). The scratch gets its own box
-                   below, with a number instead of a tier. -->
-              <div v-if="craftInst?.wear != null && hasWear(craftInst.item)" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
-                <div class="flex items-baseline gap-2">
-                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
-                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ wearTier(craftInst.wear) }}</span>
-                </div>
-                <div class="mt-2"><WearBar :item="craftInst.item" :wear="craftInst.wear" /></div>
-              </div>
-              <div v-if="craftInst?.wear != null && hasScratch(craftInst.item)" class="animate-sheet-in flex items-baseline gap-2 rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
-                <span class="font-mono text-f13">{{ craftInst.wear.toFixed(2) }}</span>
-                <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">scratched</span>
-              </div>
-              <div v-if="craftInst?.stattrak" class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
-                <span class="text-f10 uppercase tracking-cs1 text-[#f2c14e]">StatTrak™</span>
-              </div>
-            </template>
+            <!-- The read-only spec is its own component now — the focus view
+                 needs the same panel, and answering "what is this item" two
+                 different ways in two places is what left focus showing a float
+                 and nothing about the stickers or the charm. -->
+            <ItemSpecs
+              v-else
+              :inst="craftInst"
+              :charm-albedo="charmAlbedo"
+              :charm-loading="charmRailLoading"
+            />
 
           </div>
         </div>

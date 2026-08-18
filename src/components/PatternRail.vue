@@ -57,13 +57,30 @@ const props = withDefaults(
      * the pattern silently does not take. Held as a skeleton instead.
      */
     loading?: boolean;
+    /**
+     * Show the pattern, don't offer to change it — the item's read-only spec.
+     *
+     * The swatch is the whole reason this mode exists rather than a line of
+     * text in the caller. "Pattern #1" is a true statement about a charm and a
+     * useless one: the number is a coordinate into a colour space, and the one
+     * thing anybody wants from it is the colour. Everything that edits (the
+     * rail, the die, the band control, click-to-edit) is dropped; the swatch and
+     * the number stay.
+     *
+     * It also does NOT hide itself on an inert charm, which is the one place
+     * this mode disagrees with the editing one. There the rail is a control
+     * that could not do anything and the row goes with it; here the number is
+     * still a real tradeable attribute of the item being described, so it is
+     * still worth stating — just without a colour beside it.
+     */
+    readonly?: boolean;
     min?: number;
     max?: number;
     /** Chunk width. 1000 over a 100000 space is 100 bands, which is as many
      *  ticks as a rail this size can show without becoming a hatch pattern. */
     chunk?: number;
   }>(),
-  { modelValue: null, image: null, albedo: null, loading: false, min: 1, max: 100000, chunk: 1000 },
+  { modelValue: null, image: null, albedo: null, loading: false, readonly: false, min: 1, max: 100000, chunk: 1000 },
 );
 
 const emit = defineEmits<{
@@ -630,11 +647,29 @@ watch(
        `rounded-md bg-secondary/40 p-2.5` row, so carrying the same card here
        drew a box inside an identical box. A control should not assume it is a
        card; the surface it sits on is the caller's decision. -->
-  <div v-if="shown !== 'inert'">
+  <div v-if="readonly || shown !== 'inert'">
+    <!-- READ-ONLY: the colour, the caption, the number. Nothing to grab.
+         The swatch is skipped rather than drawn empty when the colour cannot be
+         computed — an inert charm, or one whose albedo never arrived — because a
+         blank square beside a number reads as a colour that failed to load. -->
+    <div v-if="readonly" class="flex items-center gap-2">
+      <span
+        v-if="shown === 'loading'"
+        class="animate-skeleton h-5 w-5 flex-none rounded-sm bg-muted-foreground/20"
+      ></span>
+      <span
+        v-else-if="swatch"
+        class="h-5 w-5 flex-none rounded-sm ring-1 ring-inset ring-white/15"
+        :style="{ background: swatch, boxShadow: `0 0 10px -2px ${swatch}` }"
+      ></span>
+      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+      <span class="font-mono text-f13 tabular-nums">#{{ seed.toLocaleString() }}</span>
+    </div>
+
     <!-- Holds the row's height while the econ lookup lands. Collapsing to
          nothing and springing back is the jump the charm slot above already
          avoids, and this control is taller than that one. -->
-    <div v-if="shown === 'loading'">
+    <div v-else-if="shown === 'loading'">
       <div class="mb-2 flex items-center gap-2">
         <span class="animate-skeleton h-5 w-5 flex-none rounded-sm bg-muted-foreground/20"></span>
         <span class="animate-skeleton h-2 w-24 rounded-full bg-muted-foreground/20" :style="{ '--i': 1 }"></span>

@@ -817,7 +817,7 @@ export function getItemIdBySteamName(name: string): number | null {
 }
 
 /** The five wear brackets Steam prints after a market name. */
-const STEAM_WEAR_TIERS = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"] as const;
+export const STEAM_WEAR_TIERS = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"] as const;
 export type SteamWearTier = (typeof STEAM_WEAR_TIERS)[number];
 const STEAM_WEAR_RE = new RegExp(` \\((${STEAM_WEAR_TIERS.join("|")})\\)$`);
 
@@ -843,6 +843,10 @@ export function parseSteamMarketName(marketHashName: string): {
   /** The name after the decorations came off — what got looked up. */
   name: string;
   stattrak: boolean;
+  /** Souvenir variant. The IMPORT ignores it (we don't model souvenirs), but a
+   *  price feed keys on it: a Souvenir AWP is a different market item from a
+   *  plain one and trades nothing like it. */
+  souvenir: boolean;
   wearTier: SteamWearTier | null;
 } {
   let name = marketHashName
@@ -858,8 +862,93 @@ export function parseSteamMarketName(marketHashName: string): {
     // `★ StatTrak™ ` for knives and gloves — the star comes off first above, so
     // one prefix test covers both forms.
     stattrak: marketHashName.startsWith("StatTrak™ ") || marketHashName.startsWith("★ StatTrak™ "),
+    souvenir: marketHashName.startsWith("Souvenir "),
     wearTier,
   };
+}
+
+/**
+ * A float's wear bracket — the half of a market name our owned rows don't store.
+ *
+ * Steam prices per BRACKET, not per float, so pricing an owned item means
+ * putting its float back in the bracket it came from. The boundaries are the
+ * ones the UI already draws (`WEAR_STOPS` in src/itemVisuals.ts) and they must
+ * stay in step with it: a tile captioned "Field-Tested" next to a Well-Worn
+ * price is a bug nobody would think to look for.
+ *
+ * cs2-lib disagrees in two thin bands — its FT tops out at 0.37 and WW at 0.44,
+ * against the commonly documented 0.38 / 0.45 used here. items_game.txt does not
+ * define the tiers (they are client-side), so the archive cannot settle it; see
+ * the cs2-lib adoption audit. Only floats in (0.37, 0.38] and (0.44, 0.45] are
+ * affected, and both readers agreeing matters more than which one is right.
+ */
+// Exported because the SAME boundaries have to exist in SQL — the price join
+// buckets a float in Postgres, not in JS (see wearTierSql in prices.ts). One
+// array, two readers, so the two can't drift into disagreeing about what a 0.4
+// float is worth.
+export const WEAR_TIER_BOUNDS = [0.07, 0.15, 0.38, 0.45] as const;
+
+const WEAR_TIER_MAX: readonly (readonly [SteamWearTier, number])[] = STEAM_WEAR_TIERS.map(
+  (tier, i) => [tier, WEAR_TIER_BOUNDS[i] ?? Infinity] as const,
+);
+
+/** Null for an item with no float at all (agents, music kits, pins) — those
+ *  price under a bare name with no bracket, which is exactly `null` here. */
+export function wearTierOf(wear: number | null | undefined): SteamWearTier | null {
+  if (wear == null || !Number.isFinite(wear)) return null;
+  return (WEAR_TIER_MAX.find(([, max]) => wear < max) ?? WEAR_TIER_MAX[4])[0];
+}
+
+/** Tier as a small int, so it can be a NOT NULL primary-key column. -1 is "this
+ *  name carries no wear bracket", which a nullable column could not express
+ *  inside a PK. */
+export const wearTierIndex = (tier: SteamWearTier | null) =>
+  tier === null ? -1 : STEAM_WEAR_TIERS.indexOf(tier);
+export const wearTierFromIndex = (index: number): SteamWearTier | null =>
+  STEAM_WEAR_TIERS[index] ?? null;
+
+/**
+ * The id of a specific VARIANT — "Skeleton Knife | Doppler" + "Ruby".
+ *
+ * The mirror image of priceGroupId, and the reason both exist: Steam sells every
+ * Doppler phase under one market name, but a real market does not. Skinport
+ * prices Ruby at four times Phase 1, and its listings carry the phase in a
+ * `version` field whose values ("Phase 1".."Phase 4", Ruby, Sapphire, Emerald,
+ * Black Pearl) are exactly cs2-lib's `alternateName`. So when a source bothers
+ * to distinguish them, so do we — collapsing there would show a Ruby owner a
+ * Phase 1 price, which is not a rounding error, it is $1,800.
+ */
+let variantIndex: Map<string, number> | null = null;
+export function getItemIdByVariant(name: string, variant: string): number | null {
+  if (!variantIndex) {
+    variantIndex = new Map();
+    for (const i of items) {
+      if (!i.alternateName) continue;
+      const key = `${i.name}\u0000${i.alternateName}`;
+      if (!variantIndex.has(key)) variantIndex.set(key, i.id);
+    }
+  }
+  return variantIndex.get(`${name}\u0000${variant}`) ?? null;
+}
+
+/**
+ * The id a price is filed under for this item.
+ *
+ * `nameIndex` keeps the FIRST id for each name, so every item that shares a name
+ * with another collapses onto one id going in — and a price feed, which is keyed
+ * by name, can only ever produce that canonical id. Coming back out we hold a
+ * specific id (the user owns Doppler *Phase 3*, id 1231, not the id the feed
+ * matched), so the lookup has to collapse the same way or 398 catalog items —
+ * every Doppler/Gamma Doppler phase and a pile of collectibles — silently price
+ * as "no data".
+ *
+ * That collapse is not a loss of fidelity we chose: Steam's own market_hash_name
+ * has no phase in it either, so Ruby and Phase 1 trade under one listing there
+ * too. We are reproducing the market's resolution, not throwing ours away.
+ */
+export function priceGroupId(itemId: number): number {
+  const name = getItem(itemId)?.name;
+  return (name ? getItemIdByName(name) : null) ?? itemId;
 }
 
 /**

@@ -1497,11 +1497,42 @@ export function worldToCharmDir(
 
 /** Move the pinned nodes, e.g. while the charm is dragged to a new anchor. The
  *  rig then trails the anchor instead of one point teleporting. */
-export function moveCharmAnchor(sim: CharmSim, dx: number, dy: number, dz: number) {
+/**
+ * Move where the rig is pinned, and CARRY the rest of it along.
+ *
+ * `carry` is the fraction of the move the free nodes take with them, and the
+ * difference it makes is the whole feel of a drag. Moving the pinned nodes alone
+ * leaves the charm's body where it was, so every pointermove stretches the
+ * constraints by the full step and the solver whips the body after the anchor —
+ * a 5cm drag becomes a 5cm impulse, sixty times a second. On screen that is a
+ * charm flailing and spinning nearly horizontal while you drag it, which reads
+ * as jitter even though every position it passes through is a legal one.
+ *
+ * Carrying `pos` and `prev` by the SAME amount is a translation and not a kick:
+ * Verlet keeps velocity in the gap between them, so shifting both leaves the
+ * charm's motion untouched and simply relocates it. Anything under 1 leaves a
+ * little trail, which is what still reads as a physical object rather than a
+ * cursor decoration.
+ */
+export function moveCharmAnchor(sim: CharmSim, dx: number, dy: number, dz: number, carry = 0) {
   for (let n = 0; n < sim.model.static; n++) {
     sim.anchor[n * 3] += dx;
     sim.anchor[n * 3 + 1] += dy;
     sim.anchor[n * 3 + 2] += dz;
+  }
+  if (carry > 0) {
+    const cx = dx * carry;
+    const cy = dy * carry;
+    const cz = dz * carry;
+    for (let k = 0; k < sim.dynamic.length; k++) {
+      const i = sim.dynamic[k] * 3;
+      sim.pos[i] += cx;
+      sim.pos[i + 1] += cy;
+      sim.pos[i + 2] += cz;
+      sim.prev[i] += cx;
+      sim.prev[i + 1] += cy;
+      sim.prev[i + 2] += cz;
+    }
   }
   resetCharmContact(sim);
 }

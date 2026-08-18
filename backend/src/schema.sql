@@ -173,3 +173,120 @@ CREATE TABLE IF NOT EXISTS inventory.steam_sync (
   steam_id bigint PRIMARY KEY,
   synced_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- ---- Market prices ---------------------------------------------------------
+-- A mirror of a Steam market price feed, resolved onto catalog ids. Rebuilt
+-- wholesale on each sync (the feed is a full snapshot, not a delta), which is
+-- why there is no updated_at per row — `price_meta.source_date` dates the whole
+-- table at once.
+--
+-- The primary key is the four facts a market listing is keyed by. `wear_tier`
+-- is an INDEX into the five Steam wear brackets with -1 for "this name carries
+-- no bracket" (agents, charms, music kits), rather than a nullable column: a
+-- NULL in a primary key would let the same floatless item in twice. Same reason
+-- `souvenir` is stored even though nothing here mints souvenirs yet — dropping
+-- the distinction would file a Souvenir AWP's price on the plain one, and those
+-- are different items with wildly different prices.
+CREATE TABLE IF NOT EXISTS inventory.prices (
+  item_id integer NOT NULL,
+  wear_tier smallint NOT NULL,
+  stattrak boolean NOT NULL,
+  souvenir boolean NOT NULL,
+  market_hash_name text NOT NULL,
+  -- Trailing sold-averages. Only a sale-history feed fills these in.
+  last_24h real,
+  last_7d real,
+  last_30d real,
+  last_90d real,
+  -- A live order book fills these instead: the market's own reference price,
+  -- the middle of what is listed, and the cheapest ask. Deliberately separate
+  -- columns rather than one `price`, because "sold for, on average, last week"
+  -- and "is on sale right now for" are different claims and a UI has to be able
+  -- to say which one it is showing.
+  suggested real,
+  median real,
+  lowest real,
+  -- How many are listed. Not a price — the thing that makes a four-figure ask
+  -- with one listing behind it readable as the outlier it is.
+  listings integer,
+  source text NOT NULL DEFAULT 'skinport',
+  PRIMARY KEY (item_id, wear_tier, stattrak, souvenir)
+);
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS suggested real;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS median real;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS lowest real;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS listings integer;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'skinport';
+-- No secondary index: every lookup joins on the full primary key (item_id +
+-- bracket + stattrak + souvenir), which the PK's own index already serves. A
+-- spare index on item_id alone would only cost write time on the ~27k-row
+-- wholesale rewrite each sync does.
+DROP INDEX IF EXISTS inventory.prices_item_id_idx;
+
+-- item_id -> the id its price is filed under.
+--
+-- The mirror is keyed by market NAME, and 398 catalog items share a name with
+-- another (every Doppler and Gamma Doppler phase, most collectible variants), so
+-- a price row can only ever carry the first of them. An owned row points at the
+-- specific one — you own Phase 3, not "Doppler" — so something has to bridge the
+-- two, and it has to live where the JOIN can reach it. In JS that bridge is
+-- priceGroupId(); this is the same collapse, in a table.
+--
+-- Derived from cs2-lib, not authored: rebuilt on boot, because a catalog bump
+-- changes it. Only ids that actually differ get a row; the join COALESCEs.
+CREATE TABLE IF NOT EXISTS inventory.price_aliases (
+  item_id integer PRIMARY KEY,
+  price_item_id integer NOT NULL
+);
+
+-- One row. Every sync outcome, success or failure, so an operator looking at a
+-- blank price column can tell "never ran", "ran and the source 404'd" and "ran
+-- fine, that item just doesn't trade" apart — three states that look identical
+-- from the UI and have completely different fixes.
+CREATE TABLE IF NOT EXISTS inventory.price_meta (
+  id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  source_url text,
+  source_name text,
+  source_date date,
+  synced_at timestamptz,
+  attempted_at timestamptz,
+  failed_at timestamptz,
+  failure text,
+  rows integer NOT NULL DEFAULT 0,
+  -- Names the catalog had no answer for. Small and boring while the mapping
+  -- works; a jump here is the whole early warning — see tools/price-coverage.ts.
+  unmatched integer NOT NULL DEFAULT 0,
+  unmatched_sample text
+);
+ALTER TABLE inventory.price_meta ADD COLUMN IF NOT EXISTS source_name text;
+
+-- ---- Sale history, per market listing --------------------------------------
+-- What copies of ONE listing actually sold for, and the spread between them.
+--
+-- The price table answers "what is this worth" with a single figure for a whole
+-- wear bracket. That is the wrong shape for a knife: a Factory New Karambit
+-- Doppler covers everything from a 0.0001 Phase 4 to a 0.069 one, and those are
+-- different items to anyone buying. The MIN and MAX of recent sales bound that
+-- spread — not perfectly (stickers and patterns move price too, and no public
+-- feed exposes per-listing floats) but honestly, and it is the difference
+-- between "$1,400" and "$1,205 to $1,520 across ten sales".
+--
+-- Cached in Postgres rather than per process because the source rate-limits to a
+-- handful of calls per five minutes: every replica shares one row, and
+-- `fetched_at` is what stops a player clicking through twenty knives from
+-- spending the whole budget.
+CREATE TABLE IF NOT EXISTS inventory.price_history (
+  market_hash_name text NOT NULL,
+  -- Doppler phase / gem, or '' for the listings that have none. Part of the key
+  -- because the source reports a row per phase and they differ by thousands.
+  version text NOT NULL DEFAULT '',
+  window text NOT NULL,
+  min real,
+  max real,
+  avg real,
+  median real,
+  volume integer NOT NULL DEFAULT 0,
+  fetched_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (market_hash_name, version, window)
+);
+CREATE INDEX IF NOT EXISTS price_history_fetched_idx ON inventory.price_history (fetched_at);

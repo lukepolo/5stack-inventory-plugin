@@ -162,6 +162,12 @@ export interface LoadoutEntry {
   stattrak_count: number;
   nametag: string | null;
   item: CatalogItem | null;
+  /** The skin alone, at its wear bracket. Null when the mirror has no listing —
+   *  never zero; "we don't know" and "worthless" are different claims. */
+  price?: PricePoint | null;
+  /** The whole slot: skin + every sticker, patch and charm on it. Safe to sum
+   *  across a team — an attachment lives on one weapon, in one slot. */
+  value?: number | null;
 }
 
 // An owned, crafted item instance in the user's inventory.
@@ -190,6 +196,10 @@ export interface InventoryItem {
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];
   origin?: "crafted" | "steam" | "copied";
+  /** This item's own market price. Summing this column across an inventory
+   *  counts every thing exactly once — an applied sticker is its own row here
+   *  as well as a line on the weapon it sits on. */
+  price?: PricePoint | null;
   /** The owned item this one is currently attached to, if it's a sticker,
    *  patch or charm sitting on a weapon. Null when it's loose in the
    *  inventory. Derived server-side from what the weapons actually reference.
@@ -437,12 +447,46 @@ export async function uploadTestSnap(key: string, blob: Blob): Promise<{ ok: boo
   }
 }
 
+/**
+ * How many stickers an item can carry — the STACK depth, five on every weapon.
+ *
+ * NOT the same number as how many anchors the weapon's model declares (4, 5 or
+ * 6; see `StickerGeometry.anchorCount`). The two are independent: the stack can
+ * outnumber the anchors, and then stickers SHARE one. cs2-lib says so outright
+ * ("a model with fewer schemas than stickers shares anchors") and its validator
+ * enforces the two separately — five stickers on an AK-47 is legal, a fifth
+ * ANCHOR on it is not.
+ *
+ * Deriving the well count from the anchors instead is what hid the fifth sticker
+ * on the sixteen weapons with four: AK-47, AWP, Glock, M4A1, Galil, M249, UMP,
+ * PP-Bizon, MAG-7, Negev, Tec-9, MP9, SCAR-20, SG 553, SSG 08, Dual Berettas.
+ *
+ * Mirrors `STICKER_LIMITS.maxStickers` (cs2-lib's `CS2_MAX_STICKERS`), which the
+ * backend enforces in `checkAttachments`. Duplicated rather than fetched because
+ * the frontend never imports cs2-lib and the craft form needs the array length
+ * before any request resolves.
+ */
+export const MAX_STICKERS = 5;
+
+/**
+ * How many patches an agent can carry — `CS2_MAX_PATCHES`, five.
+ *
+ * Equal to MAX_STICKERS today and still its own constant: they are unrelated
+ * numbers that happen to match, and this file exists to stop that kind of
+ * coincidence from being written down once and read as one rule.
+ *
+ * The equivalent of the anchor count here is `patchSlots` on /api/catalog (3-5,
+ * from the agent's own materials) — and unlike sticker anchors that one IS a cap,
+ * because the compositor has nowhere to stamp a patch the model never placed.
+ */
+export const MAX_PATCHES = 5;
+
 // Per-weapon sticker geometry (cached — schema data only moves on a CS2 model
 // change). `slots` carries the game's own per-slot UV anchors; `bounds` is the
 // looser envelope cs2-lib derives from them.
 export type StickerBounds = { x: [number, number]; y: [number, number] };
 export interface StickerSlot {
-  /** The game's slot index — this is what the protobuf `slot` field wants. */
+  /** The game's anchor index. NOT a cap on stickers — see MAX_STICKERS. */
   index: number;
   /** "body_hd" | "body_legacy" — must match the body the finish renders on. */
   mesh: string;
@@ -452,18 +496,64 @@ export interface StickerSlot {
   scale: number;
   rotation: number;
   special?: string;
+  /** Authored placement area as flat 2D triangle soup, same space as `offset`.
+   *  Absent on mounts extracted before v12. */
+  region?: number[];
+}
+/**
+ * One authored surface a charm may hang from — the game's own `KeychainMarkup`,
+ * out of the same model DATA block the sticker anchors come from.
+ *
+ * This is to a charm what `StickerSlot` is to a sticker: the model saying where
+ * the game puts one, rather than us inferring it. And the inference is what it
+ * replaces — the `keychain` attachment is a clip point that sits 70mm off an
+ * AK-47, 44mm off a MAG-7, so a charm previewed at it hangs in the air.
+ * Measured against the rendered mesh, these quads sit 1-3mm off it on every
+ * weapon and both bodies, which is the whole reason to carry them.
+ */
+export interface CharmQuad {
+  /** "body_hd" | "body_legacy" — pick the one the finish actually renders on. */
+  mesh: string;
+  /** The bone that MOVES this surface. `weapon_offset` is the static body;
+   *  slide/bolt/silencer/pump quads ride a part that animates in game. Ours
+   *  never animates, and all of them measure flush in the pose we render, so
+   *  they are all usable here — on a pistol most of the surface IS the slide. */
+  bone: string;
+  /** 4 corners x XYZ, flat, in GLB space (no base, no cal, no pose). Ordered as
+   *  two edges rather than a ring: (0,1) is one end, (2,3) the other. */
+  corners: number[];
 }
 export interface StickerGeometry {
   bounds: StickerBounds | null;
   slots: StickerSlot[];
+  /** Charm placement surfaces, empty on a knife (no charms) and on a mount
+   *  extracted before v23 — read as "we have no authored answer", not as "this
+   *  weapon takes no charm". */
+  charmQuads: CharmQuad[];
+  /** Anchors the HD body declares. 0 when the mount has no markup for the model
+   *  — read that as "unknown", not as "this weapon takes no stickers". */
+  anchorCount: number;
+  /** Anchors the LEGACY body declares. Differs from `anchorCount` on 14 of the
+   *  35 stickerable weapons (AWP 4/5, M4A1 4/7, Deagle 5/4 …), so a legacy paint
+   *  must not be placed against the HD count. */
+  anchorCountLegacy: number;
 }
 const stickerGeomCache = new Map<string, Promise<StickerGeometry>>();
 export function fetchStickerGeometry(model: string): Promise<StickerGeometry> {
   let cached = stickerGeomCache.get(model);
   if (!cached) {
     cached = request<StickerGeometry>(`/catalog/sticker-bounds/${encodeURIComponent(model)}`)
-      .then((r) => ({ bounds: r.bounds ?? null, slots: r.slots ?? [] }))
-      .catch(() => ({ bounds: null, slots: [] }));
+      .then((r) => ({
+        bounds: r.bounds ?? null,
+        slots: r.slots ?? [],
+        charmQuads: Array.isArray(r.charmQuads) ? r.charmQuads : [],
+        // Counted server-side from the same slots, so a client that only wants
+        // the number does not re-derive it — and a mount whose markup regressed
+        // shows up as a zero here rather than as a mispositioned sticker.
+        anchorCount: r.anchorCount ?? 0,
+        anchorCountLegacy: r.anchorCountLegacy ?? 0,
+      }))
+      .catch(() => ({ bounds: null, slots: [], charmQuads: [], anchorCount: 0, anchorCountLegacy: 0 }));
     stickerGeomCache.set(model, cached);
   }
   return cached;
@@ -702,6 +792,264 @@ export const setAssetCdn = (enabled: boolean) =>
 // backend: those come from the CS2 install and only an extraction restores them.
 export const clearCache = (scope: "renders" | "composites" = "renders") =>
   request<{ cleared: Record<string, number> }>(`/admin/cache?scope=${scope}`, { method: "DELETE" });
+
+// ---- Market prices ----------------------------------------------------------
+// A mirrored Steam price feed. Off by default and operator-configurable (see the
+// Prices tab in the admin console) for the same reason as the asset CDN: the
+// fetch leaves their network, so the switch and the URL are both theirs. The
+// browser never touches the feed — everything here comes from our API.
+export type PriceWindow =
+  | "suggested"
+  | "median"
+  | "lowest"
+  | "last_24h"
+  | "last_7d"
+  | "last_30d"
+  | "last_90d";
+/** Every source an instance can pull for itself. There is no 5stack price CDN —
+ *  see the note in backend/src/prices.ts for why Steam's own market isn't one
+ *  of these. */
+export type PriceSource = "skinport" | "csfloat" | "waxpeer" | "bitskins" | "feed";
+
+/** One switchable source, as the server describes it. Rendered straight into the
+ *  settings list rather than duplicated here — the backend owns which providers
+ *  exist and what each is good for, so adding one is a backend change only. */
+export interface PriceProviderInfo {
+  id: PriceSource;
+  label: string;
+  blurb: string;
+  /** Null means the operator supplies the URL (the JSON feed). */
+  url: string | null;
+  window: PriceWindow;
+}
+
+/** A price never travels as a bare number: which trailing window it came from
+ *  is part of the claim. ~38% of listings have no 24h datapoint, so a displayed
+ *  price is often a 7- or 30-day average and has to be able to say so. */
+export interface PricePoint {
+  value: number;
+  window: PriceWindow;
+  marketHashName: string;
+}
+
+export interface PriceStatus {
+  enabled: boolean;
+  source: PriceSource;
+  /** The mirror holds rows a DIFFERENT source produced, so nothing resolves —
+   *  a feed fills the trailing averages, a market fills the live-ask columns,
+   *  and each source only reads its own. Needs a re-sync, not a bug report. */
+  stale?: boolean;
+  /** Enabled AND holding data. The gate every price surface reads — an enabled
+   *  feed that has never synced must not draw empty price slots. */
+  ready: boolean;
+  window: PriceWindow;
+  listings: number;
+  sourceDate: string | null;
+  syncedAt: string | null;
+}
+export const fetchPriceStatus = () => request<PriceStatus>("/prices");
+
+/**
+ * Every price the screens need, in one request, deliberately separate from the
+ * screens' own data.
+ *
+ * The inventory and the loadout must paint the moment they're ready — money is
+ * an overlay on them, not a precondition. Being its own request also means it
+ * can be re-fetched alone: after a craft, after a Steam sync, or the instant a
+ * player flips the switch on.
+ *
+ * `items` is keyed by owned-item id (a string, like every owned id on the wire).
+ * `slots` is keyed `TEAM:slot` and is the whole slot — skin plus everything
+ * applied to it.
+ *
+ * There is deliberately NO server-side "what is my inventory worth" endpoint.
+ * Every owned row carries its own price here, so the totals — including the
+ * real-versus-crafted split on the origin tabs — are summed from rows the client
+ * already holds. A second implementation of one number is how two numbers drift.
+ */
+export interface InventoryPrices {
+  ready: boolean;
+  window: PriceWindow;
+  items: Record<string, PricePoint>;
+  slots: Record<string, number>;
+}
+export const fetchInventoryPrices = () => request<InventoryPrices>("/inventory/prices");
+
+/**
+ * What each finish in a slot costs BRAND NEW — the craft browser's price column.
+ *
+ * Factory New where it exists, the next bracket up where it doesn't: plenty of
+ * finishes have a float floor above 0.07 and are never sold Factory New, and
+ * pricing those at nothing would drop them out of a sort-by-value entirely.
+ * `wearTier` says which bracket answered, so the tooltip can be honest about it.
+ */
+export interface StockPrices {
+  ready: boolean;
+  window: PriceWindow;
+  prices: Record<string, PricePoint & { wearTier: number }>;
+}
+export const fetchStockPrices = (slot: string) =>
+  request<StockPrices>(`/prices/stock?slot=${encodeURIComponent(slot)}`);
+
+/** The five Steam wear brackets by their stored index; -1 is "this item has no
+ *  bracket" (charms, agents, music kits). */
+export const WEAR_TIER_NAME = [
+  "Factory New",
+  "Minimal Wear",
+  "Field-Tested",
+  "Well-Worn",
+  "Battle-Scarred",
+] as const;
+
+/**
+ * What copies of one exact listing recently sold for.
+ *
+ * The spread behind the single figure. A flat bracket price says a Factory New
+ * Karambit Doppler is worth $1,426; this says ten of them sold between $1,205
+ * and $1,520 — which is the part a knife owner actually wants, because their
+ * float and pattern decide where in that range theirs sits.
+ *
+ * Only Skinport publishes one (CSFloat and Waxpeer both require an account), so
+ * `available` is false on every other source. Phase-aware: `version` is the
+ * Doppler phase the rows belong to.
+ */
+export type HistoryWindow = "last_24_hours" | "last_7_days" | "last_30_days" | "last_90_days";
+export interface SaleWindow {
+  window: HistoryWindow;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  median: number | null;
+  volume: number;
+}
+export interface PriceDetail {
+  available: boolean;
+  window: PriceWindow;
+  marketHashName: string | null;
+  version: string | null;
+  history: SaleWindow[];
+}
+export const fetchPriceDetail = (itemId: number, wear: number | null, stattrak: boolean) =>
+  request<PriceDetail>(
+    `/prices/detail?item_id=${itemId}&wear=${wear ?? ""}&stattrak=${stattrak ? 1 : 0}`,
+  );
+
+/** The window a spread is worth showing from. Widest first would bury a fresh,
+ *  liquid market under three months of noise; narrowest first would show a
+ *  single sale as the whole story. Two sales is the floor for a RANGE to mean
+ *  anything at all. */
+export const bestSaleWindow = (history: SaleWindow[]): SaleWindow | null =>
+  history.find((h) => h.volume >= 2) ?? history.find((h) => h.volume >= 1) ?? null;
+
+export const HISTORY_WINDOW_LABEL: Record<HistoryWindow, string> = {
+  last_24_hours: "24h",
+  last_7_days: "7d",
+  last_30_days: "30d",
+  last_90_days: "90d",
+};
+
+export interface QuoteLine {
+  kind: "base" | "sticker" | "patch" | "charm";
+  itemId: number;
+  name: string | null;
+  price: PricePoint | null;
+}
+export interface Quote {
+  base: QuoteLine;
+  attachments: QuoteLine[];
+  baseTotal: number;
+  attachmentTotal: number;
+  total: number;
+  unpriced: number;
+  lines: number;
+}
+/** What a craft would cost to buy, itemized. Takes the craft form's own body so
+ *  the estimate can update before anything is saved. */
+export const quoteCraft = (body: {
+  item_id: number;
+  wear?: number | null;
+  stattrak?: boolean | null;
+  stickers?: unknown[] | null;
+  patches?: unknown[] | null;
+  charm_id?: number | null;
+}) => request<Quote>("/prices/quote", { method: "POST", body: JSON.stringify(body) });
+
+export interface PriceAdminStatus extends PriceStatus {
+  sources: PriceSource[];
+  providers: PriceProviderInfo[];
+  /** Which source produced the rows in the table right now — not necessarily
+   *  the configured one, if it was just changed. */
+  syncedSource: PriceSource | null;
+  base: string;
+  /** The operator typed this URL in; false means it is our default. */
+  custom: boolean;
+  url: string;
+  defaultBase: string;
+  /** Where the default mirror is built FROM, for an operator who would rather
+   *  point at the public source (or their own copy of it) directly. */
+  upstream: string;
+  windows: PriceWindow[];
+  syncing: boolean;
+  intervalMinutes: number;
+  attemptedAt: string | null;
+  failedAt: string | null;
+  failure: string | null;
+  unmatched: number;
+  unmatchedSample: string[];
+}
+export const fetchPriceAdmin = () => request<PriceAdminStatus>("/admin/prices");
+export const savePriceAdmin = (body: { enabled?: boolean; base?: string; source?: PriceSource }) =>
+  request<{ enabled: boolean; source: PriceSource; base: string; custom: boolean }>("/admin/prices", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+export const syncPricesNow = () =>
+  request<{ rows: number; unmatched: number; collisions: number }>("/admin/prices/sync", { method: "POST" });
+export const clearPrices = () => request<{ listings: number }>("/admin/prices", { method: "DELETE" });
+
+/** Money, short. Sub-$10 keeps cents (a $4.55 charm rounds to a meaningless $5);
+ *  above that they are noise on a number that moves by dollars a day, and four
+ *  digits of Dragon Lore do not fit in a tile corner. */
+export function formatPrice(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (value >= 10_000) return `$${Math.round(value / 1000)}k`;
+  if (value >= 10) return `$${Math.round(value).toLocaleString()}`;
+  return `$${value.toFixed(2)}`;
+}
+
+/** The honest caption for whichever number came back. Every price surface shows
+ *  this somewhere: a market's reference price, the middle of what's listed and a
+ *  90-day sold average are three different claims, and a bare "$41" implies a
+ *  precision none of them has. Always presented as a ROUGH ESTIMATE — none of
+ *  these is what an item would actually sell for. */
+/** The symbol and the digits, separately.
+ *
+ *  Money sits among instrument readouts here — floats, seeds, StatTrak counts —
+ *  and a full-weight "$" competes with the number it belongs to. Splitting them
+ *  lets the glyph sit back at partial opacity while the figure keeps primacy,
+ *  which is what makes a price read as a value rather than as one more code. */
+export const priceParts = (value: number) => {
+  const text = formatPrice(value);
+  return { symbol: text.slice(0, 1), digits: text.slice(1) };
+};
+
+export const PRICE_WINDOW_LABEL: Record<PriceWindow, string> = {
+  suggested: "market estimate",
+  median: "median listing",
+  lowest: "cheapest listing",
+  last_24h: "24-hour average",
+  last_7d: "7-day average",
+  last_30d: "30-day average",
+  last_90d: "90-day average",
+};
+
+export const PRICE_SOURCE_LABEL: Record<PriceSource, string> = {
+  skinport: "Skinport",
+  csfloat: "CSFloat",
+  waxpeer: "Waxpeer",
+  bitskins: "BitSkins",
+  feed: "JSON price feed",
+};
 
 // Admin: model extraction (pulls weapon GLBs + composite inputs from the
 // node's CS2 install straight onto the models mount). Runs as a child process

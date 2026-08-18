@@ -283,6 +283,37 @@
   --tac-ct-foreground: 0 0% 10%;
   --tac-ct-cta-from: color-mix(in hsl, hsl(var(--tac-ct)), white 15%);
   --tac-ct-cta-to: color-mix(in hsl, hsl(var(--tac-ct)), black 12%);
+
+  /* MONEY. Estimated values: the price on a card, a slot's worth, a loadout
+     total, the editor's live cost.
+
+     WHITE, not a hue, and that is the point. Every colour in this panel already
+     carries a meaning — amber is "you can press this" (see the action-button
+     block below), --acc/--tac-ct is "this is your CT side" and moves when you
+     flip teams, the rarity palette is the item's grade, the wear ramp is a
+     float. A value is none of those, and a fourth hue competing with them made
+     the figure look like a status rather than a number.
+
+     It also gets out of the way of its own emphasis: the digits sit at full
+     white — the brightest thing in the readout, which is right, since they are
+     what you came to read — while the "$" drops to 55% and the "est" suffix
+     further still. That hierarchy inside the figure does the work a colour was
+     doing, and it survives on both team sides and over any rarity glow.
+
+     (It was briefly a cyan against an undefined `--tac-cyan`, which rendered as
+     no background on the spine and inherited white on the digits; then a green
+     at 156°, chosen to clear --tac-ct at 198°. White needs neither dodge.)
+
+     HSL channels, not a hex, to match the shape of every other token here —
+     `hsl(var(--tac-value) / 0.55)` has to work for the tints. */
+  --tac-value: 0 0% 100%;
+
+  /* STATTRAK. The counter's gold, and the one colour here that is not ours to
+     pick — it is CS2's own, so it stays where the game put it and only moves
+     into a token so the places that had it as a raw #f2c14e agree. Not
+     --tac-amber: the panel's brand amber means "you can press this", and a
+     StatTrak badge is a fact about the item, not a control. */
+  --tac-stattrak: 45 86% 62%;
 }
 
 /* ---- action buttons --------------------------------------------------------

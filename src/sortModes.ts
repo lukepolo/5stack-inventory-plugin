@@ -16,20 +16,30 @@ import type { AttachSort } from "./api";
 
 // ---- items you own ----------------------------------------------------------
 
-export type SortMode = "default" | "rarity" | "name" | "wear";
+export type SortMode = "default" | "rarity" | "name" | "wear" | "value";
 
 export const SORTS: [SortMode, string][] = [
   ["default", "Default"],
   ["rarity", "Rarity"],
   ["name", "Name"],
   ["wear", "Wear"],
+  ["value", "Value"],
 ];
+
+/**
+ * Sorting by price only makes sense where there are prices.
+ *
+ * Offered only when the operator has a feed AND the player has values switched
+ * on — a "Value" mode that silently keeps source order is worse than no mode,
+ * because the list looks sorted. Callers filter SORTS through this.
+ */
+export const SORTS_WITHOUT_VALUE = SORTS.filter(([mode]) => mode !== "value");
 
 /**
  * Catalog lists have no float, so offering "Wear" over one is a control that
  * does nothing. Surfaces that show catalog entries filter the list through this.
  */
-export const SORTS_WITHOUT_WEAR = SORTS.filter(([mode]) => mode !== "wear");
+export const SORTS_WITHOUT_WEAR = SORTS.filter(([mode]) => mode !== "wear" && mode !== "value");
 
 /**
  * Rarity, not insertion order: an inventory reads better with the covert reds at
@@ -42,6 +52,9 @@ export const SORT_NATURAL: Record<SortMode, SortDir> = {
   rarity: "desc",
   name: "asc",
   wear: "asc",
+  // Descending: "what are my most expensive things" is the question people
+  // actually open a value sort to answer.
+  value: "desc",
 };
 
 export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
@@ -49,6 +62,7 @@ export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
   rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
   name: { asc: "A → Z", desc: "Z → A" },
   wear: { asc: "Lowest float first", desc: "Highest float first" },
+  value: { desc: "Most valuable first", asc: "Least valuable first" },
 };
 
 export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
@@ -56,6 +70,7 @@ export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
   rarity: "amount",
   name: "alpha",
   wear: "numeric",
+  value: "amount",
 };
 
 // ---- catalog attachments ----------------------------------------------------

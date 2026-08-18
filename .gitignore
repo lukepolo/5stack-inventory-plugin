@@ -15,3 +15,9 @@ tools/shadertest/snapshots/
 # what actually stop it reaching this machine.
 /cs2-model-extract/
 /cs2-models-glb.tar.gz
+
+# Agent worktrees. `git worktree add` puts real checkouts here, so an
+# `add -A` would otherwise stage a second copy of the whole tree — and each
+# one carries its own .git file, which git will happily commit as a plain file.
+# The branches are the durable artifact; these directories are scratch.
+/.claude/worktrees/

@@ -32,7 +32,7 @@
 //                       which is where a charm's material and shading come from
 //   ?charms             standalone charms + the same charm attached to a weapon
 //   ?shoot              also snapshot each regression case
-import { mountViewer, type ViewerKind } from "../../src/viewer3d";
+import { mountViewer, snapshotModel, INCOMPLETE, type ViewerKind } from "../../src/viewer3d";
 import { resolveViewerModel, type CharmSpec } from "../../src/viewerModel";
 import { liquidProbe } from "../../src/charmLiquid";
 
@@ -317,18 +317,60 @@ async function attached() {
   const host = document.createElement("div");
   host.style.cssText = "width:640px;height:480px;position:fixed;left:-9999px;top:0";
   document.body.appendChild(host);
+  // `?on=<model>` to hang it on something else — `elite` in particular, the one
+  // weapon with no keychain anchor, which resolves its pivot down a different
+  // branch entirely and is the only way to see that branch rendered.
+  const on = params.get("on") ?? "ak47";
+  const raw = (params.get("at") ?? "").split(",").map(Number);
+  const at = raw.length === 3 && raw.every(Number.isFinite)
+    ? { x: raw[0], y: raw[1], z: raw[2] }
+    : { x: null, y: null, z: null };
   try {
-    const handle = await mountViewer(host, "ak47", {
+    // The model's own charm surfaces, exactly as the app fetches them — without
+    // them the seat falls back to the nearest triangle anywhere on the weapon,
+    // so a picture taken here would not be a picture of what ships. See
+    // CharmSurface in viewer3d.ts.
+    const charmSurfaces = await fetch(`/api/catalog/sticker-bounds/${encodeURIComponent(on)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => j?.charmQuads ?? [])
+      .catch(() => []);
+    const handle = await mountViewer(host, on, {
       kind: "weapon",
+      charmSurfaces,
       interactive: false,
-      still: true,
+      // `?live=1` drops `still`, which is what selects the dual-wield SIDE-BY-SIDE
+      // layout over the tent — the tent is the card bake, and a charm hanging off
+      // the back of it cannot be seen at all.
+      still: !params.has("live"),
       frame: "fit",
-      charm: { image: "/images/kc_missinglink_ancientcurse_5d7da72d.webp", x: null, y: null, z: null, seed: 61000 },
+      // `?at=x,y,z` to force a PLACED charm rather than the unplaced default —
+      // the two take different branches of the pivot resolver.
+      charm: { image: "/images/kc_missinglink_ancientcurse_5d7da72d.webp", ...at, seed: 61000 },
     });
-    // Longer than the standalone case: the charm is a second GLB fetched after
-    // the weapon mounts, and its pendulum needs a moment to settle.
+    // AWAIT THE CHARM, then settle. mountViewer deliberately does not wait for
+    // it — a weapon should not block on the trinket hanging off it — so the
+    // handle comes back before the charm's own GLB has been fetched, and a fixed
+    // sleep is a bet on how long that takes. The bet loses exactly where it
+    // matters most: the side-by-side elite does extra work in bakePose to
+    // synthesise its layout, the charm lands after the shutter, and the picture
+    // shows a pair of pistols with no charm on them. That picture is where "the
+    // charm does not render on the elite at all" came from.
+    await (handle as { charmReady?: () => Promise<void> }).charmReady?.();
+    // The pendulum still needs a moment after that to hang.
     await new Promise((r) => setTimeout(r, 2600));
     const blob = await handle.snapshot();
+    // WHERE the charm is in THIS picture, not in some other rig's camera. A
+    // charm can be in the scene, visible, the right size and seated on the gun
+    // and still contribute no pixels; printing its normalised device coords next
+    // to the image is what turns "I cannot see it" into a place to look.
+    const seat = handle.probeCharmSeat();
+    if (seat) {
+      line(`charm: ndc=${seat.ndc ? `${seat.ndc.x.toFixed(2)},${seat.ndc.y.toFixed(2)}` : "-"} ` +
+        `inFrame=${seat.inFrame} drawn=${seat.spriteMm.y.toFixed(0)}mm scene=${seat.inScene} visible=${seat.visible}`,
+        seat.inFrame ? "dim" : "warn");
+    } else {
+      line("charm: no rig — nothing was mounted to measure", "warn");
+    }
     handle.dispose();
     if (!blob) return line("FAIL attached charm: snapshot() returned null", "fail");
     const png = await new Promise<string>((res) => {
@@ -336,7 +378,7 @@ async function attached() {
       fr.onload = () => res(String(fr.result));
       fr.readAsDataURL(blob);
     });
-    line("PASS attached charm mounted — check the picture, not just this line", "pass");
+    line(`PASS attached charm mounted on ${on} — check the picture, not just this line`, "pass");
     const img = document.createElement("img");
     img.src = png;
     img.width = 420;
@@ -345,6 +387,72 @@ async function attached() {
     line(`FAIL attached charm: ${String((e as Error)?.stack ?? e)}`, "fail");
   } finally {
     host.remove();
+  }
+}
+
+/**
+ * ?card=<image>&seeds=1,61000 — the CARD BAKE path, not the viewer path.
+ *
+ * generateRenderNow does not mount a viewer, it calls snapshotModel with a
+ * hand-built opts object, and that object is where a kind gets rendered wrong:
+ * a charm baked through the weapon branch has no charmSpec, which does not
+ * throw and does not read as broken — it just bakes a featureless grey shape
+ * and caches it under a key that says it is finished. Exactly how every painted
+ * glove card became a pair of blank white hands.
+ *
+ * So this builds the same opts the card bake does and shows what comes out,
+ * once per seed. Two seeds because a charm's whole look is its PATTERN: one
+ * render cannot tell a graded charm from an ungraded one, two identical renders
+ * at different patterns can.
+ */
+async function cardBake(image: string) {
+  head("card bake — snapshotModel through the grid-card opts");
+  // A charm is addressed by its ART (it names no model of its own); a glove or a
+  // weapon by its MODEL plus the paint chain to composite. `?model=` picks the
+  // second form — without it a glove resolves to null and the whole point of the
+  // check is missed silently.
+  const target = await resolveViewerModel(
+    params.get("model")
+      ? { type: params.get("type") ?? "glove", model: params.get("model")!, image }
+      : { type: params.get("type") ?? "keychain", image },
+  );
+  if (!target) return line(`${image}: resolveViewerModel returned null`, "warn");
+  const seeds = (params.get("seeds") ?? "1,61000").split(",").map(Number).filter(Number.isFinite);
+  const paint = params.get("paint");
+  for (const seed of seeds) {
+    const blob = await snapshotModel(target.model, {
+      kind: target.kind,
+      charmSpec: target.charm ?? null,
+      // Unconditional, exactly as the card bake passes it — a glove reaching the
+      // compositor without this is the blank-white-hands bug.
+      paintMaterial: paint,
+      legacyPaint: params.has("legacy"),
+      wear: params.has("wear") ? Number(params.get("wear")) : null,
+      seed,
+      gloveArms: false,
+      stattrak: null,
+    } as any);
+    if (!blob || blob === INCOMPLETE) {
+      line(`FAIL seed ${seed}: ${blob === INCOMPLETE ? "INCOMPLETE" : "no blob"}`, "fail");
+      continue;
+    }
+    // A data URL, not an object URL: shoot.mjs pulls `<img>` sources out of the
+    // page and can only write the ones it can read, so a blob: src silently
+    // produces no file at all.
+    const url = await new Promise<string>((res) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result));
+      fr.readAsDataURL(blob as Blob);
+    });
+    const img = document.createElement("img");
+    img.src = url;
+    img.width = 150;
+    img.title = `${image} @ ${seed}`;
+    // The card is shown at natural size, so the cropped size IS how big the
+    // picture can ever draw — a charm is a tall sliver of a 4:3 frame.
+    await new Promise((r) => (img.onload = r));
+    line(`PASS seed ${seed}: ${img.naturalWidth}x${img.naturalHeight} after crop`, "pass");
+    out.appendChild(img);
   }
 }
 
@@ -815,6 +923,8 @@ const mode = params.has("flat")
   ? gloves()
   : params.has("decals")
   ? decals()
+  : params.has("card")
+  ? cardBake(params.get("card")!)
   : params.has("charms")
   ? charms()
   : params.has("image")

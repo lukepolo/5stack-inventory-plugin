@@ -10,6 +10,7 @@ import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
 import {
   getStickerMarkup,
+  slotCount,
   getCharmMarkup,
   charmBounds,
   getCharmModels,
@@ -17,6 +18,24 @@ import {
   getPatchMaterials,
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
+import {
+  pickPrice,
+  priceTargetKey,
+  quoteItem,
+  wearTierSql,
+  PRICE_FEED_BASE,
+  PRICE_FEED_UPSTREAM,
+  PRICE_PROVIDERS,
+  PRICE_SOURCES,
+  PRICE_WINDOWS,
+  DEFAULT_PRICE_SOURCE,
+  DEFAULT_WINDOW,
+  providerUrl,
+  type PriceSource,
+  type PricePoint,
+  type PriceWindow,
+  type Quote,
+} from "./prices.ts";
 import {
   getWeapons,
   getDefaults,
@@ -34,6 +53,8 @@ import {
   getItemsByIds,
   getItem,
   getItemIdByName,
+  catalogSummary,
+  priceGroupId,
   parseSteamMarketName,
   isOwnable,
   slotForItem,
@@ -1035,11 +1056,35 @@ app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", asy
   return {
     bounds,
     slots,
+    // The anchor counts, per body. NOT a sticker cap — an item carries five on
+    // every weapon (STICKER_LIMITS.maxStickers) and shares an anchor when the
+    // stack outnumbers them; see slotCount's note. Published because the client
+    // otherwise recounts the slots itself, and because a markup regression is
+    // legible as a zero here and invisible in a rendered position.
+    anchorCount: slotCount(slots),
+    anchorCountLegacy: slotCount(slots, "body_legacy"),
     charmQuads,
     charmBounds: charmBounds(charmQuads),
     charmBoundsLegacy: charmBounds(charmQuads, "body_legacy"),
   };
 });
+
+/** What a loadout slot can be crafted from. Its own function because TWO routes
+ *  ask now — the catalog itself and the stock-price map beside it — and a slot
+ *  the two disagree about is a picker full of items with no prices. */
+function catalogForSlot(slot: string) {
+  if (slot === "knife") return { base: null, skins: getKnives() };
+  if (slot === "gloves") return { base: null, skins: getGloves() };
+  if (slot === "agent") return { base: null, skins: getAgents() };
+  if (slot === "musickit") return { base: null, skins: getMusicKits() };
+  if (slot === "collectible") return { base: null, skins: getCollectibles() };
+  // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
+  // graffiti is the one catalog whose splits aren't in any item field.
+  if (slot === "graffiti") return { base: null, ...getGraffiti() };
+  if (slot === "zeus") return getWeaponSkins("taser");
+  if (slot === "c4") return getWeaponSkins("c4");
+  return getWeaponSkins(slot);
+}
 
 app.get<{ Querystring: { slot?: string } }>(
   "/api/catalog/skins",
@@ -1048,33 +1093,7 @@ app.get<{ Querystring: { slot?: string } }>(
     if (!slot) {
       return reply.status(400).send({ error: "slot required" });
     }
-    if (slot === "knife") {
-      return { base: null, skins: getKnives() };
-    }
-    if (slot === "gloves") {
-      return { base: null, skins: getGloves() };
-    }
-    if (slot === "agent") {
-      return { base: null, skins: getAgents() };
-    }
-    if (slot === "musickit") {
-      return { base: null, skins: getMusicKits() };
-    }
-    if (slot === "collectible") {
-      return { base: null, skins: getCollectibles() };
-    }
-    if (slot === "graffiti") {
-      // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
-      // graffiti is the one catalog whose splits aren't in any item field.
-      return { base: null, ...getGraffiti() };
-    }
-    if (slot === "zeus") {
-      return getWeaponSkins("taser");
-    }
-    if (slot === "c4") {
-      return getWeaponSkins("c4");
-    }
-    return getWeaponSkins(slot);
+    return catalogForSlot(slot);
   },
 );
 
@@ -1487,6 +1506,11 @@ app.get("/api/inventory", async (request, reply) => {
   for (const row of items) {
     for (const inst of referencedInstances(row)) attachedTo.set(inst, String(row.id));
   }
+  // NO prices here, deliberately. They are a second request (see
+  // /api/inventory/prices): an inventory is what someone came for and it must
+  // paint the moment it is ready, while pricing is an enhancement that can
+  // arrive a beat later — and being separate means it can also be re-fetched on
+  // its own after a sync, a craft, or the switch being turned on.
   return resolved.map((row) => ({
     ...enrichAttachments(row),
     slot: slotForItem(row.item_id),
@@ -1976,9 +2000,13 @@ app.get("/api/loadout", async (request, reply) => {
     stattrak: boolean;
     stattrak_count: number;
     nametag: string | null;
+    stickers: unknown[] | null;
+    patches: unknown[] | null;
+    charm_id: number | null;
   }>(
     `SELECT l.team, l.slot, l.item_instance_id,
        (l.item_instance_id IS NOT NULL) AS skinned,
+       i.stickers, i.patches, i.charm_id,
        COALESCE(i.item_id, l.item_id)   AS item_id,
        COALESCE(i.wear, l.wear)         AS wear,
        COALESCE(i.seed, l.seed)         AS seed,
@@ -1992,6 +2020,8 @@ app.get("/api/loadout", async (request, reply) => {
      WHERE l.steam_id = $1`,
     [identity.steamId],
   );
+  // Prices ride on /api/inventory/prices, not here — same reasoning as the
+  // inventory: the loadout is the screen, money is an overlay on it.
   return rows
     .filter((row) => row.item_id != null)
     .map((row) => ({ ...row, item: getItem(row.item_id as number) }));
@@ -2292,10 +2322,11 @@ app.post<{ Params: { steamId: string } }>(
     const { rows } = await pool.query<{
       team: string; slot: string; base_item_id: number | null; item_id: number | null;
       wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
-      stickers: (number | null)[] | null; patches: (number | null)[] | null; charm_id: number | null;
+      stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
+      charm_offset: AttachBody["charm_offset"];
     }>(
       `SELECT l.team, l.slot, l.item_id AS base_item_id, i.item_id, i.wear, i.seed,
-              i.stattrak, i.nametag, i.stickers, i.patches, i.charm_id
+              i.stattrak, i.nametag, i.stickers, i.patches, i.charm_id, i.charm_offset
        FROM inventory.loadout l
        LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
        WHERE l.steam_id = $1`,
@@ -2304,15 +2335,37 @@ app.post<{ Params: { steamId: string } }>(
     let copied = 0;
     for (const row of rows) {
       if (row.item_id != null) {
+        // Through linkAttachments, exactly like a craft — NOT straight into the
+        // column. The specs being copied carry the SOURCE user's `inst` ids, and
+        // an inst only means anything to its owner (instFactsFor is scoped by
+        // steam_id). Written verbatim they resolved to nothing here, so every
+        // copied sticker quietly fell back to its inline `w` and was not a thing
+        // the new owner actually owned. linkAttachments already refuses an inst
+        // that is not the caller's and mints a fresh one instead, which is
+        // exactly what a copy wants.
+        //
+        // charm_offset rides along for the first time here too — it was never
+        // selected, so a copied loadout silently lost its charm PLACEMENT.
+        const linked = await linkAttachments(
+          identity.steamId,
+          {
+            stickers: row.stickers,
+            patches: row.patches,
+            charm_id: row.charm_id,
+            charm_offset: row.charm_offset,
+          },
+          null,
+        );
         const { rows: inserted } = await pool.query<{ id: string }>(
           `INSERT INTO inventory.owned_items
-             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, origin)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,'copied') RETURNING id`,
+             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, charm_offset, origin)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10::jsonb,'copied') RETURNING id`,
           [
             identity.steamId, row.item_id, row.wear, row.seed, row.stattrak, row.nametag,
-            row.stickers?.some((x) => x != null) ? JSON.stringify(row.stickers) : null,
-            row.patches?.some((x) => x != null) ? JSON.stringify(row.patches) : null,
+            normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null,
+            normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
             row.charm_id,
+            linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
           ],
         );
         await pool.query(
@@ -2660,6 +2713,904 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
       (unresolved.length ? ` | UNRESOLVED attachments: ${[...new Set(unresolved)].join("; ")}` : ""),
   );
   return { imported, updated, removed, skipped, partial: !complete };
+});
+
+// ---- Market prices (opt-in) -------------------------------------------------
+// A Steam market price feed, mirrored hourly into inventory.prices and held in
+// memory for lookups. The mapping rules live in prices.ts, on their own, so
+// tools/price-coverage.ts can prove them without a Postgres; this half is the
+// job, the cache and the endpoints.
+//
+// OPT-IN and off by default, exactly like the shared asset CDN and for the same
+// reason: the fetch leaves the operator's network. The URL is theirs too — it
+// defaults to a 5stack host rather than the upstream project's raw GitHub, so no
+// deployment quietly depends on a third party's repository. Whichever host it
+// names, only the SERVER talks to it; a browser never does.
+
+const PRICE_SYNC_INTERVAL_MS = 60 * 60_000;
+
+interface PriceConfig {
+  enabled: boolean;
+  source: PriceSource;
+  base: string;
+  custom: boolean;
+  /** Which number this source is asked for first. */
+  window: PriceWindow;
+}
+
+/** Read on nearly every priced request, and it is three short values in a
+ *  key/value table — memoised briefly so a page full of tiles doesn't ask the
+ *  database what the settings are once per tile. Short enough that flipping the
+ *  switch in the admin panel is visible immediately. */
+let priceConfigMemo: { at: number; value: PriceConfig } | null = null;
+const PRICE_CONFIG_TTL_MS = 5_000;
+
+async function priceSettings(): Promise<PriceConfig> {
+  if (priceConfigMemo && Date.now() - priceConfigMemo.at < PRICE_CONFIG_TTL_MS) {
+    return priceConfigMemo.value;
+  }
+  const { rows } = await pool.query<{ key: string; value: string }>(
+    `SELECT key, value FROM inventory.settings WHERE key IN ('prices', 'price_source', 'price_feed')`,
+  );
+  const settings = new Map(rows.map((r) => [r.key, r.value]));
+  const stored = settings.get("price_source") as PriceSource | undefined;
+  const source = stored && PRICE_SOURCES.includes(stored) ? stored : DEFAULT_PRICE_SOURCE;
+  const custom = (settings.get("price_feed") ?? "").trim();
+  const value: PriceConfig = {
+    enabled: settings.get("prices") === "1",
+    source,
+    base: custom || PRICE_FEED_BASE,
+    custom: custom !== "",
+    window: DEFAULT_WINDOW[source],
+  };
+  priceConfigMemo = { at: Date.now(), value };
+  return value;
+}
+const invalidatePriceConfig = () => (priceConfigMemo = null);
+
+interface PriceMetaRow {
+  source_url: string | null;
+  /** Which source produced the rows currently in the table — not necessarily the
+   *  one configured now, which is the whole point of storing it. */
+  source_name: string | null;
+  source_date: Date | null;
+  synced_at: Date | null;
+  attempted_at: Date | null;
+  failed_at: Date | null;
+  failure: string | null;
+  rows: number;
+  unmatched: number;
+  unmatched_sample: string | null;
+}
+async function priceMeta(): Promise<PriceMetaRow | null> {
+  const { rows } = await pool.query<PriceMetaRow>(
+    `SELECT source_url, source_name, source_date, synced_at, attempted_at, failed_at, failure, rows, unmatched, unmatched_sample
+     FROM inventory.price_meta WHERE id = 1`,
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * item_id -> the id its price is filed under, as a table.
+ *
+ * The JS twin of this is priceGroupId(), and it cannot be used here: the lookup
+ * is a JOIN in Postgres, so the name-collapse has to be something the join can
+ * reach. Rebuilt on boot rather than migrated — it is derived from cs2-lib, so a
+ * catalog bump changes it, and ~400 rows are cheaper to rewrite wholesale than
+ * to reconcile.
+ */
+async function syncPriceAliases(): Promise<number> {
+  const aliases = catalogSummary()
+    .map((item) => [item.id, priceGroupId(item.id)] as const)
+    .filter(([id, groupId]) => groupId !== id);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM inventory.price_aliases`);
+    for (let i = 0; i < aliases.length; i += 1_000) {
+      const chunk = aliases.slice(i, i + 1_000);
+      const values: number[] = [];
+      const tuples = chunk
+        .map(([id, groupId], n) => {
+          values.push(id, groupId);
+          return `($${n * 2 + 1},$${n * 2 + 2})`;
+        })
+        .join(",");
+      await client.query(`INSERT INTO inventory.price_aliases (item_id, price_item_id) VALUES ${tuples}`, values);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+  return aliases.length;
+}
+
+interface PriceTarget {
+  itemId: number;
+  wear: number | null;
+  stattrak: boolean;
+}
+
+/**
+ * Prices for a batch of items, in one query.
+ *
+ * Deliberately NOT a resident copy of the mirror. ~27k listings would sit in
+ * every worker's heap, and — the part that actually breaks — each replica would
+ * hold its own: the pod that runs a sync would serve fresh prices while its
+ * neighbours served whatever they last loaded, with nothing on screen to say
+ * which one you got. The table is the single copy; this reads it.
+ *
+ * One statement per REQUEST, not per item. The caller hands over every item it
+ * is about to render (a 200-item inventory, a 15-slot loadout, one craft with
+ * its stickers) and gets a map back — the join does the id-collapse via
+ * price_aliases and the float bucketing via wearTierSql, both of which used to
+ * be the reason this could not be SQL.
+ *
+ * Duplicates collapse before the query: an inventory with forty of the same
+ * sticker asks about it once.
+ */
+async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promise<Map<string, PricePoint>> {
+  const unique = new Map<string, PriceTarget>();
+  for (const target of targets) {
+    unique.set(priceTargetKey(target.itemId, target.wear, target.stattrak), target);
+  }
+  const found = new Map<string, PricePoint>();
+  if (unique.size === 0) return found;
+  const values: unknown[] = [];
+  const tuples = [...unique.values()]
+    .map((target, i) => {
+      values.push(target.itemId, target.wear, target.stattrak);
+      const b = i * 3;
+      return `($${b + 1}::int, $${b + 2}::real, $${b + 3}::boolean)`;
+    })
+    .join(",");
+  const { rows } = await pool.query<{
+    item_id: number;
+    wear: number | null;
+    stattrak: boolean;
+    market_hash_name: string;
+    last_24h: number | null;
+    last_7d: number | null;
+    last_30d: number | null;
+    last_90d: number | null;
+    suggested: number | null;
+    median: number | null;
+    lowest: number | null;
+  }>(
+    `SELECT v.item_id, v.wear, v.stattrak,
+            p.market_hash_name, p.last_24h, p.last_7d, p.last_30d, p.last_90d,
+            p.suggested, p.median, p.lowest
+       FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak)
+       LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
+       -- Two candidate rows, and the ORDER BY is the whole point: the item's OWN
+       -- id first, the name-collapsed one only as a fallback. A source that
+       -- prices Doppler phases separately (Skinport does; Steam does not) writes
+       -- a row per phase, and this is what lets a Ruby read its own $2.4k rather
+       -- than the shared "Doppler" price. When the source doesn't distinguish,
+       -- there is no exact row and the alias answers, exactly as before.
+       JOIN LATERAL (
+         SELECT pr.market_hash_name, pr.last_24h, pr.last_7d, pr.last_30d, pr.last_90d,
+                pr.suggested, pr.median, pr.lowest
+           FROM inventory.prices pr
+          WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
+            -- The item's own bracket, OR a listing that carries no bracket at
+            -- all (-1). That second case is not an edge: VANILLA knives are sold
+            -- as "★ Karambit", with no wear in the name, while the knife itself
+            -- very much has a float. Asking only for the float's bracket missed
+            -- every one of them — 22 melee items, and the most valuable things
+            -- most inventories hold.
+            AND pr.wear_tier IN (${wearTierSql("v.wear")}, -1)
+            AND pr.stattrak = v.stattrak
+            -- Nothing here mints souvenirs. The column exists so a Souvenir AWP's
+            -- price is never filed on the plain one; this side just never asks.
+            AND pr.souvenir = false
+          -- Exact item before its name-collapsed group, then the exact bracket
+          -- before the bracket-less fallback.
+          ORDER BY (pr.item_id = v.item_id) DESC, (pr.wear_tier = ${wearTierSql("v.wear")}) DESC
+          LIMIT 1
+       ) p ON true`,
+    values,
+  );
+  for (const row of rows) {
+    // The window fallback stays in prices.ts — one implementation, already
+    // covered by tools/price-coverage.ts. Writing it a second time as SQL
+    // COALESCE would be two places to get "which window is this" wrong.
+    const point = pickPrice(
+      {
+        last24h: row.last_24h,
+        last7d: row.last_7d,
+        last30d: row.last_30d,
+        last90d: row.last_90d,
+        suggested: row.suggested,
+        median: row.median,
+        lowest: row.lowest,
+        marketHashName: row.market_hash_name,
+      },
+      window,
+    );
+    if (point) found.set(priceTargetKey(row.item_id, row.wear, row.stattrak), point);
+  }
+  return found;
+}
+
+const itemNameOf = (id: number) => getItem(id)?.name ?? null;
+
+/** How many listings the mirror holds. Read off the meta row rather than
+ *  COUNT(*): it is written by the sync that produced them, and every price
+ *  surface asks this to decide whether to draw money at all. */
+async function priceListingCount(): Promise<number> {
+  const { rows } = await pool.query<{ rows: number }>(`SELECT rows FROM inventory.price_meta WHERE id = 1`);
+  return rows[0]?.rows ?? 0;
+}
+
+/** An itemized quote for a stored row or a craft-form body — both carry
+ *  attachments as the same jsonb specs, so both go through normSpecs. One query
+ *  for the weapon and everything on it. */
+async function quoteFor(
+  row: { item_id: number; wear?: number | null; stattrak?: boolean | null; stickers?: unknown[] | null; patches?: unknown[] | null; charm_id?: number | null },
+  window: PriceWindow,
+): Promise<Quote> {
+  const ids = (arr: unknown) => normSpecs(arr).map((spec) => (spec ? { id: spec.id } : null));
+  const spec = {
+    itemId: row.item_id,
+    wear: row.wear ?? null,
+    stattrak: row.stattrak === true,
+    stickers: ids(row.stickers),
+    patches: ids(row.patches),
+    charmId: row.charm_id ?? null,
+  };
+  // Attachments price at their bare name: no float, no StatTrak.
+  const targets: PriceTarget[] = [{ itemId: spec.itemId, wear: spec.wear, stattrak: spec.stattrak }];
+  for (const attachment of [...(spec.stickers ?? []), ...(spec.patches ?? [])]) {
+    if (attachment) targets.push({ itemId: attachment.id, wear: null, stattrak: false });
+  }
+  if (spec.charmId != null) targets.push({ itemId: spec.charmId, wear: null, stattrak: false });
+  const prices = await lookupPrices(targets, window);
+  return quoteItem(
+    spec,
+    (id, wear, stattrak) => prices.get(priceTargetKey(id, wear, stattrak)) ?? null,
+    itemNameOf,
+  );
+}
+
+const PRICE_INSERT_BATCH = 1_000;
+
+/**
+ * Pull the feed and replace the mirror.
+ *
+ * DELETE + INSERT inside ONE transaction, not an upsert: the feed is a full
+ * snapshot, so a merge would keep rows for listings that have since gone away,
+ * and prices that stopped being published would sit there looking current
+ * forever. The transaction is what makes the wholesale delete safe — a fetch
+ * that 404s, or a body that turns out to be an HTML error page, rolls back and
+ * leaves yesterday's prices exactly where they were. A failed sync must never
+ * cost an operator their price data.
+ */
+async function syncPrices(opts: { force?: boolean } = {}): Promise<
+  { skipped: "disabled" } | { rows: number; unmatched: number; collisions: number } | { error: string }
+> {
+  const { enabled, source, base } = await priceSettings();
+  if (!enabled && !opts.force) return { skipped: "disabled" };
+  const provider = PRICE_PROVIDERS[source];
+  const url = providerUrl(source, base);
+  const startedAt = performance.now();
+  await pool.query(
+    `INSERT INTO inventory.price_meta (id, source_url, source_name, attempted_at) VALUES (1, $1, $2, now())
+     ON CONFLICT (id) DO UPDATE SET source_url = EXCLUDED.source_url, source_name = EXCLUDED.source_name, attempted_at = now()`,
+    [url, source],
+  );
+  try {
+    const response = await fetch(url, {
+      // Per-provider: Skinport refuses a client that can't take Brotli (406).
+      headers: { Accept: "application/json", ...provider.headers },
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!response.ok) throw new Error(`Price source returned HTTP ${response.status}.`);
+    // The feed itself carries no date. Last-Modified is the mirror's own answer
+    // to "how old is this", and a missing header degrades to now() rather than
+    // failing the sync — a stale-looking date is a smaller problem than no
+    // prices at all.
+    const lastModified = response.headers.get("last-modified");
+    const sourceDate = lastModified ? new Date(lastModified) : new Date();
+    const { prices, unmatched, collisions } = provider.map(await response.json());
+    if (prices.length === 0) throw new Error("Price feed mapped to zero rows.");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`DELETE FROM inventory.prices`);
+      for (let i = 0; i < prices.length; i += PRICE_INSERT_BATCH) {
+        const chunk = prices.slice(i, i + PRICE_INSERT_BATCH);
+        const values: unknown[] = [];
+        const tuples = chunk
+          .map((p, n) => {
+            values.push(
+              p.itemId, p.wearTier, p.stattrak, p.souvenir, p.marketHashName,
+              p.last24h, p.last7d, p.last30d, p.last90d,
+              p.suggested, p.median, p.lowest, p.listings, source,
+            );
+            const b = n * 14;
+            return `(${Array.from({ length: 14 }, (_, k) => `$${b + k + 1}`).join(",")})`;
+          })
+          .join(",");
+        await client.query(
+          `INSERT INTO inventory.prices
+             (item_id, wear_tier, stattrak, souvenir, market_hash_name,
+              last_24h, last_7d, last_30d, last_90d,
+              suggested, median, lowest, listings, source)
+           VALUES ${tuples}`,
+          values,
+        );
+      }
+      await client.query(
+        `UPDATE inventory.price_meta
+            SET source_date = $1, synced_at = now(), failed_at = NULL, failure = NULL,
+                rows = $2, unmatched = $3, unmatched_sample = $4
+          WHERE id = 1`,
+        [sourceDate, prices.length, unmatched.length, [...new Set(unmatched)].slice(0, 20).join("\n") || null],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    app.log.info(
+      `[prices] ${source} ${url}: ${prices.length} listings, ${unmatched.length} unmatched, ${collisions.length} collisions ` +
+        `in ${Math.round(performance.now() - startedAt)}ms`,
+    );
+    return { rows: prices.length, unmatched: unmatched.length, collisions: collisions.length };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error.";
+    await pool.query(
+      `UPDATE inventory.price_meta SET failed_at = now(), failure = $1 WHERE id = 1`,
+      [message.slice(0, 1_000)],
+    );
+    // Explicit, because the alternative is a price column that silently stops
+    // updating: the table still has yesterday's rows, so nothing on screen looks
+    // broken until someone notices every number is a week old.
+    app.log.warn(`[prices] ${source} ${url}: FAILED — ${message}`);
+    return { error: message };
+  }
+}
+
+let priceSyncRunning = false;
+function schedulePriceSync() {
+  const run = async () => {
+    if (priceSyncRunning) return;
+    priceSyncRunning = true;
+    try {
+      await syncPrices();
+    } catch (error) {
+      app.log.warn(`[prices] sync job threw — ${(error as Error).message}`);
+    } finally {
+      priceSyncRunning = false;
+    }
+  };
+  void run();
+  setInterval(() => void run(), PRICE_SYNC_INTERVAL_MS);
+}
+
+/** What the UI needs to decide whether to show money at all. Any signed-in user:
+ *  it is one row of operator state, and the alternative is every price surface
+ *  guessing from whether numbers came back. */
+app.get("/api/prices", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const { enabled, source, window } = await priceSettings();
+  const meta = await priceMeta();
+  const listings = meta?.rows ?? 0;
+  // Rows produced by a DIFFERENT source than the one configured are dead weight:
+  // a feed fills last_24h..last_90d, a market fills suggested/median/lowest, and
+  // the configured source's window chain only ever looks at its own columns. So
+  // a mirror full of feed rows under a market source resolves to nothing at all,
+  // for every item, silently. Reported as not-ready rather than ready-but-blank,
+  // because "no prices anywhere" with the switch on is the single most confusing
+  // state this feature has. `null` counts as a mismatch — it means the rows
+  // predate source tracking, which is exactly the case that needs a re-sync.
+  const stale = listings > 0 && meta?.source_name !== source;
+  return {
+    enabled,
+    source,
+    stale,
+    /** Enabled AND actually holding data. The gate every price surface reads —
+     *  an enabled feed that has never synced must not draw empty price slots. */
+    ready: enabled && listings > 0 && !stale,
+    window,
+    listings,
+    sourceDate: meta?.source_date?.toISOString() ?? null,
+    syncedAt: meta?.synced_at?.toISOString() ?? null,
+  };
+});
+
+/**
+ * What a craft would cost, itemized.
+ *
+ * Takes a craft-form body rather than an owned id on purpose: the estimate has
+ * to update while someone is still choosing the float and the stickers, before
+ * anything is saved. Same body shape the craft endpoint accepts, so the form can
+ * post exactly what it is holding.
+ */
+app.post<{ Body: Partial<ItemRow> }>("/api/prices/quote", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const body = request.body ?? {};
+  const itemId = body.item_id;
+  if (typeof itemId !== "number") {
+    return reply.status(400).send({ error: "item_id is required." });
+  }
+  const { window } = await priceSettings();
+  return await quoteFor({ ...body, item_id: itemId }, window);
+});
+
+/**
+ * Every price this account's screens need, in one request, separate from the
+ * screens themselves.
+ *
+ * Split from /api/inventory and /api/loadout on purpose. An inventory is what
+ * someone came for and should paint the instant it is ready; a dollar figure is
+ * an overlay on it. Being its own request also means it can be re-fetched alone
+ * — after a craft, after a Steam sync, or the moment a player flips the switch
+ * on — without re-loading anything else.
+ *
+ * Two shapes, because two questions:
+ *   `items` — each owned row's OWN price. Summing this counts every thing once;
+ *             an applied sticker is a row here as well as a line on its weapon.
+ *   `slots` — what each equipped slot is WORTH: skin plus everything on it. Safe
+ *             to sum across a team, since an attachment lives on one weapon and
+ *             that weapon occupies one slot.
+ */
+app.get("/api/inventory/prices", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const { enabled, window } = await priceSettings();
+  if (!enabled) return { ready: false, window, items: {}, slots: {} };
+  const [{ rows: owned }, { rows: equipped }] = await Promise.all([
+    pool.query<{ id: string; item_id: number; wear: number | null; stattrak: boolean }>(
+      `SELECT id, item_id, wear, stattrak FROM inventory.owned_items WHERE steam_id = $1`,
+      [identity.steamId],
+    ),
+    pool.query<{
+      team: string; slot: string; item_id: number | null; wear: number | null; stattrak: boolean;
+      stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
+    }>(
+      `SELECT l.team, l.slot,
+              COALESCE(i.item_id, l.item_id)   AS item_id,
+              COALESCE(i.wear, l.wear)         AS wear,
+              COALESCE(i.stattrak, l.stattrak) AS stattrak,
+              i.stickers, i.patches, i.charm_id
+         FROM inventory.loadout l
+         LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+        WHERE l.steam_id = $1`,
+      [identity.steamId],
+    ),
+  ]);
+  // ONE lookup for both halves — the equipped weapons are owned rows too, so
+  // asking twice would ask the same questions twice.
+  const targets: PriceTarget[] = owned.map((row) => ({
+    itemId: row.item_id,
+    wear: row.wear,
+    stattrak: row.stattrak,
+  }));
+  for (const row of equipped) {
+    if (row.item_id == null) continue;
+    targets.push({ itemId: row.item_id, wear: row.wear, stattrak: row.stattrak });
+    for (const spec of [...normSpecs(row.stickers), ...normSpecs(row.patches)]) {
+      if (spec) targets.push({ itemId: spec.id, wear: null, stattrak: false });
+    }
+    if (row.charm_id != null) targets.push({ itemId: row.charm_id, wear: null, stattrak: false });
+  }
+  const prices = await lookupPrices(targets, window);
+  const items: Record<string, PricePoint> = {};
+  for (const row of owned) {
+    const price = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak));
+    if (price) items[String(row.id)] = price;
+  }
+  const bare = (id: number) => prices.get(priceTargetKey(id, null, false))?.value ?? 0;
+  const slots: Record<string, number> = {};
+  for (const row of equipped) {
+    if (row.item_id == null) continue;
+    const base = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak))?.value ?? 0;
+    const attachments =
+      normSpecs(row.stickers).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
+      normSpecs(row.patches).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
+      (row.charm_id != null ? bare(row.charm_id) : 0);
+    const total = base + attachments;
+    if (total > 0) slots[`${row.team}:${row.slot}`] = Math.round(total * 100) / 100;
+  }
+  return { ready: Object.keys(items).length > 0 || Object.keys(slots).length > 0, window, items, slots };
+});
+
+/**
+ * What each finish in a slot would cost to buy BRAND NEW — the craft browser's
+ * price column, and what a sort-by-value there orders on.
+ *
+ * "Brand new" is Factory New when Factory New exists, and the next bracket up
+ * when it does not. Plenty of finishes have a float floor above 0.07 and are
+ * never sold Factory New at all (a Howl caps at 0.08); a strict FN lookup would
+ * price those at nothing and drop them out of the sort entirely, which is a
+ * worse answer than "the freshest one anybody sells". The bracket that answered
+ * rides back with the figure so the UI can say which it was.
+ *
+ * Non-StatTrak and non-Souvenir on purpose: this is the cost of the FINISH, the
+ * floor you would pay to own it at all. StatTrak is a variant you opt into, and
+ * pricing every row as its StatTrak copy would make the cheap end of the list
+ * meaningless.
+ */
+app.get<{ Querystring: { slot?: string } }>("/api/prices/stock", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const slot = request.query.slot;
+  if (!slot) return reply.status(400).send({ error: "slot required" });
+  const { enabled, window } = await priceSettings();
+  const empty = { ready: false, window, prices: {} as Record<string, unknown> };
+  if (!enabled) return empty;
+  // The same catalog the picker is showing, so a price map and a grid can never
+  // be about different sets of items.
+  const ids = (catalogForSlot(slot).skins ?? []).map((skin) => skin.id);
+  if (ids.length === 0) return empty;
+  const values: number[] = [];
+  const tuples = ids
+    .map((id, i) => {
+      values.push(id);
+      return `($${i + 1}::int)`;
+    })
+    .join(",");
+  const { rows } = await pool.query<{
+    item_id: number;
+    wear_tier: number;
+    market_hash_name: string;
+    last_24h: number | null;
+    last_7d: number | null;
+    last_30d: number | null;
+    last_90d: number | null;
+    suggested: number | null;
+    median: number | null;
+    lowest: number | null;
+  }>(
+    `SELECT v.item_id, p.wear_tier, p.market_hash_name,
+            p.last_24h, p.last_7d, p.last_30d, p.last_90d,
+            p.suggested, p.median, p.lowest
+       FROM (VALUES ${tuples}) AS v(item_id)
+       LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
+       JOIN LATERAL (
+         SELECT pr.wear_tier, pr.market_hash_name, pr.last_24h, pr.last_7d, pr.last_30d,
+                pr.last_90d, pr.suggested, pr.median, pr.lowest
+           FROM inventory.prices pr
+          WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
+            AND pr.stattrak = false
+            AND pr.souvenir = false
+          -- The item's OWN row first (a source that prices Doppler phases wrote
+          -- one), then the freshest bracket that exists: wear_tier ascends
+          -- -1 (no bracket at all) → 0 Factory New → 1 Minimal Wear → …
+          ORDER BY (pr.item_id = v.item_id) DESC, pr.wear_tier ASC
+          LIMIT 1
+       ) p ON true`,
+    values,
+  );
+  const prices: Record<string, { value: number; window: PriceWindow; marketHashName: string; wearTier: number }> = {};
+  for (const row of rows) {
+    const point = pickPrice(
+      {
+        last24h: row.last_24h,
+        last7d: row.last_7d,
+        last30d: row.last_30d,
+        last90d: row.last_90d,
+        suggested: row.suggested,
+        median: row.median,
+        lowest: row.lowest,
+        marketHashName: row.market_hash_name,
+      },
+      window,
+    );
+    if (point) prices[String(row.item_id)] = { ...point, wearTier: row.wear_tier };
+  }
+  return { ready: Object.keys(prices).length > 0, window, prices };
+});
+
+// ---- Sale history for one listing -------------------------------------------
+// The spread behind the single figure. See inventory.price_history for why.
+
+/** Six hours. A sale spread moves on the scale of days, and the source allows a
+ *  handful of calls per five minutes — a short TTL would spend that budget on
+ *  numbers that had not changed. */
+const HISTORY_TTL_MS = 6 * 60 * 60_000;
+/** A floor between OUTBOUND fetches, whatever is being asked for. Clicking
+ *  through twenty knives must not become twenty requests in twenty seconds. */
+const HISTORY_MIN_GAP_MS = 3_000;
+let lastHistoryFetch = 0;
+
+const HISTORY_WINDOWS = ["last_24_hours", "last_7_days", "last_30_days", "last_90_days"] as const;
+type HistoryWindow = (typeof HISTORY_WINDOWS)[number];
+interface HistoryRow {
+  window: HistoryWindow;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  median: number | null;
+  volume: number;
+}
+
+/** Skinport's sales history, which is public, phase-aware and returns one row
+ *  per version. Only this provider publishes it; with any other source selected
+ *  the detail endpoint simply has nothing to add. */
+function skinportHistoryUrl(marketHashName: string) {
+  return `https://api.skinport.com/v1/sales/history?app_id=730&currency=USD&market_hash_name=${encodeURIComponent(marketHashName)}`;
+}
+
+async function fetchSaleHistory(marketHashName: string): Promise<Map<string, HistoryRow[]>> {
+  const response = await fetch(skinportHistoryUrl(marketHashName), {
+    headers: { "Accept-Encoding": "br, gzip", Accept: "application/json" },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Sale history returned HTTP ${response.status}.`);
+  const payload = await response.json();
+  if (!Array.isArray(payload)) throw new Error("Sale history is not an array.");
+  const byVersion = new Map<string, HistoryRow[]>();
+  for (const raw of payload) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    if (entry.market_hash_name !== marketHashName) continue;
+    const version = typeof entry.version === "string" ? entry.version : "";
+    const rows: HistoryRow[] = [];
+    for (const window of HISTORY_WINDOWS) {
+      const w = (entry[window] ?? {}) as Record<string, unknown>;
+      const volume = typeof w.volume === "number" ? w.volume : 0;
+      // A window nobody sold in is not a data point. Storing four nulls per
+      // window would only teach the cache that this item trades at nothing.
+      if (volume <= 0) continue;
+      rows.push({
+        window,
+        min: positiveOrNull(w.min),
+        max: positiveOrNull(w.max),
+        avg: positiveOrNull(w.avg),
+        median: positiveOrNull(w.median),
+        volume,
+      });
+    }
+    if (rows.length) byVersion.set(version, rows);
+  }
+  return byVersion;
+}
+
+const positiveOrNull = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+
+/**
+ * What copies of this exact listing recently sold for.
+ *
+ * Answers a question the flat bracket price cannot: a Factory New Karambit
+ * Doppler is everything from a 0.0001 Phase 4 to a 0.069 one, and the MIN and
+ * MAX of recent sales bound how much that actually matters. The caller pairs it
+ * with where the item's own float sits inside its bracket — this endpoint
+ * deliberately does not, because a spread is a fact and the adjustment is an
+ * inference, and mixing them produces a number that looks measured.
+ */
+app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>(
+  "/api/prices/detail",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) return reply.status(401).send({ error: "unauthorized" });
+    const itemId = Number(request.query.item_id);
+    if (!Number.isFinite(itemId)) return reply.status(400).send({ error: "item_id is required." });
+    const { enabled, source, window } = await priceSettings();
+    const wear = request.query.wear != null && request.query.wear !== "" ? Number(request.query.wear) : null;
+    const stattrak = request.query.stattrak === "1";
+    const none = { available: false, window, marketHashName: null, version: null, history: [] as HistoryRow[] };
+    // Only one provider publishes a sale history, and the market name to ask it
+    // about comes out of our own mirror — which is keyed by exactly the four
+    // facts a listing is: item, bracket, StatTrak, Souvenir.
+    if (!enabled || source !== "skinport") return none;
+    const prices = await lookupPrices([{ itemId, wear, stattrak }], window);
+    const point = prices.get(priceTargetKey(itemId, wear, stattrak));
+    if (!point) return none;
+    const marketHashName = point.marketHashName;
+    // The phase, when the item has one: the source reports a row per version and
+    // a Black Pearl is not a Phase 1.
+    const version = getItem(itemId)?.altName ?? "";
+
+    const { rows: cached } = await pool.query<{
+      version: string; window: HistoryWindow; min: number | null; max: number | null;
+      avg: number | null; median: number | null; volume: number; fetched_at: Date;
+    }>(
+      `SELECT version, window, min, max, avg, median, volume, fetched_at
+         FROM inventory.price_history WHERE market_hash_name = $1`,
+      [marketHashName],
+    );
+    const fresh =
+      cached.length > 0 && Date.now() - Math.max(...cached.map((r) => r.fetched_at.getTime())) < HISTORY_TTL_MS;
+
+    if (!fresh && Date.now() - lastHistoryFetch > HISTORY_MIN_GAP_MS) {
+      lastHistoryFetch = Date.now();
+      try {
+        const byVersion = await fetchSaleHistory(marketHashName);
+        const values: unknown[] = [];
+        const tuples: string[] = [];
+        for (const [ver, rows] of byVersion) {
+          for (const row of rows) {
+            const b = values.length;
+            values.push(marketHashName, ver, row.window, row.min, row.max, row.avg, row.median, row.volume);
+            tuples.push(`(${Array.from({ length: 8 }, (_, k) => `$${b + k + 1}`).join(",")}, now())`);
+          }
+        }
+        if (tuples.length) {
+          await pool.query(
+            `INSERT INTO inventory.price_history
+               (market_hash_name, version, window, min, max, avg, median, volume, fetched_at)
+             VALUES ${tuples.join(",")}
+             ON CONFLICT (market_hash_name, version, window) DO UPDATE SET
+               min = EXCLUDED.min, max = EXCLUDED.max, avg = EXCLUDED.avg,
+               median = EXCLUDED.median, volume = EXCLUDED.volume, fetched_at = now()`,
+            values,
+          );
+        }
+        const rows = byVersion.get(version) ?? byVersion.get("") ?? [];
+        return { available: rows.length > 0, window, marketHashName, version: version || null, history: rows };
+      } catch (error) {
+        // A history that won't load is not an error worth failing the request
+        // over — the caller still has a price to show.
+        app.log.warn(`[prices] sale history for ${marketHashName}: ${(error as Error).message}`);
+      }
+    }
+    // Serve what is stored, stale or not: a spread from this morning beats none.
+    const mine = cached.filter((r) => r.version === version);
+    const rows = (mine.length ? mine : cached.filter((r) => r.version === "")).map((r) => ({
+      window: r.window,
+      min: r.min,
+      max: r.max,
+      avg: r.avg,
+      median: r.median,
+      volume: r.volume,
+    }));
+    return { available: rows.length > 0, window, marketHashName, version: version || null, history: rows };
+  },
+);
+
+// ---- Admin: the price feed ---------------------------------------------------
+// Same shape as the asset-CDN panel: read the switch, flip the switch, and see
+// enough of the last attempt to tell "never ran" from "ran and failed" from "ran
+// fine, that item just doesn't trade".
+app.get("/api/admin/prices", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const { enabled, source, base, custom, window } = await priceSettings();
+  const meta = await priceMeta();
+  return {
+    enabled,
+    source,
+    sources: PRICE_SOURCES,
+    base,
+    /** The operator typed this URL in; false means it is our default. */
+    custom,
+    url: providerUrl(source, base),
+    providers: PRICE_SOURCES.map((id) => ({
+      id,
+      label: PRICE_PROVIDERS[id].label,
+      blurb: PRICE_PROVIDERS[id].blurb,
+      /** Null means "the operator supplies the URL" — only the JSON feed does. */
+      url: PRICE_PROVIDERS[id].url,
+      window: PRICE_PROVIDERS[id].window,
+    })),
+    defaultBase: PRICE_FEED_BASE,
+    /** Where the default mirror is built FROM. Shown so an operator who would
+     *  rather not depend on the 5stack host knows what to point at instead. */
+    upstream: PRICE_FEED_UPSTREAM,
+    window,
+    windows: PRICE_WINDOWS,
+    listings: meta?.rows ?? 0,
+    /** The mirror holds another source's rows — see the note in /api/prices. */
+    stale: (meta?.rows ?? 0) > 0 && meta?.source_name !== source,
+    syncing: priceSyncRunning,
+    intervalMinutes: PRICE_SYNC_INTERVAL_MS / 60_000,
+    sourceDate: meta?.source_date?.toISOString() ?? null,
+    syncedAt: meta?.synced_at?.toISOString() ?? null,
+    syncedSource: meta?.source_name ?? null,
+    attemptedAt: meta?.attempted_at?.toISOString() ?? null,
+    failedAt: meta?.failed_at?.toISOString() ?? null,
+    failure: meta?.failure ?? null,
+    unmatched: meta?.unmatched ?? 0,
+    unmatchedSample: meta?.unmatched_sample?.split("\n").filter(Boolean) ?? [],
+  };
+});
+
+app.put<{ Body: { enabled?: boolean; base?: string | null; source?: string } }>("/api/admin/prices", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const body = request.body ?? {};
+  if (body.source !== undefined) {
+    if (!PRICE_SOURCES.includes(body.source as PriceSource)) {
+      return reply.status(400).send({ error: `Unknown price source. Pick one of: ${PRICE_SOURCES.join(", ")}.` });
+    }
+    // Switching source makes every stored row the wrong shape — a Skinport
+    // reference price and a feed's 7-day average live in different columns, and
+    // the old rows would simply never resolve. Cheaper and far less confusing to
+    // drop them and re-sync than to leave a table that silently prices nothing.
+    const { rows: current } = await pool.query<{ value: string }>(
+      `SELECT value FROM inventory.settings WHERE key = 'price_source'`,
+    );
+    if ((current[0]?.value ?? DEFAULT_PRICE_SOURCE) !== body.source) {
+      await pool.query(`DELETE FROM inventory.prices`);
+      await pool.query(`UPDATE inventory.price_meta SET rows = 0, unmatched = 0, unmatched_sample = NULL, synced_at = NULL, source_date = NULL WHERE id = 1`);
+    }
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('price_source', $1, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [body.source],
+    );
+  }
+  if (body.base !== undefined) {
+    const base = (body.base ?? "").trim();
+    // An http(s) URL or nothing. Anything else would be stored, retried hourly
+    // and reported as a fetch failure once an hour forever.
+    if (base !== "") {
+      let parsed: URL;
+      try {
+        parsed = new URL(base);
+      } catch {
+        return reply.status(400).send({ error: "That isn't a valid URL." });
+      }
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        return reply.status(400).send({ error: "The feed URL must be http or https." });
+      }
+    }
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('price_feed', $1, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [base],
+    );
+  }
+  if (body.enabled !== undefined) {
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('prices', $1, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [body.enabled === true ? "1" : "0"],
+    );
+  }
+  invalidatePriceConfig();
+  const settings = await priceSettings();
+  // Turning it on with nothing mirrored yet would otherwise leave the panel
+  // saying "enabled" over an empty table until the top of the hour.
+  if (settings.enabled && (await priceListingCount()) === 0 && !priceSyncRunning) {
+    priceSyncRunning = true;
+    void syncPrices()
+      .catch(() => {})
+      .finally(() => {
+        priceSyncRunning = false;
+      });
+  }
+  return { enabled: settings.enabled, source: settings.source, base: settings.base, custom: settings.custom };
+});
+
+/** Force a refresh now, ignoring both the hourly clock and the opt-in — an
+ *  operator asking for a sync IS the opt-in, and it is how you test a URL
+ *  before flipping the switch. */
+app.post("/api/admin/prices/sync", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  if (priceSyncRunning) return reply.status(409).send({ error: "A price sync is already running." });
+  priceSyncRunning = true;
+  try {
+    const result = await syncPrices({ force: true });
+    if ("error" in result) return reply.status(502).send(result);
+    return result;
+  } finally {
+    priceSyncRunning = false;
+  }
+});
+
+/** Drop the mirror. The opt-in switch stops the refresh; this is for an operator
+ *  who wants the data gone as well — the rows are a third party's numbers about
+ *  a market, and "off" should be able to mean empty. */
+app.delete("/api/admin/prices", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  await pool.query(`DELETE FROM inventory.prices`);
+  await pool.query(
+    `UPDATE inventory.price_meta SET rows = 0, unmatched = 0, unmatched_sample = NULL, source_date = NULL, synced_at = NULL WHERE id = 1`,
+  );
+  return { listings: 0 };
 });
 
 // ---- Shared asset CDN (opt-in) ---------------------------------------------
@@ -3971,13 +4922,17 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
         wear: row.wear ?? 0,
       });
     } else if (row.slot === "musickit") {
-      out.musicKit = { musicId: item.index as number | undefined, stattrak, uid };
+      // hashed(), like every other entry. These three were the only ones built
+      // without it, which left them with NO change-detection signal at all:
+      // InventoryItem.Equals compares the hash and nothing else, so an absent
+      // hash means swapping your music kit could not be applied by !ws.
+      out.musicKit = hashed({ musicId: item.index as number | undefined, stattrak, uid });
     } else if (row.slot === "collectible") {
       // Pins and medals carry nothing but their defindex — no paint, no wear,
       // no uid to increment. The plugin hangs it off the player as-is.
-      out.collectible = { def: item.def as number | undefined };
+      out.collectible = hashed({ def: item.def as number | undefined });
     } else if (row.slot === "graffiti") {
-      out.graffiti = {
+      out.graffiti = hashed({
         def: item.index as number | undefined,
         // `?? 0`, NOT the raw field. 438 of the 2,205 graffiti carry no tint at
         // all, and the plugin's SprayGraffiti() returns early when Tint is null —
@@ -3985,7 +4940,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
         // did nothing for one graffiti in five.
         tint: (item.tint as number | undefined) ?? 0,
         uid,
-      };
+      });
     } else {
       // Weapon positions incl. zeus/c4 — keyed by weapon def index.
       if (item.def == null) continue;
@@ -4065,6 +5020,13 @@ async function start() {
   // listen() on 63 file reads.
   void warmPatchSlots(getAgents().map((a) => a.model).filter((m): m is string => !!m));
   void autoExtractIfStale();
+  // Prices: warm the index off the mirror already in Postgres, then keep it
+  // fresh on the hour. Both fire-and-forget — pricing is an enhancement, and a
+  // slow or unreachable feed must never hold up listen() or a single request.
+  void syncPriceAliases()
+    .then((n) => app.log.info(`[prices] ${n} catalog ids aliased onto their price group`))
+    .catch((error) => app.log.warn(`[prices] alias rebuild failed — ${(error as Error).message}`));
+  schedulePriceSync();
   // Freshness marker: node --watch in this container is event-based and quietly
   // misses synced edits, so "my change did nothing" is usually "the process is
   // still on old code".

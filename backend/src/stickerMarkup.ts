@@ -124,7 +124,21 @@ export async function getStickerMarkup(model: string): Promise<StickerSlot[]> {
   }
 }
 
-/** How many sticker slots this weapon really has — 4, 5 or 6, never a fixed 5. */
+/**
+ * How many ANCHORS this weapon's body declares — 4, 5 or 6, never a fixed 5.
+ *
+ * NOT a cap on stickers. An item carries a stack of `CS2_MAX_STICKERS` (5) on
+ * every weapon, and the two numbers are independent: when the stack outnumbers
+ * the anchors the extra stickers SHARE one, which is cs2-lib's documented rule
+ * ("a model with fewer schemas than stickers shares anchors") and what its
+ * validator enforces — 5 stickers on an AK-47 passes, a 5th ANCHOR on it does
+ * not. Sizing the craft form from this number is what hid the fifth sticker on
+ * the sixteen weapons that only declare four.
+ *
+ * Per MESH because the two bodies disagree on 14 of the 35 stickerable weapons
+ * (AWP 4 hd / 5 legacy, M4A1 4/7, Deagle 5/4), so a legacy paint placed against
+ * the HD count lands on anchors the body it renders on does not have.
+ */
 export function slotCount(slots: StickerSlot[], mesh = "body_hd"): number {
   return slots.filter((s) => s.mesh === mesh).length;
 }

@@ -31,6 +31,25 @@ const stopFor = (wear: number) => WEAR_STOPS.find((s) => wear < s.max) ?? WEAR_S
 export const wearColor = (wear: number) => stopFor(wear).color;
 export const wearTier = (wear: number) => stopFor(wear).tier;
 
+/**
+ * Where a float sits INSIDE its own bracket — 0 is the best copy the bracket can
+ * hold, 1 the worst.
+ *
+ * The number a price cannot carry. A market lists one figure per bracket, but
+ * Factory New spans 0.00 to 0.07 and a 0.0001 Karambit and a 0.069 one are not
+ * the same item to anyone buying. This says which end of its own bracket a copy
+ * is at; what that is WORTH is a separate question and deliberately not answered
+ * here — see the sale spread from /api/prices/detail, which bounds it with real
+ * sales instead of a guess.
+ */
+export function wearPositionInTier(wear: number): { tier: string; pct: number } {
+  const index = Math.max(0, WEAR_STOPS.findIndex((s) => wear < s.max));
+  const stop = WEAR_STOPS[index] ?? WEAR_STOPS[WEAR_STOPS.length - 1];
+  const low = index === 0 ? 0 : WEAR_STOPS[index - 1].max;
+  const high = Number.isFinite(stop.max) ? stop.max : 1;
+  return { tier: stop.tier, pct: Math.min(1, Math.max(0, (wear - low) / (high - low))) };
+}
+
 // Steam blue — the one colour that means "this came from your Steam inventory".
 export const STEAM_BLUE = "#66c0f4";
 
@@ -54,6 +73,12 @@ export const CARD_ART =
 // so the grids size rows as art + this rather than by a ratio — a ratio starved
 // the art at small sizes the moment the footer grew.
 export const CARD_CHROME_PX = 78;
+
+// What a price line under the name adds to that budget. Its own constant, and
+// added by the caller only when prices are actually shown: money is a mode the
+// player switches on, so the art it costs is opt-in too. Folding it into
+// CARD_CHROME_PX would shrink every card for everyone who never turns it on.
+export const PRICE_ROW_PX = 14;
 
 // Bottom feather for waist-cropped art — see `.art-fade-b` in style.css for
 // what it does and why it's per-item. Agents are the only type that needs it;

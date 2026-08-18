@@ -15,6 +15,7 @@
 //
 // NOTHING IS RE-EXTRACTED FOR THIS. Only the glTF JSON chunk is read — the first
 // few hundred KB of the file — never the buffers.
+import { CS2_MAX_PATCHES } from "@ianlucas/cs2-lib";
 import { open, stat } from "node:fs/promises";
 import path from "node:path";
 
@@ -58,7 +59,12 @@ function countSlots(json: Record<string, unknown>): number {
   for (const m of materials) {
     const vmat = m?.extras?.vmat;
     if (!vmat || !num(vmat.IntParams?.F_PATCHES)) continue;
-    for (let i = 0; i < 3; i++) {
+    // CS2_MAX_PATCHES, not 3. This used to stop at 3, which is the LOW end of
+    // the 3-to-5 range described above rather than the high end — so a material
+    // declaring four or five positions had the last one or two counted as
+    // nothing. Totals only ever passed 3 by summing across several materials,
+    // which made the cap look like a real model limit instead of an off-by-two.
+    for (let i = 0; i < CS2_MAX_PATCHES; i++) {
       if (Math.abs(num(vmat.FloatParams?.[`g_flPatch${i}Scale`])) > 0) n++;
     }
   }
