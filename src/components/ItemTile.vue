@@ -8,7 +8,7 @@
 // Steam-synced items are read-only server-side, so they get a Duplicate action
 // where crafted items get Edit — never both.
 import { computed, inject } from "vue";
-import { Check, Clock, Link2, Loader2, RefreshCw } from "lucide-vue-next";
+import { Check, Clock, Heart, Link2, Loader2, RefreshCw } from "lucide-vue-next";
 import type { InventoryItem } from "../api";
 import ItemArt from "./ItemArt.vue";
 import { ART_FADE_B, attachmentsOf, CARD_ART, glowStyle, isAgentArt, isReadOnly, STEAM_BLUE, weaponName } from "../itemVisuals";
@@ -63,6 +63,8 @@ const emit = defineEmits<{
    *  `group-hover`, which never fires on touch, so without this they'd be
    *  unreachable there — the host opens the same menu contextmenu opens. */
   (e: "longpress"): void;
+  /** The DESIRED state, not a toggle — see setFavourite in api.ts for why. */
+  (e: "favourite", favourite: boolean): void;
 }>();
 
 // Mirrors the slot long-press in App.vue: 450ms, 10px of slop before it's
@@ -171,6 +173,38 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       @duplicate="emit('duplicate')"
       @remove="emit('remove')"
     />
+
+    <!--
+      Star. Bottom-left, which is the only corner not already carrying a badge:
+      top-left holds the select check and the bake clock, top-right the equipped
+      dots / applied link / Steam mark.
+
+      A starred item shows its heart ALWAYS; an unstarred one only on hover, so a
+      grid of ordinary items is not a wall of empty outlines. That means the
+      control is unreachable on touch — deliberately, because compact already
+      routes every per-item verb through the long-press menu rather than growing
+      hover affordances it cannot show.
+
+      A <span role="button">, NOT a <button>: the tile root IS a button, and a
+      nested one is invalid HTML that browsers silently reparent — which drops the
+      click handler, so the heart would render and do nothing. Same reason
+      TileActions is spans. `stop` because the tile click opens the item.
+    -->
+    <span
+      v-if="!hideActions && !row"
+      role="button"
+      tabindex="-1"
+      class="absolute bottom-1.5 left-1.5 z-[4] grid h-5 w-5 cursor-pointer place-items-center rounded transition-opacity"
+      :class="inst.favourite ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'"
+      :title="inst.favourite ? 'Remove from favourites' : 'Add to favourites'"
+      :aria-pressed="!!inst.favourite"
+      @click.stop="emit('favourite', !inst.favourite)"
+    >
+      <Heart
+        class="h-3.5 w-3.5"
+        :class="inst.favourite ? 'fill-current text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground'"
+      />
+    </span>
 
     <!-- ============ ROW ============ -->
     <!-- Same information, one line: thumb · (model) name + wear · state dots. -->

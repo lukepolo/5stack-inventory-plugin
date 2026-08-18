@@ -327,3 +327,31 @@ CREATE TABLE IF NOT EXISTS inventory.stattrak_kills (
 -- index nobody reads is pure write cost on the hottest insert in the app.
 CREATE INDEX IF NOT EXISTS stattrak_kills_item_idx
   ON inventory.stattrak_kills (item_instance_id, killed_at);
+
+-- ---- Favourites -------------------------------------------------------------
+-- Two shapes, because "favourite" means two different things here and only one
+-- of them is a row you own.
+--
+-- An OWNED instance gets a column: it is one boolean about an existing row, and
+-- a side table keyed on that row would only add a join to every inventory read.
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS favourite boolean NOT NULL DEFAULT false;
+-- Partial, because the read is always "the ones I starred" and starred items are
+-- the small minority. Indexing the false side would be most of the table.
+CREATE INDEX IF NOT EXISTS owned_items_favourite_idx
+  ON inventory.owned_items (steam_id) WHERE favourite;
+
+-- A CATALOG item cannot: it is not a row in owned_items and never will be until
+-- someone crafts it, so there is nothing to flag. This is the wishlist — "I want
+-- that Fade one day" — and it is keyed by the cs2-lib item id, which is why it
+-- cannot be a nullable column on the inventory table.
+--
+-- No foreign key to anything: item_id addresses the economy, which lives in
+-- cs2-lib and not in this database. An id cs2-lib later retires simply stops
+-- resolving through getItem and the row reads as unknown, which is the same
+-- degradation every other stored item_id already has.
+CREATE TABLE IF NOT EXISTS inventory.wishlist (
+  steam_id bigint NOT NULL,
+  item_id integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (steam_id, item_id)
+);

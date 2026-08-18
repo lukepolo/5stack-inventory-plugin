@@ -1308,6 +1308,7 @@ interface ItemRow {
    * someone backfills a row, and because the date is worth showing.
    */
   created_at?: string | null;
+  favourite?: boolean;
 }
 
 // Reject bad wear on the RAW array — normSpecs() clamps, so it has to be
@@ -1481,6 +1482,7 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     // already holds, so a field the row omits is a mode that silently does
     // nothing.
     created_at: row.created_at ?? null,
+    favourite: row.favourite ?? false,
     slot: slotForItem(row.item_id),
     item,
     equipped: equippedOn.filter((e) => e.slot === slotForItem(row.item_id)),
@@ -1494,7 +1496,7 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at, favourite
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
@@ -2025,6 +2027,101 @@ app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, rep
   ]);
   return { ok: true };
 });
+
+/**
+ * Star or unstar an owned instance.
+ *
+ * Its own route rather than a field on the update route, and deliberately NOT
+ * gated on origin. That route refuses `origin = 'steam'` rows because editing an
+ * imported item would make the mirror lie about a real Steam inventory — but a
+ * favourite says nothing about the item, only about the person looking at it.
+ * Refusing to star an imported skin would make the feature useless for exactly
+ * the people with the most items.
+ *
+ * Takes the desired STATE, not a toggle. A toggle route double-fires under a
+ * double-click and lands back where it started, and the client already knows
+ * which way the heart is pointing.
+ */
+app.post<{ Params: { id: string }; Body: { favourite?: boolean } }>(
+  "/api/inventory/:id/favourite",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const want = request.body?.favourite === true;
+    const { rowCount } = await pool.query(
+      `UPDATE inventory.owned_items SET favourite = $3 WHERE id = $1 AND steam_id = $2`,
+      [Number(request.params.id), identity.steamId, want],
+    );
+    // Scoped by steam_id, so a miss means "not yours or not there" and the two
+    // are deliberately indistinguishable — answering otherwise would let anyone
+    // probe which instance ids exist.
+    if (!rowCount) {
+      return reply.status(404).send({ error: "no such item" });
+    }
+    return { favourite: want };
+  },
+);
+
+/**
+ * The wishlist: catalog items the caller wants but does not own.
+ *
+ * Enriched through getItem on the way out for the same reason the inventory is —
+ * the client should not need a second lookup to draw a tile. An id cs2-lib has
+ * retired resolves to null and is dropped rather than rendering a blank card.
+ */
+app.get("/api/wishlist", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{ item_id: number; created_at: string }>(
+    `SELECT item_id, created_at FROM inventory.wishlist WHERE steam_id = $1
+      ORDER BY created_at DESC, item_id`,
+    [identity.steamId],
+  );
+  return rows
+    .map((r) => ({ item_id: r.item_id, created_at: r.created_at, item: getItem(r.item_id) }))
+    .filter((r) => r.item != null);
+});
+
+/**
+ * Add or remove one catalog item.
+ *
+ * `isOwnable` is the gate, not `getItem` — a wishlist of things that can never
+ * enter an inventory (a case, a key, a tool) is a list of rows nothing will ever
+ * clear. Same predicate the Steam import uses, so the two agree on what "an item
+ * you could have" means.
+ */
+app.post<{ Body: { item_id?: number; want?: boolean } }>(
+  "/api/wishlist",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const itemId = Number(request.body?.item_id);
+    if (!Number.isInteger(itemId) || itemId <= 0 || !isOwnable(itemId)) {
+      return reply.status(400).send({ error: "That item can't be wishlisted." });
+    }
+    if (request.body?.want === false) {
+      await pool.query(`DELETE FROM inventory.wishlist WHERE steam_id = $1 AND item_id = $2`, [
+        identity.steamId,
+        itemId,
+      ]);
+      return { want: false };
+    }
+    // ON CONFLICT DO NOTHING, so starring twice is not an error and does not
+    // move the created_at that orders the list.
+    await pool.query(
+      `INSERT INTO inventory.wishlist (steam_id, item_id) VALUES ($1, $2)
+       ON CONFLICT (steam_id, item_id) DO NOTHING`,
+      [identity.steamId, itemId],
+    );
+    return { want: true };
+  },
+);
 
 // ---- Loadout (per-user; slots reference owned instances) ----
 

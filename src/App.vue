@@ -6,7 +6,7 @@ import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
-  MoreHorizontal,
+  MoreHorizontal, Heart,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -29,6 +29,7 @@ import {
   type ExtractStatus,
   fetchPlayerLoadout,
   copyLoadoutFrom,
+  setFavourite,
   importSteamInventory,
   fetchSteamSync,
   API_ORIGIN,
@@ -3994,6 +3995,26 @@ async function clearSlot(pos: string) {
     fail(e);
   }
 }
+/**
+ * Star or unstar an owned item.
+ *
+ * Optimistic, and it repaints from the row we already hold rather than
+ * refetching: the inventory is a few hundred items and a full reload to move one
+ * heart would drop the grid's scroll position. On failure the flag goes back and
+ * the toast says why, because a heart that silently reverts reads as the click
+ * having missed.
+ */
+async function toggleFavourite(inst: InventoryItem, want: boolean) {
+  const row = inventory.value.find((i) => i.id === inst.id);
+  const before = row?.favourite ?? false;
+  if (row) row.favourite = want;
+  try {
+    await setFavourite(inst.id, want);
+  } catch (e) {
+    if (row) row.favourite = before;
+    notify((e as Error).message);
+  }
+}
 async function toggleStatTrakInstance(inst: InventoryItem) {
   try {
     await updateInstance(inst.id, { stattrak: !inst.stattrak });
@@ -5025,6 +5046,27 @@ const invSearchApplied = invSearchCtl.applied;
 watch(invSearchApplied, () => invFade.toTop());
 // Synced (steam) vs crafted filter + adjustable card size (persisted).
 const invOrigin = ref<OriginFilter>("all");
+/**
+ * Show only starred items.
+ *
+ * A boolean rather than a value in the origin pill: origin answers "where did
+ * this come from" and every option there is mutually exclusive, while a
+ * favourite cuts ACROSS origin — the whole point is to star a Steam import and a
+ * craft and see them together.
+ *
+ * Not in STICKY_QUERY_KEYS, so it does not ride a shared link. "The ones I
+ * starred" is not a view of an inventory anyone else can see.
+ */
+const invFavourites = ref(false);
+/**
+ * Is the control worth showing at all?
+ *
+ * A "favourites only" filter on an inventory with nothing starred is a button
+ * whose only outcome is an empty grid. Hidden until the first star exists — the
+ * same "hide, do not disable, when the control provably cannot do anything" rule
+ * the 3D verb follows for a music kit.
+ */
+const invHasFavourites = computed(() => inventory.value.some((i) => i.favourite));
 // Multi-select, not one-of: toggling is the whole point of the rail, and
 // "show me my AKs AND my AWPs" is a question people actually have. An item
 // shows if it matches ANY active toggle; nothing active means everything.
@@ -5122,6 +5164,7 @@ const invRailShown = computed(
 function clearInvFilters() {
   invSearchCtl.applyNow("");
   invOrigin.value = "all";
+  invFavourites.value = false;
   invRarity.value = "";
   invModels.value = [];
   invTypes.value = [];
@@ -5140,6 +5183,7 @@ const invFilterCount = computed(
   () =>
     (invSearch.value.trim() ? 1 : 0) +
     (invOrigin.value !== "all" ? 1 : 0) +
+    (invFavourites.value ? 1 : 0) +
     (invRarity.value ? 1 : 0) +
     (invSort.value !== DEFAULT_SORT ? 1 : 0) +
     invModels.value.length +
@@ -5266,6 +5310,7 @@ const filteredInventory = computed(() => {
       (i) =>
         (!q || itemName(i.item).toLowerCase().includes(q)) &&
         matchesOrigin(i, invOrigin.value) &&
+        (!invFavourites.value || i.favourite === true) &&
         (!invRarity.value || i.item?.rarity === invRarity.value) &&
         matchesRail(i),
     ),
@@ -5295,7 +5340,7 @@ const invDesignName = computed(() =>
 // The SETTLED search term, not the raw box: invDesign is part of invFilterSig, so
 // firing this on a keystroke rebuilt the grid one keystroke early and defeated the
 // debounce for anyone who happened to be inside a colour stack.
-watch([invSearchApplied, invOrigin, invRarity, invTypes, invModels], () => (invDesign.value = null));
+watch([invSearchApplied, invOrigin, invFavourites, invRarity, invTypes, invModels], () => (invDesign.value = null));
 /**
  * Everything that changes WHICH items the grid shows — one string.
  *
@@ -5318,7 +5363,7 @@ watch([invSearchApplied, invOrigin, invRarity, invTypes, invModels], () => (invD
  * item, deleting one — where the surviving cards genuinely should slide.
  */
 const invFilterSig = computed(() =>
-  [invSearchApplied.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
+  [invSearchApplied.value, invOrigin.value, invFavourites.value ? "fav" : "", invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
 );
 const inventoryWindow = useRenderWindow(inventoryStacks, () => invFilterSig.value);
 // Down HERE, not up beside invFade where it reads more naturally, because `watch`
@@ -6908,6 +6953,22 @@ if (MDEBUG) {
           >
             <template #default="{ item: f }">{{ f[1] }}</template>
           </PillTabs>
+          <!-- Favourites. A single toggle rather than a fourth origin pill: the
+               pills are mutually exclusive and starring cuts across them. Hidden
+               entirely until something is starred, so it is not a dead control on
+               a fresh inventory. -->
+          <button
+            v-if="invHasFavourites"
+            type="button"
+            class="flex h-6 shrink-0 items-center gap-1 rounded-md border px-2 text-f10 uppercase tracking-wider transition-colors"
+            :class="invFavourites ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground hover:text-foreground'"
+            :style="invFavourites ? { background: accentSoft } : {}"
+            :aria-pressed="invFavourites"
+            :title="invFavourites ? 'Showing favourites only' : 'Show favourites only'"
+            @click="invFavourites = !invFavourites"
+          >
+            <Heart class="h-3 w-3" :class="invFavourites ? 'fill-current' : ''" />
+          </button>
           <FilterDropdown
             v-if="invRarityFacets.length"
             v-model="invRarity"
@@ -6992,6 +7053,18 @@ if (MDEBUG) {
                     :style="invOrigin === f[0] ? { background: accentSoft } : {}"
                     @click="invOrigin = f[0]"
                   >{{ f[1] }}</button>
+                  <!-- Same row as origin, because on a phone a section heading
+                       per single toggle costs more height than the control. -->
+                  <button
+                    v-if="invHasFavourites"
+                    :class="[INV_CHIP, 'gap-1.5', invFavourites ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    :style="invFavourites ? { background: accentSoft } : {}"
+                    :aria-pressed="invFavourites"
+                    @click="invFavourites = !invFavourites"
+                  >
+                    <Heart class="h-3 w-3" :class="invFavourites ? 'fill-current' : ''" />
+                    Starred
+                  </button>
                 </div>
               </section>
 
@@ -7310,6 +7383,7 @@ if (MDEBUG) {
               @edit="openEdit(st.face)"
               @duplicate="openEdit(st.face)"
               @remove="deleteOwned(st.face)"
+              @favourite="(v) => toggleFavourite(st.face, v)"
             />
           </template>
           <!-- Keyed: TransitionGroup requires it, and a stable key keeps the
@@ -8534,6 +8608,7 @@ if (MDEBUG) {
                 @edit="openEdit(st.face)"
                 @duplicate="openEdit(st.face)"
                 @remove="deleteOwned(st.face)"
+                @favourite="(v) => toggleFavourite(st.face, v)"
               />
             </template>
             <InfiniteSentinel

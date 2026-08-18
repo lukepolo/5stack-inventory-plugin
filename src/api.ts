@@ -229,6 +229,9 @@ export interface InventoryItem {
    *  does not send it, and a mode with nothing to sort on has to degrade rather
    *  than reorder the grid at random. */
   created_at?: string | null;
+  /** Starred by the owner. A personal marker, not a property of the item — which
+   *  is why it is allowed on Steam-imported rows that are otherwise read-only. */
+  favourite?: boolean;
 }
 
 // Item artwork lives on our own mount, served under /images by the plugin host
@@ -682,6 +685,33 @@ export const updateInstance = (
   request<InventoryItem>(`/inventory/${id}`, {
     method: "POST",
     body: JSON.stringify(body),
+  });
+
+/**
+ * Star or unstar an owned instance.
+ *
+ * Sends the desired STATE rather than a toggle: a double-click on a toggle route
+ * fires twice and lands back where it started, and the caller already knows
+ * which way the heart is pointing.
+ */
+export const setFavourite = (id: number, favourite: boolean) =>
+  request<{ favourite: boolean }>(`/inventory/${id}/favourite`, {
+    method: "POST",
+    body: JSON.stringify({ favourite }),
+  });
+
+/** One wishlisted CATALOG item — something wanted but not owned, so it has no
+ *  instance id and nothing to attach a flag to. See setWishlist. */
+export interface WishlistEntry {
+  item_id: number;
+  created_at: string;
+  item: CatalogItem | null;
+}
+export const fetchWishlist = () => request<WishlistEntry[]>("/wishlist");
+export const setWishlist = (item_id: number, want: boolean) =>
+  request<{ want: boolean }>("/wishlist", {
+    method: "POST",
+    body: JSON.stringify({ item_id, want }),
   });
 
 // Public read-only loadout for any player + clone it into your own.
