@@ -223,6 +223,12 @@ export interface InventoryItem {
    *  A string, like every other owned-item id on the wire — node-postgres
    *  renders bigints as strings, so `id` is `"1014"` and this must match it. */
   attached_to?: string | null;
+  /** When this instance was crafted, imported or copied — an ISO string (the
+   *  column is timestamptz; node-postgres yields a Date and JSON stringifies
+   *  it). Drives the "Recently added" sort. Optional because an older backend
+   *  does not send it, and a mode with nothing to sort on has to degrade rather
+   *  than reorder the grid at random. */
+  created_at?: string | null;
 }
 
 // Item artwork lives on our own mount, served under /images by the plugin host

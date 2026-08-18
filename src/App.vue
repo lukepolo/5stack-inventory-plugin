@@ -100,7 +100,7 @@ import FilterSheet from "./components/FilterSheet.vue";
 import { Z } from "./zLayers";
 import { SORT_DIR_ICON, type SortDir } from "./sortIcons";
 import {
-  SORTS, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, type SortMode,
+  SORTS, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, needsOwnedItem, type SortMode,
   ATTACH_SORTS, DEFAULT_ATTACH_SORT, ATTACH_SORT_NATURAL, ATTACH_DIR_HINT, ATTACH_SORT_KIND, type AttachSortMode,
 } from "./sortModes";
 import {
@@ -798,12 +798,30 @@ const byCollection = (a?: string | null, b?: string | null, flip = 1) => {
   if (!a || !b) return a === b ? 0 : a ? -1 : 1;
   return flip * a.localeCompare(b);
 };
+/**
+ * When an owned instance arrived, as a sortable number.
+ *
+ * 0 for anything without a date, which puts it at the OLD end in either
+ * direction — the honest place for "we do not know", and what an older backend
+ * that never sends created_at degrades to.
+ */
+const addedAt = (i: InventoryItem): number => {
+  const t = i.created_at ? Date.parse(i.created_at) : NaN;
+  return Number.isFinite(t) ? t : 0;
+};
 function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): InventoryItem[] {
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(itemName(a.item), itemName(b.item)));
   if (mode === "wear") return arr.sort((a, b) => flip * ((a.wear ?? 1) - (b.wear ?? 1)) || byName(itemName(a.item), itemName(b.item)));
+  if (mode === "recent") {
+    // The id breaks ties, because a craft loop can mint several rows inside one
+    // clock tick and a comparator that returns 0 on genuinely different items
+    // lets their order flicker between renders. It is an identity column, so it
+    // orders the same way the timestamp does.
+    return arr.sort((a, b) => flip * (addedAt(b) - addedAt(a) || Number(b.id) - Number(a.id)));
+  }
   if (mode === "collection") {
     // Rarity, not name, as the tiebreak WITHIN a collection: a case reads the
     // way it reads in game, covert first, which is the whole point of grouping
@@ -818,7 +836,10 @@ function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): Inv
   return arr.sort((a, b) => flip * (sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
 }
 function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
-  if (mode === "wear") return list; // catalog skins have no wear
+  // Catalog entries have neither a float nor an acquisition date, so both of
+  // those modes are inert here — see needsOwnedItem, which is also what gates
+  // them out of the pickers that offer this list.
+  if (needsOwnedItem(mode)) return list;
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
@@ -8103,7 +8124,7 @@ if (MDEBUG) {
             <FilterDropdown
               :model-value="sheetSort"
               prefix="Sort"
-              :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
+              :options="SORTS.map((s) => ({ value: s[0], label: s[1], disabled: needsOwnedItem(s[0]) && sheetMode === 'craft' }))"
               @update:model-value="setSheetSort"
             />
             <SortDirection v-model="sheetDir" :kind="sheetSortKind" :hint="sheetSortHint" />
@@ -8323,7 +8344,7 @@ if (MDEBUG) {
                     class="rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors disabled:opacity-40"
                     :class="sheetSort === s[0] ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground'"
                     :style="sheetSort === s[0] ? { background: accentSoft } : {}"
-                    :disabled="s[0] === 'wear' && sheetMode === 'craft'"
+                    :disabled="needsOwnedItem(s[0]) && sheetMode === 'craft'"
                     @click="setSheetSort(s[0])"
                   >
                     {{ s[1] }}

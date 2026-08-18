@@ -16,10 +16,13 @@ import type { AttachSort } from "./api";
 
 // ---- items you own ----------------------------------------------------------
 
-export type SortMode = "default" | "rarity" | "name" | "wear" | "collection";
+export type SortMode = "default" | "rarity" | "name" | "wear" | "recent" | "collection";
 
 export const SORTS: [SortMode, string][] = [
   ["default", "Default"],
+  // Next to Default because both answer "in what order did these arrive?", and
+  // this is the one people reach for after crafting a batch.
+  ["recent", "Recently added"],
   ["rarity", "Rarity"],
   ["name", "Name"],
   ["wear", "Wear"],
@@ -29,6 +32,18 @@ export const SORTS: [SortMode, string][] = [
   // rather than under a blank heading at the top.
   ["collection", "Collection"],
 ];
+
+/**
+ * Modes that need something only an item you OWN can have.
+ *
+ * `wear` needs a float and `recent` needs an acquisition date; a catalog entry
+ * has neither, so both are meaningless over a catalog list. Exported as one
+ * predicate because the surfaces that mix the two list kinds each used to spell
+ * the condition out inline — which is how `wear` came to be checked in two
+ * places by hand.
+ */
+export const needsOwnedItem = (mode: SortMode): boolean =>
+  mode === "wear" || mode === "recent";
 
 /**
  * Catalog lists have no float, so offering "Wear" over one is a control that
@@ -47,6 +62,9 @@ export const SORT_NATURAL: Record<SortMode, SortDir> = {
   rarity: "desc",
   name: "asc",
   wear: "asc",
+  // Newest first: "recently added" names the thing you want at the top, so the
+  // natural direction is the one that puts it there.
+  recent: "desc",
   collection: "asc",
 };
 
@@ -55,6 +73,7 @@ export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
   rarity: { desc: "Highest rarity first", asc: "Lowest rarity first" },
   name: { asc: "A → Z", desc: "Z → A" },
   wear: { asc: "Lowest float first", desc: "Highest float first" },
+  recent: { desc: "Newest first", asc: "Oldest first" },
   // Spelled out rather than reusing the name hint's "A → Z": next to a grid the
   // two modes sort visibly differently, and the hint is the only thing that says
   // WHICH name is being ordered.
@@ -66,6 +85,7 @@ export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
   rarity: "amount",
   name: "alpha",
   wear: "numeric",
+  recent: "numeric",
   collection: "alpha",
 };
 

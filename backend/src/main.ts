@@ -1295,6 +1295,19 @@ interface ItemRow {
    *  it in the same breath as the offsets. */
   charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
   patches?: unknown[] | null;
+  /**
+   * When this instance entered the inventory.
+   *
+   * A string by the time anything here reads it: node-postgres hands back a Date
+   * and it becomes an ISO string on the way out through JSON, so the client sorts
+   * lexicographically — which is the same order numerically for ISO-8601.
+   *
+   * Note the id would ALSO work as a proxy: it is an identity column, so higher
+   * means inserted later. This carries the real field anyway, because sorting a
+   * user-visible "recently added" on a surrogate key is only correct until
+   * someone backfills a row, and because the date is worth showing.
+   */
+  created_at?: string | null;
 }
 
 // Reject bad wear on the RAW array — normSpecs() clamps, so it has to be
@@ -1463,6 +1476,11 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     // re-bake treadmill every time a kill lands.
     stattrak_count: row.stattrak ? row.stattrak_count ?? 0 : 0,
     nametag: row.nametag,
+    // Drives the "Recently added" sort. Emitted for every instance rather than
+    // only when that sort is active: the client sorts in memory over the list it
+    // already holds, so a field the row omits is a mode that silently does
+    // nothing.
+    created_at: row.created_at ?? null,
     slot: slotForItem(row.item_id),
     item,
     equipped: equippedOn.filter((e) => e.slot === slotForItem(row.item_id)),
@@ -1476,7 +1494,7 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
