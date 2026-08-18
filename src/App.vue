@@ -6,6 +6,7 @@ import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
+  MoreHorizontal,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -31,6 +32,12 @@ import {
   equip,
   swapLoadout,
   unequip,
+  fetchPresets,
+  createPreset,
+  renamePreset,
+  deletePreset,
+  activatePreset,
+  type LoadoutPreset,
   type Team,
   type CatalogWeapon,
   type DefaultsMap,
@@ -1010,6 +1017,145 @@ async function refreshAll() {
   if (pend) {
     const ids = new Set(pend.items.map((i) => String(i.id)));
     inventory.value = inventory.value.filter((i) => !ids.has(String(i.id)));
+  }
+}
+
+// ---- loadout presets --------------------------------------------------------
+// Named builds you switch between. Exactly one is live at a time and the server
+// parks the rest, so `loadout` still means "the build you are wearing" — every
+// switch is a round trip followed by a full refresh, never a local swap.
+//
+// Owner-only, deliberately. A viewer (and the profile tab) sees the build that
+// is live; the others are drafts, and whose they are is the only thing that
+// makes them interesting.
+const presets = ref<LoadoutPreset[]>([]);
+const presetBusy = ref(false);
+/** Cursor anchor for the preset menu — same contract as the slot/item menus. */
+const presetCtx = ref<{ x: number; y: number } | null>(null);
+/** The in-place rename draft; null when not renaming. */
+const presetDraft = ref<string | null>(null);
+const presetInputEl = ref<HTMLInputElement | null>(null);
+
+const activePreset = computed(() => presets.value.find((p) => p.active) ?? null);
+/**
+ * The whole control hides when there is nothing to report. That is not just the
+ * signed-out and viewer cases: a backend older than this feature 404s the route
+ * and leaves the list empty, and a switcher over an empty list is a control with
+ * nothing behind it.
+ *
+ * A single preset still shows its pill. It names the build you are wearing and
+ * it is what the menu button hangs off — which is also how anyone finds out
+ * presets exist at all.
+ */
+const showPresets = computed(() => canEdit.value && presets.value.length > 0);
+
+/**
+ * DISPLAY ONLY — PRESET_LIMIT in backend/src/main.ts is the door, and it answers
+ * with a sentence a human can read. This only decides whether the menu offers an
+ * action that would bounce. If the two ever drift, the worst case is a hidden
+ * row that would have worked, or a row that returns that sentence.
+ */
+const PRESET_LIMIT = 5;
+const presetsFull = computed(() => presets.value.length >= PRESET_LIMIT);
+
+async function loadPresets() {
+  // Swallowed rather than surfaced: frontend and backend ship as separate
+  // images, so this route 404s on a backend that predates presets. That has to
+  // read as "this deployment has no presets" — an empty list hides the whole
+  // control — and not as a failed page load.
+  presets.value = canEdit.value ? await fetchPresets().catch(() => []) : [];
+}
+
+async function switchPreset(id: string) {
+  if (presetBusy.value || activePreset.value?.id === id) return;
+  presetBusy.value = true;
+  try {
+    await activatePreset(id);
+    // Everything on screen is downstream of which build is live: the loadout
+    // itself, and the inventory's `equipped` markers with it.
+    await Promise.all([refreshAll(), loadPresets()]);
+    queueLoadoutRenders();
+  } catch (e) {
+    fail(e);
+    // The strip is rendered off `presets`, so a switch that failed has to put
+    // the real active one back — otherwise the pill sits under a build the
+    // player is not actually wearing.
+    await loadPresets();
+  } finally {
+    presetBusy.value = false;
+  }
+}
+
+/** `copy` is the duplicate action: the new preset starts as what you're wearing
+ *  now, pointing at the same owned instances (it does not clone your items). */
+async function newPreset(copy: boolean) {
+  if (presetBusy.value) return;
+  presetBusy.value = true;
+  let made: LoadoutPreset | null = null;
+  try {
+    made = await createPreset({ copy });
+  } catch (e) {
+    fail(e);
+  } finally {
+    presetBusy.value = false;
+  }
+  // Straight into it — a build you made and are not wearing is two clicks for
+  // the one thing anyone wants from that button.
+  if (made) await switchPreset(made.id);
+}
+
+function startPresetRename() {
+  presetDraft.value = activePreset.value?.name ?? "";
+  void nextTick(() => presetInputEl.value?.select());
+}
+
+async function commitPresetRename() {
+  const draft = presetDraft.value;
+  const target = activePreset.value;
+  // Cleared FIRST: blur fires on Enter as the input unmounts, so commit runs
+  // twice, and the second pass has to find nothing left to do.
+  presetDraft.value = null;
+  if (!target || draft == null || !draft.trim() || draft.trim() === target.name) return;
+  try {
+    // The server does the trimming and the length cap and falls back to the old
+    // name for an empty one, so there is nothing to validate here.
+    await renamePreset(target.id, draft);
+    await loadPresets();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+function askDeletePreset() {
+  const target = activePreset.value;
+  if (!target) return;
+  confirmAsk.value = {
+    title: `Delete "${target.name}"?`,
+    // The distinction worth spelling out: a preset is an arrangement, not a
+    // container. Deleting one is not deleting anything you crafted.
+    body:
+      `That loadout and the ${target.slots} slot${target.slots === 1 ? "" : "s"} in it go away. ` +
+      "The items themselves stay in your inventory — a preset only arranges what you already own. " +
+      "You'll be switched to another loadout.",
+    confirmLabel: "Delete",
+    onConfirm: () => void removePreset(target.id),
+  };
+}
+
+async function removePreset(id: string) {
+  if (presetBusy.value) return;
+  presetBusy.value = true;
+  try {
+    await deletePreset(id);
+    // The server moves you onto another preset when you delete the live one, so
+    // the loadout on screen has changed even though nothing here equipped
+    // anything.
+    await Promise.all([refreshAll(), loadPresets()]);
+    queueLoadoutRenders();
+  } catch (e) {
+    fail(e);
+  } finally {
+    presetBusy.value = false;
   }
 }
 
@@ -5547,6 +5693,7 @@ async function load() {
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = theirs;
       inventory.value = [];
+      presets.value = [];
     } else if (!signedIn.value) {
       // Signed out. Loadout and inventory both 401, and asking for them anyway
       // is what used to dump anonymous visitors on the retry screen. Catalog is
@@ -5558,6 +5705,7 @@ async function load() {
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = [];
       inventory.value = [];
+      presets.value = [];
       loadSkins(sheetKey.value);
     } else {
       const [catalog, current, inv] = await Promise.all([fetchCatalog(), fetchLoadout(), fetchInventory()]);
@@ -5571,6 +5719,10 @@ async function load() {
       // Off to the side: the nag dot is the least important thing on screen and
       // must never hold up (or fail) the load it rides along with.
       void loadSteamSyncState();
+      // Same treatment, same reason — the switcher naming the build you are
+      // already looking at is not worth a slower first paint, and a backend
+      // that has never heard of presets must still render a loadout.
+      void loadPresets();
     }
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -5603,6 +5755,15 @@ function onGlobalKey(e: KeyboardEvent) {
       e.stopPropagation();
     } else if (itemCtx.value) {
       closeItemCtx();
+      e.stopPropagation();
+    } else if (presetCtx.value) {
+      presetCtx.value = null;
+      e.stopPropagation();
+    } else if (presetDraft.value != null) {
+      // Escape ABANDONS the rename — commitPresetRename is the blur/Enter path,
+      // and routing Escape through it would save the very edit you backed out
+      // of. Below the menus because you can only ever be in one of the two.
+      presetDraft.value = null;
       e.stopPropagation();
     } else if (loadout3d.value) {
       // dismiss*, not close*: these modals are routes now, so escaping has to
@@ -6106,6 +6267,58 @@ if (MDEBUG) {
         active-class="text-black"
         @select="(t) => switchTeam(t as Team)"
       />
+
+      <!-- Preset switcher. Sits next to the side toggle because the two are the
+           same kind of control — "which loadout am I looking at" — where Focus
+           beside them is a view mode. Same PillTabs, `accent` variant: the CT/T
+           pill is the solid one on purpose (it's a switch, not a filter) and a
+           second solid strip next to it would read as two halves of one toggle.
+
+           Never in a profile tab or a viewer's window: showPresets is gated on
+           canEdit, so someone else's page shows the build that is live and says
+           nothing about the drafts behind it. -->
+      <div
+        v-if="showPresets && (view === 'grid' || view === 'focus')"
+        class="flex flex-none items-center"
+        :class="isCompact ? 'gap-1' : 'gap-1.5'"
+      >
+        <!-- Rename happens in place, where the name already is. The input
+             REPLACES the strip rather than sitting under it: mid-rename the
+             other pills would be switches that throw the edit away, and the
+             header has no vertical room for a second row anyway. -->
+        <input
+          v-if="presetDraft !== null"
+          ref="presetInputEl"
+          v-model="presetDraft"
+          maxlength="24"
+          class="h-7 w-[9rem] rounded-lg border border-[color:var(--acc)] bg-muted px-2.5 text-f11 uppercase tracking-wider text-foreground outline-none"
+          @keydown.enter.prevent="commitPresetRename"
+          @blur="commitPresetRename"
+        />
+        <PillTabs
+          v-else
+          :items="presets"
+          :item-key="(p) => p.id"
+          :item-title="(p) => `${p.name} — ${p.slots} slot${p.slots === 1 ? '' : 's'}`"
+          :active="activePreset?.id ?? ''"
+          :button-class="`relative z-[1] flex h-7 max-w-[9rem] items-center rounded-md text-f11 uppercase tracking-wider transition-colors ${isCompact ? 'px-2' : 'px-3'}`"
+          @select="(id) => switchPreset(id)"
+        >
+          <template #default="{ item: p }">
+            <span class="truncate">{{ p.name }}</span>
+          </template>
+        </PillTabs>
+        <button
+          class="grid flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action disabled:opacity-60"
+          :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
+          :disabled="presetBusy"
+          title="Loadout presets"
+          @click="presetCtx = { x: $event.clientX, y: $event.clientY }"
+        >
+          <Loader2 v-if="presetBusy" class="h-3.5 w-3.5 animate-spin" />
+          <MoreHorizontal v-else class="h-3.5 w-3.5" />
+        </button>
+      </div>
       <button
         v-if="view === 'grid' || view === 'focus'"
         class="tac-action flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
@@ -9561,6 +9774,45 @@ if (MDEBUG) {
         >
           <Trash2 class="h-3.5 w-3.5" /> Delete from inventory
         </button>
+    </ContextMenu>
+
+    <!-- Preset menu: everything you can do to a loadout that isn't switching to
+         it. The same ContextMenu as the two above rather than a bespoke
+         dropdown — on a phone it becomes a bottom sheet with touch-sized rows,
+         which a popover anchored to a 32px header button never would. -->
+    <ContextMenu :at="presetCtx" @close="presetCtx = null">
+      <template #title>{{ activePreset?.name ?? 'Loadout' }}</template>
+      <button :class="MENU_ROW" @click="presetCtx = null; startPresetRename()">
+        <Pencil class="h-3.5 w-3.5" /> Rename…
+      </button>
+      <!-- Duplicate leads over "new empty": rebuilding 15 craft-gated slots by
+           hand is the whole reason this feature exists, so the row that starts
+           you from what you're already wearing is the one people want. -->
+      <button
+        v-if="!presetsFull"
+        :class="[MENU_ROW, 'border-t border-border']"
+        @click="presetCtx = null; newPreset(true)"
+      >
+        <Copy class="h-3.5 w-3.5" /> Duplicate this loadout
+      </button>
+      <button v-if="!presetsFull" :class="MENU_ROW" @click="presetCtx = null; newPreset(false)">
+        <Plus class="h-3.5 w-3.5" /> New empty loadout
+      </button>
+      <!-- Deliberately NOT a MENU_ROW: it is a sentence, not an action, and
+           MENU_ROW's hover highlight would promise it does something. -->
+      <div v-else class="border-t border-border px-3 py-2 text-f11 leading-relaxed text-muted-foreground">
+        {{ PRESET_LIMIT }} loadouts is the limit — delete one to make room.
+      </div>
+      <!-- Hidden, not disabled, at one preset: there is no state in which it
+           becomes available without first creating another, so a dead row here
+           would only ever be furniture. -->
+      <button
+        v-if="presets.length > 1"
+        :class="[MENU_ROW, 'border-t border-border text-muted-foreground hover:!text-[#ff7a6a]']"
+        @click="presetCtx = null; askDeletePreset()"
+      >
+        <Trash2 class="h-3.5 w-3.5" /> Delete this loadout
+      </button>
     </ContextMenu>
   </div>
   </div>

@@ -60,6 +60,42 @@ and in the panel, same slot.
 
 ---
 
+## Loadout presets: sharing, and the delete that reaches builds you can't see
+
+**Status: presets landed; two follow-ups deliberately left out of that change.**
+
+### Share a preset
+
+`ideas/inventory-loadout-presets.md` asks for it and it is the half that makes a
+preset "a shareable thing in a way *my current loadout* is not". Not built,
+because sharing needs a decision this change had no business making: the public
+endpoints (`/api/loadout/:steamId`, `/api/equipped/v5/:steamId`) serve the build
+a player is *wearing*, and a shared preset is one they are not. So either
+
+- a preset gets its own public flag and `/api/loadout/:steamId?preset=<id>`
+  starts serving drafts, which is a visibility decision about a thing that is
+  currently, by construction, private; or
+- share links stay "what I am wearing" and the switcher is purely a private
+  convenience.
+
+Whichever way it goes, the link format is `src/routes.ts`' existing vocabulary —
+the spec is explicit that this must not become a second link format. It also
+collides with `[[inventory-public-showcase]]`: *which* preset is the public one
+is the same question asked twice.
+
+### Deleting an owned item silently empties slots in presets you aren't looking at
+
+`ON DELETE CASCADE` on `loadout_preset_slots.item_instance_id` is the right
+default and was chosen on purpose (see the comment in `schema.sql`), but the
+delete confirmation still says only "anything they're equipped on falls back to
+the default" — which now understates it, because "equipped on" no longer means
+"visible on this screen". The honest version needs a count of the *parked* slots
+about to be emptied, which `DELETE /api/inventory/:id` does not currently
+compute. Cheap to add; left out so the cascade decision could be reviewed on its
+own rather than bundled with a copy change.
+
+---
+
 ## Charm | Butane Buddy
 
 Not parked — see `tools/shadertest/BUTANE-BUDDY.md`, which carries the full

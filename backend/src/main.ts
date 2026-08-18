@@ -5,6 +5,9 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Fastify, { LogController } from "fastify";
+// Type-only, so node's type stripping erases it — "pg" is CJS and has no such
+// runtime export to import.
+import type { PoolClient } from "pg";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
@@ -2002,6 +2005,9 @@ app.get("/api/loadout", async (request, reply) => {
 // shotguns + LMGs), r1-r5 = rifles (incl. snipers), plus knife/gloves/agent.
 // KEEP IN STEP WITH the slot whitelist in schema.sql — that DELETE runs on every
 // boot, so a slot this accepts and that list omits is wiped on the next restart.
+// Over there it is one `legal_slot` CTE cleaning BOTH slot-bearing tables
+// (inventory.loadout and the presets' parked rows), so adding a slot here is
+// still exactly one list to edit there.
 const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti|collectible)$/;
 const START_PISTOLS = new Set(["glock", "usp_silencer", "hkp2000"]);
 function slotCategories(slot: string): string[] | null {
@@ -2206,18 +2212,10 @@ app.post<{
   if (ma && ma === getItem(rb.resolvedItemId)?.model) {
     return reply.status(400).send({ error: "Both sides of that swap are the same weapon." });
   }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  await inTransaction(async (client) => {
     await client.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, ra));
     await client.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, rb));
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  });
   return { ok: true };
 });
 
@@ -2237,6 +2235,352 @@ app.delete<{ Querystring: { team?: string; slot?: string } }>(
       [identity.steamId, team, slot],
     );
     return { ok: true };
+  },
+);
+
+// ---- Loadout presets (named builds you switch between) ----------------------
+//
+// The preset you are wearing has no rows of its own: its slots ARE
+// inventory.loadout, which is why nothing above this comment had to change to
+// support presets. Every other preset parks its slots in
+// inventory.loadout_preset_slots, and activate swaps the two sets over inside a
+// transaction. See the long note in schema.sql for why the alternative — a
+// preset_id folded into inventory.loadout's key — was not taken: it would have
+// put a "which preset is active" lookup into /api/equipped/v5, the one read
+// every game server makes for every player on every connect.
+//
+// These routes live under /api/loadout/… alongside `/api/loadout/:steamId`.
+// find-my-way matches a static segment before a parametric one, so "presets"
+// never reaches the steam-id route — the same arrangement /api/inventory/:id
+// already has with /api/inventory/import-steam.
+
+// CS2 itself ships five loadout slots. Matching it is not deference: the
+// switcher is a pill strip in a header that already scrolls sideways on a
+// phone, and an unbounded list of them is a strip you cannot read.
+const PRESET_LIMIT = 5;
+const PRESET_NAME_MAX = 24;
+
+/**
+ * Anything that can run a query — the pool itself, or one pooled client inside
+ * a transaction. The helpers below take it so the same code can mint a preset
+ * standalone or as part of a caller's transaction, where a write that escaped
+ * to the pool would be a row that survives the rollback.
+ */
+type Queryable = typeof pool | PoolClient;
+
+/** Collapse whitespace, cap the length, fall back when nothing is left. */
+function cleanPresetName(raw: unknown, fallback: string): string {
+  const name = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim() : "";
+  return name ? name.slice(0, PRESET_NAME_MAX) : fallback;
+}
+
+/**
+ * The id of the preset whose slots are currently in inventory.loadout, minting
+ * it if this player has never had one.
+ *
+ * Every player needs exactly one from the moment they equip anything, and the
+ * boot-time backfill in schema.sql can only cover the players who had a loadout
+ * when it ran. This is the other half: a player who signs in for the first time
+ * after that gets theirs here, on whichever preset route they touch first.
+ *
+ * `q` takes a pooled client so the mint can join a caller's transaction — an
+ * activate that mints the source preset outside its own transaction would be a
+ * row that survives a rollback.
+ */
+async function ensureActivePreset(
+  steamId: string,
+  q: Queryable = pool,
+): Promise<string> {
+  const read = async () => {
+    const { rows } = await q.query<{ id: string }>(
+      `SELECT id FROM inventory.loadout_presets WHERE steam_id = $1 AND active`,
+      [steamId],
+    );
+    return rows.length ? String(rows[0].id) : null;
+  };
+  const existing = await read();
+  if (existing) return existing;
+  // The conflict target names the partial index's predicate, so this is the
+  // unique "one active per player" index and not a full-table one. DO NOTHING
+  // rather than an error because two first-ever page loads in two tabs is a
+  // real race, and losing it is not a failure — it means somebody else already
+  // made the row we were about to.
+  const { rows } = await q.query<{ id: string }>(
+    `INSERT INTO inventory.loadout_presets (steam_id, name, active)
+     VALUES ($1, 'Loadout 1', true)
+     ON CONFLICT (steam_id) WHERE active DO NOTHING
+     RETURNING id`,
+    [steamId],
+  );
+  if (rows.length) return String(rows[0].id);
+  return (await read()) as string;
+}
+
+/** A preset row the caller owns, or null. Every write route starts here. */
+async function ownedPreset(
+  steamId: string,
+  id: string,
+  q: Queryable = pool,
+): Promise<{ id: string; name: string; active: boolean } | null> {
+  if (!/^\d+$/.test(id)) return null;
+  const { rows } = await q.query<{ id: string; name: string; active: boolean }>(
+    `SELECT id, name, active FROM inventory.loadout_presets WHERE id = $1 AND steam_id = $2`,
+    [id, steamId],
+  );
+  return rows.length ? { ...rows[0], id: String(rows[0].id) } : null;
+}
+
+/**
+ * Make `presetId` the live one. MUST be called inside a transaction.
+ *
+ * Between parking the current rows and loading the new ones the player has NO
+ * loadout at all, and a game server polling /api/equipped/v5 in that window
+ * would build them a vanilla rack and never re-evaluate it (the plugin skins
+ * weapons in a GiveNamedItem detour at creation — nothing revisits a weapon that
+ * already exists). Inside a transaction that window is invisible to every other
+ * reader; outside one it is a real, if narrow, way to spawn someone skinless.
+ *
+ * Returns false when the preset was already active, so callers can skip the
+ * "switched" notification without a second query.
+ */
+async function activatePreset(
+  client: PoolClient,
+  steamId: string,
+  presetId: string,
+): Promise<boolean> {
+  const fromId = await ensureActivePreset(steamId, client);
+  // Serialises two activations for the same player. Without it both could read
+  // the same "current" preset and both park the live rows under it — the second
+  // parking whatever the first had already swapped in, so one build ends up
+  // stored under two names and the other is gone.
+  await client.query(`SELECT 1 FROM inventory.loadout_presets WHERE id = $1 FOR UPDATE`, [fromId]);
+  if (fromId === presetId) return false;
+
+  // Park what is live now under the preset that owns it. The DELETE first
+  // because a preset that was active carries no parked rows, but one that was
+  // half-parked by an interrupted earlier attempt might.
+  await client.query(`DELETE FROM inventory.loadout_preset_slots WHERE preset_id = $1`, [fromId]);
+  await client.query(
+    `INSERT INTO inventory.loadout_preset_slots
+       (preset_id, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at)
+     SELECT $1, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at
+       FROM inventory.loadout WHERE steam_id = $2`,
+    [fromId, steamId],
+  );
+  // Clear the old flag BEFORE setting the new one: loadout_presets_active_idx
+  // is a unique partial index, and the other order trips it every single time.
+  await client.query(
+    `UPDATE inventory.loadout_presets SET active = false, updated_at = now() WHERE id = $1`,
+    [fromId],
+  );
+
+  await client.query(`DELETE FROM inventory.loadout WHERE steam_id = $1`, [steamId]);
+  await client.query(
+    `INSERT INTO inventory.loadout
+       (steam_id, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at)
+     SELECT $1, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at
+       FROM inventory.loadout_preset_slots WHERE preset_id = $2`,
+    [steamId, presetId],
+  );
+  // The rows live in exactly ONE of the two tables, never both. A copy left
+  // behind here would be a second source of truth that every subsequent equip
+  // silently diverges from, and switching away and back would hand the player
+  // their loadout as it was at this moment instead of as they left it.
+  await client.query(`DELETE FROM inventory.loadout_preset_slots WHERE preset_id = $1`, [presetId]);
+  await client.query(
+    `UPDATE inventory.loadout_presets SET active = true, updated_at = now() WHERE id = $1`,
+    [presetId],
+  );
+  return true;
+}
+
+/** Run `fn` in a transaction. */
+async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    return out;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// The filled-slot count is per preset and comes from two different places for
+// the same reason the whole feature does: the active one's slots are the live
+// loadout, everyone else's are parked.
+const PRESET_LIST_SQL = `
+  SELECT p.id, p.name, p.active,
+         (CASE WHEN p.active
+               THEN (SELECT count(*) FROM inventory.loadout l WHERE l.steam_id = p.steam_id)
+               ELSE (SELECT count(*) FROM inventory.loadout_preset_slots s WHERE s.preset_id = p.id)
+          END)::int AS slots
+    FROM inventory.loadout_presets p
+   WHERE p.steam_id = $1
+   ORDER BY p.created_at, p.id`;
+
+type PresetRow = { id: string; name: string; active: boolean; slots: number };
+const listPresets = async (steamId: string, q: Queryable = pool) =>
+  (await q.query<PresetRow>(PRESET_LIST_SQL, [steamId])).rows.map((r) => ({
+    ...r,
+    id: String(r.id),
+  }));
+
+app.get("/api/loadout/presets", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  // A read that writes, deliberately: this is where a player who has never
+  // equipped anything gets their first preset, so the switcher has something to
+  // show and "duplicate this one" has a source. It is idempotent and costs one
+  // indexed lookup on the path that already hit it.
+  await ensureActivePreset(identity.steamId);
+  return listPresets(identity.steamId);
+});
+
+// Create a preset. `copy` seeds it from the loadout you are wearing right now —
+// that is the "duplicate" action; without it the preset starts empty.
+//
+// NOT modelled on /api/loadout/copy-from, which mints a fresh owned_items row
+// per slot. That is right for cloning a STRANGER's loadout (their instances are
+// not yours to point at) and wrong here: crafting is the gate, presets are only
+// arrangements of what you already own. Minting would double your inventory
+// every time you duplicated a build, and each copy would then wear its own
+// stickers and its own StatTrak count.
+app.post<{ Body: { name?: string; copy?: boolean } }>(
+  "/api/loadout/presets",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const copy = request.body?.copy === true;
+    const created = await inTransaction(async (client) => {
+      await ensureActivePreset(identity.steamId, client);
+      const { rows: count } = await client.query<{ n: string }>(
+        `SELECT count(*) AS n FROM inventory.loadout_presets WHERE steam_id = $1`,
+        [identity.steamId],
+      );
+      if (Number(count[0].n) >= PRESET_LIMIT) {
+        return null;
+      }
+      const name = cleanPresetName(request.body?.name, `Loadout ${Number(count[0].n) + 1}`);
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO inventory.loadout_presets (steam_id, name, active)
+         VALUES ($1, $2, false) RETURNING id`,
+        [identity.steamId, name],
+      );
+      const id = String(rows[0].id);
+      if (copy) {
+        await client.query(
+          `INSERT INTO inventory.loadout_preset_slots
+             (preset_id, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at)
+           SELECT $1, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, now()
+             FROM inventory.loadout WHERE steam_id = $2`,
+          [id, identity.steamId],
+        );
+      }
+      return id;
+    });
+    if (created == null) {
+      return reply
+        .status(400)
+        .send({ error: `You can keep ${PRESET_LIMIT} loadouts — delete one to make room.` });
+    }
+    const presets = await listPresets(identity.steamId);
+    return presets.find((p) => p.id === created) ?? presets[presets.length - 1];
+  },
+);
+
+app.patch<{ Params: { id: string }; Body: { name?: string } }>(
+  "/api/loadout/presets/:id",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const preset = await ownedPreset(identity.steamId, request.params.id);
+    if (!preset) {
+      return reply.status(404).send({ error: "No such loadout." });
+    }
+    const name = cleanPresetName(request.body?.name, preset.name);
+    await pool.query(
+      `UPDATE inventory.loadout_presets SET name = $1, updated_at = now() WHERE id = $2`,
+      [name, preset.id],
+    );
+    return { id: preset.id, name, active: preset.active };
+  },
+);
+
+// Wear a different build. One transaction, because the swap is a window in
+// which the player has no loadout — see activatePreset.
+app.post<{ Params: { id: string } }>(
+  "/api/loadout/presets/:id/activate",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const preset = await ownedPreset(identity.steamId, request.params.id);
+    if (!preset) {
+      return reply.status(404).send({ error: "No such loadout." });
+    }
+    await inTransaction((client) => activatePreset(client, identity.steamId, preset.id));
+    return { ok: true, active: preset.id };
+  },
+);
+
+// Delete a preset. Deleting the one you are WEARING is allowed and moves you to
+// the oldest of the rest — the buttons in the header act on the preset on
+// screen, and refusing the only one you can see is a worse rule to explain than
+// "you always end up wearing something". The last preset is not deletable for
+// that same reason: there would be nothing left to move to, and inventory.
+// loadout would have no name.
+app.delete<{ Params: { id: string } }>(
+  "/api/loadout/presets/:id",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const preset = await ownedPreset(identity.steamId, request.params.id);
+    if (!preset) {
+      return reply.status(404).send({ error: "No such loadout." });
+    }
+    const outcome = await inTransaction(async (client) => {
+      const { rows: rest } = await client.query<{ id: string }>(
+        `SELECT id FROM inventory.loadout_presets
+          WHERE steam_id = $1 AND id <> $2 ORDER BY created_at, id`,
+        [identity.steamId, preset.id],
+      );
+      if (!rest.length) {
+        return null;
+      }
+      let active = preset.active ? String(rest[0].id) : await ensureActivePreset(identity.steamId, client);
+      if (preset.active) {
+        // Reuses the ordinary switch rather than a bespoke "delete and adopt"
+        // path. It parks the doomed preset's live rows on its way out, which
+        // the DELETE below then cascades away — a wasted write, and worth it
+        // for there being exactly one piece of code that moves the live rows.
+        await activatePreset(client, identity.steamId, active);
+      }
+      // Cascades its parked slots. Scoped to the owner as well as the id so a
+      // guessed id can never reach somebody else's build.
+      await client.query(`DELETE FROM inventory.loadout_presets WHERE id = $1 AND steam_id = $2`, [
+        preset.id,
+        identity.steamId,
+      ]);
+      return active;
+    });
+    if (outcome == null) {
+      return reply.status(400).send({ error: "That's your only loadout — rename it instead." });
+    }
+    return { ok: true, active: outcome };
   },
 );
 

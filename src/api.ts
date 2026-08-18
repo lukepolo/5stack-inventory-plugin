@@ -862,3 +862,48 @@ export const unequip = (team: Team, slot: string) =>
     `/loadout?team=${team}&slot=${encodeURIComponent(slot)}`,
     { method: "DELETE" },
   );
+
+// ---- Loadout presets --------------------------------------------------------
+// Named builds. Only ONE of them is "the loadout" at a time — the rest are
+// parked server-side — so every mutation below changes what `fetchLoadout`
+// returns, and callers refresh rather than patch their copy.
+
+export interface LoadoutPreset {
+  /** A bigint on the wire, i.e. a STRING, same as every owned-item id here.
+   *  Compare with `String(...)` and never with `===` against a literal number. */
+  id: string;
+  name: string;
+  /** The one whose slots are the live loadout. Exactly one is ever true. */
+  active: boolean;
+  /** Filled slots across both teams — what the switcher shows under the name. */
+  slots: number;
+}
+
+export const fetchPresets = () => request<LoadoutPreset[]>("/loadout/presets");
+
+/** `copy: true` seeds the new preset from the loadout you are wearing now.
+ *  It does NOT duplicate the owned items — both presets point at the same
+ *  crafted instances, because crafting is the gate and a preset is only an
+ *  arrangement of what you already own. */
+export const createPreset = (body: { name?: string; copy?: boolean } = {}) =>
+  request<LoadoutPreset>("/loadout/presets", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const renamePreset = (id: string, name: string) =>
+  request<{ id: string; name: string; active: boolean }>(`/loadout/presets/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+
+/** Deleting the preset you are wearing moves you to another one, so the
+ *  response names whichever is active afterwards. */
+export const deletePreset = (id: string) =>
+  request<{ ok: true; active: string }>(`/loadout/presets/${id}`, { method: "DELETE" });
+
+export const activatePreset = (id: string) =>
+  request<{ ok: true; active: string }>(`/loadout/presets/${id}/activate`, {
+    method: "POST",
+    body: "{}",
+  });
