@@ -55,6 +55,8 @@ import {
   getItemIdByName,
   catalogSummary,
   priceGroupId,
+  wearTierIndex,
+  wearTierOf,
   parseSteamMarketName,
   isOwnable,
   slotForItem,
@@ -3434,10 +3436,10 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
     const version = getItem(itemId)?.altName ?? "";
 
     const { rows: cached } = await pool.query<{
-      version: string; window: HistoryWindow; min: number | null; max: number | null;
+      version: string; period: HistoryWindow; min: number | null; max: number | null;
       avg: number | null; median: number | null; volume: number; fetched_at: Date;
     }>(
-      `SELECT version, window, min, max, avg, median, volume, fetched_at
+      `SELECT version, period, min, max, avg, median, volume, fetched_at
          FROM inventory.price_history WHERE market_hash_name = $1`,
       [marketHashName],
     );
@@ -3460,9 +3462,9 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
         if (tuples.length) {
           await pool.query(
             `INSERT INTO inventory.price_history
-               (market_hash_name, version, window, min, max, avg, median, volume, fetched_at)
+               (market_hash_name, version, period, min, max, avg, median, volume, fetched_at)
              VALUES ${tuples.join(",")}
-             ON CONFLICT (market_hash_name, version, window) DO UPDATE SET
+             ON CONFLICT (market_hash_name, version, period) DO UPDATE SET
                min = EXCLUDED.min, max = EXCLUDED.max, avg = EXCLUDED.avg,
                median = EXCLUDED.median, volume = EXCLUDED.volume, fetched_at = now()`,
             values,
@@ -3479,7 +3481,7 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
     // Serve what is stored, stale or not: a spread from this morning beats none.
     const mine = cached.filter((r) => r.version === version);
     const rows = (mine.length ? mine : cached.filter((r) => r.version === "")).map((r) => ({
-      window: r.window,
+      window: r.period,
       min: r.min,
       max: r.max,
       avg: r.avg,

@@ -280,13 +280,16 @@ CREATE TABLE IF NOT EXISTS inventory.price_history (
   -- Doppler phase / gem, or '' for the listings that have none. Part of the key
   -- because the source reports a row per phase and they differ by thousands.
   version text NOT NULL DEFAULT '',
-  window text NOT NULL,
+  -- NOT "window": that is a reserved word in Postgres (window functions), and an
+  -- unquoted column by that name is a syntax error that fails the whole schema
+  -- apply — which runs on every boot, so it took the backend down with it.
+  period text NOT NULL,
   min real,
   max real,
   avg real,
   median real,
   volume integer NOT NULL DEFAULT 0,
   fetched_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (market_hash_name, version, window)
+  PRIMARY KEY (market_hash_name, version, period)
 );
 CREATE INDEX IF NOT EXISTS price_history_fetched_idx ON inventory.price_history (fetched_at);

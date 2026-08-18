@@ -167,6 +167,61 @@ check(
   ownedPriceKey(vanillaRow!.itemId, 0.02, false) !== priceKey(vanillaRow!.itemId, -1, false, false),
 );
 
+// ---- 3c. the relaxed match ----------------------------------------------------
+// StatTrak exists for a fraction of finishes and trades thinly, and the ends of
+// the wear range are frequently unlisted — a Battle-Scarred StatTrak weapon can
+// have nothing of its own for sale, and refusing to answer left its owner
+// dragging the wear slider with nothing ever appearing.
+//
+// The preference order is SQL (see lookupPrices), so what is pinned here is the
+// LABEL: a substituted price must be able to say what it substituted, because a
+// stand-in that renders identically to an exact price is a wrong answer with a
+// confident face.
+console.log("\nRelaxed match");
+// Mirrors src/api.ts's approxNote — the harness cannot import it (that module
+// reaches for browser globals), so the rules are restated and any drift shows up
+// as one of these four failing.
+const WEAR_NAMES = ["Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"];
+const tierOf = (wear: number) => {
+  const i = [0.07, 0.15, 0.38, 0.45].findIndex((b) => wear < b);
+  return i === -1 ? 4 : i;
+};
+function approxNote(
+  price: { approx?: { wearTier: number; stattrak: boolean } },
+  wear: number | null,
+  stattrak: boolean,
+) {
+  if (!price.approx) return "";
+  const parts: string[] = [];
+  if (price.approx.stattrak !== stattrak) parts.push(price.approx.stattrak ? "StatTrak™" : "non-StatTrak");
+  const asked = wear == null ? -1 : tierOf(wear);
+  if (price.approx.wearTier !== asked) {
+    parts.push(price.approx.wearTier === -1 ? "no wear bracket" : WEAR_NAMES[price.approx.wearTier]);
+  }
+  return parts.join(", ");
+}
+const exact = { value: 40, window: "suggested" as const, marketHashName: "x" };
+check("an exact listing has nothing to declare", approxNote(exact, 0.2, false) === "");
+check(
+  "a plain listing standing in for StatTrak says so",
+  approxNote({ ...exact, approx: { wearTier: 2, stattrak: false } }, 0.2, true) === "non-StatTrak",
+  approxNote({ ...exact, approx: { wearTier: 2, stattrak: false } }, 0.2, true),
+);
+check(
+  "a neighbouring bracket names the bracket",
+  approxNote({ ...exact, approx: { wearTier: 0, stattrak: false } }, 0.6, false) === "Factory New",
+  approxNote({ ...exact, approx: { wearTier: 0, stattrak: false } }, 0.6, false),
+);
+check(
+  "both at once reads as both",
+  approxNote({ ...exact, approx: { wearTier: 0, stattrak: false } }, 0.6, true) === "non-StatTrak, Factory New",
+  approxNote({ ...exact, approx: { wearTier: 0, stattrak: false } }, 0.6, true),
+);
+check(
+  "a bracket-less listing is named as such",
+  approxNote({ ...exact, approx: { wearTier: -1, stattrak: false } }, 0.02, false) === "no wear bracket",
+);
+
 // ---- 4. an itemized quote ----------------------------------------------------
 console.log("\nCraft quote");
 const lookupFrom = (rows: PriceRow[]) => {

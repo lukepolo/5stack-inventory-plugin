@@ -31,6 +31,7 @@ import {
   fetchInventoryPrices,
   fetchStockPrices,
   fetchPriceDetail,
+  approxNote,
   bestSaleWindow,
   HISTORY_WINDOW_LABEL,
   type PriceDetail,
@@ -5292,7 +5293,13 @@ const craftQuoteTip = computed(() => {
       "Try another source in Admin → Prices, or a different wear — thinly traded brackets often have none."
     );
   }
+  // The substitution leads, when there is one: it changes what the total means.
+  const note =
+    quote.base.price && craft.value
+      ? approxNote(quote.base.price, craft.value.wear ?? null, craft.value.stattrak)
+      : "";
   const lines = [
+    ...(note ? [`No exact listing for this variant — priced from the ${note} one.`, ""] : []),
     `${quote.base.name ?? "Skin"} — ${quote.base.price ? formatPrice(quote.base.price.value) : "no price"}`,
     ...quote.attachments.map((a) => `${a.name ?? a.kind} — ${a.price ? formatPrice(a.price.value) : "no price"}`),
   ];
@@ -8842,6 +8849,20 @@ if (MDEBUG) {
                   >
                     <Hammer class="h-2.5 w-2.5" /> Craft
                   </span>
+                  <!-- Top left, in the flow above the art — the same corner an
+                       owned card puts it in, under the model label. The craft
+                       card has no model label to sit under (its name is at the
+                       bottom), but the POSITION is what people have learned, and
+                       a price that moves between two grids of the same shape is
+                       a price you have to hunt for. -->
+                  <PriceTag
+                    v-if="pricesOn"
+                    class="relative z-[2] mb-0.5"
+                    size="xs"
+                    :value="stockPriceOf(st.card.id)?.value"
+                    :missing="!stockPriceOf(st.card.id)"
+                    :title="stockPriceTip(st.card.id)"
+                  />
                   <div :class="CARD_ART">
                     <img
                       :src="catalogArt[st.card.id] ?? st.card.image ?? undefined"
@@ -8853,17 +8874,6 @@ if (MDEBUG) {
                     />
                   </div>
                   <ItemName :item="st.card" strip class="relative z-[2]" />
-                  <!-- What it would cost to craft this brand new. Under the name
-                       for the same reason the owned tiles put it there, and the
-                       one number that makes the craft list sortable by price. -->
-                  <PriceTag
-                    v-if="pricesOn"
-                    class="relative z-[2] mt-0.5"
-                    size="xs"
-                    :value="stockPriceOf(st.card.id)?.value"
-                    :missing="!stockPriceOf(st.card.id)"
-                    :title="stockPriceTip(st.card.id)"
-                  />
                 </button>
               </div>
               <InfiniteSentinel
@@ -9289,6 +9299,7 @@ if (MDEBUG) {
                     :value="craftQuote.total"
                     :extra="craftQuote.attachmentTotal"
                     :missing="craftQuote.total === 0"
+                    :approx="!!craftQuote.base.price?.approx"
                   />
                   <!-- The spread behind that figure, and where THIS copy sits in
                        it. Two measured facts; the sentence joining them lives in

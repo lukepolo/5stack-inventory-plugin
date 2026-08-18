@@ -18,7 +18,7 @@ import WearBar from "./WearBar.vue";
 import PriceTag from "./PriceTag.vue";
 import ItemBadges from "./ItemBadges.vue";
 import SlotStatus from "./SlotStatus.vue";
-import { PRICE_WINDOW_LABEL } from "../api";
+import { approxNote, PRICE_WINDOW_LABEL } from "../api";
 import { wearTier } from "../itemVisuals";
 
 const props = withDefaults(
@@ -82,7 +82,13 @@ const props = withDefaults(
  *  skin implies a precision a whole-wear-bracket average does not have. */
 const priceTitle = computed(() => {
   if (props.inst.price) {
-    return `Rough estimate — ${PRICE_WINDOW_LABEL[props.inst.price.window]} for ${props.inst.price.marketHashName}. Not a sale price.`;
+    const note = approxNote(props.inst.price, props.inst.wear ?? null, props.inst.stattrak === true);
+    // A substituted listing says so first: it is the thing that makes the number
+    // mean something different from what the tile appears to claim.
+    return (
+      (note ? `No exact listing — this is the ${note} one. ` : "") +
+      `Rough estimate — ${PRICE_WINDOW_LABEL[props.inst.price.window]} for ${props.inst.price.marketHashName}. Not a sale price.`
+    );
   }
   // Say WHY it is blank. "No price" and "pricing is broken" look identical on a
   // card, and the wear bracket is usually the answer: a market lists a finish
@@ -232,6 +238,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
             :value="inst.price?.value"
             :pending="pricePending"
             :missing="!inst.price"
+            :approx="!!inst.price?.approx"
             :title="priceTitle"
           />
           <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" inline compact class="min-w-0 flex-1" />
@@ -258,6 +265,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
           :value="inst.price?.value"
           :pending="pricePending"
           :missing="!inst.price"
+          :approx="!!inst.price?.approx"
           suffix="est"
           :title="priceTitle"
         />

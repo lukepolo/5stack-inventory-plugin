@@ -461,6 +461,7 @@ async function hookSweep(models: string[], charms: string[], live = false, cases
         // again be printed about a weapon that draws no charm.
         line(`${"".padEnd(8)} ${"".padEnd(38)} drawn=${seat.spriteMm.x.toFixed(0)}x${seat.spriteMm.y.toFixed(0)}x${seat.spriteMm.z.toFixed(0)}mm ` +
           `offPivot=${seat.spriteToPivotMm == null ? "EMPTY" : seat.spriteToPivotMm.toFixed(1) + "mm"} ` +
+          `mapRefused=${seat.mapSpots ? `${seat.mapSpots.enclosed}/${seat.mapSpots.total}` : "-"} ` +
           `scene=${seat.inScene} visible=${seat.visible} ` +
           `ndc=${seat.ndc ? `${seat.ndc.x.toFixed(2)},${seat.ndc.y.toFixed(2)},${seat.ndc.z.toFixed(2)}` : "-"} ` +
           `inFrame=${seat.inFrame}`, seat.inFrame ? "dim" : "warn");

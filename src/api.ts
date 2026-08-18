@@ -830,6 +830,52 @@ export interface PricePoint {
   value: number;
   window: PriceWindow;
   marketHashName: string;
+  /**
+   * The listing found was NOT the one asked for.
+   *
+   * Markets don't carry every variant: StatTrak exists for a fraction of
+   * finishes and trades thinly, and the ends of the wear range are often
+   * unlisted — a Battle-Scarred StatTrak weapon can genuinely have nothing of
+   * its own for sale. Rather than showing no price at all, the closest listing
+   * answers and says so here.
+   *
+   * Anything rendering a price MUST make this visible. "$40" and "$40, for the
+   * non-StatTrak Field-Tested one" are different claims, and the second is only
+   * useful while it stays honest about being a stand-in.
+   */
+  approx?: { wearTier: number; stattrak: boolean };
+}
+
+/** The five Steam wear brackets by their stored index; -1 is "this item has no
+ *  bracket" (charms, agents, music kits, vanilla knives). */
+export const WEAR_TIER_NAME = [
+  "Factory New",
+  "Minimal Wear",
+  "Field-Tested",
+  "Well-Worn",
+  "Battle-Scarred",
+] as const;
+
+/** Which bracket a float falls in. Mirrors WEAR_STOPS in itemVisuals — the same
+ *  four boundaries, kept here so the API layer doesn't import presentation. */
+const wearTierIndexOf = (wear: number) => {
+  const i = [0.07, 0.15, 0.38, 0.45].findIndex((b) => wear < b);
+  return i === -1 ? 4 : i;
+};
+
+/** What was substituted, in words — for the caption beside an approximate
+ *  figure. Empty when the listing was the one asked for. */
+export function approxNote(price: PricePoint, wear: number | null, stattrak: boolean): string {
+  if (!price.approx) return "";
+  const parts: string[] = [];
+  if (price.approx.stattrak !== stattrak) parts.push(price.approx.stattrak ? "StatTrak™" : "non-StatTrak");
+  const asked = wear == null ? -1 : wearTierIndexOf(wear);
+  if (price.approx.wearTier !== asked) {
+    parts.push(
+      price.approx.wearTier === -1 ? "no wear bracket" : WEAR_TIER_NAME[price.approx.wearTier] ?? "another wear",
+    );
+  }
+  return parts.join(", ");
 }
 
 export interface PriceStatus {
@@ -890,16 +936,6 @@ export interface StockPrices {
 }
 export const fetchStockPrices = (slot: string) =>
   request<StockPrices>(`/prices/stock?slot=${encodeURIComponent(slot)}`);
-
-/** The five Steam wear brackets by their stored index; -1 is "this item has no
- *  bracket" (charms, agents, music kits). */
-export const WEAR_TIER_NAME = [
-  "Factory New",
-  "Minimal Wear",
-  "Field-Tested",
-  "Well-Worn",
-  "Battle-Scarred",
-] as const;
 
 /**
  * What copies of one exact listing recently sold for.

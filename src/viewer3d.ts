@@ -2138,6 +2138,10 @@ export interface CharmSeatProbe {
   bulkWorld: { x: number; y: number; z: number } | null;
   /** The weapon's own rendered bounds, to read those two against. */
   weaponBox: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null;
+  /** Authored charm surfaces, and how many of their centres `enclosedSpot`
+   *  would have refused a drag onto. Anything above zero is the guard
+   *  overruling the game — see onCharmMap. */
+  mapSpots: { total: number; enclosed: number } | null;
   /** The drawn bulk's centre in normalised device coords. */
   ndc: { x: number; y: number; z: number } | null;
   /** Is that centre inside the photographed frame at all? */
@@ -6952,6 +6956,19 @@ async function buildViewer(
     c.sprite.updateMatrixWorld(true);
   }
 
+  /**
+   * Does the game's own map say a charm may hang here?
+   *
+   * The authored quads are the ONE source here that is not our inference, so
+   * where they have an answer it outranks every heuristic below. False when a
+   * model ships no map at all, which must read as "no authored answer" and not
+   * as "no".
+   */
+  function onCharmMap(p: import("three").Vector3) {
+    const near = nearestOnCharmSurface(p);
+    return !!near && near.dist <= sizeL * 0.004;
+  }
+
   function attachToBody(p: import("three").Vector3) {
     // A dragged anchor already sits CHARM_CLEARANCE off the surface it was
     // picked from, so the tolerance has to clear that or every drag would be
@@ -8086,7 +8103,15 @@ async function buildViewer(
       // magazine well or a gap, and there is nothing there to hang from. See
       // enclosedSpot; this guards BOTH ways of choosing an anchor, and the
       // direct pointer ray is the one that reaches the magwell.
-      if (enclosedSpot(anchor)) return;
+      // …UNLESS the game says a charm goes there. `enclosedSpot` is a guess made
+      // out of six rays: if enough of them hit geometry inside the charm's swing
+      // radius it calls the spot enclosed and the frame is dropped. That is a
+      // fair description of the magazine well, and a poor one of a divot, a
+      // rail, the gap beside a trigger guard — all places CS2 hangs charms and
+      // all places the guess refuses, which is what "it won't let me put it
+      // there, and I know it goes there" is. The authored map is not a guess, so
+      // where it has an answer the guess does not get a vote.
+      if (enclosedSpot(anchor) && !onCharmMap(anchor)) return;
       // NOT constrained to the placement map, deliberately. The map covers 1-17%
       // of a weapon's surface (measured by ?quads=1 — a USP-S is 1%, an AK 17%),
       // so refusing every frame that lands outside it would refuse almost every
@@ -9812,6 +9837,26 @@ async function buildViewer(
           return b.isEmpty()
             ? null
             : { min: { x: b.min.x, y: b.min.y, z: b.min.z }, max: { x: b.max.x, y: b.max.y, z: b.max.z } };
+        })(),
+        // HOW MANY OF THE GAME'S OWN SPOTS OUR GUARDS WOULD REFUSE. The point of
+        // carrying an authored map is to stop guessing, so the interesting
+        // number is where the guesses still disagree with it.
+        mapSpots: (() => {
+          const xyz = charmSurfaceTris;
+          if (!xyz) return null;
+          const c = new THREE.Vector3();
+          let total = 0;
+          let enclosed = 0;
+          for (let q = 0; q + 17 < xyz.length; q += 18) {
+            c.set(
+              (xyz[q] + xyz[q + 3] + xyz[q + 6] + xyz[q + 15]) / 4,
+              (xyz[q + 1] + xyz[q + 4] + xyz[q + 7] + xyz[q + 16]) / 4,
+              (xyz[q + 2] + xyz[q + 5] + xyz[q + 8] + xyz[q + 17]) / 4,
+            );
+            total++;
+            if (enclosedSpot(c)) enclosed++;
+          }
+          return { total, enclosed };
         })(),
         ndc: ndc ? { x: ndc.x, y: ndc.y, z: ndc.z } : null,
         inFrame: !!ndc && Math.abs(ndc.x) <= 1 && Math.abs(ndc.y) <= 1 && ndc.z <= 1,

@@ -49,6 +49,14 @@ const props = withDefaults(
      * default has no listing to miss, and a dash there would be a claim.
      */
     missing?: boolean;
+    /**
+     * This figure came from a DIFFERENT listing than the one asked for — the
+     * non-StatTrak copy, or a neighbouring wear bracket. Renders a leading "~"
+     * and dims the figure, because a stand-in that looks identical to an exact
+     * price is worse than no price: it is a wrong answer with a confident face.
+     * The caller's title says what was substituted.
+     */
+    approx?: boolean;
     size?: "xs" | "sm" | "md" | "lg";
     /**
      * How the figure is separated from what surrounds it.
@@ -72,7 +80,7 @@ const props = withDefaults(
      *  no whole-wear-bracket estimate has. */
     title?: string;
   }>(),
-  { value: null, label: null, extra: null, suffix: null, pending: false, missing: false, size: "sm", frame: "none", stack: false, title: "" },
+  { value: null, label: null, extra: null, suffix: null, pending: false, missing: false, approx: false, size: "sm", frame: "none", stack: false, title: "" },
 );
 
 const FIGURE = { xs: "text-f9", sm: "text-f10", md: "text-f12", lg: "text-f13" } as const;
