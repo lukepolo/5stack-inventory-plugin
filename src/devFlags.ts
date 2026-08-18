@@ -17,6 +17,7 @@
  * sets it. A shared debug URL from before this file keeps working.
  */
 import { ref } from "vue";
+import { DEFAULT_ENVIRONMENT, VIEWER_ENVIRONMENTS } from "./viewerEnvironments";
 
 export interface DevFlag {
   /** The `?name=1` param and the localStorage suffix. */
@@ -86,6 +87,15 @@ export const FLAGS: DevFlag[] = [
     name: "bloom",
     label: "Bloom",
     hint: "A soft glow on the brightest parts of a skin. Applies to the 3D viewer; item cards are always rendered without it.",
+    dflt: true,
+    remount: true,
+    group: "3D viewer",
+    audience: "user",
+  },
+  {
+    name: "inspectanim",
+    label: "Motion",
+    hint: "Play the weapon's own inspect animation in the 3D viewer instead of turning it on a turntable. Item cards are always rendered from the still pose.",
     dflt: true,
     remount: true,
     group: "3D viewer",
@@ -199,6 +209,74 @@ export function setFlag(name: string, on: boolean): void {
   flagsVersion.value++;
 }
 
+/**
+ * A setting that PICKS ONE OF SEVERAL, for values that are neither a switch nor
+ * a dial.
+ *
+ * The third kind, and the reason it needs its own shape rather than being
+ * squeezed into the other two: a flag answers "which code path", a number
+ * answers "how much", and this answers "which one" — an enum with labels and its
+ * own per-option hint. Encoding four lighting rigs as three booleans would make
+ * two of the eight combinations meaningless and the picker unrepresentable.
+ *
+ * Shares the same `viewer3d.<name>` localStorage convention, so `?name=studio`
+ * in a debug URL works exactly like it does for the other two.
+ */
+export interface DevChoice {
+  name: string;
+  label: string;
+  hint: string;
+  dflt: string;
+  options: { value: string; label: string; hint?: string }[];
+  group: DevFlag["group"];
+  remount?: boolean;
+  audience?: "user" | "developer";
+}
+
+export const CHOICES: DevChoice[] = [
+  {
+    name: "env",
+    label: "Lighting",
+    hint: "Which rig the viewer lights an item under. Item CARDS are always baked under Studio, whatever this says — a card is cached against its render key, so a preset baked into one could never be told apart from a bug.",
+    dflt: DEFAULT_ENVIRONMENT,
+    options: VIEWER_ENVIRONMENTS.map((e) => ({ value: e.key, label: e.label, hint: e.hint })),
+    // Read once when the rig is built, like the other lighting values.
+    remount: true,
+    group: "3D viewer",
+    audience: "user",
+  },
+];
+
+/** Bumped on every choice write, so the HUD re-renders and the viewer re-reads. */
+export const choicesVersion = ref(0);
+
+export function choiceValue(name: string): string {
+  const spec = CHOICES.find((c) => c.name === name);
+  const dflt = spec?.dflt ?? "";
+  try {
+    const stored = localStorage.getItem(key(name));
+    // Validated against the declared options, not just returned: a value from a
+    // build that offered a preset this one dropped has to fall back rather than
+    // reach the renderer as an unknown key.
+    if (stored && spec?.options.some((o) => o.value === stored)) return stored;
+    return dflt;
+  } catch {
+    return dflt;
+  }
+}
+
+export function setChoice(name: string, v: string): void {
+  try {
+    localStorage.setItem(key(name), v);
+  } catch {
+    /* private mode — the value just does not stick */
+  }
+  choicesVersion.value++;
+}
+
+export const userChoices = (): DevChoice[] => CHOICES.filter((c) => c.audience === "user");
+export const devChoices = (): DevChoice[] => CHOICES.filter((c) => c.audience !== "user");
+
 /** Back to defaults, and forget every stored answer. */
 export function resetFlags(): void {
   for (const n of NUMBERS) {
@@ -217,6 +295,14 @@ export function resetFlags(): void {
     }
   }
   flagsVersion.value++;
+  for (const c of CHOICES) {
+    try {
+      localStorage.removeItem(key(c.name));
+    } catch {
+      /* ignore */
+    }
+  }
+  choicesVersion.value++;
 }
 
 /** Bumped on every numeric write, so a slider re-renders and the viewer re-reads. */

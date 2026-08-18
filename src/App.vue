@@ -6,6 +6,7 @@ import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock, CircleDollarSign,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
+  MoreHorizontal, Heart,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -20,11 +21,15 @@ import {
   updateInstance,
   deleteInstance,
   fetchInspectLink,
+  fetchKillHistory,
+  type KillHistory,
   fetchDraftInspectLink,
   fetchServerApiKey,
   fetchExtractStatus,
   type ExtractStatus,
   fetchPlayerLoadout,
+  copyLoadoutFrom,
+  setFavourite,
   importSteamInventory,
   fetchSteamSync,
   fetchPriceStatus,
@@ -46,6 +51,12 @@ import {
   equip,
   swapLoadout,
   unequip,
+  fetchPresets,
+  createPreset,
+  renamePreset,
+  deletePreset,
+  activatePreset,
+  type LoadoutPreset,
   type Team,
   type CatalogWeapon,
   type DefaultsMap,
@@ -111,7 +122,7 @@ import FilterSheet from "./components/FilterSheet.vue";
 import { Z } from "./zLayers";
 import { SORT_DIR_ICON, type SortDir } from "./sortIcons";
 import {
-  SORTS, SORTS_WITHOUT_VALUE, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, type SortMode,
+  SORTS, SORTS_WITHOUT_VALUE, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, needsOwnedItem, type SortMode,
   ATTACH_SORTS, DEFAULT_ATTACH_SORT, ATTACH_SORT_NATURAL, ATTACH_DIR_HINT, ATTACH_SORT_KIND, type AttachSortMode,
 } from "./sortModes";
 import {
@@ -131,7 +142,7 @@ import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowSt
 import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
-import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type ViewerKind, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type CameraState, type ViewerHandle, type ViewerKind, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
 
@@ -491,15 +502,17 @@ function instanceById(id: unknown): InventoryItem | undefined {
 /** What's in this slot, in money — the skin plus every sticker, patch and charm
  *  on it (the server's per-slot `value`). Null when prices are off or the slot
  *  holds a free default, which is most of them and correctly worth nothing. */
-function cellValue(pos: string): number | null {
+function valueForSlot(pos: string, forTeam: Team): number | null {
   if (!pricesOn.value) return null;
   // Shared slots (knife, gloves) can be stored under either side, same rule as
   // rowFor — otherwise a knife equipped from the T side prices as nothing on CT.
   const value = isShared(pos)
     ? slotValues.value[`CT:${pos}`] ?? slotValues.value[`T:${pos}`]
-    : slotValues.value[`${team.value}:${pos}`];
+    : slotValues.value[`${forTeam}:${pos}`];
   return value && value > 0 ? value : null;
 }
+/** The showing side's figure — what a cell draws. */
+const cellValue = (pos: string) => valueForSlot(pos, team.value);
 
 /**
  * Everything a loadout cell needs to DRAW, for one slot.
@@ -878,36 +891,85 @@ const { mode: sheetSort, dir: sheetDir, setMode: setSheetSort, kind: sheetSortKi
 const invSorts = computed(() => (pricesOn.value ? SORTS : SORTS_WITHOUT_VALUE));
 
 const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
+/**
+ * Collection order, with the uncollected pinned to the BOTTOM in both
+ * directions.
+ *
+ * Half of what anyone owns has no collection — every vanilla weapon, every music
+ * kit, and all but 96 knife finishes (the classic knife pool is the rare special
+ * of eleven cases at once, so no single one is true; see collectionOf in
+ * catalog.ts). Sorted as an empty string they lead the grid, so picking
+ * "Collection" scrolled the collections off the bottom and showed a wall of
+ * things that have none. Flipping the direction pins them the same way, for the
+ * same reason the name tiebreak stays A → Z either way.
+ */
+const byCollection = (a?: string | null, b?: string | null, flip = 1) => {
+  if (!a || !b) return a === b ? 0 : a ? -1 : 1;
+  return flip * a.localeCompare(b);
+};
+/**
+ * When an owned instance arrived, as a sortable number.
+ *
+ * 0 for anything without a date, which puts it at the OLD end in either
+ * direction — the honest place for "we do not know", and what an older backend
+ * that never sends created_at degrades to.
+ */
+const addedAt = (i: InventoryItem): number => {
+  const t = i.created_at ? Date.parse(i.created_at) : NaN;
+  return Number.isFinite(t) ? t : 0;
+};
 function sortInstances(list: InventoryItem[], mode: SortMode, dir: SortDir): InventoryItem[] {
   const flip = dir === SORT_NATURAL[mode] ? 1 : -1;
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(itemName(a.item), itemName(b.item)));
   if (mode === "wear") return arr.sort((a, b) => flip * ((a.wear ?? 1) - (b.wear ?? 1)) || byName(itemName(a.item), itemName(b.item)));
+  if (mode === "recent") {
+    // The id breaks ties, because a craft loop can mint several rows inside one
+    // clock tick and a comparator that returns 0 on genuinely different items
+    // lets their order flicker between renders. It is an identity column, so it
+    // orders the same way the timestamp does.
+    return arr.sort((a, b) => flip * (addedAt(b) - addedAt(a) || Number(b.id) - Number(a.id)));
+  }
   // Unpriced items sink to the bottom in BOTH directions — treated as -1 rather
   // than 0, so "least valuable first" still leads with the cheap things we can
   // actually price instead of a wall of items we know nothing about.
   if (mode === "value") {
     return arr.sort(
       (a, b) =>
-        (b.price ? 0 : 1) - (a.price ? 0 : 1) ||
+        (a.price ? 0 : 1) - (b.price ? 0 : 1) ||
         flip * ((b.price?.value ?? -1) - (a.price?.value ?? -1)) ||
+        byName(itemName(a.item), itemName(b.item)),
+    );
+  }
+  if (mode === "collection") {
+    // Rarity, not name, as the tiebreak WITHIN a collection: a case reads the
+    // way it reads in game, covert first, which is the whole point of grouping
+    // by one.
+    return arr.sort(
+      (a, b) =>
+        byCollection(a.item?.collection, b.item?.collection, flip) ||
+        sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity) ||
         byName(itemName(a.item), itemName(b.item)),
     );
   }
   return arr.sort((a, b) => flip * (sortRarityRank(b.item?.rarity) - sortRarityRank(a.item?.rarity)) || byName(itemName(a.item), itemName(b.item)));
 }
 function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
-  if (mode === "wear") return list; // catalog skins have no float of their own
-  // Catalog entries have no price of their own either — what they have is a
-  // STOCK cost, which is a different question ("what would making one cost")
-  // answered by a different map. Unpriced finishes sink in both directions, same
-  // rule as the inventory's value sort.
+  // Catalog entries have neither a float nor an acquisition date, so both of
+  // those modes are inert here — see needsOwnedItem, which is also what gates
+  // them out of the pickers that offer this list.
+  if (needsOwnedItem(mode)) return list;
+  // They have no price of their own either — what they have is a STOCK cost,
+  // which is a different question ("what would making one cost") answered by a
+  // different map. Unpriced finishes sink in both directions, same rule as the
+  // inventory's value sort. Not folded into needsOwnedItem: that predicate is
+  // about what an item IS, this is about whether the operator has a feed.
   if (mode === "value") {
     const flip = dir === SORT_NATURAL.value ? 1 : -1;
     return [...list].sort(
       (a, b) =>
-        (stockPriceOf(b.id) ? 0 : 1) - (stockPriceOf(a.id) ? 0 : 1) ||
+        (stockPriceOf(a.id) ? 0 : 1) - (stockPriceOf(b.id) ? 0 : 1) ||
         flip * ((stockPriceOf(b.id)?.value ?? -1) - (stockPriceOf(a.id)?.value ?? -1)) ||
         byName(a.name, b.name),
     );
@@ -916,6 +978,14 @@ function sortSkins(list: Skin[], mode: SortMode, dir: SortDir): Skin[] {
   if (mode === "default") return flip === 1 ? list : [...list].reverse();
   const arr = [...list];
   if (mode === "name") return arr.sort((a, b) => flip * byName(a.name, b.name));
+  if (mode === "collection") {
+    return arr.sort(
+      (a, b) =>
+        byCollection(a.collection, b.collection, flip) ||
+        sortRarityRank(b.rarity) - sortRarityRank(a.rarity) ||
+        byName(a.name, b.name),
+    );
+  }
   return arr.sort((a, b) => flip * (sortRarityRank(b.rarity) - sortRarityRank(a.rarity)) || byName(a.name, b.name));
 }
 
@@ -1143,6 +1213,145 @@ async function refreshAll() {
   if (pend) {
     const ids = new Set(pend.items.map((i) => String(i.id)));
     inventory.value = inventory.value.filter((i) => !ids.has(String(i.id)));
+  }
+}
+
+// ---- loadout presets --------------------------------------------------------
+// Named builds you switch between. Exactly one is live at a time and the server
+// parks the rest, so `loadout` still means "the build you are wearing" — every
+// switch is a round trip followed by a full refresh, never a local swap.
+//
+// Owner-only, deliberately. A viewer (and the profile tab) sees the build that
+// is live; the others are drafts, and whose they are is the only thing that
+// makes them interesting.
+const presets = ref<LoadoutPreset[]>([]);
+const presetBusy = ref(false);
+/** Cursor anchor for the preset menu — same contract as the slot/item menus. */
+const presetCtx = ref<{ x: number; y: number } | null>(null);
+/** The in-place rename draft; null when not renaming. */
+const presetDraft = ref<string | null>(null);
+const presetInputEl = ref<HTMLInputElement | null>(null);
+
+const activePreset = computed(() => presets.value.find((p) => p.active) ?? null);
+/**
+ * The whole control hides when there is nothing to report. That is not just the
+ * signed-out and viewer cases: a backend older than this feature 404s the route
+ * and leaves the list empty, and a switcher over an empty list is a control with
+ * nothing behind it.
+ *
+ * A single preset still shows its pill. It names the build you are wearing and
+ * it is what the menu button hangs off — which is also how anyone finds out
+ * presets exist at all.
+ */
+const showPresets = computed(() => canEdit.value && presets.value.length > 0);
+
+/**
+ * DISPLAY ONLY — PRESET_LIMIT in backend/src/main.ts is the door, and it answers
+ * with a sentence a human can read. This only decides whether the menu offers an
+ * action that would bounce. If the two ever drift, the worst case is a hidden
+ * row that would have worked, or a row that returns that sentence.
+ */
+const PRESET_LIMIT = 5;
+const presetsFull = computed(() => presets.value.length >= PRESET_LIMIT);
+
+async function loadPresets() {
+  // Swallowed rather than surfaced: frontend and backend ship as separate
+  // images, so this route 404s on a backend that predates presets. That has to
+  // read as "this deployment has no presets" — an empty list hides the whole
+  // control — and not as a failed page load.
+  presets.value = canEdit.value ? await fetchPresets().catch(() => []) : [];
+}
+
+async function switchPreset(id: string) {
+  if (presetBusy.value || activePreset.value?.id === id) return;
+  presetBusy.value = true;
+  try {
+    await activatePreset(id);
+    // Everything on screen is downstream of which build is live: the loadout
+    // itself, and the inventory's `equipped` markers with it.
+    await Promise.all([refreshAll(), loadPresets()]);
+    queueLoadoutRenders();
+  } catch (e) {
+    fail(e);
+    // The strip is rendered off `presets`, so a switch that failed has to put
+    // the real active one back — otherwise the pill sits under a build the
+    // player is not actually wearing.
+    await loadPresets();
+  } finally {
+    presetBusy.value = false;
+  }
+}
+
+/** `copy` is the duplicate action: the new preset starts as what you're wearing
+ *  now, pointing at the same owned instances (it does not clone your items). */
+async function newPreset(copy: boolean) {
+  if (presetBusy.value) return;
+  presetBusy.value = true;
+  let made: LoadoutPreset | null = null;
+  try {
+    made = await createPreset({ copy });
+  } catch (e) {
+    fail(e);
+  } finally {
+    presetBusy.value = false;
+  }
+  // Straight into it — a build you made and are not wearing is two clicks for
+  // the one thing anyone wants from that button.
+  if (made) await switchPreset(made.id);
+}
+
+function startPresetRename() {
+  presetDraft.value = activePreset.value?.name ?? "";
+  void nextTick(() => presetInputEl.value?.select());
+}
+
+async function commitPresetRename() {
+  const draft = presetDraft.value;
+  const target = activePreset.value;
+  // Cleared FIRST: blur fires on Enter as the input unmounts, so commit runs
+  // twice, and the second pass has to find nothing left to do.
+  presetDraft.value = null;
+  if (!target || draft == null || !draft.trim() || draft.trim() === target.name) return;
+  try {
+    // The server does the trimming and the length cap and falls back to the old
+    // name for an empty one, so there is nothing to validate here.
+    await renamePreset(target.id, draft);
+    await loadPresets();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+function askDeletePreset() {
+  const target = activePreset.value;
+  if (!target) return;
+  confirmAsk.value = {
+    title: `Delete "${target.name}"?`,
+    // The distinction worth spelling out: a preset is an arrangement, not a
+    // container. Deleting one is not deleting anything you crafted.
+    body:
+      `That loadout and the ${target.slots} slot${target.slots === 1 ? "" : "s"} in it go away. ` +
+      "The items themselves stay in your inventory — a preset only arranges what you already own. " +
+      "You'll be switched to another loadout.",
+    confirmLabel: "Delete",
+    onConfirm: () => void removePreset(target.id),
+  };
+}
+
+async function removePreset(id: string) {
+  if (presetBusy.value) return;
+  presetBusy.value = true;
+  try {
+    await deletePreset(id);
+    // The server moves you onto another preset when you delete the live one, so
+    // the loadout on screen has changed even though nothing here equipped
+    // anything.
+    await Promise.all([refreshAll(), loadPresets()]);
+    queueLoadoutRenders();
+  } catch (e) {
+    fail(e);
+  } finally {
+    presetBusy.value = false;
   }
 }
 
@@ -1876,6 +2085,77 @@ function openView(inst: InventoryItem) {
 const craftInst = computed(() =>
   craftInstId.value != null ? instanceById(craftInstId.value) ?? null : null,
 );
+
+// ---- StatTrak history -------------------------------------------------------
+//
+// The ledger behind the counter: first kill, which matches, which map, and a
+// trend. Loaded lazily and only here, on the item's own detail surface — it is
+// a scan of one item's kills rather than a column read, so it deliberately does
+// NOT ride along on /api/inventory the way stattrak_count does. A grid of two
+// hundred tiles has no use for it.
+const killHistory = ref<KillHistory | null>(null);
+const killHistoryBusy = ref(false);
+/**
+ * Load the history for whatever StatTrak item the modal is VIEWING.
+ *
+ * Gated on view mode, not just on an item being open: the editor is where you
+ * change the gun, and a record of where it has been belongs to the read-only
+ * spec beside the float and the pattern. Non-StatTrak items resolve to null and
+ * never ask.
+ */
+watch(
+  () => (viewOnly.value && craftInst.value?.stattrak ? craftInst.value.id : null),
+  async (id) => {
+    killHistory.value = null;
+    if (id == null) return;
+    killHistoryBusy.value = true;
+    try {
+      const history = await fetchKillHistory(id);
+      // The modal can close, or move to another item, while this is in flight.
+      // Publishing unconditionally would paint one knife's record under
+      // another's name — the request is keyed by id but the panel is not.
+      if (viewOnly.value && craftInst.value?.id === id) killHistory.value = history;
+    } catch (error) {
+      // Deliberately silent in the UI. This is a bonus readout on an item that
+      // renders perfectly without it; an error banner over somebody's knife
+      // because an aggregate timed out is strictly worse than the panel simply
+      // not appearing. The console line is here for when someone asks why.
+      console.warn("[stattrak] kill history failed to load", error);
+    } finally {
+      killHistoryBusy.value = false;
+    }
+  },
+  { immediate: true },
+);
+
+/**
+ * "This rack has 4,312 kills" — the equipped loadout's StatTrak total.
+ *
+ * Summed off the counters the loadout rows ALREADY carry rather than out of the
+ * ledger. That costs no request and no index, it agrees with the number printed
+ * on each module (the whole point of a showcase stat), and it counts the kills
+ * that predate the ledger, which a `count(*)` never can.
+ *
+ * Deduped by instance, because knife and gloves are equipped on BOTH sides and
+ * the shared row appears twice — a plain sum double-counts every kill on them.
+ *
+ * Own loadout only. The public player endpoint withholds stattrak_count
+ * entirely (kill counts are the owner's business), so for a visitor this would
+ * be a sum over undefined; `viewerId` keeps it off screen instead of showing
+ * them a confident zero.
+ */
+const rackKills = computed(() => {
+  if (viewerId.value) return 0;
+  const seen = new Set<number>();
+  let total = 0;
+  for (const row of loadout.value) {
+    if (row.team !== team.value || row.item_instance_id == null) continue;
+    if (seen.has(row.item_instance_id)) continue;
+    seen.add(row.item_instance_id);
+    total += row.stattrak_count ?? 0;
+  }
+  return total;
+});
 /**
  * Does the preview need the waist-crop feather (ART_FADE_B)? Three ways into
  * this modal and only two of them carry a type: an owned item and a shared
@@ -2407,6 +2687,25 @@ provide("itemArt", { renderSrc, onRenderError, renderingIds, queuedIds, assetsPe
 // at every depth and threading it through each component adds nothing.
 provide("tr", tr);
 
+/**
+ * Transport wiring for one viewer slot's control legend.
+ *
+ * ViewerControls POLLS this rather than being handed a value (see its `inspect`
+ * prop), so all a slot has to give it is a getter that follows whichever handle
+ * the slot currently holds — the getter identity then survives a remount, and
+ * the bar keeps working when the modal rebuilds its viewer under it.
+ *
+ * Per slot, not once: the focus stage stays mounted behind the craft modal, so
+ * two of these are live at the same time and they must not share a handle.
+ */
+function viewerTransport(slot: ReturnType<typeof useViewerMount>) {
+  return {
+    read: () => slot.current()?.inspect() ?? null,
+    play: (on: boolean) => slot.current()?.setInspectPlaying(on),
+    seek: (t: number) => slot.current()?.setInspectTime(t),
+  };
+}
+
 // 3D preview inside the craft/edit modal.
 const modal3d = ref(false);
 const modal3dAvailable = ref(false);
@@ -2420,6 +2719,7 @@ const modalViewer = useViewerMount({
     fail(e);
   },
 });
+const craftInspect = viewerTransport(modalViewer);
 const teardownModalViewer = () => {
   charmPending.value = false;
   modalViewer.teardown();
@@ -4008,6 +4308,26 @@ async function clearSlot(pos: string) {
     fail(e);
   }
 }
+/**
+ * Star or unstar an owned item.
+ *
+ * Optimistic, and it repaints from the row we already hold rather than
+ * refetching: the inventory is a few hundred items and a full reload to move one
+ * heart would drop the grid's scroll position. On failure the flag goes back and
+ * the toast says why, because a heart that silently reverts reads as the click
+ * having missed.
+ */
+async function toggleFavourite(inst: InventoryItem, want: boolean) {
+  const row = inventory.value.find((i) => i.id === inst.id);
+  const before = row?.favourite ?? false;
+  if (row) row.favourite = want;
+  try {
+    await setFavourite(inst.id, want);
+  } catch (e) {
+    if (row) row.favourite = before;
+    notify((e as Error).message);
+  }
+}
 async function toggleStatTrakInstance(inst: InventoryItem) {
   try {
     await updateInstance(inst.id, { stattrak: !inst.stattrak });
@@ -5039,6 +5359,27 @@ const invSearchApplied = invSearchCtl.applied;
 watch(invSearchApplied, () => invFade.toTop());
 // Synced (steam) vs crafted filter + adjustable card size (persisted).
 const invOrigin = ref<OriginFilter>("all");
+/**
+ * Show only starred items.
+ *
+ * A boolean rather than a value in the origin pill: origin answers "where did
+ * this come from" and every option there is mutually exclusive, while a
+ * favourite cuts ACROSS origin — the whole point is to star a Steam import and a
+ * craft and see them together.
+ *
+ * Not in STICKY_QUERY_KEYS, so it does not ride a shared link. "The ones I
+ * starred" is not a view of an inventory anyone else can see.
+ */
+const invFavourites = ref(false);
+/**
+ * Is the control worth showing at all?
+ *
+ * A "favourites only" filter on an inventory with nothing starred is a button
+ * whose only outcome is an empty grid. Hidden until the first star exists — the
+ * same "hide, do not disable, when the control provably cannot do anything" rule
+ * the 3D verb follows for a music kit.
+ */
+const invHasFavourites = computed(() => inventory.value.some((i) => i.favourite));
 // Multi-select, not one-of: toggling is the whole point of the rail, and
 // "show me my AKs AND my AWPs" is a question people actually have. An item
 // shows if it matches ANY active toggle; nothing active means everything.
@@ -5136,6 +5477,7 @@ const invRailShown = computed(
 function clearInvFilters() {
   invSearchCtl.applyNow("");
   invOrigin.value = "all";
+  invFavourites.value = false;
   invRarity.value = "";
   invModels.value = [];
   invTypes.value = [];
@@ -5530,9 +5872,17 @@ const inventoryUnpriced = computed(() => inventory.value.filter((i) => !i.price)
  *  patches and charms, which is why this sums that and not `price`. */
 const loadoutValue = computed(() => {
   const totals: Record<string, number> = { CT: 0, T: 0 };
-  for (const [key, value] of Object.entries(slotValues.value)) {
-    const side = key.split(":")[0];
-    totals[side] = (totals[side] ?? 0) + value;
+  // Through cellValue, not the raw keys. A shared slot (knife, gloves, zeus, C4,
+  // music kit, graffiti, collectible) is stored under whichever side equipped it
+  // and cellValue falls back CT→T to find it — so summing the raw map credited it
+  // to one side only, and the header total came out lower than the cells drawn
+  // underneath it. Flipping sides then changed the total for a loadout that had
+  // not changed.
+  for (const team of ["CT", "T"] as Team[]) {
+    for (const group of POSITION_GROUPS) {
+      for (const pos of group.positions) totals[team] += valueForSlot(pos, team) ?? 0;
+    }
+    for (const special of ALL_SPECIALS) totals[team] += valueForSlot(special.slot, team) ?? 0;
   }
   return totals;
 });
@@ -5604,6 +5954,7 @@ const invFilterCount = computed(
   () =>
     (invSearch.value.trim() ? 1 : 0) +
     (invOrigin.value !== "all" ? 1 : 0) +
+    (invFavourites.value ? 1 : 0) +
     (invRarity.value ? 1 : 0) +
     (invSort.value !== DEFAULT_SORT ? 1 : 0) +
     invModels.value.length +
@@ -5730,6 +6081,7 @@ const filteredInventory = computed(() => {
       (i) =>
         (!q || itemName(i.item).toLowerCase().includes(q)) &&
         matchesOrigin(i, invOrigin.value) &&
+        (!invFavourites.value || i.favourite === true) &&
         (!invRarity.value || i.item?.rarity === invRarity.value) &&
         matchesRail(i),
     ),
@@ -5759,7 +6111,7 @@ const invDesignName = computed(() =>
 // The SETTLED search term, not the raw box: invDesign is part of invFilterSig, so
 // firing this on a keystroke rebuilt the grid one keystroke early and defeated the
 // debounce for anyone who happened to be inside a colour stack.
-watch([invSearchApplied, invOrigin, invRarity, invTypes, invModels], () => (invDesign.value = null));
+watch([invSearchApplied, invOrigin, invFavourites, invRarity, invTypes, invModels], () => (invDesign.value = null));
 /**
  * Everything that changes WHICH items the grid shows — one string.
  *
@@ -5782,7 +6134,7 @@ watch([invSearchApplied, invOrigin, invRarity, invTypes, invModels], () => (invD
  * item, deleting one — where the surviving cards genuinely should slide.
  */
 const invFilterSig = computed(() =>
-  [invSearchApplied.value, invOrigin.value, invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
+  [invSearchApplied.value, invOrigin.value, invFavourites.value ? "fav" : "", invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
 );
 const inventoryWindow = useRenderWindow(inventoryStacks, () => invFilterSig.value);
 // Down HERE, not up beside invFade where it reads more naturally, because `watch`
@@ -5956,6 +6308,50 @@ const focusLegacyPaint = computed(() => !!focusRow.value?.item?.legacyPaint);
 const ISSUE_NEW_URL = "https://github.com/lukepolo/5stack-inventory-plugin/issues/new";
 // Deliberately quiet — it only needs to be findable at the moment something
 // looks wrong, so it reads as a footnote until hovered.
+/**
+ * Save what is on the 3D stage as a PNG.
+ *
+ * The renderer could already produce this — `snapshot()` is how every item card
+ * is baked — but it had exactly one caller, the bake queue, so the picture this
+ * app is best at making was the one thing you could not take away from it. A
+ * shared craft link carries the exact state and shows nothing; this is the other
+ * half of that.
+ *
+ * Grabs the LIVE stage rather than re-mounting an offscreen one, so you get the
+ * angle you framed, not a canonical three-quarter view. That is the point: if
+ * the interesting thing about a pattern is only visible from one side, a
+ * standard pose does not capture it.
+ */
+async function downloadStageImage(slot: ReturnType<typeof useViewerMount>, name: string) {
+  const handle = slot.current();
+  if (!handle) return;
+  let blob: Blob | null = null;
+  try {
+    blob = await handle.snapshot();
+  } catch (e) {
+    notify((e as Error).message);
+    return;
+  }
+  if (!blob) {
+    // Null rather than a throw is how the viewer reports "nothing to capture" —
+    // a model that never finished, a context that was lost. Say so, because a
+    // button that does nothing reads as a broken click.
+    notify("Nothing to save yet — the model has not finished loading.");
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  // Item names carry "|" and spaces, which survive a download but make an ugly
+  // file and break naive shell globs on the other side.
+  const slug = name.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+  a.download = (slug || "item") + ".png";
+  a.click();
+  // Revoked a tick later, not immediately: some browsers have not started
+  // reading the blob when click() returns, and revoking first cancels the save.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
 const REPORT_LINK =
   "text-f9 uppercase tracking-cs2 text-muted-foreground/40 underline decoration-dotted underline-offset-2 transition-colors hover:text-[color:var(--acc)]";
 
@@ -6007,7 +6403,10 @@ function issue3dHref(o: {
 // Focus stage.
 const focusReportHref = computed(() => {
   const row = focusRow.value;
-  const inst = focusInstance.value;
+  // The attachment source, not the instance: a report filed from someone else's
+  // loadout has to count the stickers that are on the stage, and in viewer mode
+  // there is no instance behind them.
+  const inst = focusAttachments.value;
   return issue3dHref({
     weapon: sheetWeaponName.value,
     finish: isSkinned(row) ? [row?.item?.name, row?.item?.altName].filter(Boolean).join(" · ") : null,
@@ -6060,6 +6459,7 @@ const focusViewer = useViewerMount({
     fail(e);
   },
 });
+const focusInspect = viewerTransport(focusViewer);
 const teardownViewer = focusViewer.teardown;
 watch([focusModelKey, focusPaint], async ([key]) => {
   teardownViewer();
@@ -6074,11 +6474,31 @@ watch([focusModelKey, focusPaint], async ([key]) => {
     if (focus3d.value && wasOn) await mount3d();
   }
 });
-// The equipped instance behind the focused slot (own loadout only — public
-// viewer mode has no inventory list, so attachments just don't render there).
+/**
+ * Anything that can dress a model: an owned inventory item, or a public loadout
+ * row. Both carry the same enriched `stickers`/`patches`/`charm` and the same
+ * StatTrak pair, which is all instPlacements ever reads off either.
+ */
+type AttachSource = InventoryItem | LoadoutEntry;
+// The equipped instance behind the focused slot. Own loadout only: viewer mode
+// withholds the instance id (it is the owner's row handle), so nothing here can
+// resolve — see focusAttachments for where a visitor's stickers come from.
 const focusInstance = computed(() => {
   return instanceById(focusRow.value?.item_instance_id) ?? null;
 });
+/**
+ * Where the focused slot's attachments come from, whichever loadout it is.
+ *
+ * Your own resolves the owned instance out of the inventory list; a visitor has
+ * no inventory for the player they are looking at, so the PUBLIC loadout row
+ * carries the same enriched stickers/patches/charm and stands in for it. That
+ * fallback is the whole of "render attachments in viewer mode" — before it, a
+ * shared loadout showed the right finish, wear and pattern on a gun with none of
+ * the work on it, which is the part people actually spend their time placing.
+ */
+const focusAttachments = computed<AttachSource | null>(
+  () => focusInstance.value ?? focusRow.value ?? null,
+);
 // InventoryItem → viewer placement shapes (Focus + loadout 3D overlay).
 /**
  * "Applied to AK-47 | Redline", for an attachment that is currently on a gun.
@@ -6096,7 +6516,7 @@ function attachedName(inst?: InventoryItem | null): string | null {
   const host = inventory.value.find((i) => String(i.id) === String(to));
   return host ? itemName(host.item) : null;
 }
-function instPlacements(inst?: InventoryItem | null) {
+function instPlacements(inst?: AttachSource | null) {
   return {
     stickers: (inst?.stickers ?? []).flatMap((st, i) =>
       st?.image ? [{ slot: i, image: st.image, x: st.x ?? null, y: st.y ?? null, r: st.r ?? null, w: st.w ?? null }] : [],
@@ -6146,22 +6566,116 @@ async function mount3d() {
       wear: focusRow.value?.wear ?? focusInstance.value?.wear,
       seed: focusRow.value?.seed ?? focusInstance.value?.seed,
       ...(isWeapon ? await stickerGeom(key) : {}),
-      ...(isWeapon ? instPlacements(focusInstance.value) : {}),
+      ...(isWeapon ? instPlacements(focusAttachments.value) : {}),
       // See the craft modal for why patches are their own option rather than
       // part of instPlacements.
       patches:
         focusTarget.value?.kind === "agent"
-          ? (focusInstance.value?.patches ?? []).map((p) => p?.image ?? null)
+          ? (focusAttachments.value?.patches ?? []).map((p) => p?.image ?? null)
           : undefined,
       // Focus can be showing a loadout DEFAULT rather than an owned item, and
       // a default can be StatTrak too — instPlacements sees no instance there
       // and would drop the module, so fall back to the row.
       stattrak:
-        focusInstance.value?.stattrak || focusRow.value?.stattrak
-          ? { count: focusInstance.value?.stattrak_count ?? focusRow.value?.stattrak_count ?? 0 }
+        focusAttachments.value?.stattrak || focusRow.value?.stattrak
+          ? { count: focusAttachments.value?.stattrak_count ?? focusRow.value?.stattrak_count ?? 0 }
           : null,
     };
   });
+}
+
+// ---- Compare: two owned items, ONE stage, ONE camera -------------------------
+//
+// A/B BLINK, not two panes side by side, and that is the whole design.
+//
+// There is exactly one live WebGL viewer at a time — a rule this app enforces
+// everywhere because a second live context is the "gun renders below the pane"
+// orphan. Two panes would mean breaking it. But blink is also simply the better
+// instrument: two images an inch apart are compared by eye across a gap, while
+// two images in the SAME pixels a second apart are compared by change, and the
+// eye is far better at spotting change than at spotting difference.
+//
+// It only works if the camera does not move between the two, which is what
+// ViewerOpts.camera and ViewerHandle.cameraState exist for — the pose is read
+// off the outgoing mount and handed to the incoming one, so the item swaps
+// underneath a camera that stays put.
+const compareShown = ref<"a" | "b">("a");
+const compareEl = ref<HTMLElement | null>(null);
+/** Carried across the swap. Null on the first mount, which frames normally. */
+let compareCam: CameraState | null = null;
+const comparePair = computed(() => {
+  const r = route.value;
+  if (r.name !== "compare") return null;
+  const find = (id: string) => inventory.value.find((i) => String(i.id) === id) ?? null;
+  const a = find(r.a);
+  const b = find(r.b);
+  // Both or neither: half a comparison is not a screen, and a link to an item
+  // the viewer does not own has to say so rather than mount the other one and
+  // look like it worked.
+  return a && b ? { a, b } : null;
+});
+const compareItem = computed(() => (comparePair.value ? comparePair.value[compareShown.value] : null));
+const compareViewer = useViewerMount({
+  label: "compare",
+  host: () => compareEl.value,
+  onError: (e) => fail(e),
+});
+async function mountCompare() {
+  const inst = compareItem.value;
+  const target = inst?.item ? resolveViewerModelSync(inst.item) : null;
+  if (!inst || !target) return;
+  await compareViewer.mount(target.model, async () => {
+    const isWeapon = (target.kind ?? "weapon") === "weapon";
+    // Simpler than the focus stage's payload, and deliberately not shared with
+    // it: focus has to cope with a loadout DEFAULT that has no instance behind
+    // it, so every field there falls back through the row. Compare is only ever
+    // handed owned items, so there is nothing to fall back to and the fallbacks
+    // would be dead branches pretending to be live ones.
+    return {
+      kind: target.kind,
+      paintMaterial: inst.item?.paintMaterial ?? null,
+      legacyPaint: !!inst.item?.legacyPaint,
+      wear: inst.wear ?? undefined,
+      seed: inst.seed ?? undefined,
+      camera: compareCam ?? undefined,
+      ...(isWeapon ? await stickerGeom(target.model) : {}),
+      ...(isWeapon ? instPlacements(inst) : {}),
+      patches:
+        target.kind === "agent" ? (inst.patches ?? []).map((p) => p?.image ?? null) : undefined,
+      stattrak: inst.stattrak ? { count: inst.stattrak_count ?? 0 } : null,
+    };
+  });
+}
+function swapCompare() {
+  // Read the pose BEFORE the swap tears the handle down. `?? compareCam` keeps
+  // the last good one if the read misses (a swap during a mount), so a fast
+  // double-press cannot reset the framing.
+  compareCam = compareViewer.current()?.cameraState() ?? compareCam;
+  compareShown.value = compareShown.value === "a" ? "b" : "a";
+}
+watch(
+  [comparePair, compareShown],
+  () => {
+    if (comparePair.value) void mountCompare();
+    else compareViewer.teardown();
+  },
+  { immediate: true },
+);
+// Leaving the screen forgets the pose. Coming back to a comparison should frame
+// itself the way any other stage does rather than restore an angle from a
+// session the user has stopped thinking about.
+watch(comparePair, (p) => {
+  if (!p) {
+    compareCam = null;
+    compareShown.value = "a";
+  }
+});
+/** Open a comparison of the two selected items. */
+function compareSelected() {
+  const [a, b] = [...selectedIds.value];
+  if (a == null || b == null) return;
+  exitSelectMode();
+  go(buildPath({ name: "compare", a: String(a), b: String(b) }));
 }
 
 // ---- 3D overlay for a DEFAULT weapon (ctx menu → View in 3D) ----------------
@@ -6338,6 +6852,7 @@ async function load() {
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = theirs;
       inventory.value = [];
+      presets.value = [];
     } else if (!signedIn.value) {
       // Signed out. Loadout and inventory both 401, and asking for them anyway
       // is what used to dump anonymous visitors on the retry screen. Catalog is
@@ -6349,6 +6864,7 @@ async function load() {
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = [];
       inventory.value = [];
+      presets.value = [];
       loadSkins(sheetKey.value);
     } else {
       const [catalog, current, inv] = await Promise.all([fetchCatalog(), fetchLoadout(), fetchInventory()]);
@@ -6368,6 +6884,10 @@ async function load() {
       // Off to the side: the nag dot is the least important thing on screen and
       // must never hold up (or fail) the load it rides along with.
       void loadSteamSyncState();
+      // Same treatment, same reason — the switcher naming the build you are
+      // already looking at is not worth a slower first paint, and a backend
+      // that has never heard of presets must still render a loadout.
+      void loadPresets();
     }
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -6400,6 +6920,15 @@ function onGlobalKey(e: KeyboardEvent) {
       e.stopPropagation();
     } else if (itemCtx.value) {
       closeItemCtx();
+      e.stopPropagation();
+    } else if (presetCtx.value) {
+      presetCtx.value = null;
+      e.stopPropagation();
+    } else if (presetDraft.value != null) {
+      // Escape ABANDONS the rename — commitPresetRename is the blur/Enter path,
+      // and routing Escape through it would save the very edit you backed out
+      // of. Below the menus because you can only ever be in one of the two.
+      presetDraft.value = null;
       e.stopPropagation();
     } else if (loadout3d.value) {
       // dismiss*, not close*: these modals are routes now, so escaping has to
@@ -6680,6 +7209,59 @@ async function runSteamImport() {
   }
 }
 
+// ---- copy the loadout you're looking at -------------------------------------
+// /loadout/copy-from has existed since player profiles shipped and nothing in
+// the UI ever pointed at it, so the one action a visitor actually wants from
+// someone else's loadout was reachable only by hand-rolling a POST.
+//
+// It is not a "follow" or a bookmark: it mints a real copy of every equipped
+// skin into your inventory (origin 'copied') and equips each one in the same
+// slot, overwriting what you had there. That's worth a sentence BEFORE the
+// click rather than a surprise after it — hence the confirm, in the neutral
+// tone: nothing is lost, but your own loadout is rearranged.
+const copyBusy = ref(false);
+function askCopyLoadout() {
+  const source = viewerId.value;
+  if (!source || copyBusy.value) return;
+  confirmAsk.value = {
+    title: "Copy this loadout?",
+    body:
+      "Every skin equipped here is copied into your inventory and equipped in" +
+      " the same slot of your own loadout, replacing whatever you have in those" +
+      " slots. Nothing of theirs changes, and nothing of yours is deleted — the" +
+      " items you had stay in your inventory.",
+    confirmLabel: "Copy loadout",
+    tone: "neutral",
+    onConfirm: () => void copyViewedLoadout(source),
+  };
+}
+async function copyViewedLoadout(source: string) {
+  copyBusy.value = true;
+  try {
+    const { copied } = await copyLoadoutFrom(source);
+    // Deliberately NO refreshAll(): in viewer mode `loadout` holds THEIR rows
+    // and `inventory` is empty by design, so refreshing would swap the screen
+    // for yours — the copy would look like it had teleported you somewhere.
+    // The toast says where the items went; the loadout you came to look at
+    // stays on screen.
+    const summary = copied === 1 ? "1 item" : `${copied} items`;
+    notify(
+      copied
+        ? tr(
+            "inventory.notify.loadout_copied",
+            `Copied ${summary} into your inventory and equipped them on your own loadout.`,
+            { summary },
+          )
+        : tr("inventory.notify.loadout_copy_empty", "Nothing to copy — that loadout is empty."),
+      "success",
+    );
+  } catch (e) {
+    fail(e);
+  } finally {
+    copyBusy.value = false;
+  }
+}
+
 // ---- bulk select/delete (inventory view) ----
 const selectMode = ref(false);
 
@@ -6700,6 +7282,15 @@ const selectMode = ref(false);
 function openArmory() {
   go(buildPath({ name: "armory" }));
 }
+/**
+ * Which catalog ids the viewer already has, as a set.
+ *
+ * The armory's ownership progress ("you own 4 of 17 in this collection") is this
+ * intersected with a collection's members — no endpoint, and no second source of
+ * truth about what is owned. Derived from the inventory already in memory, so it
+ * follows a craft or a delete the moment the grid does.
+ */
+const ownedItemIds = computed(() => new Set(inventory.value.map((i) => i.item_id)));
 /** A finish chosen in the armory: straight into the editor, over the armory. */
 function armoryPick(skin: Skin) {
   modalBackdrop.value = "armory";
@@ -6903,6 +7494,58 @@ if (MDEBUG) {
         active-class="text-black"
         @select="(t) => switchTeam(t as Team)"
       />
+
+      <!-- Preset switcher. Sits next to the side toggle because the two are the
+           same kind of control — "which loadout am I looking at" — where Focus
+           beside them is a view mode. Same PillTabs, `accent` variant: the CT/T
+           pill is the solid one on purpose (it's a switch, not a filter) and a
+           second solid strip next to it would read as two halves of one toggle.
+
+           Never in a profile tab or a viewer's window: showPresets is gated on
+           canEdit, so someone else's page shows the build that is live and says
+           nothing about the drafts behind it. -->
+      <div
+        v-if="showPresets && (view === 'grid' || view === 'focus')"
+        class="flex flex-none items-center"
+        :class="isCompact ? 'gap-1' : 'gap-1.5'"
+      >
+        <!-- Rename happens in place, where the name already is. The input
+             REPLACES the strip rather than sitting under it: mid-rename the
+             other pills would be switches that throw the edit away, and the
+             header has no vertical room for a second row anyway. -->
+        <input
+          v-if="presetDraft !== null"
+          ref="presetInputEl"
+          v-model="presetDraft"
+          maxlength="24"
+          class="h-7 w-[9rem] rounded-lg border border-[color:var(--acc)] bg-muted px-2.5 text-f11 uppercase tracking-wider text-foreground outline-none"
+          @keydown.enter.prevent="commitPresetRename"
+          @blur="commitPresetRename"
+        />
+        <PillTabs
+          v-else
+          :items="presets"
+          :item-key="(p) => p.id"
+          :item-title="(p) => `${p.name} — ${p.slots} slot${p.slots === 1 ? '' : 's'}`"
+          :active="activePreset?.id ?? ''"
+          :button-class="`relative z-[1] flex h-7 max-w-[9rem] items-center rounded-md text-f11 uppercase tracking-wider transition-colors ${isCompact ? 'px-2' : 'px-3'}`"
+          @select="(id) => switchPreset(id)"
+        >
+          <template #default="{ item: p }">
+            <span class="truncate">{{ p.name }}</span>
+          </template>
+        </PillTabs>
+        <button
+          class="grid flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action disabled:opacity-60"
+          :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
+          :disabled="presetBusy"
+          title="Loadout presets"
+          @click="presetCtx = { x: $event.clientX, y: $event.clientY }"
+        >
+          <Loader2 v-if="presetBusy" class="h-3.5 w-3.5 animate-spin" />
+          <MoreHorizontal v-else class="h-3.5 w-3.5" />
+        </button>
+      </div>
       <button
         v-if="view === 'grid' || view === 'focus'"
         class="tac-action flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
@@ -6936,6 +7579,23 @@ if (MDEBUG) {
           suffix="est"
         />
       </Tooltip>
+      <!-- "This rack has 4,312 kills." The loadout screens' one showcase stat:
+           the StatTrak counters on everything equipped on this side, added up,
+           so it moves the moment you swap a gun in. A readout, not a control —
+           hence a span, and hence no hover state.
+           Hidden at zero rather than shown as "0 kills": on a fresh account
+           that would be the loudest thing in the header and it would be saying
+           nothing. Hidden for a visitor too — see rackKills. -->
+      <span
+        v-if="(view === 'grid' || view === 'focus') && rackKills > 0"
+        class="flex flex-none items-center gap-1.5 rounded-lg border border-[#e0a92e]/40 bg-[#e0a92e]/10 px-2.5 text-f11 font-semibold uppercase tracking-wider text-[#f2c14e]"
+        :class="isCompact ? 'h-8' : 'h-9'"
+        :title="`StatTrak™ kills across everything equipped on ${team}`"
+      >
+        <Sparkles class="h-3.5 w-3.5" />
+        <span class="font-mono tabular-nums">{{ rackKills.toLocaleString() }}</span>
+        <span v-if="!isCompact" class="font-normal normal-case tracking-normal text-muted-foreground">kills</span>
+      </span>
 
       <!-- Utility actions sit LEFT of the tabs and are grouped tight, so the
            header reads as "tools | where you are" instead of three things
@@ -6957,8 +7617,31 @@ if (MDEBUG) {
           <Pencil class="h-3.5 w-3.5" />
           <span v-if="!isCompact">Edit</span>
         </a>
-        <!-- Nothing here for someone else's loadout: it is a read-only look at
-             their profile, not a starting point for your own. -->
+        <!-- Someone else's loadout is read-only, with exactly one way to act on
+             it: take it home. This is the only entry point to
+             /loadout/copy-from, which the backend has had all along — and the
+             corner it sits in is the one every other surface puts its actions
+             in, so it reads as "the thing to do here" rather than an offer.
+             Hidden on your own profile tab (copying yourself onto yourself),
+             signed out (nowhere to copy TO) and on an empty loadout (nothing to
+             copy), because a button that can only disappoint is worse than no
+             button. The dialog behind it says what it will do first. -->
+        <button
+          v-if="viewerId && !viewingSelf && signedIn && loadout.length && !loading && !error"
+          class="tac-action flex items-center gap-1.5 rounded-lg border border-border text-f11 font-semibold uppercase tracking-wider text-muted-foreground disabled:opacity-60"
+          :class="isCompact ? 'h-8 px-2' : 'h-9 px-3.5'"
+          :disabled="copyBusy"
+          title="Copy every skin in this loadout into your own inventory"
+          @click="askCopyLoadout"
+        >
+          <Loader2 v-if="copyBusy" class="h-3.5 w-3.5 animate-spin" />
+          <Copy v-else class="h-3.5 w-3.5" />
+          <!-- Compact keeps the label. The icon alone is the same two sheets
+               of paper the inventory uses for "duplicate an item", and here it
+               would be the only header control whose meaning depends on
+               knowing whose loadout you are on. -->
+          <span>Copy loadout</span>
+        </button>
 
         <div v-if="user && !embedMode" class="flex items-center gap-1.5">
           <!-- Steam sync lives up here with the other account-level tools
@@ -7129,6 +7812,7 @@ if (MDEBUG) {
         v-if="view === 'armory'"
         key="armory"
         :weapons="weapons"
+        :owned="ownedItemIds"
         :compact="isCompact"
         @pick="armoryPick"
       />
@@ -7165,6 +7849,16 @@ if (MDEBUG) {
             <Check class="h-3 w-3" /> {{ allVisibleSelected ? 'Clear all' : 'Select all' }}
           </button>
           <div class="ml-auto flex items-center gap-2">
+            <!-- Exactly two. Comparison has an arity, and a Compare button that
+                 greys out at one or three explains itself less well than one that
+                 appears when the thing it does becomes possible. -->
+            <button
+              v-if="selectedIds.size === 2"
+              class="flex items-center gap-1.5 rounded-md border border-border bg-background/60 px-3.5 py-1.5 text-f10 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[hsl(var(--tac-amber,33_94%_58%))] hover:text-foreground"
+              @click="compareSelected"
+            >
+              <Copy class="h-3 w-3" /> Compare
+            </button>
             <button
               v-if="selectedIds.size"
               class="flex items-center gap-1.5 rounded-md border border-[#e04a3a]/60 bg-[#e04a3a]/10 px-3.5 py-1.5 text-f10 font-semibold uppercase tracking-wider text-[#ff7a6a] transition-colors hover:bg-[#e04a3a]/20"
@@ -7263,6 +7957,22 @@ if (MDEBUG) {
               ></template
             >
           </PillTabs>
+          <!-- Favourites. A single toggle rather than a fourth origin pill: the
+               pills are mutually exclusive and starring cuts across them. Hidden
+               entirely until something is starred, so it is not a dead control on
+               a fresh inventory. -->
+          <button
+            v-if="invHasFavourites"
+            type="button"
+            class="flex h-6 shrink-0 items-center gap-1 rounded-md border px-2 text-f10 uppercase tracking-wider transition-colors"
+            :class="invFavourites ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground hover:text-foreground'"
+            :style="invFavourites ? { background: accentSoft } : {}"
+            :aria-pressed="invFavourites"
+            :title="invFavourites ? 'Showing favourites only' : 'Show favourites only'"
+            @click="invFavourites = !invFavourites"
+          >
+            <Heart class="h-3 w-3" :class="invFavourites ? 'fill-current' : ''" />
+          </button>
           <FilterDropdown
             v-if="invRarityFacets.length"
             v-model="invRarity"
@@ -7356,6 +8066,18 @@ if (MDEBUG) {
                     :style="invOrigin === f[0] ? { background: accentSoft } : {}"
                     @click="invOrigin = f[0]"
                   >{{ f[1] }}</button>
+                  <!-- Same row as origin, because on a phone a section heading
+                       per single toggle costs more height than the control. -->
+                  <button
+                    v-if="invHasFavourites"
+                    :class="[INV_CHIP, 'gap-1.5', invFavourites ? INV_CHIP_ON : INV_CHIP_OFF]"
+                    :style="invFavourites ? { background: accentSoft } : {}"
+                    :aria-pressed="invFavourites"
+                    @click="invFavourites = !invFavourites"
+                  >
+                    <Heart class="h-3 w-3" :class="invFavourites ? 'fill-current' : ''" />
+                    Starred
+                  </button>
                 </div>
               </section>
 
@@ -7677,6 +8399,7 @@ if (MDEBUG) {
               @edit="openEdit(st.face)"
               @duplicate="openEdit(st.face)"
               @remove="deleteOwned(st.face)"
+              @favourite="(v) => toggleFavourite(st.face, v)"
             />
           </template>
           <!-- Keyed: TransitionGroup requires it, and a stable key keeps the
@@ -8203,13 +8926,27 @@ if (MDEBUG) {
               >
                 Report a problem
               </a>
+              <!-- Save. Opposite corner from the report link, on the same row,
+                   because both are things you do WITH the picture rather than to
+                   the item. -->
+              <button
+                v-if="focus3d && !focusViewer.busy.value"
+                :class="['absolute bottom-1 right-1 z-[3]', REPORT_LINK]"
+                title="Save this view as a PNG"
+                @click="downloadStageImage(focusViewer, itemName(focusRow?.item) || 'item')"
+              >
+                Save image
+              </button>
               <!-- Camera legend. Floats over the canvas at the bottom edge, where
                    the model almost never is, and sits at 70% until hovered so it
                    reads as chrome rather than as part of the item. -->
               <ViewerControls
                 v-if="focus3d && !focusViewer.busy.value"
                 variant="overlay"
+                :inspect="focusInspect.read"
                 class="absolute bottom-1 left-1/2 z-[3] -translate-x-1/2"
+                @inspect-play="focusInspect.play"
+                @inspect-seek="focusInspect.seek"
               />
             </div>
 
@@ -8373,10 +9110,14 @@ if (MDEBUG) {
                "Rarity" next to the actual rarity dropdown read as a second,
                broken rarity filter. -->
           <template v-if="sheetMode !== 'replace' && (!isCompact || sheetFiltersOpen)">
+            <!-- invSorts (HEAD's list — drops Value when there is no
+                 feed) crossed with needsOwnedItem (the predicate that knows wear
+                 and recent are meaningless over a catalog). Two different reasons
+                 a mode can be unavailable, and both still apply. -->
             <FilterDropdown
               :model-value="sheetSort"
               prefix="Sort"
-              :options="invSorts.map((s) => ({ value: s[0], label: s[1], disabled: s[0] === 'wear' && sheetMode === 'craft' }))"
+              :options="invSorts.map((s) => ({ value: s[0], label: s[1], disabled: needsOwnedItem(s[0]) && sheetMode === 'craft' }))"
               @update:model-value="setSheetSort"
             />
             <SortDirection v-model="sheetDir" :kind="sheetSortKind" :hint="sheetSortHint" />
@@ -8596,7 +9337,7 @@ if (MDEBUG) {
                     class="rounded-md border px-2.5 py-2 text-f10 uppercase tracking-cs1 transition-colors disabled:opacity-40"
                     :class="sheetSort === s[0] ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground'"
                     :style="sheetSort === s[0] ? { background: accentSoft } : {}"
-                    :disabled="s[0] === 'wear' && sheetMode === 'craft'"
+                    :disabled="needsOwnedItem(s[0]) && sheetMode === 'craft'"
                     @click="setSheetSort(s[0])"
                   >
                     {{ s[1] }}
@@ -8789,6 +9530,7 @@ if (MDEBUG) {
                 @edit="openEdit(st.face)"
                 @duplicate="openEdit(st.face)"
                 @remove="deleteOwned(st.face)"
+                @favourite="(v) => toggleFavourite(st.face, v)"
               />
             </template>
             <InfiniteSentinel
@@ -9382,7 +10124,18 @@ if (MDEBUG) {
                      half of this row. Without the two rules the link's text
                      wrapped to a second line at phone widths and shoved the
                      legend down with it. -->
-                <ViewerControls class="flex-none" :edit="!viewOnly" :rotate="craft.stickers.some(Boolean)" />
+                <!-- Transport in VIEW mode only. The viewer pauses itself on
+                     entering edit mode (setInteractive), and offering a play
+                     button that would start the camera turning under a sticker
+                     someone is aiming is the same mistake with an extra step. -->
+                <ViewerControls
+                  class="flex-none"
+                  :edit="!viewOnly"
+                  :rotate="craft.stickers.some(Boolean)"
+                  :inspect="viewOnly ? craftInspect.read : null"
+                  @inspect-play="craftInspect.play"
+                  @inspect-seek="craftInspect.seek"
+                />
               </div>
             </div>
           </div>
@@ -9733,6 +10486,8 @@ if (MDEBUG) {
               :inst="craftInst"
               :charm-albedo="charmAlbedo"
               :charm-loading="charmRailLoading"
+              :kill-history="killHistory"
+              :kill-history-busy="killHistoryBusy"
             />
 
           </div>
@@ -9902,6 +10657,65 @@ if (MDEBUG) {
          to /items/<id>/3d instead, which opens the craft modal in view mode —
          so there's no spec strip and no Edit/Inspect/Share here: a default
          weapon is a model, not an item anyone owns. -->
+    <!-- ============ COMPARE ============ -->
+    <!-- One stage, one camera, two items swapping underneath it. See the script
+         block for why this is a blink rather than two panes. -->
+    <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
+      <div
+        v-if="comparePair"
+        class="fixed inset-0 flex items-center justify-center bg-background" :style="{ zIndex: Z.stage }"
+        role="dialog" aria-modal="true" aria-label="Compare two items"
+        :class="isCompact ? 'p-0' : 'p-6'"
+      >
+        <div
+          class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
+          :class="isCompact ? 'h-full w-full' : 'h-[min(88vh,900px)] w-[min(96vw,1400px)] rounded-lg border border-border'"
+        >
+          <div class="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
+            <!-- Both names always, with the one on screen lit. The pair IS the
+                 context: a single title would make the blink ambiguous, because
+                 the whole point is that you stop being able to tell which you are
+                 looking at without being told. -->
+            <div class="flex min-w-0 items-center gap-2 text-f11 uppercase tracking-cs3">
+              <span class="truncate" :class="compareShown === 'a' ? 'text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground/50'">
+                {{ itemName(comparePair.a.item) }}
+              </span>
+              <span class="flex-none text-muted-foreground/40">vs</span>
+              <span class="truncate" :class="compareShown === 'b' ? 'text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground/50'">
+                {{ itemName(comparePair.b.item) }}
+              </span>
+            </div>
+            <div class="flex flex-none items-center gap-2">
+              <button
+                v-if="!compareViewer.busy.value"
+                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
+                title="Save this view as a PNG"
+                @click="downloadStageImage(compareViewer, itemName(compareItem?.item) || 'item')"
+              >
+                <Download class="h-3 w-3" /> Save
+              </button>
+              <button
+                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
+                title="Swap which item is on the stage — the camera stays put"
+                @click="swapCompare"
+              >
+                <RotateCcw class="h-3 w-3" /> Swap
+              </button>
+              <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="Close" aria-label="Close" @click="go(buildPath({ name: 'inventory' }))">
+                <X class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          <div class="relative min-h-0 flex-1">
+            <div ref="compareEl" class="h-full w-full"></div>
+            <div v-if="compareViewer.busy.value" class="pointer-events-none absolute inset-0 grid place-items-center">
+              <Loader2 class="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
       <!-- Edge to edge on compact, same reasoning as the craft modal above. -->
       <div
@@ -10375,6 +11189,45 @@ if (MDEBUG) {
         >
           <Trash2 class="h-3.5 w-3.5" /> Delete from inventory
         </button>
+    </ContextMenu>
+
+    <!-- Preset menu: everything you can do to a loadout that isn't switching to
+         it. The same ContextMenu as the two above rather than a bespoke
+         dropdown — on a phone it becomes a bottom sheet with touch-sized rows,
+         which a popover anchored to a 32px header button never would. -->
+    <ContextMenu :at="presetCtx" @close="presetCtx = null">
+      <template #title>{{ activePreset?.name ?? 'Loadout' }}</template>
+      <button :class="MENU_ROW" @click="presetCtx = null; startPresetRename()">
+        <Pencil class="h-3.5 w-3.5" /> Rename…
+      </button>
+      <!-- Duplicate leads over "new empty": rebuilding 15 craft-gated slots by
+           hand is the whole reason this feature exists, so the row that starts
+           you from what you're already wearing is the one people want. -->
+      <button
+        v-if="!presetsFull"
+        :class="[MENU_ROW, 'border-t border-border']"
+        @click="presetCtx = null; newPreset(true)"
+      >
+        <Copy class="h-3.5 w-3.5" /> Duplicate this loadout
+      </button>
+      <button v-if="!presetsFull" :class="MENU_ROW" @click="presetCtx = null; newPreset(false)">
+        <Plus class="h-3.5 w-3.5" /> New empty loadout
+      </button>
+      <!-- Deliberately NOT a MENU_ROW: it is a sentence, not an action, and
+           MENU_ROW's hover highlight would promise it does something. -->
+      <div v-else class="border-t border-border px-3 py-2 text-f11 leading-relaxed text-muted-foreground">
+        {{ PRESET_LIMIT }} loadouts is the limit — delete one to make room.
+      </div>
+      <!-- Hidden, not disabled, at one preset: there is no state in which it
+           becomes available without first creating another, so a dead row here
+           would only ever be furniture. -->
+      <button
+        v-if="presets.length > 1"
+        :class="[MENU_ROW, 'border-t border-border text-muted-foreground hover:!text-[#ff7a6a]']"
+        @click="presetCtx = null; askDeletePreset()"
+      >
+        <Trash2 class="h-3.5 w-3.5" /> Delete this loadout
+      </button>
     </ContextMenu>
   </div>
   </div>

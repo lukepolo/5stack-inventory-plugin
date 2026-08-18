@@ -28,7 +28,23 @@ const RESERVED = new Set([
 /** Lines that open a table CONSTRAINT rather than a column. */
 const CONSTRAINT = /^(primary|foreign|unique|check|constraint|exclude)\b/i;
 
-const sql = readFileSync("backend/src/schema.sql", "utf8");
+const rawSql = readFileSync("backend/src/schema.sql", "utf8");
+/**
+ * Comments stripped BEFORE the table scan.
+ *
+ * The scan is a regex for CREATE TABLE ... \n); and prose is not excluded from
+ * a regex. A comment containing the words "CREATE TABLE" — and one does, in the
+ * loadout-presets section — starts a match inside the prose, which then runs to
+ * the next `\n);` a hundred lines away and swallows a dollar-quoted DO block
+ * whole. Every PL/pgSQL keyword in it (DO, SELECT, WHERE, FOR, END) then gets
+ * reported as a reserved-word COLUMN, which is nine confident failures pointing
+ * at nothing.
+ *
+ * Only line comments: a `--` inside a string literal would be mangled by this,
+ * but schema.sql has none and a column default containing "--" would be its own
+ * kind of alarming.
+ */
+const sql = rawSql.replace(/^\s*--.*$/gm, "");
 const problems = [];
 
 for (const [, body] of sql.matchAll(/CREATE TABLE[^(]*\(([\s\S]*?)\n\);/g)) {

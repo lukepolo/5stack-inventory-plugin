@@ -16,13 +16,21 @@ import type { AttachSort } from "./api";
 
 // ---- items you own ----------------------------------------------------------
 
-export type SortMode = "default" | "rarity" | "name" | "wear" | "value";
+export type SortMode = "default" | "rarity" | "name" | "wear" | "recent" | "value" | "collection";
 
 export const SORTS: [SortMode, string][] = [
   ["default", "Default"],
+  // Next to Default because both answer "in what order did these arrive?", and
+  // this is the one people reach for after crafting a batch.
+  ["recent", "Recently added"],
   ["rarity", "Rarity"],
   ["name", "Name"],
   ["wear", "Wear"],
+  // Last, and after Wear, because it is the only mode that leaves part of the
+  // grid unsorted: an item with no collection (a vanilla weapon, a music kit,
+  // most knives) has nothing to rank by, and those all land together at the end
+  // rather than under a blank heading at the top.
+  ["collection", "Collection"],
   ["value", "Value"],
 ];
 
@@ -34,6 +42,21 @@ export const SORTS: [SortMode, string][] = [
  * because the list looks sorted. Callers filter SORTS through this.
  */
 export const SORTS_WITHOUT_VALUE = SORTS.filter(([mode]) => mode !== "value");
+
+/**
+ * Modes that need something only an item you OWN can have.
+ *
+ * `wear` needs a float, `recent` needs an acquisition date, and `value` needs a
+ * price the mirror may not carry; a catalog entry has none of them. Exported as
+ * one predicate because the surfaces that mix the two list kinds each used to
+ * spell the condition out inline — which is how `wear` came to be checked in two
+ * places by hand.
+ *
+ * `value` is NOT in here: it has its own gate (SORTS_WITHOUT_VALUE) because it
+ * turns on the operator's feed rather than on what kind of list this is.
+ */
+export const needsOwnedItem = (mode: SortMode): boolean =>
+  mode === "wear" || mode === "recent";
 
 /**
  * Catalog lists have no float, so offering "Wear" over one is a control that
@@ -55,6 +78,10 @@ export const SORT_NATURAL: Record<SortMode, SortDir> = {
   // Descending: "what are my most expensive things" is the question people
   // actually open a value sort to answer.
   value: "desc",
+  // Newest first: "recently added" names the thing you want at the top, so the
+  // natural direction is the one that puts it there.
+  recent: "desc",
+  collection: "asc",
 };
 
 export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
@@ -63,6 +90,11 @@ export const SORT_DIR_HINT: Record<SortMode, Record<SortDir, string>> = {
   name: { asc: "A → Z", desc: "Z → A" },
   wear: { asc: "Lowest float first", desc: "Highest float first" },
   value: { desc: "Most valuable first", asc: "Least valuable first" },
+  recent: { desc: "Newest first", asc: "Oldest first" },
+  // Spelled out rather than reusing the name hint's "A → Z": next to a grid the
+  // two modes sort visibly differently, and the hint is the only thing that says
+  // WHICH name is being ordered.
+  collection: { asc: "Collection A → Z", desc: "Collection Z → A" },
 };
 
 export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
@@ -71,6 +103,8 @@ export const SORT_DIR_KIND: Record<SortMode, SortKind> = {
   name: "alpha",
   wear: "numeric",
   value: "amount",
+  recent: "numeric",
+  collection: "alpha",
 };
 
 // ---- catalog attachments ----------------------------------------------------

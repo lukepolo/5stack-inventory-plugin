@@ -80,12 +80,16 @@ export interface Skin {
   wearMax?: number | null;
   seedMin?: number | null;
   seedMax?: number | null;
-  // ---- sheet facets. Only graffiti carries these today; the sheet's filter bar
-  // is driven entirely by which of them appear on the list it loaded, so a
-  // catalog without them renders exactly as it did before.
+  // ---- sheet facets. The sheet's filter bar is driven entirely by which of
+  // them appear on the list it loaded, so a catalog without them renders exactly
+  // as it did before — which is what let `collection` spread from graffiti to
+  // every weapon, knife, glove and agent finish without touching the bar.
   /** Coarse "what IS this" split — the sheet's tab strip. */
   group?: string;
-  /** Capsule / box / tournament it came in. Absent when it came in none. */
+  /** The set it came in — a capsule for graffiti, a case, map or drop pool for a
+   *  finish. Absent when it came in none: M4A4 | Howl's collection was withdrawn
+   *  with the skin, and the classic knife pool is the special of eleven cases at
+   *  once, so no single one is true. */
   collection?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
@@ -142,6 +146,10 @@ export interface CatalogItem {
   design?: number;
   /** That variant's colourway ("Cash Green"). */
   tintName?: string;
+  /** The set it came in — see `Skin.collection`. Present on an OWNED instance
+   *  too (the backend resolver fills it), which is what lets the inventory grid
+   *  and the loadout sheet sort by collection. */
+  collection?: string;
 }
 
 export interface LoadoutEntry {
@@ -168,6 +176,21 @@ export interface LoadoutEntry {
   /** The whole slot: skin + every sticker, patch and charm on it. Safe to sum
    *  across a team — an attachment lives on one weapon, in one slot. */
   value?: number | null;
+  /**
+   * Attachments, sent only by the PUBLIC player-loadout endpoint.
+   *
+   * Your own loadout doesn't carry them and doesn't need to: every skinned row
+   * there points at something in your inventory, and that item is where the
+   * screen reads stickers from. A visitor holds no inventory for the player
+   * they are looking at, so nothing could resolve — which is why viewing
+   * someone's loadout used to show a bare gun where they had five stickers and
+   * a charm. The row brings its own, enriched exactly like an owned item's,
+   * minus the `inst` handles: those name rows in the owner's inventory and
+   * never leave their account.
+   */
+  stickers?: PlacedItem[];
+  patches?: PlacedItem[];
+  charm?: PlacedCharm;
 }
 
 // An owned, crafted item instance in the user's inventory.
@@ -178,6 +201,10 @@ export interface LoadoutEntry {
 // It must survive the round trip — see the Attach type in App.vue.
 export type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null } | null;
 export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null }) | null;
+/** An attached charm: catalog item, its offset on the gun, and the pattern that
+ *  grades its material. Named rather than inlined because two shapes carry one
+ *  — an owned item and a public loadout row — and they must not drift. */
+export type PlacedCharm = (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
 
 export interface InventoryItem {
   id: number;
@@ -191,7 +218,7 @@ export interface InventoryItem {
   nametag: string | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
-  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
+  charm?: PlacedCharm;
   slot: string | null;
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];
@@ -206,6 +233,15 @@ export interface InventoryItem {
    *  A string, like every other owned-item id on the wire — node-postgres
    *  renders bigints as strings, so `id` is `"1014"` and this must match it. */
   attached_to?: string | null;
+  /** When this instance was crafted, imported or copied — an ISO string (the
+   *  column is timestamptz; node-postgres yields a Date and JSON stringifies
+   *  it). Drives the "Recently added" sort. Optional because an older backend
+   *  does not send it, and a mode with nothing to sort on has to degrade rather
+   *  than reorder the grid at random. */
+  created_at?: string | null;
+  /** Starred by the owner. A personal marker, not a property of the item — which
+   *  is why it is allowed on Steam-imported rows that are otherwise read-only. */
+  favourite?: boolean;
 }
 
 // Item artwork lives on our own mount, served under /images by the plugin host
@@ -573,6 +609,45 @@ export const fetchSkins = (slot: string) =>
     tints: Array.isArray(r.tints) ? r.tints : [],
   }));
 
+// ---- Collections ------------------------------------------------------------
+//
+// The case, map or drop pool a finish came out of. The index is small enough to
+// hold whole, and it carries the member ids on purpose: "you own 4 of 17" is
+// then an intersection with the inventory already in memory, so the badge on a
+// tile and the page behind it can never disagree.
+
+/** How you get a collection — the tab strip on the collections index, and what
+ *  decides whether its skins can be StatTrak (case) or Souvenir (souvenir). */
+export type CollectionSource = "case" | "souvenir" | "drop";
+
+export interface Collection {
+  /** cs2-lib's own key ("set_bravo_i") — the handle, not the display name. */
+  key: string;
+  name: string;
+  /** The set's best finish — its art and its rarity colour, so a collection
+   *  tile lights the same way an item tile does. */
+  image: string | null;
+  rarity: string | null;
+  source: CollectionSource;
+  itemIds: number[];
+}
+
+// Normalised here for the same reason every other catalog fetch is: frontend and
+// backend ship as SEPARATE images, so a bundle that knows about collections runs
+// against a backend that doesn't for as long as it takes both to roll. An empty
+// list is what "this backend has no collections" has to look like — the armory
+// hides the section rather than showing one that opens onto nothing.
+export const fetchCollections = () =>
+  request<Collection[]>("/catalog/collections")
+    .then((r) => (Array.isArray(r) ? r : []))
+    .catch(() => [] as Collection[]);
+
+export const fetchCollection = (key: string) =>
+  request<Collection & { skins: Skin[] }>(`/catalog/collection?key=${encodeURIComponent(key)}`).then((r) => ({
+    ...r,
+    skins: r.skins ?? [],
+  }));
+
 export const fetchLoadout = () => request<LoadoutEntry[]>("/loadout");
 
 // ---- Inventory (owned instances) ----
@@ -700,6 +775,33 @@ export const updateInstance = (
   request<InventoryItem>(`/inventory/${id}`, {
     method: "POST",
     body: JSON.stringify(body),
+  });
+
+/**
+ * Star or unstar an owned instance.
+ *
+ * Sends the desired STATE rather than a toggle: a double-click on a toggle route
+ * fires twice and lands back where it started, and the caller already knows
+ * which way the heart is pointing.
+ */
+export const setFavourite = (id: number, favourite: boolean) =>
+  request<{ favourite: boolean }>(`/inventory/${id}/favourite`, {
+    method: "POST",
+    body: JSON.stringify({ favourite }),
+  });
+
+/** One wishlisted CATALOG item — something wanted but not owned, so it has no
+ *  instance id and nothing to attach a flag to. See setWishlist. */
+export interface WishlistEntry {
+  item_id: number;
+  created_at: string;
+  item: CatalogItem | null;
+}
+export const fetchWishlist = () => request<WishlistEntry[]>("/wishlist");
+export const setWishlist = (item_id: number, want: boolean) =>
+  request<{ want: boolean }>("/wishlist", {
+    method: "POST",
+    body: JSON.stringify({ item_id, want }),
   });
 
 // Public read-only loadout for any player + clone it into your own.
@@ -1216,6 +1318,48 @@ export const fetchDraftInspectLink = (body: {
 export const fetchInspectLink = (id: number) =>
   request<{ inspect: string; stattrak: boolean }>(`/inventory/${id}/inspect`);
 
+// ---- StatTrak history -------------------------------------------------------
+// The ledger behind the counter: where this gun has actually been. OWNER ONLY —
+// the endpoint is scoped to the caller and there is deliberately no public
+// equivalent, so nothing here is reachable from a shared loadout link or the
+// player-profile tab. Kill history says when somebody was playing and on which
+// server; a loadout says what colour their AK is.
+
+/** One match leg — a match on one map. A best-of-three is three of these. */
+export interface KillMatch {
+  /** Panel match id, or null for kills we could not attribute (pickup server,
+   *  panel tables unreachable, or the match had already ended). */
+  match_id: string | null;
+  match_map_id: string | null;
+  map: string | null;
+  kills: number;
+  first_at: string;
+  last_at: string;
+}
+
+export interface KillHistory {
+  /** owned_items.stattrak_count — the number on the module. */
+  counted: number;
+  /** Rows in the ledger. Lower than `counted` by however many kills landed
+   *  before the ledger existed; the UI shows both rather than pretending. */
+  logged: number;
+  first_at: string | null;
+  last_at: string | null;
+  /** Distinct panel matches, which is NOT `matches.length` — a best-of-three is
+   *  one match and three legs, and unattributed kills are legs with no match. */
+  match_count: number;
+  /** Match legs, most recent first. */
+  matches: KillMatch[];
+  maps: { map: string; kills: number }[];
+  /** Daily totals over the last 30 days, ascending, keyed `YYYY-MM-DD` in UTC.
+   *  Sparse — only days with kills are present, so the client fills the gaps
+   *  itself rather than the server sending thirty rows of mostly zero. */
+  days: { day: string; kills: number }[];
+}
+
+export const fetchKillHistory = (id: number) =>
+  request<KillHistory>(`/inventory/${id}/kills`);
+
 export const deleteInstance = (id: number) =>
   request<{ ok: true }>(`/inventory/${id}`, { method: "DELETE" });
 
@@ -1250,3 +1394,48 @@ export const unequip = (team: Team, slot: string) =>
     `/loadout?team=${team}&slot=${encodeURIComponent(slot)}`,
     { method: "DELETE" },
   );
+
+// ---- Loadout presets --------------------------------------------------------
+// Named builds. Only ONE of them is "the loadout" at a time — the rest are
+// parked server-side — so every mutation below changes what `fetchLoadout`
+// returns, and callers refresh rather than patch their copy.
+
+export interface LoadoutPreset {
+  /** A bigint on the wire, i.e. a STRING, same as every owned-item id here.
+   *  Compare with `String(...)` and never with `===` against a literal number. */
+  id: string;
+  name: string;
+  /** The one whose slots are the live loadout. Exactly one is ever true. */
+  active: boolean;
+  /** Filled slots across both teams — what the switcher shows under the name. */
+  slots: number;
+}
+
+export const fetchPresets = () => request<LoadoutPreset[]>("/loadout/presets");
+
+/** `copy: true` seeds the new preset from the loadout you are wearing now.
+ *  It does NOT duplicate the owned items — both presets point at the same
+ *  crafted instances, because crafting is the gate and a preset is only an
+ *  arrangement of what you already own. */
+export const createPreset = (body: { name?: string; copy?: boolean } = {}) =>
+  request<LoadoutPreset>("/loadout/presets", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const renamePreset = (id: string, name: string) =>
+  request<{ id: string; name: string; active: boolean }>(`/loadout/presets/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+
+/** Deleting the preset you are wearing moves you to another one, so the
+ *  response names whichever is active afterwards. */
+export const deletePreset = (id: string) =>
+  request<{ ok: true; active: string }>(`/loadout/presets/${id}`, { method: "DELETE" });
+
+export const activatePreset = (id: string) =>
+  request<{ ok: true; active: string }>(`/loadout/presets/${id}/activate`, {
+    method: "POST",
+    body: "{}",
+  });

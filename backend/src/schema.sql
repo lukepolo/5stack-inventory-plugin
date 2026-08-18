@@ -43,19 +43,6 @@ CREATE TABLE IF NOT EXISTS inventory.loadout (
 );
 CREATE INDEX IF NOT EXISTS loadout_steam_id_idx ON inventory.loadout (steam_id);
 
--- CS2-style positional slots: sp (starting pistol), p1-p4 (other pistols),
--- m1-m5 (mid-tier), r1-r5 (rifles), knife, gloves, agent. Drop rows from the
--- legacy one-slot-per-weapon scheme.
---
--- KEEP THIS IN STEP WITH SLOT_RE IN main.ts. This file is re-applied on every
--- boot, so a slot the API accepts but this list forgets is not a stale-data
--- cleanup — it is a wipe on the next restart, and it looks like the equip
--- silently failing hours later. 'graffiti' was exactly that: equippable since
--- the graffiti sheet shipped, absent here, deleted on every backend restart.
-DELETE FROM inventory.loadout WHERE slot NOT IN
-  ('sp','p1','p2','p3','p4','m1','m2','m3','m4','m5','r1','r2','r3','r4','r5',
-   'knife','gloves','agent','zeus','c4','musickit','graffiti','collectible');
-
 -- Migration: point the loadout at an owned instance instead of an inline item.
 ALTER TABLE inventory.loadout ADD COLUMN IF NOT EXISTS item_instance_id bigint;
 ALTER TABLE inventory.loadout ALTER COLUMN item_id DROP NOT NULL;
@@ -68,6 +55,120 @@ DO $$ BEGIN
       FOREIGN KEY (item_instance_id) REFERENCES inventory.owned_items (id) ON DELETE CASCADE;
   END IF;
 END $$;
+
+-- ---- Loadout presets --------------------------------------------------------
+--
+-- Named builds you switch between, the way CS2 ships five loadout slots. The
+-- shape here is deliberately lopsided: the preset you are WEARING has no rows
+-- of its own at all — its slots are `inventory.loadout`, unchanged, exactly the
+-- rows every query in main.ts already reads. Only the presets you are not
+-- wearing park their slots in `loadout_preset_slots`, and activating one swaps
+-- the two sets over inside a transaction.
+--
+-- The obvious alternative — fold a preset_id into inventory.loadout's primary
+-- key — was rejected for one reason: `GET /api/equipped/v5/:steamId` is the
+-- hottest read in the system. Every CS2 game server hits it, unauthenticated,
+-- for every player on every connect, and it is one index scan on (steam_id).
+-- A preset_id in that key would make it carry a "which preset is active"
+-- lookup forever, on every connect, to serve a feature the game server does not
+-- know exists — and it would put a preset filter into five other loadout
+-- queries besides, each of them a place to forget one and serve a player
+-- somebody else's build. Keeping the live loadout a table of exactly the live
+-- rows means none of those queries learned that presets exist.
+CREATE TABLE IF NOT EXISTS inventory.loadout_presets (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  steam_id bigint NOT NULL,
+  name text NOT NULL,
+  -- The pointer. Exactly one row per player carries it: the preset whose slots
+  -- are the ones sitting in inventory.loadout right now.
+  active boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS loadout_presets_steam_id_idx ON inventory.loadout_presets (steam_id);
+
+-- "At most one active preset per player", enforced by the database rather than
+-- by a code path that has to remember. Activation clears one flag and sets
+-- another; two tabs racing, or a crash between the two statements, would
+-- otherwise leave a player with two actives and nothing able to say which of
+-- them inventory.loadout actually holds — an ambiguity that costs you a build
+-- the next time you switch.
+CREATE UNIQUE INDEX IF NOT EXISTS loadout_presets_active_idx
+  ON inventory.loadout_presets (steam_id) WHERE active;
+
+-- The parked slots of every preset that is NOT active: the same columns as
+-- inventory.loadout, minus steam_id (the preset row owns that).
+--
+-- item_instance_id cascades on delete, matching the live loadout. That is a
+-- decision, not an inherited default: the loadout is craft-gated, so a slot IS
+-- a pointer at one specific owned instance, and once that instance is gone
+-- there is nothing legal left for the slot to hold. RESTRICT would instead make
+-- deleting a skin from your inventory fail because of a preset you are not
+-- looking at, naming a slot you would then have to go and empty by hand. The
+-- cost is that a delete now quietly empties that slot in every preset, not just
+-- the one on screen — same behaviour as today, just reaching further.
+CREATE TABLE IF NOT EXISTS inventory.loadout_preset_slots (
+  preset_id bigint NOT NULL REFERENCES inventory.loadout_presets (id) ON DELETE CASCADE,
+  team text NOT NULL,
+  slot text NOT NULL,
+  item_id integer,                 -- free vanilla weapon, same meaning as inventory.loadout.item_id
+  item_instance_id bigint REFERENCES inventory.owned_items (id) ON DELETE CASCADE,
+  wear real,
+  seed integer,
+  stattrak boolean NOT NULL DEFAULT false,
+  nametag text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (preset_id, team, slot)
+);
+
+-- Backfill: every player who already has a loadout gets a preset that IS it.
+--
+-- This moves ZERO rows. The live loadout stays in inventory.loadout untouched;
+-- all the new row does is give it a name and a handle. That is the property
+-- worth having in a migration re-applied on every boot — there is no step in it
+-- that can lose somebody's build, because there is no step in it that writes to
+-- inventory.loadout at all.
+--
+-- Guarded on "has no ACTIVE preset" rather than "has no presets": a player left
+-- with presets but no active one (a half-applied activation, say) has no live
+-- loadout the backend can name, and every write path is stuck until one exists.
+-- Self-healing beats stuck. main.ts mints the same row lazily for players who
+-- have never equipped anything, so this only has to cover the ones who have.
+INSERT INTO inventory.loadout_presets (steam_id, name, active)
+SELECT DISTINCT l.steam_id, 'Loadout 1', true
+  FROM inventory.loadout l
+ WHERE NOT EXISTS (
+   SELECT 1 FROM inventory.loadout_presets p WHERE p.steam_id = l.steam_id AND p.active
+ );
+
+-- CS2-style positional slots: sp (starting pistol), p1-p4 (other pistols),
+-- m1-m5 (mid-tier), r1-r5 (rifles), knife, gloves, agent. Drop rows from the
+-- legacy one-slot-per-weapon scheme.
+--
+-- KEEP THIS IN STEP WITH SLOT_RE IN main.ts. This file is re-applied on every
+-- boot, so a slot the API accepts but this list forgets is not a stale-data
+-- cleanup — it is a wipe on the next restart, and it looks like the equip
+-- silently failing hours later. 'graffiti' was exactly that: equippable since
+-- the graffiti sheet shipped, absent here, deleted on every backend restart.
+--
+-- Presets doubled the number of tables holding a `slot`, so the list is written
+-- ONCE into a CTE and both are cleaned from it — two literal copies would just
+-- have been the same trap again, one table deep. A data-modifying CTE always
+-- runs to completion whether or not the outer query reads it, which is what
+-- lets the first DELETE ride along inside a statement whose result is the
+-- second one. It has to sit here, below both CREATE TABLEs, for that reason.
+WITH legal_slot (slot) AS (
+  VALUES ('sp'),('p1'),('p2'),('p3'),('p4'),
+         ('m1'),('m2'),('m3'),('m4'),('m5'),
+         ('r1'),('r2'),('r3'),('r4'),('r5'),
+         ('knife'),('gloves'),('agent'),('zeus'),('c4'),
+         ('musickit'),('graffiti'),('collectible')
+), live AS (
+  DELETE FROM inventory.loadout
+   WHERE slot NOT IN (SELECT slot FROM legal_slot)
+)
+DELETE FROM inventory.loadout_preset_slots
+ WHERE slot NOT IN (SELECT slot FROM legal_slot);
 
 -- Attachments become owned instances.
 --
@@ -293,3 +394,83 @@ CREATE TABLE IF NOT EXISTS inventory.price_history (
   PRIMARY KEY (market_hash_name, version, period)
 );
 CREATE INDEX IF NOT EXISTS price_history_fetched_idx ON inventory.price_history (fetched_at);
+-- Append-only StatTrak kill ledger: one row per counted kill.
+--
+-- `owned_items.stattrak_count` remains the source of truth for the NUMBER — it
+-- is what the module renders, what the equipped feed carries and what a player
+-- actually sees. This table is the STORY behind that number, and the two are
+-- written by separate statements on purpose (see /api/increment-item-stattrak):
+-- a ledger that is missing, slow or broken must never cost somebody a kill.
+--
+-- Consequence worth stating plainly: `count(*)` here is normally LOWER than
+-- stattrak_count, and that is correct rather than drift. Every kill counted
+-- before this table existed has no row, and never will — the information was
+-- discarded at the time. The history view says "of N" against the real counter
+-- instead of pretending the ledger is complete.
+CREATE TABLE IF NOT EXISTS inventory.stattrak_kills (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  item_instance_id bigint NOT NULL REFERENCES inventory.owned_items (id) ON DELETE CASCADE,
+  -- Denormalised owner. The endpoint has already proved this pair (the increment
+  -- is scoped to `id = $1 AND steam_id = $2`), and carrying it means a history
+  -- read is a filter on this table rather than a join through owned_items —
+  -- one fewer way for a scoping bug to hand somebody else's kills out.
+  steam_id bigint NOT NULL,
+  killed_at timestamptz NOT NULL DEFAULT now(),
+  -- Panel match context, resolved AT WRITE TIME. The game-server plugin sends
+  -- no match id, so the only moment anyone can tell which match this kill
+  -- belonged to is while it is still running; an hour later the join is
+  -- guesswork against a finished match's timestamps.
+  --
+  -- A SNAPSHOT, deliberately not a foreign key. `public.matches` belongs to the
+  -- panel, not to this plugin: a real FK would make our boot-time schema depend
+  -- on their tables existing (this plugin is also installable against a database
+  -- that has no panel in it), tie our rows to their retention policy, and put
+  -- our table in the way of their deletes. text rather than uuid for the same
+  -- reason — we do not own that column's type and should not encode a bet on it.
+  --
+  -- All three are nullable and stay nullable. "Kill 1,204, and we could not tell
+  -- you where" is a perfectly good ledger row; a kill on a pickup server or with
+  -- the panel unreachable still happened.
+  match_id text,
+  match_map_id text,
+  map_name text
+);
+-- The one index this table needs, and it is the only read path: every history
+-- query enters through an item the caller owns and walks that item's rows in
+-- time order (first kill, per-match rollup, the daily trend). Leading with
+-- item_instance_id also gives the ON DELETE CASCADE above an index to use, so
+-- scrapping a gun with a long history stays a lookup rather than a table scan.
+--
+-- Nothing here indexes steam_id on its own. There is no "all kills by player"
+-- read — the loadout rollup sums owned_items.stattrak_count instead — and an
+-- index nobody reads is pure write cost on the hottest insert in the app.
+CREATE INDEX IF NOT EXISTS stattrak_kills_item_idx
+  ON inventory.stattrak_kills (item_instance_id, killed_at);
+
+-- ---- Favourites -------------------------------------------------------------
+-- Two shapes, because "favourite" means two different things here and only one
+-- of them is a row you own.
+--
+-- An OWNED instance gets a column: it is one boolean about an existing row, and
+-- a side table keyed on that row would only add a join to every inventory read.
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS favourite boolean NOT NULL DEFAULT false;
+-- Partial, because the read is always "the ones I starred" and starred items are
+-- the small minority. Indexing the false side would be most of the table.
+CREATE INDEX IF NOT EXISTS owned_items_favourite_idx
+  ON inventory.owned_items (steam_id) WHERE favourite;
+
+-- A CATALOG item cannot: it is not a row in owned_items and never will be until
+-- someone crafts it, so there is nothing to flag. This is the wishlist — "I want
+-- that Fade one day" — and it is keyed by the cs2-lib item id, which is why it
+-- cannot be a nullable column on the inventory table.
+--
+-- No foreign key to anything: item_id addresses the economy, which lives in
+-- cs2-lib and not in this database. An id cs2-lib later retires simply stops
+-- resolving through getItem and the row reads as unknown, which is the same
+-- degradation every other stored item_id already has.
+CREATE TABLE IF NOT EXISTS inventory.wishlist (
+  steam_id bigint NOT NULL,
+  item_id integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (steam_id, item_id)
+);

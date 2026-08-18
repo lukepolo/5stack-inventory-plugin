@@ -21,13 +21,17 @@
 // kind of surface without borrowing a single new colour or typeface to do it.
 import { computed, inject, nextTick, ref, shallowRef, watch } from "vue";
 import { makeRail, railTransition } from "../pill";
-import { ChevronRight, Loader2, Search, X } from "lucide-vue-next";
+import { Check, ChevronRight, Loader2, Search, X } from "lucide-vue-next";
 import {
+  fetchCollection,
+  fetchCollections,
   fetchSkins,
   searchAttachments,
   type AttachFacet,
   type AttachKind,
   type CatalogWeapon,
+  type Collection,
+  type CollectionSource,
   type Skin,
 } from "../api";
 import { CARD_ART, glowStyle, itemName, rarityName, rarityRank, stripName } from "../itemVisuals";
@@ -43,6 +47,16 @@ import CatalogFilters, { type FacetAxis, type FacetOption } from "./CatalogFilte
 const props = defineProps<{
   /** Already loaded by App — the armory never re-fetches the weapon list. */
   weapons: CatalogWeapon[];
+  /**
+   * Catalog ids the viewer owns at least one copy of.
+   *
+   * A SET rather than the inventory, because that is the only shape this screen
+   * has any use for: "you own 4 of 17" is `collection.itemIds` intersected with
+   * this, and nothing here cares how many copies, what float, or which instance.
+   * Passing the inventory itself would hand a browser screen a list of the
+   * viewer's possessions it would then have to be careful with.
+   */
+  owned: Set<number>;
   compact: boolean;
 }>();
 const emit = defineEmits<{
@@ -57,10 +71,13 @@ const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
 // so the rail, the fetch and the breadcrumb all read from one place.
 type Section =
   | { key: string; label: string; kind: "weapons" }
+  | { key: string; label: string; kind: "collections" }
   | { key: string; label: string; kind: "slot"; slot: string }
   | { key: string; label: string; kind: "attach"; attach: AttachKind };
 
 const SECTIONS: Section[] = [
+  // Two levels, like Weapons: the sets, then what is in one.
+  { key: "collection", label: "Collections", kind: "collections" },
   { key: "weapon", label: "Weapons", kind: "weapons" },
   { key: "knife", label: "Knives", kind: "slot", slot: "knife" },
   { key: "gloves", label: "Gloves", kind: "slot", slot: "gloves" },
@@ -72,23 +89,52 @@ const SECTIONS: Section[] = [
   { key: "charm", label: "Charms", kind: "attach", attach: "charm" },
   { key: "patch", label: "Patches", kind: "attach", attach: "patch" },
 ];
+// Fetched ONCE, up front, and held for the life of the screen — 94 rows, and the
+// ownership badge on every tile needs the member ids anyway. It also decides
+// whether the rail lists the section at all, so it cannot wait for someone to
+// open it. Declared HERE, above the rail that reads it: `sectionLive` runs inside
+// a computed the template evaluates on first render, and a `const` reached
+// before its declaration throws on the temporal dead zone — which takes the whole
+// screen out, since a setup that throws mounts nothing. Same trap as `rail` below.
+const collections = shallowRef<Collection[]>([]);
+void fetchCollections().then((list) => (collections.value = list));
+
 /**
- * The rail's two halves, NAMED — gear you equip, then things you stick on it.
+ * Hide a section the backend behind this bundle can't answer.
+ *
+ * Frontend and backend ship as separate images, so a bundle that knows about
+ * collections runs against a backend that doesn't for as long as it takes both
+ * to roll. An index that comes back empty means exactly that, and a rail entry
+ * that opens onto a permanently blank grid is worse than no entry.
+ */
+const sectionLive = (s: Section) => s.kind !== "collections" || collections.value.length > 0;
+
+/**
+ * The rail's three parts, NAMED — where things came from, gear you equip, then
+ * things you stick on it.
  *
  * Headed groups rather than the bare hairline that was here before, matching the
  * panel's settings side-tabs: nine flat entries with a rule two-thirds down
  * leaves you to infer what the rule meant.
  */
 const RAIL_GROUPS: { label: string; keys: string[] }[] = [
+  // Its own group, and FIRST. A collection is not a peer of Knives or Stickers —
+  // it cuts across both halves below it, and it is the one entry here that
+  // browses by where something CAME FROM rather than by what it is.
+  { label: "Browse", keys: ["collection"] },
   { label: "Gear", keys: ["weapon", "knife", "gloves", "agent", "musickit", "graffiti", "collectible"] },
   { label: "Attachments", keys: ["sticker", "charm", "patch"] },
 ];
+// A group whose every entry dropped out goes with them — an amber heading over
+// nothing reads as a section that failed to load.
 const railGroups = computed(() =>
   RAIL_GROUPS.map((g) => ({
     label: g.label,
-    items: g.keys.map((k) => SECTIONS.find((s) => s.key === k)!).filter(Boolean),
-  })),
+    items: g.keys.map((k) => SECTIONS.find((s) => s.key === k)!).filter((s) => s && sectionLive(s)),
+  })).filter((g) => g.items.length),
 );
+/** The compact rail is the same list, flat — so it has to drop the same entries. */
+const liveSections = computed(() => SECTIONS.filter(sectionLive));
 
 // CS2's own buy-menu grouping. Ordered as the buy menu orders it, because that
 // is the order these weapons live in every player's head.
@@ -117,8 +163,32 @@ watch(
 );
 /** The weapon drilled into, within the Weapons section. Null = still picking one. */
 const model = ref<string | null>(null);
+/** The collection drilled into, by key. Null = still on the index of them. */
+const collectionKey = ref<string | null>(null);
 const weaponGroup = ref("");
 const q = ref("");
+
+/** Tab order as shown. "All" is the UI's own and goes last, same as everywhere. */
+const COLLECTION_SOURCES: { value: CollectionSource; label: string }[] = [
+  { value: "case", label: "Cases" },
+  { value: "souvenir", label: "Souvenir" },
+  { value: "drop", label: "Drops" },
+];
+/** Singular, for the line under a collection's name. */
+const SOURCE_NOTE: Record<CollectionSource, string> = {
+  case: "Weapon case",
+  souvenir: "Souvenir package",
+  drop: "In-game drop",
+};
+
+const collection = computed(() => collections.value.find((c) => c.key === collectionKey.value) ?? null);
+/** How many of a set you already have. The whole of the ownership feature: the
+ *  inventory is loaded, the members are on the row, so this is an intersection
+ *  and never a request. */
+const ownedIn = (c: Collection) => c.itemIds.reduce((n, id) => n + (props.owned.has(id) ? 1 : 0), 0);
+const progress = computed(() =>
+  collection.value ? { have: ownedIn(collection.value), of: collection.value.itemIds.length } : null,
+);
 
 // ---- results -----------------------------------------------------------------
 // shallowRef: these lists run to thousands of plain data objects that are only
@@ -175,6 +245,11 @@ function countBy(pick: (s: Skin) => string | undefined, skip: string) {
   }
   return seen;
 }
+/** The search box, over a list this screen holds whole. */
+const matchesQuery = (name: string) => {
+  const needle = q.value.trim().toLowerCase();
+  return !needle || name.toLowerCase().includes(needle);
+};
 /** Does this row survive the active filters, optionally ignoring one axis? */
 function passes(s: Skin, skip = "") {
   if (skip !== "group" && group.value && (s.group ?? "") !== group.value) return false;
@@ -185,7 +260,21 @@ function passes(s: Skin, skip = "") {
 }
 
 const isAttach = computed(() => section.value.kind === "attach");
+/** The index OF collections, as opposed to the inside of one — the level whose
+ *  rows are sets rather than skins, and so the one level that facets itself. */
+const isCollectionIndex = computed(() => section.value.kind === "collections" && !collectionKey.value);
 const tabs = computed<FacetOption[]>(() => {
+  if (isCollectionIndex.value) {
+    const matching = collections.value.filter((c) => matchesQuery(c.name));
+    return [
+      ...COLLECTION_SOURCES.map((s) => ({
+        value: s.value,
+        label: s.label,
+        count: matching.filter((c) => c.source === s.value).length,
+      })),
+      { value: "", label: "All", count: matching.length },
+    ];
+  }
   if (isAttach.value) {
     if (srvGroups.value.length < 2) return [];
     // "All" is the UI's own tab and goes LAST, counting matches for the text
@@ -207,6 +296,9 @@ const tabs = computed<FacetOption[]>(() => {
   ];
 });
 const axes = computed<FacetAxis[]>(() => {
+  // A set has no rarity and no colourway of its own, and its ONE narrowing axis
+  // — how you get it — is already the tab strip above.
+  if (isCollectionIndex.value) return [];
   if (isAttach.value) {
     const out: FacetAxis[] = [];
     if (srvCollections.value.length > 1) {
@@ -297,14 +389,37 @@ type Tile = {
   image: string | null;
   rarity?: string;
   altName?: string | null;
-  /** Set when clicking goes DEEPER instead of opening the editor. */
+  /** Set when clicking goes DEEPER instead of opening the editor. A weapon model
+   *  within Weapons, a collection key within Collections — `section.kind` is
+   *  what says which, the same way it says what `load` should fetch. */
   drill?: string;
   skin?: Skin;
   /** Secondary line in the hero — "Rifle", "Classified", etc. */
   note?: string;
+  /** How much of a SET you have. Only collection tiles carry it. */
+  own?: { have: number; of: number };
+  /** This exact finish is already in your inventory. */
+  mine?: boolean;
 };
 
 const tiles = computed<Tile[]>(() => {
+  if (isCollectionIndex.value) {
+    return collections.value
+      .filter((c) => (!group.value || c.source === group.value) && matchesQuery(c.name))
+      .map((c) => ({
+        key: `c-${c.key}`,
+        // "The … Collection" wraps both ends of every single name here, so on a
+        // 124px tile it is most of a truncated label saying nothing — "The Chop
+        // Shop Colle…". Trimmed to the part that differs; the hero band and the
+        // breadcrumb both print the full name, so nothing is actually lost.
+        name: c.name.replace(/^The /, "").replace(/ Collection$/, ""),
+        image: c.image,
+        rarity: c.rarity ?? undefined,
+        drill: c.key,
+        note: `${c.itemIds.length} skins · ${SOURCE_NOTE[c.source]}`,
+        own: { have: ownedIn(c), of: c.itemIds.length },
+      }));
+  }
   if (section.value.kind === "weapons" && !model.value) {
     return weaponModels.value.map((w) => ({
       key: `w-${w.model}`,
@@ -331,6 +446,11 @@ const tiles = computed<Tile[]>(() => {
       altName: s.altName,
       skin: s,
       note: s.collection ?? undefined,
+      // Marked on every catalog, not only inside a collection: "do I already
+      // have this" is the question you are asking of any grid of things you
+      // don't own, and it is what makes "4 of 17" legible as a picture rather
+      // than as a number.
+      mine: props.owned.has(s.id),
     }));
 });
 
@@ -347,6 +467,19 @@ async function load(offset = 0) {
   try {
     if (sec.kind === "weapons" && !model.value) {
       // Nothing to fetch — the weapon list came with the catalog.
+      return;
+    }
+    if (sec.kind === "collections") {
+      // Same: the index arrived at mount. Only the inside of a set is a request,
+      // and it is a whole one — a collection is 9 to 41 finishes, so it is held
+      // and filtered locally like every other non-attachment catalog here.
+      if (!collectionKey.value) return;
+      const page = await fetchCollection(collectionKey.value);
+      if (mine !== token) return;
+      rows.value = page.skins;
+      total.value = page.skins.length;
+      sheetGroups.value = [];
+      sheetTints.value = [];
       return;
     }
     if (sec.kind === "attach") {
@@ -405,7 +538,7 @@ function loadMore() {
 // Section / drill changes reset the view AND its filters: a collection picked
 // among stickers means nothing among knives, and carrying it over would show an
 // empty grid with no visible cause.
-watch([sectionKey, model], () => {
+watch([sectionKey, model, collectionKey], () => {
   hover.value = null;
   group.value = "";
   facet.value = {};
@@ -424,15 +557,17 @@ watch([q, group, facet, sort, dir], () => {
 void load();
 
 function openSection(key: string) {
-  if (sectionKey.value === key && !model.value) return;
+  if (sectionKey.value === key && !model.value && !collectionKey.value) return;
   sectionKey.value = key;
   model.value = null;
+  collectionKey.value = null;
   weaponGroup.value = "";
   q.value = "";
 }
 function onTile(t: Tile) {
   if (t.drill) {
-    model.value = t.drill;
+    if (section.value.kind === "collections") collectionKey.value = t.drill;
+    else model.value = t.drill;
     q.value = "";
     return;
   }
@@ -444,7 +579,27 @@ function onTile(t: Tile) {
 // empty — an empty hero would make the page look broken on arrival, and the
 // first row is a fair advertisement for what the section holds.
 const hover = ref<Tile | null>(null);
-const hero = computed<Tile | null>(() => hover.value ?? tiles.value[0] ?? null);
+/**
+ * Inside a collection, the resting hero is the COLLECTION, not its first skin.
+ *
+ * That is what makes this a landing page rather than a filtered grid: you arrive
+ * at "The Bravo Collection — 15 skins · Weapon case", set big and lit by its own
+ * covert, and the band only becomes about individual finishes once you point at
+ * one. Everywhere else the first tile is still a fair advertisement for what the
+ * section holds, so nothing else changes.
+ */
+const collectionHero = computed<Tile | null>(() => {
+  const c = collection.value;
+  if (!c) return null;
+  return {
+    key: `ch-${c.key}`,
+    name: c.name,
+    image: c.image,
+    rarity: c.rarity ?? undefined,
+    note: `${c.itemIds.length} skins · ${SOURCE_NOTE[c.source]}`,
+  };
+});
+const hero = computed<Tile | null>(() => hover.value ?? collectionHero.value ?? tiles.value[0] ?? null);
 
 const crumbs = computed(() => {
   const out: { label: string; back?: () => void }[] = [{ label: section.value.label }];
@@ -452,6 +607,12 @@ const crumbs = computed(() => {
     out[0].back = () => (model.value = null);
     const w = props.weapons.find((x) => x.model === model.value);
     out.push({ label: w?.name ?? model.value });
+  }
+  if (section.value.kind === "collections" && collectionKey.value) {
+    out[0].back = () => (collectionKey.value = null);
+    // The key, not "Collection", when the index hasn't arrived: a breadcrumb
+    // that says nothing is worse than one that says something ugly.
+    out.push({ label: collection.value?.name ?? collectionKey.value });
   }
   return out;
 });
@@ -565,7 +726,7 @@ const count = computed(() =>
         <!-- Compact rail: the same list as a horizontal scroller. -->
         <div v-if="compact" class="flex flex-none gap-1.5 overflow-x-auto border-b border-border px-3 py-2">
           <button
-            v-for="s in SECTIONS"
+            v-for="s in liveSections"
             :key="s.key"
             class="flex-none rounded-md border px-2.5 py-1 text-f9 uppercase tracking-cs1 transition-colors"
             :class="sectionKey === s.key ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground'"
@@ -676,6 +837,33 @@ const count = computed(() =>
             >{{ g.label }}</button>
           </template>
 
+          <!-- ============ COLLECTION PROGRESS ============
+               The one number this screen knows that the catalog doesn't: how
+               much of the set in front of you is already yours. It sits on the
+               breadcrumb line rather than in the hero because the hero belongs
+               to whatever the cursor is on, and this belongs to the PAGE — it
+               must not change as you sweep across the grid.
+               A bar as well as the count, because "4 of 17" and "14 of 17" read
+               the same at a glance and are completely different situations. -->
+          <template v-if="progress">
+            <span class="mx-1 h-3.5 w-px flex-none bg-border"></span>
+            <span class="flex min-w-0 flex-none items-center gap-2" :title="`You own ${progress.have} of ${progress.of} in this collection`">
+              <span class="h-1 w-16 flex-none overflow-hidden rounded-full bg-border">
+                <span
+                  class="block h-full rounded-full transition-[width] duration-500"
+                  :style="{
+                    width: `${progress.of ? (progress.have / progress.of) * 100 : 0}%`,
+                    background: 'hsl(var(--tac-amber, 33 94% 58%))',
+                  }"
+                ></span>
+              </span>
+              <span class="flex-none font-mono text-f9 tabular-nums text-muted-foreground">
+                {{ progress.have }}<span class="text-muted-foreground/40">/{{ progress.of }}</span>
+              </span>
+              <span class="flex-none text-f9 uppercase tracking-cs1 text-muted-foreground/50">owned</span>
+            </span>
+          </template>
+
           <span v-if="!loading" class="ml-auto flex-none font-mono text-f9 text-muted-foreground/50">{{ count }}</span>
         </div>
 
@@ -688,13 +876,19 @@ const count = computed(() =>
           v-if="!loading && (tabs.length > 1 || axes.length)"
           class="flex flex-none items-center border-b border-border px-4 py-2"
         >
+          <!-- `sorts` goes empty over the SETS themselves. Two of the three
+               modes mean nothing to a collection — it has no rarity, and
+               "Collection" as an order OVER collections is a riddle — and a Sort
+               dropdown left holding a value it can no longer name reads as
+               broken (see FilterDropdown's `current`). The index is in release
+               order, which is what a shelf looks like. -->
           <CatalogFilters
             class="w-full"
             :tabs="tabs"
             :tab="group"
             :axes="axes"
             :axis-values="facet"
-            :sorts="ATTACH_SORTS"
+            :sorts="isCollectionIndex ? [] : ATTACH_SORTS"
             :sort="sort"
             :dir="dir"
             :sort-kind="sortKind"
@@ -738,6 +932,25 @@ const count = computed(() =>
                   v-if="t.drill"
                   class="pointer-events-none absolute right-1 top-1 z-[3] text-muted-foreground/40 transition-all duration-200 group-hover:translate-x-0.5 group-hover:text-[color:var(--acc)]"
                 ><ChevronRight class="h-3.5 w-3.5" /></span>
+                <!-- What you already have. On a SET it is the fraction, on a
+                     finish a bare tick — a "1/1" on a single skin would be a
+                     sum nobody asked for. Amber only once the set is complete,
+                     so a full case is findable by scanning for the colour
+                     rather than by reading 94 fractions. -->
+                <span
+                  v-if="t.own"
+                  class="pointer-events-none absolute left-1 top-1 z-[3] rounded border px-1 font-mono text-f9 leading-[15px] tabular-nums"
+                  :class="t.own.have >= t.own.of
+                    ? 'border-transparent text-background'
+                    : 'border-border bg-background/70 text-muted-foreground'"
+                  :style="t.own.have >= t.own.of ? { background: 'hsl(var(--tac-amber, 33 94% 58%))' } : {}"
+                >{{ t.own.have }}/{{ t.own.of }}</span>
+                <span
+                  v-else-if="t.mine"
+                  class="pointer-events-none absolute left-1 top-1 z-[3] grid h-4 w-4 place-items-center rounded-full text-background"
+                  style="background: hsl(var(--tac-amber, 33 94% 58%))"
+                  title="In your inventory"
+                ><Check class="h-2.5 w-2.5" stroke-width="3" /></span>
                 <div :class="CARD_ART">
                   <img
                     :src="t.image ?? undefined"

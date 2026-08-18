@@ -128,6 +128,21 @@ is hard-scoped to the caller, and the only public per-player endpoints are
 full collection would need a new endpoint *and* a decision about whether an
 owned-item list should be public at all.
 
+The public loadout carries its **attachments** — stickers, patches and the charm,
+enriched exactly as `/api/inventory` enriches an owned item. It has to: your own
+loadout rows resolve their stickers out of the inventory list they point at, and
+a visitor holds no inventory for the player they are looking at, so a row with
+nothing but an item id renders a bare gun. What it withholds is every row
+*handle* — `item_instance_id` and the `inst` on each attachment both go out null.
+Those name rows in the owner's inventory and the only thing anyone does with one
+is act on it; the placement, the scratch wear and the charm's pattern are all
+inline by then, so nothing on screen needs them.
+
+From that view, **Copy loadout** (`POST /api/loadout/copy-from/:steamId`) mints a
+copy of every equipped skin into your own inventory with `origin='copied'` and
+equips it in the same slot. It confirms first: it does not spend anything, but it
+does overwrite the slots of your own loadout.
+
 The navigation contract is unchanged, but the host wires it differently:
 `navigate` writes **local state** instead of doing a `router.push`. That's the
 whole trick — a push would send the viewer to `/apps/<slug>` the moment they
@@ -160,6 +175,19 @@ if you're looking for it in git history, this section is what it became.
   agree — `SLOT_RE` in `backend/src/main.ts` and the whitelist in the boot-time
   `DELETE` in `backend/src/schema.sql`. A slot the API accepts and the SQL
   forgets gets wiped on the next restart.
+- **Loadout presets**: named builds you switch between (five, like CS2). The
+  shape is deliberately lopsided — the preset you are *wearing* has no rows of
+  its own, its slots **are** `inventory.loadout`; only the ones you are not
+  wearing park their slots in `inventory.loadout_preset_slots`, and activating
+  swaps the two sets over in a transaction. That is what keeps
+  `/api/equipped/v5` — the read every game server makes for every player on
+  every connect — the same single indexed lookup it always was, and it is why no
+  other loadout query learned that presets exist. Duplicating a preset does
+  **not** clone your items: both presets point at the same owned instances,
+  because crafting is the gate and a preset is only an arrangement of what you
+  already own. Deleting an owned item therefore empties that slot in *every*
+  preset (`ON DELETE CASCADE` on both tables) — the loadout is craft-gated, so a
+  slot whose instance is gone has nothing legal left to hold.
 - **Craft attributes are validated per ITEM, not per type** (`validateCraftAttrs`
   in `backend/src/catalog.ts`). cs2-lib knows each finish's real float range, and
   most of them are not 0..1: **1,683 of the 2,106 paintable items are narrower**
@@ -177,8 +205,46 @@ if you're looking for it in git history, this section is what it became.
   - `GET /api/loadout` → the user's equipped slots (enriched with item name/image)
   - `POST /api/loadout` `{team, slot, item_id}` → equip
   - `DELETE /api/loadout?team=&slot=` → unequip
+  - `GET /api/inventory/:id/kills` → one item's StatTrak history (owner only)
+  - `GET /api/loadout/presets` → the caller's named builds (mints their first)
+  - `POST /api/loadout/presets` `{name?, copy?}` → create; `copy` seeds it from
+    the build you are wearing
+  - `PATCH /api/loadout/presets/:id` `{name}` → rename
+  - `POST /api/loadout/presets/:id/activate` → wear it
+  - `DELETE /api/loadout/presets/:id` → delete (moves you to another build; the
+    last one is not deletable)
 - The UI has a CT/T toggle, special-equipment slots, weapon sections by category,
   and a skin picker. Knife/gloves apply to both teams; agents are per-team.
+
+### StatTrak history
+
+Every inventory simulator can fake a StatTrak number. This one counts real kills
+from real matches — and because the plugin shares the panel's database, the
+match those kills happened in is a join rather than an integration. That is the
+half nobody else has, so the counter stores more than a number:
+
+- `inventory.stattrak_kills` is an **append-only ledger**, one row per counted
+  kill: the item instance, when, and the match/map it resolved to.
+  `owned_items.stattrak_count` stays the source of truth for the *number* — the
+  ledger is the story behind it, never the count itself.
+- **Match context is resolved at write time**, in `backend/src/killLedger.ts`.
+  The game plugin's payload carries no match id, so the only cheap moment to
+  answer "which match?" is while it is still `Live` and the player is still in
+  its lineup. The join runs against `public.matches` / `match_lineup_players` /
+  `match_maps` / `maps` and is cached per player for 30s; what it stores is a
+  **snapshot** (`match_id`/`match_map_id` as text, plus the map name), not a
+  foreign key — those tables belong to the panel, and a deployment pointed at a
+  bare Postgres has none of them. The first `42P01` turns the join off for the
+  life of the process and kills keep being logged with a null match.
+- **A failed ledger insert can never cost the counter.** The `UPDATE` is its own
+  committed statement and the insert happens after it, outside any transaction,
+  in a function that does not throw. See the comment on the endpoint.
+- `count(*)` in the ledger is normally **lower** than `stattrak_count`, and that
+  is correct rather than drift: kills counted before the ledger existed have no
+  row and never will. The item view says "N of M" instead of pretending.
+- Kill history is more revealing than a loadout — it says when somebody was
+  playing and how often — so it is **owner only**. `GET /api/loadout/:steamId`
+  and the equipped feed carry no kill data and must not start.
 
 ## Game-server API
 
