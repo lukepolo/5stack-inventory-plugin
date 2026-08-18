@@ -1953,6 +1953,12 @@ export interface InspectTransport {
   playing: boolean;
 }
 
+/** Where the eye is and what it looks at. Six numbers, world space. */
+export interface CameraState {
+  pos: [number, number, number];
+  target: [number, number, number];
+}
+
 export interface ViewerHandle {
   dispose: () => void;
   setStickers: (stickers: StickerPlacement[]) => void;
@@ -1998,6 +2004,14 @@ export interface ViewerHandle {
    * the GUN; see the implementation. Null when this model has no paint UVs.
    */
   paintUvWeights: (size: number) => Float32Array | null;
+  /**
+   * The camera as it stands right now, to hand to the next mount.
+   *
+   * Read at the moment of the swap rather than tracked continuously — there is no
+   * change event worth subscribing to here, and a pose sampled mid-orbit is the
+   * pose the user is looking at, which is exactly the one to keep.
+   */
+  cameraState: () => CameraState;
   /**
    * The charm's authored albedo, downsampled — what the pattern grade operates
    * on, for anything that wants to predict a pattern's colour without rendering.
@@ -2475,6 +2489,22 @@ export interface ViewerOpts {
    * "it looks washed out" went wrong.
    */
   lighting?: { env?: number; key?: number; rim?: number; ambient?: number; spot?: number };
+  /**
+   * Start from a camera someone else was already using, instead of the framing
+   * this model would compute for itself.
+   *
+   * Exists for A/B comparison. Two items are only comparable from the SAME angle,
+   * and swapping which one is mounted otherwise re-frames to that model's default
+   * — so the thing you had lined up moves, and the difference you were looking
+   * for is lost in the difference in framing.
+   *
+   * Applied AFTER framing rather than instead of it, so everything framing
+   * derives (the pivot, the frustum height, the upright chest-lift) is still
+   * computed and only the eye and pivot are then overridden. A pose from a model
+   * of a very different size will look wrong, which is the caller's problem:
+   * only pass one read off a comparable mount.
+   */
+  camera?: CameraState;
   /**
    * Post-process bloom. Defaults to the user's setting; card bakes force it OFF.
    *
@@ -3774,6 +3804,15 @@ async function buildViewer(
   // actually appears to rotate. Fraction of the box height rather than an
   // absolute, so it holds for the shortest and tallest agents alike.
   if (pres.frame === "upright") controls.target.y = cbox.min.y + (cbox.max.y - cbox.min.y) * 0.62;
+
+  // Adopt a handed-in camera, if there is one. Guarded on all six numbers being
+  // finite: a partially-populated pose would put the eye at NaN, and three
+  // renders that as nothing at all rather than as an error.
+  if (opts?.camera && [...opts.camera.pos, ...opts.camera.target].every(Number.isFinite)) {
+    camera.position.fromArray(opts.camera.pos);
+    controls.target.fromArray(opts.camera.target);
+    controls.update();
+  }
 
   // Every decision PRESENTATION drives, in one line, for
   // tools/shadertest/item3d.html. Off unless the rig sets the flag, so
@@ -9323,6 +9362,10 @@ async function buildViewer(
     charmReady: () => charmWork,
     setPaintVariant: (wear, seed, proxy) => setPaintVariant(wear, seed, proxy),
     paintUvWeights: (size) => paintUvWeights(size),
+    cameraState: () => ({
+      pos: camera.position.toArray() as [number, number, number],
+      target: controls.target.toArray() as [number, number, number],
+    }),
     setCharmSeed(seed) {
       if (disposed) return;
       // The standalone mount: the charm is the model, so it has no charm record

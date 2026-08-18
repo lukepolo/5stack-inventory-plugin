@@ -121,7 +121,7 @@ import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowSt
 import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
-import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type ViewerHandle, type ViewerKind, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type CameraState, type ViewerHandle, type ViewerKind, type StickerPlacement, type CharmPlacement } from "./viewer3d";
 import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
 
@@ -5769,6 +5769,100 @@ async function mount3d() {
   });
 }
 
+// ---- Compare: two owned items, ONE stage, ONE camera -------------------------
+//
+// A/B BLINK, not two panes side by side, and that is the whole design.
+//
+// There is exactly one live WebGL viewer at a time — a rule this app enforces
+// everywhere because a second live context is the "gun renders below the pane"
+// orphan. Two panes would mean breaking it. But blink is also simply the better
+// instrument: two images an inch apart are compared by eye across a gap, while
+// two images in the SAME pixels a second apart are compared by change, and the
+// eye is far better at spotting change than at spotting difference.
+//
+// It only works if the camera does not move between the two, which is what
+// ViewerOpts.camera and ViewerHandle.cameraState exist for — the pose is read
+// off the outgoing mount and handed to the incoming one, so the item swaps
+// underneath a camera that stays put.
+const compareShown = ref<"a" | "b">("a");
+const compareEl = ref<HTMLElement | null>(null);
+/** Carried across the swap. Null on the first mount, which frames normally. */
+let compareCam: CameraState | null = null;
+const comparePair = computed(() => {
+  const r = route.value;
+  if (r.name !== "compare") return null;
+  const find = (id: string) => inventory.value.find((i) => String(i.id) === id) ?? null;
+  const a = find(r.a);
+  const b = find(r.b);
+  // Both or neither: half a comparison is not a screen, and a link to an item
+  // the viewer does not own has to say so rather than mount the other one and
+  // look like it worked.
+  return a && b ? { a, b } : null;
+});
+const compareItem = computed(() => (comparePair.value ? comparePair.value[compareShown.value] : null));
+const compareViewer = useViewerMount({
+  label: "compare",
+  host: () => compareEl.value,
+  onError: (e) => fail(e),
+});
+async function mountCompare() {
+  const inst = compareItem.value;
+  const target = inst?.item ? resolveViewerModelSync(inst.item) : null;
+  if (!inst || !target) return;
+  await compareViewer.mount(target.model, async () => {
+    const isWeapon = (target.kind ?? "weapon") === "weapon";
+    // Simpler than the focus stage's payload, and deliberately not shared with
+    // it: focus has to cope with a loadout DEFAULT that has no instance behind
+    // it, so every field there falls back through the row. Compare is only ever
+    // handed owned items, so there is nothing to fall back to and the fallbacks
+    // would be dead branches pretending to be live ones.
+    return {
+      kind: target.kind,
+      paintMaterial: inst.item?.paintMaterial ?? null,
+      legacyPaint: !!inst.item?.legacyPaint,
+      wear: inst.wear ?? undefined,
+      seed: inst.seed ?? undefined,
+      camera: compareCam ?? undefined,
+      ...(isWeapon ? await stickerGeom(target.model) : {}),
+      ...(isWeapon ? instPlacements(inst) : {}),
+      patches:
+        target.kind === "agent" ? (inst.patches ?? []).map((p) => p?.image ?? null) : undefined,
+      stattrak: inst.stattrak ? { count: inst.stattrak_count ?? 0 } : null,
+    };
+  });
+}
+function swapCompare() {
+  // Read the pose BEFORE the swap tears the handle down. `?? compareCam` keeps
+  // the last good one if the read misses (a swap during a mount), so a fast
+  // double-press cannot reset the framing.
+  compareCam = compareViewer.current()?.cameraState() ?? compareCam;
+  compareShown.value = compareShown.value === "a" ? "b" : "a";
+}
+watch(
+  [comparePair, compareShown],
+  () => {
+    if (comparePair.value) void mountCompare();
+    else compareViewer.teardown();
+  },
+  { immediate: true },
+);
+// Leaving the screen forgets the pose. Coming back to a comparison should frame
+// itself the way any other stage does rather than restore an angle from a
+// session the user has stopped thinking about.
+watch(comparePair, (p) => {
+  if (!p) {
+    compareCam = null;
+    compareShown.value = "a";
+  }
+});
+/** Open a comparison of the two selected items. */
+function compareSelected() {
+  const [a, b] = [...selectedIds.value];
+  if (a == null || b == null) return;
+  exitSelectMode();
+  go(buildPath({ name: "compare", a: String(a), b: String(b) }));
+}
+
 // ---- 3D overlay for a DEFAULT weapon (ctx menu → View in 3D) ----------------
 // Owned items don't come here — they open the craft modal in view mode, which
 // can show their spec and hand off to Edit. This overlay is what's left for a
@@ -6884,6 +6978,16 @@ if (MDEBUG) {
             <Check class="h-3 w-3" /> {{ allVisibleSelected ? 'Clear all' : 'Select all' }}
           </button>
           <div class="ml-auto flex items-center gap-2">
+            <!-- Exactly two. Comparison has an arity, and a Compare button that
+                 greys out at one or three explains itself less well than one that
+                 appears when the thing it does becomes possible. -->
+            <button
+              v-if="selectedIds.size === 2"
+              class="flex items-center gap-1.5 rounded-md border border-border bg-background/60 px-3.5 py-1.5 text-f10 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[hsl(var(--tac-amber,33_94%_58%))] hover:text-foreground"
+              @click="compareSelected"
+            >
+              <Copy class="h-3 w-3" /> Compare
+            </button>
             <button
               v-if="selectedIds.size"
               class="flex items-center gap-1.5 rounded-md border border-[#e04a3a]/60 bg-[#e04a3a]/10 px-3.5 py-1.5 text-f10 font-semibold uppercase tracking-wider text-[#ff7a6a] transition-colors hover:bg-[#e04a3a]/20"
@@ -9775,6 +9879,57 @@ if (MDEBUG) {
          to /items/<id>/3d instead, which opens the craft modal in view mode —
          so there's no spec strip and no Edit/Inspect/Share here: a default
          weapon is a model, not an item anyone owns. -->
+    <!-- ============ COMPARE ============ -->
+    <!-- One stage, one camera, two items swapping underneath it. See the script
+         block for why this is a blink rather than two panes. -->
+    <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
+      <div
+        v-if="comparePair"
+        class="fixed inset-0 flex items-center justify-center bg-background" :style="{ zIndex: Z.stage }"
+        role="dialog" aria-modal="true" aria-label="Compare two items"
+        :class="isCompact ? 'p-0' : 'p-6'"
+      >
+        <div
+          class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
+          :class="isCompact ? 'h-full w-full' : 'h-[min(88vh,900px)] w-[min(96vw,1400px)] rounded-lg border border-border'"
+        >
+          <div class="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
+            <!-- Both names always, with the one on screen lit. The pair IS the
+                 context: a single title would make the blink ambiguous, because
+                 the whole point is that you stop being able to tell which you are
+                 looking at without being told. -->
+            <div class="flex min-w-0 items-center gap-2 text-f11 uppercase tracking-cs3">
+              <span class="truncate" :class="compareShown === 'a' ? 'text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground/50'">
+                {{ itemName(comparePair.a.item) }}
+              </span>
+              <span class="flex-none text-muted-foreground/40">vs</span>
+              <span class="truncate" :class="compareShown === 'b' ? 'text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground/50'">
+                {{ itemName(comparePair.b.item) }}
+              </span>
+            </div>
+            <div class="flex flex-none items-center gap-2">
+              <button
+                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
+                title="Swap which item is on the stage — the camera stays put"
+                @click="swapCompare"
+              >
+                <RotateCcw class="h-3 w-3" /> Swap
+              </button>
+              <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="Close" aria-label="Close" @click="go(buildPath({ name: 'inventory' }))">
+                <X class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          <div class="relative min-h-0 flex-1">
+            <div ref="compareEl" class="h-full w-full"></div>
+            <div v-if="compareViewer.busy.value" class="pointer-events-none absolute inset-0 grid place-items-center">
+              <Loader2 class="h-6 w-6 animate-spin text-muted-foreground" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
       <!-- Edge to edge on compact, same reasoning as the craft modal above. -->
       <div
