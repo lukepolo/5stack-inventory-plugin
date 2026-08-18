@@ -71,3 +71,72 @@ cannot be captured programmatically, and the inventory icon is at a different
 camera — fine for colour, useless for silhouette or brightness. Everything
 shape-related stays unfalsifiable until someone grabs the charm in game or in a
 browser at a known angle.
+
+---
+
+## StatTrak ledger: confirm the match join, then decide whether it needs partitioning
+
+**Status: shipped, two things outstanding — one check, one measurement.**
+
+### THE CHECK (this is the blocking bit)
+
+`resolveMatchContext` in `backend/src/killLedger.ts` was written against the
+panel's Hasura migrations, not against a running database — this repo has no
+Postgres and the backend cannot be booted here. The shape it assumes:
+
+- `public.matches (id uuid, status text, started_at, lineup_1_id, lineup_2_id)`,
+  where live is the literal string `'Live'`
+- `public.match_lineup_players (steam_id bigint, match_lineup_id uuid)` — joined
+  through `matches.lineup_1_id`/`lineup_2_id` rather than
+  `match_lineups.match_id`, which is nullable
+- `public.match_maps (id, match_id, map_id, status, "order")`, current leg being
+  the lowest-ordered row whose status is not `'Finished'`
+- `public.maps (id, name)`
+
+Get a kill on a live 5stack match with a StatTrak weapon equipped, then read the
+row back:
+
+```sql
+SELECT * FROM inventory.stattrak_kills ORDER BY id DESC LIMIT 5;
+```
+
+Three nulls means the join missed, and the two ways it can miss are worth
+separating before changing anything: the backend logs
+`[stattrak] no panel match tables in this database` exactly once if the tables
+are not reachable at all, and says nothing whatsoever if they are there and the
+predicate simply did not match.
+
+Worth confirming in the same sitting: the role behind `DATABASE_URL` can
+actually `SELECT` from `public.*`. Today this backend only ever touches
+`public.match_type_cfgs`, and a role narrowed to just that would produce a
+perfectly healthy-looking ledger of entirely null matches.
+
+The other half of the check is the count itself: kill something with a StatTrak
+gun and confirm `stattrak_count` and a new ledger row move together. They are
+separate statements on purpose (a failed insert must not cost the counter), so
+"the number went up and no row appeared" is a real, expected state and not
+automatically a bug — read the log line before assuming otherwise.
+
+### THEN: decide whether this needs partitioning
+
+Deliberately not partitioned and deliberately not pruned, because the
+arithmetic says it does not need to be yet. An MR12 match is ~150 kills across
+ten players, only the ones holding a StatTrak weapon log a row, and a row is
+~100 bytes with its one index — a hundred matches a day lands in single-digit
+millions of rows a year. The only read path is a range scan of one item's rows
+on `(item_instance_id, killed_at)`, which does not care about table size.
+
+It is still the first table here that breaks the "a few hundred rows"
+assumption `main.ts` flags, so measure rather than assume:
+
+```sql
+SELECT count(*),
+       pg_size_pretty(pg_total_relation_size('inventory.stattrak_kills'))
+  FROM inventory.stattrak_kills;
+```
+
+If it does start to matter, monthly `PARTITION BY RANGE (killed_at)` is the
+move — never a retention policy, since a gun's first kill staying readable years
+later is the entire point of the feature. One thing to plan for when that
+happens: a partitioned table's primary key has to include the partition key, so
+`id` alone stops being usable as the PK and becomes `(id, killed_at)`.

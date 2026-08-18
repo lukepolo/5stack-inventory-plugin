@@ -8,6 +8,7 @@ import Fastify, { LogController } from "fastify";
 import { pool } from "./db.ts";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
+import { recordKill, killHistory } from "./killLedger.ts";
 import {
   getStickerMarkup,
   getCharmMarkup,
@@ -1937,6 +1938,37 @@ app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request
     return reply.status(400).send({ error: "That item can't be expressed as an inspect link." });
   }
   return { inspect: link, stattrak: row.stattrak };
+});
+
+// Where this gun has actually been: the ledger behind the StatTrak counter.
+//
+// OWNER ONLY, and deliberately with no public counterpart. A loadout says what
+// colour somebody's AK is; a kill history says when they were playing, how
+// often, and on which maps — a different order of disclosure, and theirs to
+// hand out rather than ours. `/api/loadout/:steamId` and the equipped feed stay
+// exactly as they were: neither has ever carried a kill count and neither
+// should start.
+app.get<{ Params: { id: string } }>("/api/inventory/:id/kills", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const id = Number(request.params.id);
+  // The ownership check and the counter come off the same row, so "no such
+  // item" and "not yours" are one branch and look identical from outside —
+  // which is what they should look like.
+  const { rows } = await pool.query<{ counted: number }>(
+    `SELECT COALESCE(stattrak_count, 0) AS counted
+     FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    [id, identity.steamId],
+  );
+  if (!rows.length) {
+    return reply.status(404).send({ error: "That item isn't in your inventory." });
+  }
+  // `counted` is passed down rather than re-read: the number the history is
+  // measured against has to be the one this request already proved the caller
+  // owns, not a second read that could disagree with it.
+  return killHistory(id, identity.steamId, rows[0].counted);
 });
 
 app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, reply) => {
@@ -4036,12 +4068,36 @@ app.post<{ Body: { apiKey?: string; targetUid?: number; userId?: string } }>(
     if (targetUid == null || !userId || !/^\d{17}$/.test(userId)) {
       return reply.status(400).send({ error: "targetUid and userId required" });
     }
-    await pool.query(
+    // ORDER IS THE CONTRACT HERE, and it is the reason there is no transaction
+    // around these two statements.
+    //
+    // The counter goes up first, on its own, and is committed before the ledger
+    // is touched at all. That number is what a player watches tick over on
+    // their gun and what the equipped feed carries; the ledger is the story
+    // behind it, and a story is worth strictly less than the number. Wrapping
+    // the pair in a transaction would let a full disk or a missing table roll
+    // back a kill that has already happened — and this endpoint is
+    // fire-and-forget from the game server's side, so nothing would ever
+    // notice, let alone retry it.
+    const { rowCount } = await pool.query(
       `UPDATE inventory.owned_items
        SET stattrak_count = stattrak_count + 1
        WHERE id = $1 AND steam_id = $2 AND stattrak`,
       [targetUid, userId],
     );
+    // No row updated means the item is gone, isn't theirs, or isn't StatTrak.
+    // Nothing was counted, so there is nothing to record: a ledger row here
+    // would invent a kill the counter never moved for.
+    if (rowCount) {
+      // Awaited rather than fired and forgotten. It cannot cost the increment
+      // either way — that has already committed, and recordKill swallows and
+      // logs its own failures, so this can never become a 500 for the game
+      // server. What the await buys is backpressure: an un-awaited insert per
+      // kill would have us answer instantly while queueing writes into the pool
+      // behind a struggling database until the process ran out of memory, with
+      // nothing anywhere reporting it.
+      await recordKill(Number(targetUid), userId, app.log);
+    }
     return {};
   },
 );
