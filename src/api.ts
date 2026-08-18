@@ -894,6 +894,48 @@ export const fetchDraftInspectLink = (body: {
 export const fetchInspectLink = (id: number) =>
   request<{ inspect: string; stattrak: boolean }>(`/inventory/${id}/inspect`);
 
+// ---- StatTrak history -------------------------------------------------------
+// The ledger behind the counter: where this gun has actually been. OWNER ONLY —
+// the endpoint is scoped to the caller and there is deliberately no public
+// equivalent, so nothing here is reachable from a shared loadout link or the
+// player-profile tab. Kill history says when somebody was playing and on which
+// server; a loadout says what colour their AK is.
+
+/** One match leg — a match on one map. A best-of-three is three of these. */
+export interface KillMatch {
+  /** Panel match id, or null for kills we could not attribute (pickup server,
+   *  panel tables unreachable, or the match had already ended). */
+  match_id: string | null;
+  match_map_id: string | null;
+  map: string | null;
+  kills: number;
+  first_at: string;
+  last_at: string;
+}
+
+export interface KillHistory {
+  /** owned_items.stattrak_count — the number on the module. */
+  counted: number;
+  /** Rows in the ledger. Lower than `counted` by however many kills landed
+   *  before the ledger existed; the UI shows both rather than pretending. */
+  logged: number;
+  first_at: string | null;
+  last_at: string | null;
+  /** Distinct panel matches, which is NOT `matches.length` — a best-of-three is
+   *  one match and three legs, and unattributed kills are legs with no match. */
+  match_count: number;
+  /** Match legs, most recent first. */
+  matches: KillMatch[];
+  maps: { map: string; kills: number }[];
+  /** Daily totals over the last 30 days, ascending, keyed `YYYY-MM-DD` in UTC.
+   *  Sparse — only days with kills are present, so the client fills the gaps
+   *  itself rather than the server sending thirty rows of mostly zero. */
+  days: { day: string; kills: number }[];
+}
+
+export const fetchKillHistory = (id: number) =>
+  request<KillHistory>(`/inventory/${id}/kills`);
+
 export const deleteInstance = (id: number) =>
   request<{ ok: true }>(`/inventory/${id}`, { method: "DELETE" });
 

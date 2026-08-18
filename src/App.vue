@@ -20,6 +20,8 @@ import {
   updateInstance,
   deleteInstance,
   fetchInspectLink,
+  fetchKillHistory,
+  type KillHistory,
   fetchDraftInspectLink,
   fetchServerApiKey,
   fetchExtractStatus,
@@ -1771,6 +1773,108 @@ function openView(inst: InventoryItem) {
 const craftInst = computed(() =>
   craftInstId.value != null ? instanceById(craftInstId.value) ?? null : null,
 );
+
+// ---- StatTrak history -------------------------------------------------------
+//
+// The ledger behind the counter: first kill, which matches, which map, and a
+// trend. Loaded lazily and only here, on the item's own detail surface — it is
+// a scan of one item's kills rather than a column read, so it deliberately does
+// NOT ride along on /api/inventory the way stattrak_count does. A grid of two
+// hundred tiles has no use for it.
+const killHistory = ref<KillHistory | null>(null);
+const killHistoryBusy = ref(false);
+/**
+ * Load the history for whatever StatTrak item the modal is VIEWING.
+ *
+ * Gated on view mode, not just on an item being open: the editor is where you
+ * change the gun, and a record of where it has been belongs to the read-only
+ * spec beside the float and the pattern. Non-StatTrak items resolve to null and
+ * never ask.
+ */
+watch(
+  () => (viewOnly.value && craftInst.value?.stattrak ? craftInst.value.id : null),
+  async (id) => {
+    killHistory.value = null;
+    if (id == null) return;
+    killHistoryBusy.value = true;
+    try {
+      const history = await fetchKillHistory(id);
+      // The modal can close, or move to another item, while this is in flight.
+      // Publishing unconditionally would paint one knife's record under
+      // another's name — the request is keyed by id but the panel is not.
+      if (viewOnly.value && craftInst.value?.id === id) killHistory.value = history;
+    } catch (error) {
+      // Deliberately silent in the UI. This is a bonus readout on an item that
+      // renders perfectly without it; an error banner over somebody's knife
+      // because an aggregate timed out is strictly worse than the panel simply
+      // not appearing. The console line is here for when someone asks why.
+      console.warn("[stattrak] kill history failed to load", error);
+    } finally {
+      killHistoryBusy.value = false;
+    }
+  },
+  { immediate: true },
+);
+/** Where this one has killed most. Absent until a kill resolved to a real map. */
+const killBestMap = computed(() => killHistory.value?.maps[0] ?? null);
+const KILL_TREND_DAYS = 30;
+/**
+ * The trend, as a DENSE day-by-day series over the last 30 days.
+ *
+ * Dense on purpose. The ledger only carries days that saw kills, and drawing
+ * those bars side by side makes a gun used twice a month look like a daily
+ * driver — the gaps are most of the signal. Days are keyed in UTC to match the
+ * buckets the server cut, so the newest bar isn't a half-day short of the rest.
+ */
+const killTrend = computed<number[]>(() => {
+  const days = killHistory.value?.days;
+  if (!days?.length) return [];
+  const byDay = new Map(days.map((d) => [d.day, d.kills]));
+  const now = new Date();
+  const out: number[] = [];
+  for (let back = KILL_TREND_DAYS - 1; back >= 0; back--) {
+    const day = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - back),
+    );
+    out.push(byDay.get(day.toISOString().slice(0, 10)) ?? 0);
+  }
+  return out;
+});
+const killTrendMax = computed(() => Math.max(1, ...killTrend.value));
+/** Hidden rather than drawn flat: 30 empty bars over a gun last fired in March
+ *  says "no data" in a shape that looks like data. The dates below say it. */
+const killTrendActive = computed(() => killTrend.value.some((n) => n > 0));
+const killDate = (iso: string) =>
+  new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+
+/**
+ * "This rack has 4,312 kills" — the equipped loadout's StatTrak total.
+ *
+ * Summed off the counters the loadout rows ALREADY carry rather than out of the
+ * ledger. That costs no request and no index, it agrees with the number printed
+ * on each module (the whole point of a showcase stat), and it counts the kills
+ * that predate the ledger, which a `count(*)` never can.
+ *
+ * Deduped by instance, because knife and gloves are equipped on BOTH sides and
+ * the shared row appears twice — a plain sum double-counts every kill on them.
+ *
+ * Own loadout only. The public player endpoint withholds stattrak_count
+ * entirely (kill counts are the owner's business), so for a visitor this would
+ * be a sum over undefined; `viewerId` keeps it off screen instead of showing
+ * them a confident zero.
+ */
+const rackKills = computed(() => {
+  if (viewerId.value) return 0;
+  const seen = new Set<number>();
+  let total = 0;
+  for (const row of loadout.value) {
+    if (row.team !== team.value || row.item_instance_id == null) continue;
+    if (seen.has(row.item_instance_id)) continue;
+    seen.add(row.item_instance_id);
+    total += row.stattrak_count ?? 0;
+  }
+  return total;
+});
 /**
  * Does the preview need the waist-crop feather (ART_FADE_B)? Three ways into
  * this modal and only two of them carry a type: an owned item and a shared
@@ -6239,6 +6343,23 @@ if (MDEBUG) {
         <Crosshair class="h-3.5 w-3.5" />
         <span v-if="!isCompact">{{ view === 'focus' ? 'Focused' : 'Focus' }}</span>
       </button>
+      <!-- "This rack has 4,312 kills." The loadout screens' one showcase stat:
+           the StatTrak counters on everything equipped on this side, added up,
+           so it moves the moment you swap a gun in. A readout, not a control —
+           hence a span, and hence no hover state.
+           Hidden at zero rather than shown as "0 kills": on a fresh account
+           that would be the loudest thing in the header and it would be saying
+           nothing. Hidden for a visitor too — see rackKills. -->
+      <span
+        v-if="(view === 'grid' || view === 'focus') && rackKills > 0"
+        class="flex flex-none items-center gap-1.5 rounded-lg border border-[#e0a92e]/40 bg-[#e0a92e]/10 px-2.5 text-f11 font-semibold uppercase tracking-wider text-[#f2c14e]"
+        :class="isCompact ? 'h-8' : 'h-9'"
+        :title="`StatTrak™ kills across everything equipped on ${team}`"
+      >
+        <Sparkles class="h-3.5 w-3.5" />
+        <span class="font-mono tabular-nums">{{ rackKills.toLocaleString() }}</span>
+        <span v-if="!isCompact" class="font-normal normal-case tracking-normal text-muted-foreground">kills</span>
+      </span>
 
       <!-- Utility actions sit LEFT of the tabs and are grouped tight, so the
            header reads as "tools | where you are" instead of three things
@@ -9061,8 +9182,85 @@ if (MDEBUG) {
                 <span class="font-mono text-f13">{{ craftInst.wear.toFixed(2) }}</span>
                 <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">scratched</span>
               </div>
-              <div v-if="craftInst?.stattrak" class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
-                <span class="text-f10 uppercase tracking-cs1 text-[#f2c14e]">StatTrak™</span>
+              <!-- StatTrak, and the record behind the number.
+                   A counter on its own is a number with no story: it cannot say
+                   which match, which map or when. This one can, because the
+                   kills are real and the match data lives in the same Postgres
+                   — so the box that used to hold a lone gold label now holds
+                   the thing that makes the gold label mean something.
+                   Same `bg-secondary/40` chrome as every other readout in this
+                   column on purpose: it is part of the item's spec, not a
+                   dashboard bolted onto the side of it. -->
+              <div v-if="craftInst?.stattrak" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
+                <div class="flex items-baseline justify-between gap-2">
+                  <span class="text-f10 uppercase tracking-cs1 text-[#f2c14e]">StatTrak™</span>
+                  <span class="font-mono tabular-nums text-f13 text-[#f2c14e]">{{ (craftInst.stattrak_count ?? 0).toLocaleString() }}</span>
+                </div>
+                <!-- Everything below needs the ledger, so it is gated on
+                     `logged` rather than on the counter. An item whose kills all
+                     predate the ledger has a number and no story, and blank rows
+                     under it would read as a broken panel instead of as history
+                     nobody ever recorded. -->
+                <template v-if="killHistory && killHistory.logged > 0">
+                  <div
+                    v-if="killTrendActive"
+                    class="mt-2.5 flex h-8 items-end gap-px"
+                    :title="`Kills per day over the last ${KILL_TREND_DAYS} days`"
+                  >
+                    <span
+                      v-for="(n, i) in killTrend"
+                      :key="i"
+                      class="min-w-0 flex-1 rounded-[1px]"
+                      :style="{
+                        height: Math.max(2, (n / killTrendMax) * 100) + '%',
+                        background: n ? '#e0a92e' : 'rgba(255,255,255,0.07)',
+                      }"
+                    ></span>
+                  </div>
+                  <dl class="mt-2.5 flex flex-col gap-1.5">
+                    <div v-if="killHistory.first_at" class="flex items-baseline justify-between gap-2">
+                      <dt class="text-f10 uppercase tracking-cs1 text-muted-foreground">First kill</dt>
+                      <dd class="font-mono tabular-nums text-f11 text-foreground/85">{{ killDate(killHistory.first_at) }}</dd>
+                    </div>
+                    <div v-if="killBestMap" class="flex items-baseline justify-between gap-2">
+                      <dt class="text-f10 uppercase tracking-cs1 text-muted-foreground">Best map</dt>
+                      <dd class="min-w-0 truncate text-f11 text-foreground/85">
+                        {{ killBestMap.map }}
+                        <span class="font-mono tabular-nums text-muted-foreground">· {{ killBestMap.kills.toLocaleString() }}</span>
+                      </dd>
+                    </div>
+                    <div v-if="killHistory.match_count" class="flex items-baseline justify-between gap-2">
+                      <dt class="text-f10 uppercase tracking-cs1 text-muted-foreground">Matches</dt>
+                      <dd class="font-mono tabular-nums text-f11 text-foreground/85">{{ killHistory.match_count.toLocaleString() }}</dd>
+                    </div>
+                    <!-- Only shown when the two disagree, which is every item
+                         that was already killing before the ledger existed.
+                         Printing `logged` as though it were the whole record
+                         would make a 2,000-kill AK look like it had forty. -->
+                    <div v-if="killHistory.logged < killHistory.counted" class="flex items-baseline justify-between gap-2">
+                      <dt class="text-f10 uppercase tracking-cs1 text-muted-foreground">Logged</dt>
+                      <dd class="font-mono tabular-nums text-f11 text-muted-foreground">
+                        {{ killHistory.logged.toLocaleString() }} of {{ killHistory.counted.toLocaleString() }}
+                      </dd>
+                    </div>
+                  </dl>
+                  <!-- Where it has been lately. Three is enough to say that
+                       without turning the spec column into a match list; the
+                       rollups above already carry the whole history. -->
+                  <div class="mt-2.5 flex flex-col gap-1 border-t border-border/60 pt-2">
+                    <span
+                      v-for="m in killHistory.matches.slice(0, 3)"
+                      :key="(m.match_map_id ?? m.match_id ?? 'none') + m.first_at"
+                      class="flex items-baseline justify-between gap-2"
+                    >
+                      <span class="min-w-0 truncate text-f10 text-foreground/70">{{ m.map ?? 'Unattributed' }}</span>
+                      <span class="flex-none font-mono tabular-nums text-f10 text-muted-foreground">{{ killDate(m.last_at) }} · {{ m.kills }}</span>
+                    </span>
+                  </div>
+                </template>
+                <div v-else-if="killHistoryBusy" class="mt-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
+                  Loading history…
+                </div>
               </div>
             </template>
 

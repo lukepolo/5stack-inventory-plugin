@@ -173,3 +173,56 @@ CREATE TABLE IF NOT EXISTS inventory.steam_sync (
   steam_id bigint PRIMARY KEY,
   synced_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Append-only StatTrak kill ledger: one row per counted kill.
+--
+-- `owned_items.stattrak_count` remains the source of truth for the NUMBER — it
+-- is what the module renders, what the equipped feed carries and what a player
+-- actually sees. This table is the STORY behind that number, and the two are
+-- written by separate statements on purpose (see /api/increment-item-stattrak):
+-- a ledger that is missing, slow or broken must never cost somebody a kill.
+--
+-- Consequence worth stating plainly: `count(*)` here is normally LOWER than
+-- stattrak_count, and that is correct rather than drift. Every kill counted
+-- before this table existed has no row, and never will — the information was
+-- discarded at the time. The history view says "of N" against the real counter
+-- instead of pretending the ledger is complete.
+CREATE TABLE IF NOT EXISTS inventory.stattrak_kills (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  item_instance_id bigint NOT NULL REFERENCES inventory.owned_items (id) ON DELETE CASCADE,
+  -- Denormalised owner. The endpoint has already proved this pair (the increment
+  -- is scoped to `id = $1 AND steam_id = $2`), and carrying it means a history
+  -- read is a filter on this table rather than a join through owned_items —
+  -- one fewer way for a scoping bug to hand somebody else's kills out.
+  steam_id bigint NOT NULL,
+  killed_at timestamptz NOT NULL DEFAULT now(),
+  -- Panel match context, resolved AT WRITE TIME. The game-server plugin sends
+  -- no match id, so the only moment anyone can tell which match this kill
+  -- belonged to is while it is still running; an hour later the join is
+  -- guesswork against a finished match's timestamps.
+  --
+  -- A SNAPSHOT, deliberately not a foreign key. `public.matches` belongs to the
+  -- panel, not to this plugin: a real FK would make our boot-time schema depend
+  -- on their tables existing (this plugin is also installable against a database
+  -- that has no panel in it), tie our rows to their retention policy, and put
+  -- our table in the way of their deletes. text rather than uuid for the same
+  -- reason — we do not own that column's type and should not encode a bet on it.
+  --
+  -- All three are nullable and stay nullable. "Kill 1,204, and we could not tell
+  -- you where" is a perfectly good ledger row; a kill on a pickup server or with
+  -- the panel unreachable still happened.
+  match_id text,
+  match_map_id text,
+  map_name text
+);
+-- The one index this table needs, and it is the only read path: every history
+-- query enters through an item the caller owns and walks that item's rows in
+-- time order (first kill, per-match rollup, the daily trend). Leading with
+-- item_instance_id also gives the ON DELETE CASCADE above an index to use, so
+-- scrapping a gun with a long history stays a lookup rather than a table scan.
+--
+-- Nothing here indexes steam_id on its own. There is no "all kills by player"
+-- read — the loadout rollup sums owned_items.stattrak_count instead — and an
+-- index nobody reads is pure write cost on the hottest insert in the app.
+CREATE INDEX IF NOT EXISTS stattrak_kills_item_idx
+  ON inventory.stattrak_kills (item_instance_id, killed_at);
