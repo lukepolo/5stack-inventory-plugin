@@ -5537,6 +5537,50 @@ const focusLegacyPaint = computed(() => !!focusRow.value?.item?.legacyPaint);
 const ISSUE_NEW_URL = "https://github.com/lukepolo/5stack-inventory-plugin/issues/new";
 // Deliberately quiet — it only needs to be findable at the moment something
 // looks wrong, so it reads as a footnote until hovered.
+/**
+ * Save what is on the 3D stage as a PNG.
+ *
+ * The renderer could already produce this — `snapshot()` is how every item card
+ * is baked — but it had exactly one caller, the bake queue, so the picture this
+ * app is best at making was the one thing you could not take away from it. A
+ * shared craft link carries the exact state and shows nothing; this is the other
+ * half of that.
+ *
+ * Grabs the LIVE stage rather than re-mounting an offscreen one, so you get the
+ * angle you framed, not a canonical three-quarter view. That is the point: if
+ * the interesting thing about a pattern is only visible from one side, a
+ * standard pose does not capture it.
+ */
+async function downloadStageImage(slot: ReturnType<typeof useViewerMount>, name: string) {
+  const handle = slot.current();
+  if (!handle) return;
+  let blob: Blob | null = null;
+  try {
+    blob = await handle.snapshot();
+  } catch (e) {
+    notify((e as Error).message);
+    return;
+  }
+  if (!blob) {
+    // Null rather than a throw is how the viewer reports "nothing to capture" —
+    // a model that never finished, a context that was lost. Say so, because a
+    // button that does nothing reads as a broken click.
+    notify("Nothing to save yet — the model has not finished loading.");
+    return;
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  // Item names carry "|" and spaces, which survive a download but make an ugly
+  // file and break naive shell globs on the other side.
+  const slug = name.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
+  a.download = (slug || "item") + ".png";
+  a.click();
+  // Revoked a tick later, not immediately: some browsers have not started
+  // reading the blob when click() returns, and revoking first cancels the save.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
 const REPORT_LINK =
   "text-f9 uppercase tracking-cs2 text-muted-foreground/40 underline decoration-dotted underline-offset-2 transition-colors hover:text-[color:var(--acc)]";
 
@@ -8131,6 +8175,17 @@ if (MDEBUG) {
               >
                 Report a problem
               </a>
+              <!-- Save. Opposite corner from the report link, on the same row,
+                   because both are things you do WITH the picture rather than to
+                   the item. -->
+              <button
+                v-if="focus3d && !focusViewer.busy.value"
+                :class="['absolute bottom-1 right-1 z-[3]', REPORT_LINK]"
+                title="Save this view as a PNG"
+                @click="downloadStageImage(focusViewer, itemName(focusRow?.item) || 'item')"
+              >
+                Save image
+              </button>
               <!-- Camera legend. Floats over the canvas at the bottom edge, where
                    the model almost never is, and sits at 70% until hovered so it
                    reads as chrome rather than as part of the item. -->
@@ -9908,6 +9963,14 @@ if (MDEBUG) {
               </span>
             </div>
             <div class="flex flex-none items-center gap-2">
+              <button
+                v-if="!compareViewer.busy.value"
+                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
+                title="Save this view as a PNG"
+                @click="downloadStageImage(compareViewer, itemName(compareItem?.item) || 'item')"
+              >
+                <Download class="h-3 w-3" /> Save
+              </button>
               <button
                 class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
                 title="Swap which item is on the stage — the camera stays put"
