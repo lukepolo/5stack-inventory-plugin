@@ -264,8 +264,23 @@ or there is no WebGL context and every render comes back blank.
    weak BY DESIGN and ours already computes the same products theirs does. The
    one amplifier they have and we do not is **BLOOM** (`enableBloom: 'auto'` in
    their options) — a post pass would turn the small bright specular dots the
-   perturbed normals produce into visible glowing bubbles. That is the next thing
-   to build, and it is a renderer feature rather than a shader fix.
+   perturbed normals produce into visible glowing bubbles. It is a renderer
+   feature rather than a shader fix.
+
+   **UPDATE: bloom shipped, so this is now a testable claim rather than a plan.**
+   See "Bloom is ON by default" below — UnrealBloomPass at strength 0.05,
+   threshold 0.18. The prediction to check is specific: the bubbles should read as
+   glowing rather than merely present, and turning bloom off with `?bloom=0`
+   should visibly kill them again. Nobody has looked yet. Do NOT write more shader
+   code for the bubbles until someone has, because if bloom already closed it then
+   the per-fragment jitter below is the only real gap left, and if it did not then
+   the weakness is somewhere neither this note nor the bloom section predicted.
+
+   Lighting presets (`src/viewerEnvironments.ts`) give the check a sharper tool
+   than bloom alone: the **Dark** rig strips the fill light, which is exactly the
+   condition under which a faint specular dot either survives as a glow or
+   disappears. Compare Dark against Studio on this charm before touching the
+   shader.
 
    Separately still missing, a minor one: their base coordinate adds
    `(normal.xy - 0.5) * 0.25`, a per-fragment jitter that breaks up the lattice.

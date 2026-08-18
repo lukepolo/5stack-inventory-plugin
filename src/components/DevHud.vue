@@ -25,6 +25,7 @@ import { X, RotateCcw, ChevronRight } from "lucide-vue-next";
 import {
   activeFlags, devFlags, devNumbers, flagValue, flagsVersion, numberValue, numbersVersion,
   resetFlags, setFlag, setNumber, userFlags, userNumbers, type DevFlag, type DevNumber,
+  choiceValue, choicesVersion, setChoice, userChoices, type DevChoice,
 } from "../devFlags";
 
 const props = defineProps<{ open: boolean }>();
@@ -45,6 +46,16 @@ const shown = (list: DevNumber[]) => {
   void flagsVersion.value;
   return list.filter((n) => !n.requires || flagValue(n.requires));
 };
+const pickValue = (c: DevChoice) => {
+  void choicesVersion.value;
+  return choiceValue(c.name);
+};
+/** The hint under a picker is the SELECTED option's, not the setting's — the
+ *  setting's label already says what it is; what you want to know is what the
+ *  thing you just chose does. */
+const pickHint = (c: DevChoice) =>
+  c.options.find((o) => o.value === pickValue(c))?.hint ?? c.hint;
+const userPicks = computed(() => userChoices());
 const userSwitches = computed(() => userFlags());
 const userKnobs = computed(() => shown(userNumbers()));
 /** Advanced, grouped, so Patches and Diagnostics stay apart. */
@@ -127,6 +138,32 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
     <div class="max-h-[60vh] overflow-y-auto p-2">
       <!-- USER SETTINGS. No group heading: this IS the panel as far as most
            people are concerned, and a heading over a single section is chrome. -->
+
+      <!-- Pickers first: a lighting rig frames every switch under it, so choosing
+           one is the outer decision. Segmented rather than a <select> — there are
+           four options and the panel is already 240px of buttons, so a native
+           dropdown would be the only OS-chrome control in it. -->
+      <div v-for="c in userPicks" :key="c.name" class="rounded px-1.5 py-1.5">
+        <span class="block text-f11 text-foreground">{{ c.label }}</span>
+        <div class="mt-1.5 flex flex-wrap gap-1">
+          <button
+            v-for="o in c.options"
+            :key="o.value"
+            type="button"
+            class="rounded border px-2 py-1 text-f10 transition-colors"
+            :class="pickValue(c) === o.value
+              ? 'border-[#f2c14e] text-[#f2c14e]'
+              : 'border-border/60 text-muted-foreground hover:text-foreground'"
+            :aria-pressed="pickValue(c) === o.value"
+            @click="setChoice(c.name, o.value)"
+          >{{ o.label }}</button>
+        </div>
+        <span class="mt-1 block text-f10 leading-snug text-muted-foreground/70">{{ pickHint(c) }}</span>
+        <!-- Same note the flags carry: read when the rig is built, so an open
+             viewer keeps the old one until it is rebuilt. -->
+        <span v-if="c.remount" class="mt-0.5 block text-f9 text-muted-foreground/50">Reopen the item to apply</span>
+      </div>
+
       <button
         v-for="f in userSwitches"
         :key="f.name"

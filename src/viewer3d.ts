@@ -15,7 +15,8 @@
 // Skin rendering is a faithful port of CS2's compositing pipeline — see
 // paintComposite.ts for the shader and its provenance.
 import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
-import { FLAGS, NUMBERS, flagValue, numberValue, setFlag, setNumber } from "./devFlags";
+import { FLAGS, NUMBERS, choiceValue, flagValue, numberValue, setFlag, setNumber } from "./devFlags";
+import { DEFAULT_ENVIRONMENT, viewerEnvironment } from "./viewerEnvironments";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
 import { tickCharmLiquid } from "./charmLiquid";
@@ -2685,16 +2686,25 @@ async function buildViewer(
   // stay as calibrated above, because the ratios closed on colour alone. If this
   // is ever re-tuned, re-check both: the CDN weapon targets AND a charm against
   // csgoskins, because this rig now answers to both.
-  const L = opts?.lighting ?? {};
-  scene.environmentIntensity = L.env ?? 0.8;
+  // WHICH RIG. Precedence, widest to narrowest:
+  //   1. `opts.lighting` — explicit numbers from tools/shadertest, sweeping a
+  //      value to MEASURE it. Still wins over everything, unchanged.
+  //   2. Studio, for a card bake or the /admin/tests sweep, whatever the user
+  //      picked. This is the load-bearing one: a baked card is cached forever
+  //      against its render key, so a preset baked into one is indistinguishable
+  //      from a bug — the same argument that already forces bloom off for bakes.
+  //   3. the rig the user chose.
+  const rig = viewerEnvironment(opts?.still ? DEFAULT_ENVIRONMENT : choiceValue("env"));
+  const L = { ...rig.lighting, ...(opts?.lighting ?? {}) };
+  scene.environmentIntensity = L.env;
   // Theirs too: the HDRI is a real place, so which way it faces decides where the
   // sun and the bright sky sit in every reflection. 3.8 rad is what csgoskins use.
-  scene.environmentRotation = new THREE.Euler(0, 3.8, 0);
-  scene.add(new THREE.AmbientLight(0xffffff, L.ambient ?? 0.12));
-  const key = new THREE.DirectionalLight(0xffccb3, L.key ?? 1.15);
+  scene.environmentRotation = new THREE.Euler(0, rig.envRotation, 0);
+  scene.add(new THREE.AmbientLight(0xffffff, L.ambient));
+  const key = new THREE.DirectionalLight(0xffccb3, L.key);
   key.position.set(2, 3, 4);
   scene.add(key);
-  const rim = new THREE.DirectionalLight(0xdde6ff, L.rim ?? 0.35);
+  const rim = new THREE.DirectionalLight(0xdde6ff, L.rim);
   rim.position.set(-3, 1, -2);
   scene.add(rim);
   // THE OVERHEAD SPOT — the light we did not have at all.
@@ -2729,7 +2739,7 @@ async function buildViewer(
   // copied. Everything else about the light IS theirs.
   // Positioned once the model has been measured — see `spot.position` below.
   // The scene is built before the GLB resolves, so there is no size here yet.
-  const spot = new THREE.SpotLight(0xffb3b3, L.spot ?? 1.2, 0, 0.8, 0.3, 0);
+  const spot = new THREE.SpotLight(0xffb3b3, L.spot, 0, 0.8, 0.3, 0);
   scene.add(spot);
   scene.add(spot.target);
   // Context allocation + the PMREM prefilter of RoomEnvironment. Both are per
