@@ -1389,6 +1389,21 @@ const BTN_DANGER =
                     <span class="whitespace-nowrap font-mono text-sm">{{ prices.unmatched.toLocaleString() }}</span>
                   </div>
                 </div>
+                <!-- The sale-history cache. Its own row because the number it
+                     protects is a RATE BUDGET: the source allows a handful of
+                     calls per five minutes, so every listing already looked up is
+                     one nobody has to spend a request on for a week. -->
+                <div v-if="prices.history?.listings" class="flex items-center justify-between gap-4 rounded-md border border-border px-4 py-3">
+                  <span class="min-w-0">
+                    <span class="block text-sm text-foreground">Sale history cached</span>
+                    <span class="block text-xs text-muted-foreground">
+                      {{ prices.history.withData.toLocaleString() }} with recent sales; the rest are recorded as having
+                      none, so they aren't looked up again. Refreshed after
+                      {{ prices.history.staleAfterDays }} days.
+                    </span>
+                  </span>
+                  <span class="whitespace-nowrap font-mono text-sm">{{ prices.history.listings.toLocaleString() }}</span>
+                </div>
                 <details v-if="prices.unmatchedSample.length" class="rounded-md border border-border px-4 py-2.5">
                   <summary class="cursor-pointer text-xs text-muted-foreground">Sample of unmatched names</summary>
                   <ul class="mt-2 space-y-0.5 font-mono text-xs text-muted-foreground">

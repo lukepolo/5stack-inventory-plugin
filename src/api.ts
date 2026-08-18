@@ -1032,6 +1032,10 @@ export interface PriceAdminStatus extends PriceStatus {
   failure: string | null;
   unmatched: number;
   unmatchedSample: string[];
+  /** The sale-history cache — the thing standing between browsing knives and a
+   *  rate limit. `listings` were looked up; `withData` had sales to report, and
+   *  the rest are cached as "nothing here" so they aren't asked about again. */
+  history?: { listings: number; withData: number; oldest: string | null; staleAfterDays: number };
 }
 export const fetchPriceAdmin = () => request<PriceAdminStatus>("/admin/prices");
 export const savePriceAdmin = (body: { enabled?: boolean; base?: string; source?: PriceSource }) =>

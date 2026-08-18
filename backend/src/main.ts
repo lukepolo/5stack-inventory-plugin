@@ -3531,6 +3531,26 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
 // Same shape as the asset-CDN panel: read the switch, flip the switch, and see
 // enough of the last attempt to tell "never ran" from "ran and failed" from "ran
 // fine, that item just doesn't trade".
+/** What the sale-history cache holds. One cheap aggregate; the admin panel is
+ *  the only caller. */
+async function historyCacheStats() {
+  const { rows } = await pool.query<{ listings: string; withdata: string; oldest: Date | null }>(
+    `SELECT count(DISTINCT market_hash_name)                                 AS listings,
+            count(DISTINCT market_hash_name) FILTER (WHERE period <> 'none') AS withdata,
+            min(fetched_at)                                                  AS oldest
+       FROM inventory.price_history`,
+  );
+  const row = rows[0];
+  return {
+    listings: Number(row?.listings ?? 0),
+    /** The rest were asked about and genuinely have no recent sales — cached as
+     *  such so they are not asked about again for a week. */
+    withData: Number(row?.withdata ?? 0),
+    oldest: row?.oldest?.toISOString() ?? null,
+    staleAfterDays: HISTORY_TTL_MS / (24 * 60 * 60_000),
+  };
+}
+
 app.get("/api/admin/prices", async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
@@ -3561,6 +3581,10 @@ app.get("/api/admin/prices", async (request, reply) => {
     listings: meta?.rows ?? 0,
     /** The mirror holds another source's rows — see the note in /api/prices. */
     stale: (meta?.rows ?? 0) > 0 && meta?.source_name !== source,
+    /** The sale-history cache: how many listings have been looked up, and when
+     *  the oldest of them was. Shown because the rate budget it protects is the
+     *  reason it exists, and a cache nobody can see is a cache nobody trusts. */
+    history: await historyCacheStats(),
     syncing: priceSyncRunning,
     intervalMinutes: PRICE_SYNC_INTERVAL_MS / 60_000,
     sourceDate: meta?.source_date?.toISOString() ?? null,
