@@ -200,3 +200,63 @@ move — never a retention policy, since a gun's first kill staying readable yea
 later is the entire point of the feature. One thing to plan for when that
 happens: a partitioned table's primary key has to include the partition key, so
 `id` alone stops being usable as the PK and becomes `(id, killed_at)`.
+## Inspect animation: confirm the clip, then decide about moving parts
+
+**Status: code landed, never seen running.** It was written without access to a
+CS2 models mount, so every claim below about what a weapon GLB contains is
+inference from the comments already in `viewer3d.ts`, not observation.
+
+### What landed
+
+The viewer plays the model's own inspect clip by turning the CAMERA and the
+whole light rig, rather than the weapon — which is exactly equivalent to turning
+the weapon under a fixed rig, and is the only version available: a weapon's
+geometry is CPU-skinned into a static mesh at mount (`bakePose`), and its
+stickers, charm pivot, collision grid and game-space offsets are all stated in
+world coordinates and measured once. The full reasoning is in the `Inspect
+motion` block in `viewer3d.ts`.
+
+Clip choice is `PRESENTATION.inspectClips` — an explicit per-tree list with no
+generic fallback — and every candidate then has to MEASURE as moving the body
+bone by more than `INSPECT_MIN_DEGREES` before it is accepted. A model that
+matches nothing, or matches a single-key pose, stays exactly as static as it is
+today.
+
+### THE CHECKS (this is the blocking bit)
+
+1. **Which clip actually gets picked.** Open a rifle in the 3D viewer with
+   `?perf=1` and read the `inspect` line: it prints the chosen clip, the play
+   head, the current turn in degrees, and — the important half — every clip the
+   GLB shipped. `inspectClips` currently names `inspect_loop` and
+   `inventory_inspect` on the strength of the elite measurement in `bakePose`
+   ("icon/inspect/dropped" vs "shoot/reload") and of the glove tree's clip
+   names. If the real names are different, that HUD line is where they are read
+   off, and `?inspectclip=<name>` tries any one of them without a rebuild.
+2. **Which way the environment turns.** The three lamps and the environment map
+   are rotated by the same quaternion; the lamps are unambiguous, but the env
+   goes through `scene.environmentRotation`, whose sign was derived from three's
+   shader (`envMapRotation` is the inverse of the Euler you set) rather than
+   observed. On a mirror-finish skin — Doppler, a chrome knife — the reflection
+   should sweep the SAME way as the specular highlight. If it sweeps the other
+   way, invert `envQuat` in `applyInspect` and nothing else changes.
+3. **What the charm does.** Gravity is already camera-relative, so a charm
+   swings under this for free and by the physics that was here. An inspect clip
+   turns several times faster than the 0.9 turntable it replaces, though, so
+   watch `charm … substeps/f` and `contacts/f` on `?perf=1` and watch for the
+   charm passing through the body (`reseatIfBehind` is the existing guard and
+   runs every awake frame). If it flails, the lever is the playback rate, not
+   the solver — nothing about the clip requires it to play at game speed.
+
+### THEN: moving parts
+
+What plays is the body's RIGID motion. A slide pull or a magazine drop lives in
+bones that `bakePose` has already resolved into static vertices, so they cannot
+move, and the same limitation is why gloves are listed with an empty
+`inspectClips` even though they ship `inspect_loop` — a hand's motion is
+per-finger and there is no rigid part of it worth playing.
+
+Undoing that for a live viewer means keeping the SkinnedMeshes and skinning on
+the GPU, which is cheaper per frame than the bake it replaces — but it moves the
+body in world space, and every world-space measurement listed above would have
+to move with it. Do not start this as "just don't call bakePose": start by
+listing what reads world coordinates after the mount.

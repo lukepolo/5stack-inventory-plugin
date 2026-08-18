@@ -83,6 +83,15 @@ export const FLAGS: DevFlag[] = [
     audience: "user",
   },
   {
+    name: "inspectanim",
+    label: "Motion",
+    hint: "Play the weapon's own inspect animation in the 3D viewer instead of turning it on a turntable. Item cards are always rendered from the still pose.",
+    dflt: true,
+    remount: true,
+    group: "3D viewer",
+    audience: "user",
+  },
+  {
     name: "perf",
     label: "Perf HUD",
     hint: "Frame-time split, skinned mesh count and mount cost, drawn over the model.",

@@ -89,6 +89,42 @@
     box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
     cursor: ew-resize;
   }
+
+  /* Inspect-clip scrub, in the viewer's control legend.
+     Not `pattern-range` even though the shape is the same: that track's decile
+     hairlines say "you are at index N of a range", which is the honest reading
+     of a pattern and the wrong one for a clip — a clip has a start and an end
+     and the only interesting quantity is how far through you are. So the track
+     FILLS, and it is sized to sit inside a 26px legend cell rather than to span
+     a settings panel. */
+  [data-cs2-inventory] .clip-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 76px;
+    height: 4px;
+    border-radius: 9999px;
+    outline: none;
+    background: rgba(255, 255, 255, 0.16);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  }
+  [data-cs2-inventory] .clip-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 12px;
+    width: 5px;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.7);
+    cursor: ew-resize;
+  }
+  [data-cs2-inventory] .clip-range::-moz-range-thumb {
+    height: 12px;
+    width: 5px;
+    border: none;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.7);
+    cursor: ew-resize;
+  }
 }
 
 
