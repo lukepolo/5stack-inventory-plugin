@@ -175,6 +175,19 @@ if you're looking for it in git history, this section is what it became.
   agree — `SLOT_RE` in `backend/src/main.ts` and the whitelist in the boot-time
   `DELETE` in `backend/src/schema.sql`. A slot the API accepts and the SQL
   forgets gets wiped on the next restart.
+- **Loadout presets**: named builds you switch between (five, like CS2). The
+  shape is deliberately lopsided — the preset you are *wearing* has no rows of
+  its own, its slots **are** `inventory.loadout`; only the ones you are not
+  wearing park their slots in `inventory.loadout_preset_slots`, and activating
+  swaps the two sets over in a transaction. That is what keeps
+  `/api/equipped/v5` — the read every game server makes for every player on
+  every connect — the same single indexed lookup it always was, and it is why no
+  other loadout query learned that presets exist. Duplicating a preset does
+  **not** clone your items: both presets point at the same owned instances,
+  because crafting is the gate and a preset is only an arrangement of what you
+  already own. Deleting an owned item therefore empties that slot in *every*
+  preset (`ON DELETE CASCADE` on both tables) — the loadout is craft-gated, so a
+  slot whose instance is gone has nothing legal left to hold.
 - **Craft attributes are validated per ITEM, not per type** (`validateCraftAttrs`
   in `backend/src/catalog.ts`). cs2-lib knows each finish's real float range, and
   most of them are not 0..1: **1,683 of the 2,106 paintable items are narrower**
@@ -193,6 +206,13 @@ if you're looking for it in git history, this section is what it became.
   - `POST /api/loadout` `{team, slot, item_id}` → equip
   - `DELETE /api/loadout?team=&slot=` → unequip
   - `GET /api/inventory/:id/kills` → one item's StatTrak history (owner only)
+  - `GET /api/loadout/presets` → the caller's named builds (mints their first)
+  - `POST /api/loadout/presets` `{name?, copy?}` → create; `copy` seeds it from
+    the build you are wearing
+  - `PATCH /api/loadout/presets/:id` `{name}` → rename
+  - `POST /api/loadout/presets/:id/activate` → wear it
+  - `DELETE /api/loadout/presets/:id` → delete (moves you to another build; the
+    last one is not deletable)
 - The UI has a CT/T toggle, special-equipment slots, weapon sections by category,
   and a skin picker. Knife/gloves apply to both teams; agents are per-team.
 
