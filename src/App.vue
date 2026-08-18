@@ -2213,6 +2213,25 @@ provide("itemArt", { renderSrc, onRenderError, renderingIds, queuedIds, assetsPe
 // at every depth and threading it through each component adds nothing.
 provide("tr", tr);
 
+/**
+ * Transport wiring for one viewer slot's control legend.
+ *
+ * ViewerControls POLLS this rather than being handed a value (see its `inspect`
+ * prop), so all a slot has to give it is a getter that follows whichever handle
+ * the slot currently holds — the getter identity then survives a remount, and
+ * the bar keeps working when the modal rebuilds its viewer under it.
+ *
+ * Per slot, not once: the focus stage stays mounted behind the craft modal, so
+ * two of these are live at the same time and they must not share a handle.
+ */
+function viewerTransport(slot: ReturnType<typeof useViewerMount>) {
+  return {
+    read: () => slot.current()?.inspect() ?? null,
+    play: (on: boolean) => slot.current()?.setInspectPlaying(on),
+    seek: (t: number) => slot.current()?.setInspectTime(t),
+  };
+}
+
 // 3D preview inside the craft/edit modal.
 const modal3d = ref(false);
 const modal3dAvailable = ref(false);
@@ -2226,6 +2245,7 @@ const modalViewer = useViewerMount({
     fail(e);
   },
 });
+const craftInspect = viewerTransport(modalViewer);
 const teardownModalViewer = () => {
   charmPending.value = false;
   modalViewer.teardown();
@@ -5269,6 +5289,7 @@ const focusViewer = useViewerMount({
     fail(e);
   },
 });
+const focusInspect = viewerTransport(focusViewer);
 const teardownViewer = focusViewer.teardown;
 watch([focusModelKey, focusPaint], async ([key]) => {
   teardownViewer();
@@ -7438,7 +7459,10 @@ if (MDEBUG) {
               <ViewerControls
                 v-if="focus3d && !focusViewer.busy.value"
                 variant="overlay"
+                :inspect="focusInspect.read"
                 class="absolute bottom-1 left-1/2 z-[3] -translate-x-1/2"
+                @inspect-play="focusInspect.play"
+                @inspect-seek="focusInspect.seek"
               />
             </div>
 
@@ -8530,7 +8554,18 @@ if (MDEBUG) {
                      half of this row. Without the two rules the link's text
                      wrapped to a second line at phone widths and shoved the
                      legend down with it. -->
-                <ViewerControls class="flex-none" :edit="!viewOnly" :rotate="craft.stickers.some(Boolean)" />
+                <!-- Transport in VIEW mode only. The viewer pauses itself on
+                     entering edit mode (setInteractive), and offering a play
+                     button that would start the camera turning under a sticker
+                     someone is aiming is the same mistake with an extra step. -->
+                <ViewerControls
+                  class="flex-none"
+                  :edit="!viewOnly"
+                  :rotate="craft.stickers.some(Boolean)"
+                  :inspect="viewOnly ? craftInspect.read : null"
+                  @inspect-play="craftInspect.play"
+                  @inspect-seek="craftInspect.seek"
+                />
               </div>
             </div>
           </div>
