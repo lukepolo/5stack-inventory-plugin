@@ -63,6 +63,10 @@
         "cleared": "Cleared {count} files.",
         "verdict_failed": "Verdict not saved: {error}"
       }
+    },
+    "armory": {
+      "search": "Search…",
+      "drill": "Browse finishes"
     }
   }
 }
