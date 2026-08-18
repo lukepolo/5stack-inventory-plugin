@@ -127,7 +127,7 @@ import { useBuildCheck } from "./composables/useBuildCheck";
 import { useViewerMount } from "./composables/useViewerMount";
 import { useDebouncedSearch, SEARCH_DEBOUNCE_MS } from "./composables/useDebouncedSearch";
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
-import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, PRICE_ROW_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
+import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
@@ -7648,7 +7648,7 @@ if (MDEBUG) {
             <DeckCard
               v-if="st.variants.length > 1"
               class="cv-tile"
-              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + (pricesOn ? PRICE_ROW_PX : 0) + 'px' }"
+              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
               :face="st.face"
               :behind="st.behind"
               :count="st.variants.length"
@@ -7659,7 +7659,7 @@ if (MDEBUG) {
             <ItemTile
               v-else
               class="cv-tile"
-              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + (pricesOn ? PRICE_ROW_PX : 0) + 'px' }"
+              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
               :inst="st.face"
               :attached-name="attachedName(st.face)"
               :show-price="pricesOn"
@@ -8857,7 +8857,7 @@ if (MDEBUG) {
                        a price you have to hunt for. -->
                   <PriceTag
                     v-if="pricesOn"
-                    class="relative z-[2] mb-0.5"
+                    class="absolute left-2.5 top-2 z-[3]"
                     size="xs"
                     :value="stockPriceOf(st.card.id)?.value"
                     :missing="!stockPriceOf(st.card.id)"

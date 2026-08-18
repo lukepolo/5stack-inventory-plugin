@@ -74,11 +74,9 @@ export const CARD_ART =
 // the art at small sizes the moment the footer grew.
 export const CARD_CHROME_PX = 78;
 
-// What a price line under the name adds to that budget. Its own constant, and
-// added by the caller only when prices are actually shown: money is a mode the
-// player switches on, so the art it costs is opt-in too. Folding it into
-// CARD_CHROME_PX would shrink every card for everyone who never turns it on.
-export const PRICE_ROW_PX = 14;
+// NB: prices deliberately cost this budget NOTHING. They render as an overlay
+// under the model label, because paying for them in flow meant switching values
+// on resized every card and cell in the app — see PriceTag's call sites.
 
 // Bottom feather for waist-cropped art — see `.art-fade-b` in style.css for
 // what it does and why it's per-item. Agents are the only type that needs it;

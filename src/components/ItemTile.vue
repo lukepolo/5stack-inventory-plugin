@@ -257,11 +257,13 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
            value off it costs the art nothing that a footer line wouldn't, while
            keeping the name row to the name. Reads top-down as "what it is, what
            it's worth". -->
-      <span class="min-w-0 flex-1">
+      <span class="relative min-w-0 flex-1">
         <span class="block truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ weaponName(inst.item) || inst.slot }}</span>
+        <!-- Absolute: in flow it grew the card's chrome, so toggling values on
+             resized every tile in the grid. See the note in LoadoutCell. -->
         <PriceTag
           v-if="showPrice"
-          class="mt-0.5"
+          class="absolute left-0 top-full"
           :value="inst.price?.value"
           :pending="pricePending"
           :missing="!inst.price"

@@ -146,10 +146,21 @@ defineEmits<{
     />
 
     <!-- Label, then the price under it: the cell's quietest corner, reading
-         top-down as "what it is, what it's worth". -->
+         top-down as "what it is, what it's worth".
+         The price is ABSOLUTE, and that is the whole point. In flow it took its
+         line out of CARD_ART — which is `flex-1` — so switching values on visibly
+         shrank every weapon in the loadout. Money is an overlay on an item, and
+         turning an overlay on must not resize the thing underneath it. -->
     <div v-if="!compact" class="relative z-[2] min-w-0">
       <span class="block truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ label }}</span>
-      <PriceTag v-if="showPrice" class="relative z-[2]" size="xs" :value="value" :missing="valueMissing" :title="valueTip" />
+      <PriceTag
+        v-if="showPrice"
+        class="absolute left-0 top-full z-[2]"
+        size="xs"
+        :value="value"
+        :missing="valueMissing"
+        :title="valueTip"
+      />
     </div>
 
     <div

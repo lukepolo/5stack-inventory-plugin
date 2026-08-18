@@ -3338,14 +3338,34 @@ app.get<{ Querystring: { slot?: string } }>("/api/prices/stock", async (request,
 // ---- Sale history for one listing -------------------------------------------
 // The spread behind the single figure. See inventory.price_history for why.
 
-/** Six hours. A sale spread moves on the scale of days, and the source allows a
- *  handful of calls per five minutes — a short TTL would spend that budget on
- *  numbers that had not changed. */
-const HISTORY_TTL_MS = 6 * 60 * 60_000;
+/**
+ * One week.
+ *
+ * A sale spread moves on the scale of days, and the source allows a handful of
+ * calls per five minutes — the budget is the scarce thing here, not freshness.
+ * A tighter TTL spends it re-fetching numbers that have not moved, and the cost
+ * of being a few days stale on a range is nil next to the cost of having no
+ * range at all because the last twenty requests were refused.
+ */
+const HISTORY_TTL_MS = 7 * 24 * 60 * 60_000;
 /** A floor between OUTBOUND fetches, whatever is being asked for. Clicking
  *  through twenty knives must not become twenty requests in twenty seconds. */
 const HISTORY_MIN_GAP_MS = 3_000;
 let lastHistoryFetch = 0;
+/**
+ * Refused, so stop asking.
+ *
+ * The per-request floor is not enough on its own: once the source starts
+ * answering 429 the polite thing — and the only thing that gets the budget
+ * back — is to go quiet for a while rather than keep knocking every three
+ * seconds. Process-local because it is a property of THIS pod's recent
+ * behaviour; the shared TTL below is what keeps replicas off each other's toes.
+ */
+let historyCooldownUntil = 0;
+const HISTORY_COOLDOWN_MS = 5 * 60_000;
+/** Marks "we asked about this name and it has no sale history" — see the note at
+ *  the write below. Not a real window; it never renders. */
+const HISTORY_NONE = "none";
 
 const HISTORY_WINDOWS = ["last_24_hours", "last_7_days", "last_30_days", "last_90_days"] as const;
 type HistoryWindow = (typeof HISTORY_WINDOWS)[number];
@@ -3370,6 +3390,10 @@ async function fetchSaleHistory(marketHashName: string): Promise<Map<string, His
     headers: { "Accept-Encoding": "br, gzip", Accept: "application/json" },
     signal: AbortSignal.timeout(20_000),
   });
+  if (response.status === 429) {
+    historyCooldownUntil = Date.now() + HISTORY_COOLDOWN_MS;
+    throw new Error("Sale history is rate-limited; backing off.");
+  }
   if (!response.ok) throw new Error(`Sale history returned HTTP ${response.status}.`);
   const payload = await response.json();
   if (!Array.isArray(payload)) throw new Error("Sale history is not an array.");
@@ -3436,7 +3460,9 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
     const version = getItem(itemId)?.altName ?? "";
 
     const { rows: cached } = await pool.query<{
-      version: string; period: HistoryWindow; min: number | null; max: number | null;
+      // `period` is a HistoryWindow OR the HISTORY_NONE sentinel, so it is typed
+      // as it is stored: a string, narrowed when the usable rows are picked.
+      version: string; period: string; min: number | null; max: number | null;
       avg: number | null; median: number | null; volume: number; fetched_at: Date;
     }>(
       `SELECT version, period, min, max, avg, median, volume, fetched_at
@@ -3446,7 +3472,7 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
     const fresh =
       cached.length > 0 && Date.now() - Math.max(...cached.map((r) => r.fetched_at.getTime())) < HISTORY_TTL_MS;
 
-    if (!fresh && Date.now() - lastHistoryFetch > HISTORY_MIN_GAP_MS) {
+    if (!fresh && Date.now() > historyCooldownUntil && Date.now() - lastHistoryFetch > HISTORY_MIN_GAP_MS) {
       lastHistoryFetch = Date.now();
       try {
         const byVersion = await fetchSaleHistory(marketHashName);
@@ -3458,6 +3484,14 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
             values.push(marketHashName, ver, row.window, row.min, row.max, row.avg, row.median, row.volume);
             tuples.push(`(${Array.from({ length: 8 }, (_, k) => `$${b + k + 1}`).join(",")}, now())`);
           }
+        }
+        // NOTHING is a result too. Without a row saying "asked, and this name
+        // has no sale history", every view of that item re-asked — and the items
+        // with no history are exactly the thin ones people click through while
+        // browsing, so the empty answers were spending the whole budget.
+        if (!tuples.length) {
+          values.push(marketHashName, version, HISTORY_NONE, null, null, null, null, 0);
+          tuples.push(`(${Array.from({ length: 8 }, (_, k) => `$${k + 1}`).join(",")}, now())`);
         }
         if (tuples.length) {
           await pool.query(
@@ -3479,9 +3513,10 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
       }
     }
     // Serve what is stored, stale or not: a spread from this morning beats none.
-    const mine = cached.filter((r) => r.version === version);
-    const rows = (mine.length ? mine : cached.filter((r) => r.version === "")).map((r) => ({
-      window: r.period,
+    const usable = cached.filter((r) => r.period !== HISTORY_NONE);
+    const mine = usable.filter((r) => r.version === version);
+    const rows = (mine.length ? mine : usable.filter((r) => r.version === "")).map((r) => ({
+      window: r.period as HistoryWindow,
       min: r.min,
       max: r.max,
       avg: r.avg,
