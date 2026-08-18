@@ -1,4 +1,5 @@
 import {
+  CS2ContainerType,
   CS2Economy,
   CS2RarityColorOrder,
   CS2_ITEMS,
@@ -83,12 +84,15 @@ export interface CatalogSkin {
    *  link (1,767 of the 2,205 graffiti have none), which is the one thing the
    *  frontend can't work out for itself — so every listing says. */
   def?: number;
-  // ---- sheet facets. Optional, and only graffiti carries them today; the
-  // sheet's filter bar is driven ENTIRELY by which of these show up on the
-  // list it loaded, so a catalog that omits them renders exactly as before.
+  // ---- sheet facets. All optional, and the sheet's filter bar is driven
+  // ENTIRELY by which of these show up on the list it loaded — so a catalog that
+  // omits them renders exactly as before, and a catalog that starts filling one
+  // in grows a control for it without the frontend being told. That is what let
+  // `collection` spread from graffiti alone to every finish and agent.
   /** Coarse "what IS this" split — the tab strip. See GRAFFITI_GROUPS. */
   group?: string;
-  /** Capsule / box / tournament this came in. Omitted when it came in none. */
+  /** Capsule, case, map or drop pool this came in. Omitted when it came in
+   *  none — see collectionOf, which is what fills it for every finish. */
   collection?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
@@ -120,6 +124,115 @@ function wearRange(i: (typeof items)[number]) {
   return {
     ...(i.hasWear() ? { wearMin: i.getMinimumWear(), wearMax: i.getMaximumWear() } : {}),
     ...(i.hasSeed() ? { seedMin: i.getMinimumSeed(), seedMax: i.getMaximumSeed() } : {}),
+  };
+}
+
+// ---- Collections ------------------------------------------------------------
+//
+// The case, map or drop pool a finish came out of — the axis the community
+// actually indexes skins by. Nobody hunts "a red AK", they hunt the Bravo case,
+// and until now that was the one question the weapon catalog could not answer
+// while the sticker one could.
+//
+// The field is `collectionName`, NOT the `categoryName` the attachment index
+// reads. Those two look interchangeable and are not: `categoryName` is the
+// CAPSULE and is undefined on all 1,492 weapons; `collectionName` is the
+// COLLECTION and is undefined on all 11,144 stickers. Read the wrong one and you
+// get a field that is empty everywhere you look and populated everywhere you
+// don't — the same shape of failure as the 9.0.0 renames, and just as quiet.
+
+/**
+ * Collections that offer an item as a RARE SPECIAL — knives and gloves.
+ *
+ * They carry no `collectionName` at all (0 of 556 melee finishes, 0 of 94 glove
+ * finishes) because in the game's data they are not members of a collection;
+ * they are the special pool bolted onto one. The only record is each
+ * container's own `specialIds`, read backwards — the same trick getGraffiti uses
+ * on `contentIds` for the spray boxes, and `specialIds`/`contentIds` rather than
+ * `contents` for the same reason: the latter asserts the item IS a container
+ * (cs2-lib throws otherwise) and inflates every id into a full item object.
+ *
+ * Read backwards it is MANY-TO-MANY, and that is why this answers "" so often.
+ * The classic knife set (Bayonet, Karambit, Flip, …) is the special pool of
+ * eleven different cases at once, so "Bayonet | Fade came from the Bravo case"
+ * is a sentence with no true version — 312 melee and 72 glove finishes sit in
+ * two collections or more, and the Kukri is in two on its own (Kilowatt and
+ * Gallery). Only the ones offered by exactly ONE get a name: 102 of the 578
+ * melee entries and 22 of the 104 glove ones. The rest stay uncollected rather
+ * than being handed whichever case the walk happened to reach first.
+ */
+let specialCollections: Map<number, string> | null = null;
+function specialCollectionOf(id: number): string {
+  if (!specialCollections) {
+    const offers = new Map<number, Set<string>>();
+    for (const c of items) {
+      if (c.type !== "case" || !c.collectionName) continue;
+      for (const special of c.specialIds ?? []) {
+        let names = offers.get(special);
+        if (!names) offers.set(special, (names = new Set()));
+        names.add(c.collectionName as string);
+      }
+    }
+    specialCollections = new Map(
+      [...offers].flatMap(([id, names]) => (names.size === 1 ? [[id, [...names][0]] as [number, string]] : [])),
+    );
+  }
+  return specialCollections.get(id) ?? "";
+}
+
+/**
+ * The collection a finish belongs to, or "" for the ones that belong to none.
+ *
+ * "" is a real answer, not a gap: M4A4 | Howl's collection was withdrawn along
+ * with the skin, and the shared knife and glove pools above genuinely have no
+ * single one. It is spelled the same way the sticker index spells a capsule-less
+ * sticker, so both facet paths agree on what "uncollected" looks like.
+ */
+function collectionOf(i: (typeof items)[number]): string {
+  if (i.collectionName) return i.collectionName as string;
+  return i.type === "melee" || i.type === "glove" ? specialCollectionOf(i.id) : "";
+}
+
+/** Spread form. Absent rather than empty, because the sheet's filter bar is
+ *  driven by which facets APPEAR on the loaded list — an empty string would be
+ *  a collection called "" with its own dropdown row. */
+const collectionFacet = (i: (typeof items)[number]) => {
+  const collection = collectionOf(i);
+  return collection ? { collection } : {};
+};
+
+/**
+ * One painted finish, as every surface that offers one needs it.
+ *
+ * Weapon skins, knife finishes and glove finishes were three near-identical
+ * copies of this literal and the collection page would have been a fourth —
+ * which matters more than the duplication does: the craft editor picks an item's
+ * whole FORM from `type`, `model` and `paintMaterial`, so a listing that drops
+ * one of them opens the wrong editor, and it does it silently. `altName` and
+ * `legacyPaint` are constant on gloves (0 of 104 carry either) and so cost that
+ * catalog nothing but a field it can ignore.
+ */
+function paintedListing(i: (typeof items)[number]): CatalogSkin {
+  return {
+    id: i.id,
+    name: i.name,
+    // Phase/variant — "Ruby", "Phase 2". Its own paint index; without this the
+    // sheet shows N identically-named rows.
+    altName: i.alternateName ?? null,
+    rarity: i.rarityColor as string,
+    image: img(i.imagePath),
+    // Per FINISH, not per slot: "★ Karambit | Doppler" and "★ Bayonet | Doppler"
+    // are different models, so the craft editor can only mount 3D if the listing
+    // carries it. `paintMaterial` rides along because a finish needs its own
+    // compositor, and because its presence is what the resolver checks to decide
+    // whether the item can render in 3D yet.
+    model: (i.modelKey as string) ?? null,
+    paintMaterial: i.materialPath ?? null,
+    legacyPaint: !!i.isLegacyModel,
+    type: i.type as string,
+    def: i.definitionIndex,
+    ...collectionFacet(i),
+    ...wearRange(i),
   };
 }
 
@@ -162,19 +275,7 @@ export function getWeaponSkins(model: string): {
   );
   const skins = items
     .filter((i) => i.type === "weapon" && i.modelKey === model && i.variantIndex)
-    .map((i) => ({
-      id: i.id,
-      name: i.name,
-      altName: i.alternateName ?? null,
-      rarity: i.rarityColor as string,
-      image: img(i.imagePath),
-      model: (i.modelKey as string) ?? null,
-      paintMaterial: i.materialPath ?? null,
-      legacyPaint: !!i.isLegacyModel,
-      type: i.type,
-      def: i.definitionIndex,
-      ...wearRange(i),
-    }));
+    .map(paintedListing);
   return {
     base: base
       ? {
@@ -210,28 +311,17 @@ export function getAgents() {
       model: (a.modelKey as string) ?? null,
       type: a.type,
       def: a.definitionIndex,
+      // All 63 agents carry one — "Shattered Web Agents", "Broken Fang Agents",
+      // "Operation Riptide Agents" — so the agent sheet gets a Collection
+      // dropdown out of this line alone. They stay OUT of the collections index
+      // (see getCollections): that page is about finishes, and an operation's
+      // agent roster is a different kind of set.
+      ...collectionFacet(a),
     }));
 }
 
 export function getKnives(): CatalogSkin[] {
-  return items
-    .filter((i) => i.type === "melee")
-    .map((k) => ({
-      id: k.id,
-      name: k.name,
-      altName: k.alternateName ?? null,
-      rarity: k.rarityColor as string,
-      image: img(k.imagePath),
-      // Per FINISH, not per slot: "★ Karambit | Doppler" and "★ Bayonet |
-      // Doppler" are different models, so the craft editor can only mount 3D
-      // if the listing carries it.
-      model: (k.modelKey as string) ?? null,
-      paintMaterial: k.materialPath ?? null,
-      legacyPaint: !!k.isLegacyModel,
-      type: k.type,
-      def: k.definitionIndex,
-      ...wearRange(k),
-    }));
+  return items.filter((i) => i.type === "melee").map(paintedListing);
 }
 
 export function getMusicKits(): CatalogSkin[] {
@@ -676,6 +766,7 @@ export function getItemsByIds(ids: number[]): (CatalogSkin & {
       // the only casualty was the button, on the one route where the item comes
       // from a stranger's URL rather than from your own inventory.
       def: i.definitionIndex,
+      ...collectionFacet(i),
       ...wearRange(i),
     });
   }
@@ -683,22 +774,180 @@ export function getItemsByIds(ids: number[]): (CatalogSkin & {
 }
 
 export function getGloves(): CatalogSkin[] {
-  return items
-    .filter((i) => i.type === "glove")
-    .map((g) => ({
-      id: g.id,
-      name: g.name,
-      rarity: g.rarityColor as string,
-      image: img(g.imagePath),
-      // Same reason as the agents above. `paintMaterial` rides along because a
-      // glove finish needs its own compositor — and because its presence is what
-      // the resolver checks to decide whether a glove can render yet.
-      model: (g.modelKey as string) ?? null,
-      type: g.type,
-      paintMaterial: g.materialPath ?? null,
-      def: g.definitionIndex,
-      ...wearRange(g),
-    }));
+  return items.filter((i) => i.type === "glove").map(paintedListing);
+}
+
+/**
+ * How you GET a collection — the tab strip on the collections index.
+ *
+ * Not cosmetic: it is also what decides whether a finish in it can be StatTrak
+ * (case) or Souvenir (souvenir package), which is the first thing anyone wants
+ * to know about a skin they are about to hunt.
+ */
+export type CollectionSource = "case" | "souvenir" | "drop";
+
+export interface CatalogCollection {
+  /** cs2-lib's own key ("set_bravo_i"). The URL handle, deliberately not the
+   *  name: a display name is translated and can be retitled, and a link to a
+   *  collection should outlive both. */
+  key: string;
+  name: string;
+  /** The collection's best finish, standing in for the set. NOT cs2-lib's
+   *  `collectionImagePath` (the case icon): build-asset-manifest.mjs stages
+   *  `imagePath` and nothing else, so the case icons are not on our mirror and
+   *  pointing at them would render 94 broken tiles. A case is recognised by its
+   *  covert anyway. */
+  image: string | null;
+  /** That same finish's rarity colour. Shipped so a collection tile and the
+   *  collection's hero band are lit like every other tile in the app instead of
+   *  being the one grey grid on the screen. It means "the best thing in here",
+   *  which is the sense in which a case has a rarity at all. */
+  rarity: string | null;
+  // NO description, even though cs2-lib carries `collectionDescription`. Two of
+  // the 94 have one and both are the ITEM's grant note leaking up ("This item
+  // was granted during Operation Bravo to an Operation Bravo Coin owner"), which
+  // is not a sentence about the collection at all. A field that is absent 92
+  // times and wrong twice is worse than no field.
+  source: CollectionSource;
+  /** Every finish in it. Shipped with the INDEX rather than behind a second
+   *  request because "you own 4 of 17" is then a set intersection against the
+   *  inventory the client already holds — no endpoint, no round trip, and no
+   *  chance of the badge disagreeing with the page it links to. ~2k ids across
+   *  the whole index. */
+  itemIds: number[];
+}
+
+/**
+ * Which container offers which collection.
+ *
+ * A collection is never marked "souvenir" — its PACKAGES are — so the only
+ * record of how you get one is its containers, read backwards off `contentIds`.
+ * A collection reachable from a weapon case AND a souvenir package (The Anubis
+ * Collection is the one) counts as a case: that is the way you can open it for a
+ * StatTrak, which is the stronger fact.
+ *
+ * `keyOfItem` is the index built by the caller — item id to collection key. The
+ * containers only ever list the finishes themselves, so there is no other way
+ * back from a `contentIds` entry to the set it belongs to.
+ */
+function collectionSources(keyOfItem: Map<number, string>): Map<string, CollectionSource> {
+  const sources = new Map<string, CollectionSource>();
+  for (const c of items) {
+    if (c.type !== "case") continue;
+    const from: CollectionSource | null =
+      c.containerType === CS2ContainerType.WeaponCase
+        ? "case"
+        : c.containerType === CS2ContainerType.SouvenirCase
+          ? "souvenir"
+          : null;
+    if (!from) continue;
+    for (const id of c.contentIds ?? []) {
+      const key = keyOfItem.get(id);
+      if (key && !(from === "souvenir" && sources.get(key) === "case")) sources.set(key, from);
+    }
+  }
+  return sources;
+}
+
+let collectionIndex: CatalogCollection[] | null = null;
+
+/**
+ * Every skin collection, in release order.
+ *
+ * Built from the FINISHES rather than from the containers, because a collection
+ * outlives its container: 28 of the 94 come from no container at all (the map
+ * collections that only ever dropped in game, and the six timed-drop pools), and
+ * reading the case list would simply not have them.
+ *
+ * Painted finishes only — weapon, knife, glove. Agents carry a `collectionName`
+ * too and it faceted their own sheet (see getAgents), but "Broken Fang Agents"
+ * is a roster, not a case, and mixing the two here would make the index answer a
+ * different question per row.
+ */
+export function getCollections(): CatalogCollection[] {
+  if (collectionIndex) return collectionIndex;
+  const byName = new Map<string, CatalogCollection>();
+  const keyOfItem = new Map<number, string>();
+  // Pass 1 — the items that name their own collection. Insertion order is
+  // catalog order, which is roughly release order and reads far better than
+  // alphabetical: the Chroma trilogy lands together and the newest sets are at
+  // the end, where "what came out recently" expects them.
+  for (const i of items) {
+    if (i.type !== "weapon" || !i.variantIndex || !i.collectionName) continue;
+    const name = i.collectionName as string;
+    let entry = byName.get(name);
+    if (!entry) {
+      byName.set(
+        name,
+        (entry = {
+          key: (i.collectionKey as string) ?? name,
+          name,
+          image: null,
+          rarity: null,
+          source: "drop",
+          itemIds: [],
+        }),
+      );
+    }
+    entry.itemIds.push(i.id);
+    keyOfItem.set(i.id, entry.key);
+  }
+  // Pass 2 — the knives and gloves that belong to exactly one collection. Joined
+  // by NAME because that is all `specialIds` can give us; every such collection
+  // already exists from pass 1, so a name that misses is a set with no weapons
+  // in it and nothing to show.
+  for (const i of items) {
+    if (i.type !== "melee" && i.type !== "glove") continue;
+    const entry = byName.get(specialCollectionOf(i.id));
+    if (!entry) continue;
+    entry.itemIds.push(i.id);
+    keyOfItem.set(i.id, entry.key);
+  }
+  const sources = collectionSources(keyOfItem);
+  const art = new Map(
+    items.map((i) => [
+      i.id,
+      { image: img(i.imagePath), rarity: (i.rarityColor as string) ?? null, rank: rarityRank(i.rarityColor as string) },
+    ]),
+  );
+  for (const entry of byName.values()) {
+    entry.source = sources.get(entry.key) ?? "drop";
+    // The highest-rarity finish, first one wins. Deterministic on purpose: the
+    // tile is the collection's face and it must not change between two requests
+    // that returned the same set.
+    let best = -1;
+    for (const id of entry.itemIds) {
+      const a = art.get(id);
+      if (a && a.rank > best) {
+        best = a.rank;
+        entry.image = a.image;
+        entry.rarity = a.rarity;
+      }
+    }
+  }
+  collectionIndex = [...byName.values()];
+  return collectionIndex;
+}
+
+/** One collection with its finishes. Null for a key nothing answers to — a
+ *  stale link, not an error. */
+export function getCollection(key: string): (CatalogCollection & { skins: CatalogSkin[] }) | null {
+  const entry = getCollections().find((c) => c.key === key);
+  if (!entry) return null;
+  // Rarity order is the CLIENT's job (it sorts every catalog it holds whole), so
+  // this ships them in the order they were indexed and lets the sheet's own sort
+  // control decide — otherwise "Sort · Name" would be sorting a list that had
+  // already been reordered on the way out.
+  const skins: CatalogSkin[] = [];
+  for (const id of entry.itemIds) {
+    try {
+      const i = CS2Economy.getById(id);
+      if (i) skins.push(paintedListing(i));
+    } catch {
+      continue;
+    }
+  }
+  return { ...entry, skins };
 }
 
 export interface RenderTestItem {
@@ -986,6 +1235,10 @@ export function getItem(id: number) {
       tintName: i.type === "graffiti" ? /\(([^()]+)\)\s*$/.exec(i.name)?.[1] : undefined,
       paintMaterial: i.materialPath ?? null,
       legacyPaint: !!i.isLegacyModel,
+      // This is the resolver every OWNED instance comes through, so it is what
+      // lets the inventory grid and the loadout sheet sort by collection at all
+      // — the catalog listings alone only cover things you haven't crafted yet.
+      ...collectionFacet(i),
     };
   } catch {
     return null;
