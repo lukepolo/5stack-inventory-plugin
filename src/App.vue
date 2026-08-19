@@ -1884,6 +1884,22 @@ const editingId = ref<number | null>(null);
 // The weapon model this craft/edit is about. Crafting from the sheet = the
 // selected slot's weapon; editing from anywhere = the ITEM's own weapon.
 const craftModel = ref<string | null>(null);
+/**
+ * What the craft/view modal prints above the finish name — the craft's OWN
+ * weapon, never the loadout's. It used to show `sheetWeaponName`, which was
+ * right when every craft started from the selected slot and wrong from the
+ * armory: `selected` still points at whatever position was last touched, so an
+ * M4A4 finish opened over an MP7 slot read "MP7". The finish's own name prefix
+ * covers knives, gloves and agents, whose models aren't in the base-weapon
+ * list; items with no weapon in their name (pins, vanilla knives) answer null
+ * and the line hides rather than name an unrelated gun.
+ */
+const craftWeaponLabel = computed(() => {
+  const w = weaponByModel.value.get(craftModel.value ?? "")?.name;
+  if (w) return w;
+  const name = craft.value?.skin.name ?? "";
+  return name.includes(" | ") ? name.split(" | ")[0] : null;
+});
 // What the 3D stage MOUNTS for this craft/edit — model key plus what kind of
 // thing it is. Distinct from craftModel, which stays "the weapon", because
 // plenty here is weapon-specific (sticker geometry, the weapon name, the
@@ -5926,7 +5942,11 @@ const craftReportHref = computed(() => {
   const c = craft.value;
   if (!c) return ISSUE_NEW_URL;
   return issue3dHref({
-    weapon: weaponByModel.value.get(craftModel.value ?? "")?.name ?? sheetWeaponName.value,
+    // The craft's own weapon — same rule as craftWeaponLabel, and for the same
+    // reason: the loadout's selected slot says nothing about a craft opened
+    // from the armory. Prefix-less items (a pin, a vanilla knife) report their
+    // full name rather than an unrelated gun.
+    weapon: craftWeaponLabel.value ?? c.skin.name,
     finish: [c.skin.name, c.skin.altName].filter(Boolean).join(" · "),
     model: craftModel.value,
     paintMaterial: c.skin.paintMaterial,
@@ -8803,7 +8823,7 @@ if (MDEBUG) {
             >
               <div :class="isCompact ? 'w-full text-center' : 'col-start-2 text-center'">
                 <div class="mx-auto mb-1.5 h-px" :class="isCompact ? 'w-40' : 'w-28'" :style="{ background: `linear-gradient(90deg, transparent, ${craft.skin.rarity}, transparent)` }"></div>
-                <div class="text-f11 uppercase tracking-cs1 text-muted-foreground">{{ editingId != null || duplicating ? (weaponByModel.get(craftModel ?? '')?.name ?? sheetWeaponName) : sheetWeaponName }}</div>
+                <div v-if="craftWeaponLabel" class="text-f11 uppercase tracking-cs1 text-muted-foreground">{{ craftWeaponLabel }}</div>
                 <ItemName :item="craft.skin" strip name-class="text-f13 font-semibold" :style="{ color: craft.skin.rarity }" />
               </div>
               <!-- Controls legend. Overlaying the model put it on top of the
