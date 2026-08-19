@@ -13,6 +13,7 @@
 // The chrome lives here; the facet sections stay at the call site, since what
 // you can filter genuinely differs between a drawer of things you own and a
 // catalog of things you don't.
+import { inject } from "vue";
 import { isCompact } from "../responsive";
 import { useSwipeDismiss } from "../composables/useSwipeDismiss";
 import { Z } from "../zLayers";
@@ -24,6 +25,8 @@ defineProps<{
 }>();
 
 const emit = defineEmits<{ (e: "close"): void; (e: "reset"): void }>();
+
+const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
 
 // Its own instance: only one sheet is open at a time, and owning the drag keeps
 // it out of the host's state.
@@ -57,7 +60,7 @@ const handlers = swipe.forSheet(() => emit("close"));
               class="ml-auto rounded-md border border-border px-2 py-1 text-f9 uppercase tracking-cs1 text-muted-foreground"
               @click="emit('reset')"
             >
-              Reset
+              {{ tr('inventory.filters.reset', 'Reset') }}
             </button>
           </div>
         </div>

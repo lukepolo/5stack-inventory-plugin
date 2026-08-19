@@ -395,22 +395,13 @@ CREATE TABLE IF NOT EXISTS inventory.price_history (
 );
 CREATE INDEX IF NOT EXISTS price_history_fetched_idx ON inventory.price_history (fetched_at);
 
--- ---- Favourites -------------------------------------------------------------
--- Two shapes, because "favourite" means two different things here and only one
--- of them is a row you own.
+-- ---- Wishlist --------------------------------------------------------------
+-- Catalog items the caller wants but does not own — "I want that Fade one day".
 --
--- An OWNED instance gets a column: it is one boolean about an existing row, and
--- a side table keyed on that row would only add a join to every inventory read.
-ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS favourite boolean NOT NULL DEFAULT false;
--- Partial, because the read is always "the ones I starred" and starred items are
--- the small minority. Indexing the false side would be most of the table.
-CREATE INDEX IF NOT EXISTS owned_items_favourite_idx
-  ON inventory.owned_items (steam_id) WHERE favourite;
-
--- A CATALOG item cannot: it is not a row in owned_items and never will be until
--- someone crafts it, so there is nothing to flag. This is the wishlist — "I want
--- that Fade one day" — and it is keyed by the cs2-lib item id, which is why it
--- cannot be a nullable column on the inventory table.
+-- Its own table rather than a flag on the item, because a wanted item is not a
+-- row in owned_items and never will be until someone crafts it, so there is
+-- nothing to flag. Keyed by the cs2-lib item id, which is why it cannot be a
+-- nullable column on the inventory table.
 --
 -- No foreign key to anything: item_id addresses the economy, which lives in
 -- cs2-lib and not in this database. An id cs2-lib later retires simply stops

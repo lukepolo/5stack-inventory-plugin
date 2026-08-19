@@ -2,7 +2,7 @@
 // App.vue only, which is how the inventory grid and the loadout sheet ended up
 // drawing the same item two different ways — keep new tile chrome in here (or
 // in ItemTile) rather than re-deriving it per view.
-import type { InventoryItem } from "./api";
+import type { AttachSource, InventoryItem } from "./api";
 
 // The CS2 wear scale. The hard stops aren't decoration — they're the real tier
 // boundaries, which is why the ramp is worth drawing at all: it says "this
@@ -96,8 +96,13 @@ export function glowStyle(color?: string | null, opacity = 0.42) {
  *  The kind used to be flattened away, which left a tile rendering the charm as
  *  a fifth sticker at sticker size — and a charm is one per weapon, chosen
  *  separately, so it deserves to read as its own thing rather than get lost in
- *  the row. Callers that only want images can still ignore it. */
-export function attachmentsOf(i: InventoryItem) {
+ *  the row. Callers that only want images can still ignore it.
+ *
+ *  Takes an AttachSource, not an InventoryItem: a public loadout row carries the
+ *  identical enriched arrays, and it is the ONLY thing a visitor has — narrowed
+ *  to the owned shape, this helper was the reason someone else's loadout listed
+ *  no stickers even once the endpoint started sending them. */
+export function attachmentsOf(i: AttachSource) {
   const tag = <T,>(list: (T | null | undefined)[], kind: "sticker" | "patch" | "charm") =>
     list.filter((x): x is NonNullable<T> => !!x).map((x) => ({ ...x, kind }));
   return [
@@ -249,3 +254,19 @@ export const isCustomizable = (item?: { type?: string | null } | null) =>
  * listing carries `def` for exactly this.
  */
 export const canInspect = (item?: { def?: number | null } | null) => item?.def != null;
+
+/**
+ * The team accent at 16% — the fill every "this one is on" control wears.
+ *
+ * Built on var(--acc) rather than the computed hex so it rides the registered
+ * property's crossfade when the team flips (see @property --acc in style.css).
+ * Lives here rather than in App.vue because the screens extracted out of that
+ * file all paint their active chips with it, and a second copy of the string is
+ * a second place for the percentage to drift.
+ */
+export const accentSoft = "color-mix(in srgb, var(--acc) 16%, transparent)";
+
+/** The selected-tile ring: a border plus a 1px outer glow in the team accent. */
+export function selRing(on: boolean) {
+  return on ? { borderColor: "var(--acc)", boxShadow: "0 0 0 1px var(--acc)" } : {};
+}

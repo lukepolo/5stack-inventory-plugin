@@ -34,6 +34,13 @@ export interface DevFlag {
    * Most of these are read once at module load or at mount, so flipping them
    * mid-session changes nothing until the model is rebuilt. Saying so in the HUD
    * is the difference between "this toggle is broken" and "reopen the item".
+   *
+   * ABSENT MEANS "NEEDS A REMOUNT" — the HUD asks `remount !== false`, so a flag
+   * that says nothing gets the reload prompt. That is the safe way round: the
+   * only cost of an unnecessary prompt is a reload, while a flag wrongly marked
+   * live is a control that silently does nothing and no longer admits it. So
+   * `remount: false` is a claim about the viewer, and only three of these make
+   * it — see the live setters in viewer3d.ts.
    */
   remount?: boolean;
   /** Grouping in the panel. */
@@ -88,7 +95,12 @@ export const FLAGS: DevFlag[] = [
     label: "Bloom",
     hint: "A soft glow on the brightest parts of a skin. Applies to the 3D viewer; item cards are always rendered without it.",
     dflt: true,
-    remount: true,
+    // Live: the viewer builds and frees the composer on the switch. Stated as
+    // `false` rather than left out, because ABSENT MEANS "needs a remount" — the
+    // HUD reads `remount !== false` — and the three sliders under this one were
+    // always live, so a group where the dials moved and the switch above them
+    // asked you to reopen the item was the whole complaint.
+    remount: false,
     group: "3D viewer",
     audience: "user",
   },
@@ -97,7 +109,10 @@ export const FLAGS: DevFlag[] = [
     label: "Motion",
     hint: "Play the weapon's own inspect animation in the 3D viewer instead of turning it on a turntable. Item cards are always rendered from the still pose.",
     dflt: true,
-    remount: true,
+    // Live: the clip drives the camera and the light rig, never the mesh, so the
+    // viewer makes and unmakes a mixer instead of being rebuilt. Explicit for the
+    // same reason as bloom above — absent reads as "needs a remount".
+    remount: false,
     group: "3D viewer",
     audience: "user",
   },
@@ -229,6 +244,8 @@ export interface DevChoice {
   dflt: string;
   options: { value: string; label: string; hint?: string }[];
   group: DevFlag["group"];
+  /** See DevFlag.remount — and note the picker only prints the note, so leaving
+   *  it out here reads as "live" rather than as "needs a remount". State it. */
   remount?: boolean;
   audience?: "user" | "developer";
 }
@@ -240,8 +257,11 @@ export const CHOICES: DevChoice[] = [
     hint: "Which rig the viewer lights an item under. Item CARDS are always baked under Studio, whatever this says — a card is cached against its render key, so a preset baked into one could never be told apart from a bug.",
     dflt: DEFAULT_ENVIRONMENT,
     options: VIEWER_ENVIRONMENTS.map((e) => ({ value: e.key, label: e.label, hint: e.hint })),
-    // Read once when the rig is built, like the other lighting values.
-    remount: true,
+    // Live: a preset is five intensities and an env rotation, and the viewer
+    // re-assigns them on the lights it already has. It was remount-gated only
+    // because the rig was read once at mount, which made picking a preset update
+    // this hint and leave the render pixel for pixel identical.
+    remount: false,
     group: "3D viewer",
     audience: "user",
   },

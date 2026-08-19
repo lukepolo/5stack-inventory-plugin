@@ -8,11 +8,12 @@
 // Steam-synced items are read-only server-side, so they get a Duplicate action
 // where crafted items get Edit — never both.
 import { computed, inject } from "vue";
-import { Check, Clock, Heart, Loader2 } from "lucide-vue-next";
+import { Check, Clock, Loader2 } from "lucide-vue-next";
 import type { InventoryItem } from "../api";
 import ItemArt from "./ItemArt.vue";
 import { ART_FADE_B, CARD_ART, glowStyle, isAgentArt, weaponName } from "../itemVisuals";
 import ItemName from "./ItemName.vue";
+import MusicPlayer from "./MusicPlayer.vue";
 import TileActions from "./TileActions.vue";
 import WearBar from "./WearBar.vue";
 import PriceTag from "./PriceTag.vue";
@@ -78,6 +79,8 @@ const props = withDefaults(
   { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false, row: false, showPrice: false, pricePending: false, priceSource: "the price feed" },
 );
 
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
+
 /** Always "est." and always says which window it came from. A bare "$41" on a
  *  skin implies a precision a whole-wear-bracket average does not have. */
 const priceTitle = computed(() => {
@@ -86,15 +89,21 @@ const priceTitle = computed(() => {
     // A substituted listing says so first: it is the thing that makes the number
     // mean something different from what the tile appears to claim.
     return (
-      (note ? `No exact listing — this is the ${note} one. ` : "") +
-      `Rough estimate — ${PRICE_WINDOW_LABEL[props.inst.price.window]} for ${props.inst.price.marketHashName}. Not a sale price.`
+      (note ? tr("inventory.price.approx_note", "No exact listing — this is the {note} one.", { note }) + " " : "") +
+      tr("inventory.price.estimate", "Rough estimate — {window} for {name}. Not a sale price.", {
+        window: PRICE_WINDOW_LABEL[props.inst.price.window],
+        name: props.inst.price.marketHashName,
+      })
     );
   }
   // Say WHY it is blank. "No price" and "pricing is broken" look identical on a
   // card, and the wear bracket is usually the answer: a market lists a finish
   // per bracket, and the beaten-up end of the range often has no listing at all.
   const bracket = props.inst.wear != null ? ` (${wearTier(props.inst.wear)})` : "";
-  return `No ${props.priceSource} listing for this item${bracket}.`;
+  return tr("inventory.price.none", "No {source} listing for this item{bracket}.", {
+    source: props.priceSource,
+    bracket,
+  });
 });
 
 const emit = defineEmits<{
@@ -103,8 +112,6 @@ const emit = defineEmits<{
    *  `group-hover`, which never fires on touch, so without this they'd be
    *  unreachable there — the host opens the same menu contextmenu opens. */
   (e: "longpress"): void;
-  /** The DESIRED state, not a toggle — see setFavourite in api.ts for why. */
-  (e: "favourite", favourite: boolean): void;
 }>();
 
 // Mirrors the slot long-press in App.vue: 450ms, 10px of slop before it's
@@ -156,6 +163,12 @@ const queued = computed(() => !!art?.queuedIds.value.has(props.inst.id));
 // implying the queue is merely slow.
 const preparing = computed(() => !!art?.assetsPending.value && !baking.value);
 const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.team));
+
+// A music kit is the one thing in the catalog whose art says nothing about it —
+// every kit is a disc on a coloured square, so the tile could not tell you what
+// you owned. Absent whenever this instance has no extracted audio, which is what
+// keeps a mount without the music step looking exactly as it did before.
+const audioSrc = computed(() => props.inst.item?.audio ?? null);
 </script>
 
 <template>
@@ -196,7 +209,7 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       class="absolute left-1.5 top-1.5 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
     >
       <Loader2 v-if="baking" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" />
-      {{ baking ? 'baking' : preparing ? 'preparing' : 'queued' }}
+      {{ baking ? tr('inventory.tile.baking', 'baking') : preparing ? tr('inventory.tile.preparing', 'preparing') : tr('inventory.tile.queued', 'queued') }}
     </span>
 
     <!-- Hover actions. Shared with the loadout rail's equipment tiles.
@@ -211,38 +224,6 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       @duplicate="emit('duplicate')"
       @remove="emit('remove')"
     />
-
-    <!--
-      Star. Bottom-left, which is the only corner not already carrying a badge:
-      top-left holds the select check and the bake clock, top-right the equipped
-      dots / applied link / Steam mark.
-
-      A starred item shows its heart ALWAYS; an unstarred one only on hover, so a
-      grid of ordinary items is not a wall of empty outlines. That means the
-      control is unreachable on touch — deliberately, because compact already
-      routes every per-item verb through the long-press menu rather than growing
-      hover affordances it cannot show.
-
-      A <span role="button">, NOT a <button>: the tile root IS a button, and a
-      nested one is invalid HTML that browsers silently reparent — which drops the
-      click handler, so the heart would render and do nothing. Same reason
-      TileActions is spans. `stop` because the tile click opens the item.
-    -->
-    <span
-      v-if="!hideActions && !row"
-      role="button"
-      tabindex="-1"
-      class="absolute bottom-1.5 left-1.5 z-[4] grid h-5 w-5 cursor-pointer place-items-center rounded transition-opacity"
-      :class="inst.favourite ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'"
-      :title="inst.favourite ? 'Remove from favourites' : 'Add to favourites'"
-      :aria-pressed="!!inst.favourite"
-      @click.stop="emit('favourite', !inst.favourite)"
-    >
-      <Heart
-        class="h-3.5 w-3.5"
-        :class="inst.favourite ? 'fill-current text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground'"
-      />
-    </span>
 
     <!-- ============ ROW ============ -->
     <!-- Same information, one line: thumb · (model) name + wear · state dots. -->
@@ -275,7 +256,11 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
             :approx="!!inst.price?.approx"
             :title="priceTitle"
           />
-          <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" inline compact class="min-w-0 flex-1" />
+          <!-- Transport only. A row has one line under the name and the wear bar
+               owns it — but a music kit has no wear to draw there, so the space
+               is genuinely free rather than borrowed. -->
+          <MusicPlayer v-if="audioSrc" :src="audioSrc" compact class="min-w-0 flex-1" />
+          <WearBar v-else :item="inst.item" :wear="inst.wear" :seed="inst.seed" inline compact class="min-w-0 flex-1" />
         </div>
       </div>
       <SlotStatus inline :teams="equippedTeams" :inst="inst" :attached-name="attachedName" />
@@ -333,7 +318,11 @@ const equippedTeams = computed(() => (props.inst.equipped ?? []).map((e) => e.te
       <ItemBadges :inst="inst" :max="6" class="ml-auto" />
     </div>
 
-    <WearBar :item="inst.item" :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
+    <!-- Where the wear bar would be. Same reasoning as the row above: a kit has
+         no float, so this takes nothing from the card — and it is the only thing
+         on it that says what the kit actually sounds like. -->
+    <MusicPlayer v-if="audioSrc" :src="audioSrc" class="relative z-[2] mt-2" />
+    <WearBar v-else :item="inst.item" :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
     </template>
   </button>
 </template>

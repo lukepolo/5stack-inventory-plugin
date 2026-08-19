@@ -1,4 +1,4 @@
-import { readFileSync, createWriteStream } from "node:fs";
+import { readFileSync, createReadStream, createWriteStream } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -21,6 +21,17 @@ import {
   getPatchMaterials,
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
+import {
+  itemDescription,
+  itemTitle,
+  parseShareTarget,
+  pngPixelSize,
+  renderUnfurl,
+  requestOrigin,
+  truncate,
+  type ItemFacts,
+  type ShareTarget,
+} from "./share.ts";
 import {
   pickPrice,
   priceTargetKey,
@@ -323,12 +334,42 @@ const COMPOSITE_MAX_BYTES = 48 * 1024 * 1024;
 const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
 const MODELS_DIR = process.env.MODELS_DIR ?? "/cs2-models/models";
+const MUSIC_DIR = process.env.MUSIC_DIR ?? "/cs2-models/music";
 const ASSET_TYPES: Record<string, string> = {
   ".json": "application/json",
   ".webp": "image/webp",
   ".png": "image/png",
   ".glb": "model/gltf-binary",
+  // Music kit menu themes. Both containers, because the extractor probes what
+  // Source2Viewer actually wrote rather than assuming mp3 — the format follows
+  // the codec inside the .vsnd_c.
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
 };
+
+/**
+ * One `bytes=` range against a known size, or null when none was asked for and
+ * false when the one asked for cannot be met.
+ *
+ * The distinction matters: an unsatisfiable range is a 416, and answering it
+ * with the whole file instead hands a media element bytes from an offset it did
+ * not ask about, which it decodes as noise.
+ */
+function parseByteRange(header: string | undefined, size: number): { start: number; end: number } | null | false {
+  const m = /^bytes=(\d*)-(\d*)$/.exec((header ?? "").trim());
+  if (!m) return null;
+  const [, rawStart, rawEnd] = m;
+  // `bytes=-500` means the LAST 500 bytes. Media elements use the suffix form
+  // to read a trailing index, so reading it as "0 to 500" serves the header
+  // where the tail was asked for.
+  let start = rawStart === "" ? size - Number(rawEnd) : Number(rawStart);
+  let end = rawStart === "" ? size - 1 : rawEnd === "" ? size - 1 : Number(rawEnd);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+  start = Math.max(0, start);
+  end = Math.min(size - 1, end);
+  if (size === 0 || start > end || start >= size) return false;
+  return { start, end };
+}
 // Static asset mounts, populated ONLY by our own extractor from the instance's
 // own CS2 install (scripts/extract-models.sh). A miss is a 404 and stays a
 // 404: there is no upstream to fall back to by design, so an unpopulated or
@@ -343,24 +384,49 @@ function serveAssetDir(routePrefix: string, dir: string) {
       return reply.status(404).send({ error: "not found" });
     }
     reply.header("Access-Control-Allow-Origin", "*");
+    // On EVERY reply, not just ranged ones: a browser only attempts a range
+    // request after an ordinary response told it ranges are available, so an
+    // <audio> element that never sees this header treats the track as
+    // unseekable and downloads all 3.5MB before the first note.
+    reply.header("Accept-Ranges", "bytes");
+    const file = path.join(dir, rel);
+    // Two very different lifetimes behind one route:
+    //
+    //  - TEXTURES and ICONS carry a content hash in the filename, so a given
+    //    URL never changes meaning. Cache them hard.
+    //  - MATERIAL JSON does NOT: the filename comes from cs2-lib and is fixed,
+    //    while the content (and the texture names it points at) is rewritten
+    //    by every extraction. Caching those for a day meant a browser kept a
+    //    material referencing textures the new run had renamed — every one
+    //    404'd and the skin rendered white long after the mount was correct.
+    //  - MUSIC is the material case again: `valve_cs2_01.mp3` is a name the
+    //    extractor reuses every run, so it is NOT self-versioning either, and
+    //    treating it as immutable on filename alone would pin a browser to one
+    //    CS2 build's audio forever.
+    //
+    // So both are only immutable once the client has stamped the extraction
+    // version on them (see withAssetVersion). Unversioned requests still
+    // revalidate, which keeps old clients and hand-typed URLs correct.
+    const versioned = (request.query as { v?: string } | undefined)?.v != null;
+    const selfVersioning = type !== "application/json" && !type.startsWith("audio/");
+    const cacheControl = selfVersioning || versioned ? "public, max-age=31536000, immutable" : "no-cache";
+    reply.header("Cache-Control", cacheControl);
     try {
-      const buf = await fs.readFile(path.join(dir, rel));
-      // Two very different lifetimes behind one route:
-      //
-      //  - TEXTURES and ICONS carry a content hash in the filename, so a given
-      //    URL never changes meaning. Cache them hard.
-      //  - MATERIAL JSON does NOT: the filename comes from cs2-lib and is fixed,
-      //    while the content (and the texture names it points at) is rewritten
-      //    by every extraction. Caching those for a day meant a browser kept a
-      //    material referencing textures the new run had renamed — every one
-      //    404'd and the skin rendered white long after the mount was correct.
-      //
-      // So a material is only immutable once the client has stamped the
-      // extraction version on it (see withAssetVersion). Unversioned requests
-      // still revalidate, which keeps old clients and hand-typed URLs correct.
-      const versioned = (request.query as { v?: string } | undefined)?.v != null;
-      const immutable = type !== "application/json" || versioned;
-      reply.header("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
+      // Only stat when a range was actually asked for: the icon and texture
+      // routes are hot and pay nothing for a feature they never use.
+      if (request.headers.range) {
+        const { size } = await fs.stat(file);
+        const range = parseByteRange(request.headers.range, size);
+        if (range === false) {
+          return reply.code(416).header("Content-Range", `bytes */${size}`).send();
+        }
+        if (range) {
+          reply.header("Content-Range", `bytes ${range.start}-${range.end}/${size}`);
+          reply.header("Content-Length", range.end - range.start + 1);
+          return reply.code(206).type(type).send(createReadStream(file, { start: range.start, end: range.end }));
+        }
+      }
+      const buf = await fs.readFile(file);
       return reply.type(type).send(buf);
     } catch {
       return reply.status(404).send({ error: "not extracted" });
@@ -377,6 +443,10 @@ serveAssetDir("/images", IMAGES_DIR);
 // brief blank. Same contract as the others: our own extractor is the only
 // writer, and a genuine miss stays a 404.
 serveAssetDir("/models", MODELS_DIR);
+// Music kit audio. Registered here for the same cross-node reason as the rest —
+// nginx's /music/ block ends in `try_files $uri @backend` — and it is the one
+// mount whose clients seek, which is why serveAssetDir learned byte ranges.
+serveAssetDir("/music", MUSIC_DIR);
 
 // Serve renders directly too — nginx falls back here when its mount copy
 // misses (e.g. frontend/backend pods on different nodes).
@@ -402,6 +472,492 @@ for (const route of ["/api/renders/:key", "/renders/:key"]) {
   }
   });
 }
+
+// ---- Share cards (what a pasted link unfurls to) ----------------------------
+//
+// A shared craft or loadout link shows a picture in Discord, and that picture is
+// a render the OWNER'S BROWSER already baked — never one made on demand.
+//
+// That constraint is the design. This pod has no GL context and no headless
+// browser, so rendering here is not on the table; and even if it were, a crawler
+// must never be able to start a 40-second composite by following a link, because
+// a chat client fanning five unfurl fetches at a skin nobody has rendered is the
+// cheapest denial of service in the building. So these routes only ever SERVE
+// what is already on the mount: the card bake the client uploads through POST
+// /api/render/:id, or failing that the flat econ icon that ships with every
+// finish. A skin nobody has opened in 3D unfurls with its Steam icon and the
+// right words — a card, not a stall.
+//
+// The INCOMPLETE sentinel is inherited rather than re-checked: a white
+// mid-extraction snapshot is refused by the client before it is ever uploaded
+// (snapshotModelNow in src/viewer3d.ts), so everything in RENDERS_DIR has
+// already passed that gate. Nothing here writes to that directory, so nothing
+// here can weaken it.
+//
+// The public URL of a card is /api/share/image with the link's own state in the
+// query, and it stays that URL whatever it resolves to. That is deliberate: the
+// first person to paste a link may only get the flat icon, and when the owner's
+// client bakes the render later the SAME url starts answering with it, so the
+// unfurl improves on its own. The cache lifetime carries that (see below) —
+// there is nothing to invalidate, because there is nothing keyed on the answer.
+
+/**
+ * The one item a loadout card shows, in preference order.
+ *
+ * A loadout is 20-odd slots and an unfurl is one picture, so something has to
+ * choose. The knife leads because it is the piece a CS2 loadout is judged by and
+ * the one people spend on; rifles next (the gun the sender is most likely
+ * showing off), then SMGs/heavies, then pistols. Gloves and the agent sit below
+ * the guns — they render as a pair of hands and a person, which read as a
+ * different kind of picture entirely — and the slots with no model at all
+ * (music kit, graffiti) come last so they are only ever a last resort.
+ *
+ * Within this order a slot whose render is already baked wins over one that is
+ * not, so a shared loadout shows a real render whenever the owner has ever
+ * looked at one of these items in 3D.
+ *
+ * This is a THIRD list of slot names (SLOT_RE and schema.sql's boot DELETE are
+ * the other two) and deliberately not enforced against them: those two must
+ * agree or a restart wipes people's equips, while a slot missing from this one
+ * merely ranks last in a beauty contest. Nothing here can lose a row.
+ */
+const SHARE_HERO_SLOTS = [
+  "knife", "r1", "r2", "r3", "r4", "r5",
+  "m1", "m2", "m3", "m4", "m5",
+  "sp", "p1", "p2", "p3", "p4",
+  "gloves", "agent", "zeus", "c4",
+  "collectible", "graffiti", "musickit",
+];
+
+/** An item a card can be written about: the catalog scalars, plus the owned row
+ *  behind them when there is one (a draft has none — nothing owns it yet). */
+type ShareFacts = ItemFacts & { instanceId: number | null };
+
+/** Where a card's picture comes from: a file on the mount, or the first-party
+ *  CDN for a box whose own extraction has not run yet. */
+interface ShareArt {
+  file?: string;
+  url?: string;
+  type: string;
+  /** True for the owner's real 3D bake, false for the flat econ icon. Decides
+   *  the cache lifetime and nothing else. */
+  baked: boolean;
+}
+
+/**
+ * The owner's baked card for one row, if it is already on the mount.
+ *
+ * Keyed through renderKeyForRow — the SAME server-side derivation the upload
+ * path uses, so this cannot be pointed at another user's slot by anything in the
+ * request. The key is never handed out: the file is served as bytes rather than
+ * redirected to /renders/<key>, because that filename spells `inst-<row id>` and
+ * a Location header would put the owner's row handle in a public response, which
+ * is exactly what withoutInstanceHandle exists to prevent one level down.
+ */
+async function bakedShareRender(facts: ShareFacts, version: number): Promise<string | null> {
+  if (facts.instanceId == null) return null;
+  const file = path.join(
+    RENDERS_DIR,
+    renderKeyForRow({ id: facts.instanceId, wear: facts.wear, seed: facts.seed, stattrak: facts.stattrak }, version),
+  );
+  return (await fs.stat(file).then((s) => s.isFile(), () => false)) ? file : null;
+}
+
+/** The econ icon's path on the mount, or null if the catalog's value is not the
+ *  shape this mount serves. Validated like serveAssetDir even though the string
+ *  comes from cs2-lib rather than the request — the ITEM ID does come from the
+ *  request, and one exported path with a `..` in it would be enough. */
+function econIconFile(image: string | null | undefined): string | null {
+  if (!image || !image.startsWith("/images/")) return null;
+  const rel = image.slice("/images/".length);
+  if (rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+\.webp$/.test(rel)) return null;
+  return path.join(IMAGES_DIR, rel);
+}
+
+/**
+ * The best picture we HAVE for an item — bake, then icon, then the CDN.
+ *
+ * Never the picture we could make: see the header. The icon fallback is what
+ * makes "never bake cold" a feature rather than a hole — every finish in the
+ * economy ships one, so a craft link for a skin nobody has rendered still
+ * unfurls with the artwork Steam itself shows.
+ *
+ * That icon goes out as WEBP, which every crawler worth the name reads
+ * (Discord, Slack and Twitter cards all do). Transcoding is not an option
+ * anyway: there is no image encoder in this pod, and the choice is a webp or no
+ * picture at all.
+ */
+async function shareArtFor(facts: ShareFacts | null, version: number): Promise<ShareArt | null> {
+  if (!facts) return null;
+  const baked = await bakedShareRender(facts, version);
+  if (baked) return { file: baked, type: "image/png", baked: true };
+  const image = getItem(facts.itemId)?.image ?? null;
+  const icon = econIconFile(image);
+  if (icon && (await fs.stat(icon).then((s) => s.isFile(), () => false))) {
+    return { file: icon, type: "image/webp", baked: false };
+  }
+  // A deployment whose own extraction has never run has no icons either, and a
+  // link that unfurls blank on a fresh install reads as the feature being
+  // broken. assetOrigin() is the same first-party mirror the client falls back
+  // to in that state, and it stops answering the moment a local extraction
+  // completes — see its own note on why that is not "silently using someone
+  // else's assets".
+  const origin = await assetOrigin();
+  return origin && image ? { url: `${origin}${image}`, type: "image/webp", baked: false } : null;
+}
+
+/**
+ * The equipped-only rule, and why the share routes need one.
+ *
+ * /api/loadout/:steamId is public by design — an equipped loadout is already
+ * public, because /api/equipped/v5 hands the same items to any game server that
+ * asks with no credential at all. What a player merely OWNS is not, and the
+ * README is explicit that an owned-item list would need a decision before it got
+ * a route. An image endpoint that answered for any instance id would be that
+ * route in pictures, reachable by counting.
+ *
+ * So a row answers only while it is equipped in the live loadout — precisely the
+ * set /api/loadout/:steamId already discloses. Anything else reads as unknown
+ * and unfurls as the plain app card, WITHOUT even the item's icon: the icon
+ * would name the skin, and "instance 41,207 is a Redline" is the disclosure this
+ * whole rule exists to withhold. That costs nothing real, because an item link
+ * is owner-only by design — the share menu says so in as many words, and the
+ * portable form of a craft is the /craft link, which needs no row at all.
+ */
+async function equippedShareFacts(instanceId: number): Promise<ShareFacts | null> {
+  const { rows } = await pool.query<{
+    id: string; item_id: number; wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+  }>(
+    `SELECT i.id, i.item_id, i.wear, i.seed, i.stattrak, i.nametag
+       FROM inventory.owned_items i
+      WHERE i.id = $1
+        AND EXISTS (SELECT 1 FROM inventory.loadout l WHERE l.item_instance_id = i.id)`,
+    [instanceId],
+  );
+  const row = rows[0];
+  return row
+    ? {
+        instanceId: Number(row.id),
+        itemId: Number(row.item_id),
+        wear: row.wear == null ? null : Number(row.wear),
+        seed: row.seed == null ? null : Number(row.seed),
+        stattrak: !!row.stattrak,
+        nametag: row.nametag,
+      }
+    : null;
+}
+
+/** The hero of a public loadout: highest-ranked slot with a bake, else the
+ *  highest-ranked slot at all. Reads the same rows /api/loadout/:steamId serves
+ *  and returns none of the handles — only the scalars a card is written from. */
+async function loadoutShareFacts(
+  steamId: string,
+  team: "CT" | "T" | null,
+  version: number,
+): Promise<ShareFacts | null> {
+  const { rows } = await pool.query<{
+    team: string; slot: string; id: string | null; item_id: number | null;
+    wear: number | null; seed: number | null; stattrak: boolean | null; nametag: string | null;
+  }>(
+    `SELECT l.team, l.slot, i.id,
+            COALESCE(i.item_id, l.item_id) AS item_id,
+            COALESCE(i.wear, l.wear) AS wear,
+            COALESCE(i.seed, l.seed) AS seed,
+            COALESCE(i.stattrak, l.stattrak) AS stattrak,
+            COALESCE(i.nametag, l.nametag) AS nametag
+       FROM inventory.loadout l
+       LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+      WHERE l.steam_id = $1`,
+    [steamId],
+  );
+  // An absent `team` means CT, not "either": App.vue's viewQuery omits the key
+  // when it matches DEFAULT_TEAM, so the commonest loadout link in existence
+  // carries no team at all and must not land on the T side by row order.
+  const wanted = team ?? "CT";
+  const ordered = rows
+    .filter((r) => r.item_id != null)
+    .map((r) => {
+      const slot = SHARE_HERO_SLOTS.indexOf(r.slot);
+      return { r, rank: (r.team === wanted ? 0 : 1000) + (slot < 0 ? 999 : slot) };
+    })
+    .sort((a, b) => a.rank - b.rank)
+    .map(({ r }) => ({
+      instanceId: r.id == null ? null : Number(r.id),
+      itemId: Number(r.item_id),
+      wear: r.wear == null ? null : Number(r.wear),
+      seed: r.seed == null ? null : Number(r.seed),
+      stattrak: !!r.stattrak,
+      nametag: r.nametag,
+    }));
+  for (const facts of ordered) {
+    if (await bakedShareRender(facts, version)) return facts;
+  }
+  return ordered[0] ?? null;
+}
+
+async function shareFactsFor(target: ShareTarget, version: number): Promise<ShareFacts | null> {
+  switch (target.kind) {
+    case "draft": {
+      // No row and no bake by definition — a draft is a link, not an item
+      // anybody owns yet. It resolves to the finish's icon, which is why the
+      // craft link that carries a full sticker layout still unfurls with the
+      // skin on it.
+      //
+      // The defaults matter as much as the values: encodeDraft OMITS anything
+      // sitting at its default, so an absent wear or seed is not "unknown", it
+      // is the editor's neutral pair — which is why decodeDraft restores
+      // DEFAULT_WEAR and seed 1 on the way back in. Without the same restoration
+      // here the commonest craft link in existence (a finish nobody has dragged
+      // a slider on) unfurls with no float, no pattern and no wear bracket. The
+      // floor is the finish's own minimum where it has one: 1,683 of the 2,106
+      // finishes are narrower than 0..1, and a card claiming a Factory New
+      // 0.0000 Blaze describes an item that cannot exist.
+      const skin = getItem(target.skinId);
+      return {
+        instanceId: null,
+        itemId: target.skinId,
+        wear: target.wear ?? skin?.wearMin ?? 0,
+        seed: target.seed ?? 1,
+        stattrak: target.stattrak,
+        nametag: target.nametag,
+      };
+    }
+    case "instance":
+      return equippedShareFacts(target.instanceId);
+    case "player":
+      return loadoutShareFacts(target.steamId, target.team, version);
+    default:
+      return null;
+  }
+}
+
+/** Title and blurb for a target, once its facts are known. */
+function shareText(target: ShareTarget, facts: ShareFacts | null): { title: string; description: string } {
+  const name = facts ? itemTitle(facts) : null;
+  const specs = facts ? itemDescription(facts) : "";
+  if (target.kind === "player") {
+    // Nothing here knows the player's NAME — identity lives in the panel, and
+    // this endpoint is unauthenticated. The panel's own unfurl middleware does
+    // know it, which is why /api/share/meta hands back the parts separately: it
+    // can put the person in the title and keep the item in the line below.
+    return {
+      title: name ?? "CS2 loadout",
+      description: truncate(["Equipped CS2 loadout", specs].filter(Boolean).join(" · ")),
+    };
+  }
+  if (name) {
+    return { title: name, description: truncate(specs || "CS2 skin on 5Stack") };
+  }
+  return {
+    title: "5Stack Inventory",
+    description: "Craft, equip and inspect CS2 skins — rendered with the game's own shaders.",
+  };
+}
+
+/**
+ * The canonical query for a card's IMAGE — the state, and nothing else.
+ *
+ * Rebuilt from the parsed target rather than forwarded from the request so the
+ * image URL is stable and cacheable: two links to the same craft that differ
+ * only in which screen they were copied from (`?from=`, `?sort=`, a stale `?d=2`)
+ * must not fan out into two cache entries of the identical picture. The keys
+ * dropped here are the ones the picture cannot depend on — the renderer never
+ * sees them.
+ */
+function shareImageQuery(target: ShareTarget): URLSearchParams {
+  const params = new URLSearchParams();
+  switch (target.kind) {
+    case "draft":
+      params.set("path", `/craft/${target.skinId}`);
+      if (target.wear != null) params.set("wear", String(target.wear));
+      if (target.seed != null) params.set("seed", String(target.seed));
+      if (target.stattrak) params.set("st", "1");
+      if (target.nametag) params.set("name", target.nametag);
+      break;
+    case "instance":
+      params.set("path", `/items/${target.instanceId}`);
+      break;
+    case "player":
+      params.set("path", "/");
+      params.set("player", target.steamId);
+      if (target.team) params.set("team", target.team);
+      break;
+    default:
+      params.set("path", "/");
+  }
+  return params;
+}
+
+/**
+ * The link's own query as it arrived, minus the `path` key these routes add.
+ *
+ * Used only for the HUMAN destination, and it has to be the whole thing: the
+ * placement of five stickers and a charm lives in `s0..s4`/`charm`, so a
+ * redirect that kept only the canonical keys would hand the recipient the same
+ * gun with the stickers slid back to their defaults — a link that looks like it
+ * worked. Bounded because it is reflected into a crawler-facing page: escaping
+ * makes it safe, a cap makes it small.
+ */
+function forwardedShareQuery(query: Record<string, string>): URLSearchParams {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(query)) {
+    if (k === "path" || params.size >= 32) continue;
+    if (v) params.set(k, v.slice(0, 256));
+  }
+  return params;
+}
+
+/** First value wins, so a repeated `?player=` cannot smuggle an array into a
+ *  parser that expects a string. Mirrors the client router's flatten(). */
+function flatQuery(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries((raw ?? {}) as Record<string, unknown>)) {
+    const first = Array.isArray(v) ? v[0] : v;
+    if (typeof first === "string") out[k] = first;
+  }
+  return out;
+}
+
+/**
+ * Where a human who clicks a share link should land: the plugin's page in the
+ * PANEL, which is a different origin from this one and one the backend cannot
+ * derive. The panel is only ever reached in-cluster here (FIVESTACK_AUTH_URL),
+ * and the plugin's public domain is a sibling of the panel's rather than a
+ * suffix of it, so there is nothing to infer it from — it has to be configured,
+ * as FIVESTACK_PANEL_URL. Null when it is not, so callers can fall back to a URL
+ * they can prove; the card still unfurls either way, because the tags need no
+ * panel at all.
+ *
+ * Deliberately not learned from traffic the way resolveInvsimUrl learns this
+ * pod's own URL. The only header that would carry it is `Origin`, which any page
+ * on the internet can set on a credentialed request — remembering one would turn
+ * a share link into an open redirect to wherever the last attacker pointed it.
+ *
+ * The base is `/apps/<slug>` with the slug from 5stack-plugin.json, which is the
+ * contract the host implements (see the routing section of the README).
+ */
+function panelShareUrl(pluginPath: string, query: URLSearchParams): string | null {
+  const panel = (process.env.FIVESTACK_PANEL_URL ?? "").replace(/\/+$/, "");
+  if (!panel) return null;
+  const search = query.toString();
+  return `${panel}/apps/inventory${pluginPath === "/" ? "" : pluginPath}${search ? `?${search}` : ""}`;
+}
+
+/** The plugin-relative path a target came from — the human link's other half. */
+function sharePluginPath(target: ShareTarget): string {
+  switch (target.kind) {
+    case "draft":
+      return `/craft/${target.skinId}`;
+    case "instance":
+      return `/items/${target.instanceId}`;
+    default:
+      return "/";
+  }
+}
+
+/** PNG dimensions without reading the file: 24 bytes off the front. Only the
+ *  bakes are PNGs, so an icon simply has no dimensions to declare. */
+async function pngSizeOf(file: string): Promise<{ width: number; height: number } | null> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(file, "r");
+    const head = Buffer.alloc(24);
+    const { bytesRead } = await handle.read(head, 0, 24, 0);
+    return pngPixelSize(head.subarray(0, bytesRead));
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/** Everything the three routes below need, derived once — so the picture, the
+ *  words and the tags cannot disagree about what a link is. */
+async function resolveShare(query: Record<string, string>) {
+  const target = parseShareTarget(query.path ?? "/", query);
+  const version = await renderVersion();
+  const facts = await shareFactsFor(target, version);
+  const art = await shareArtFor(facts, version);
+  return { target, art, ...shareText(target, facts) };
+}
+
+// The card image. Public and unauthenticated because a crawler has no session —
+// that is the whole point of an unfurl — and because everything it can answer
+// with is either already public (an equipped loadout) or catalog artwork.
+app.get("/api/share/image", async (request, reply) => {
+  const { art } = await resolveShare(flatQuery(request.query));
+  if (!art) return reply.status(404).send({ error: "no share image" });
+  // A bake is final for its key, so it caches for a day. The icon fallback is
+  // NOT final — it is standing in for a render that may land minutes later, and
+  // an unfurl cached for a day would keep showing the flat icon long after the
+  // real thing existed. Ten minutes is enough to absorb the burst of fetches one
+  // paste produces and short enough that the next paste gets the render.
+  reply.header("Cache-Control", art.baked ? "public, max-age=86400" : "public, max-age=600");
+  if (art.url) return reply.redirect(art.url, 302);
+  try {
+    return reply.type(art.type).send(await fs.readFile(art.file as string));
+  } catch {
+    return reply.status(404).send({ error: "no share image" });
+  }
+});
+
+// The same answer as JSON, for a host that renders its own tags. The panel's
+// link shims (web/server/middleware/*-unfurl.ts) sniff the crawler UA and
+// answer at the pasted URL itself; when one lands for /apps/inventory/* this is
+// the call it makes — one request, no database access, no idea what a render key
+// is. Title and description arrive separately from the image for the same
+// reason: the panel knows the player's name and this endpoint does not.
+app.get("/api/share/meta", async (request, reply) => {
+  const query = flatQuery(request.query);
+  const { target, art, title, description } = await resolveShare(query);
+  const origin = requestOrigin(request);
+  const size = art?.file && art.type === "image/png" ? await pngSizeOf(art.file) : null;
+  reply.header("Cache-Control", "public, max-age=300");
+  return {
+    kind: target.kind,
+    title,
+    description,
+    image: art ? `${origin}/api/share/image?${shareImageQuery(target)}` : null,
+    imageWidth: size?.width ?? null,
+    imageHeight: size?.height ?? null,
+    /** False means the picture is the flat econ icon — a host that would rather
+     *  show nothing than a 2D icon can act on it. */
+    baked: art?.baked ?? false,
+    canonical: panelShareUrl(sharePluginPath(target), forwardedShareQuery(query)),
+  };
+});
+
+// A complete unfurl document, served from this plugin's own domain. Point a link
+// here and it unfurls today with no host changes at all; the tags are the same
+// set the panel's own shims emit, so this doubles as the reference the middleware
+// above would render.
+app.get("/api/share/unfurl", async (request, reply) => {
+  const query = flatQuery(request.query);
+  const { target, art, title, description } = await resolveShare(query);
+  const origin = requestOrigin(request);
+  const size = art?.file && art.type === "image/png" ? await pngSizeOf(art.file) : null;
+  const canonical = panelShareUrl(sharePluginPath(target), forwardedShareQuery(query));
+  // og:url is the address of the THING, so it is the panel's page when we know
+  // it and the URL actually fetched when we do not — never a guess. The human
+  // link degrades further, to this plugin's own front door: a page that unfurls
+  // beautifully and then dead-ends is worse than no page.
+  const humanUrl = canonical ?? `${origin}/`;
+  // Short, not immutable: the picture behind this page can improve on its own
+  // (icon today, the owner's render tomorrow), and a chat client that cached the
+  // document for a day would never ask again.
+  reply.header("Cache-Control", "public, max-age=300");
+  return reply.type("text/html; charset=utf-8").send(
+    renderUnfurl({
+      title,
+      description,
+      pageUrl: canonical ?? `${origin}${request.url}`,
+      humanUrl,
+      image: art ? `${origin}/api/share/image?${shareImageQuery(target)}` : null,
+      imageWidth: size?.width ?? null,
+      imageHeight: size?.height ?? null,
+    }),
+  );
+});
 
 // ---- Composite store routes ---------------------------------------------------
 // Filename builder. MUST agree with compositeKey() in src/compositeStore.ts.
@@ -1327,7 +1883,6 @@ interface ItemRow {
    * someone backfills a row, and because the date is worth showing.
    */
   created_at?: string | null;
-  favourite?: boolean;
 }
 
 // Reject bad wear on the RAW array — normSpecs() clamps, so it has to be
@@ -1501,7 +2056,6 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     // already holds, so a field the row omits is a mode that silently does
     // nothing.
     created_at: row.created_at ?? null,
-    favourite: row.favourite ?? false,
     slot: slotForItem(row.item_id),
     item,
     equipped: equippedOn.filter((e) => e.slot === slotForItem(row.item_id)),
@@ -1515,7 +2069,7 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at, favourite
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
@@ -2022,42 +2576,6 @@ app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, rep
   ]);
   return { ok: true };
 });
-
-/**
- * Star or unstar an owned instance.
- *
- * Its own route rather than a field on the update route, and deliberately NOT
- * gated on origin. That route refuses `origin = 'steam'` rows because editing an
- * imported item would make the mirror lie about a real Steam inventory — but a
- * favourite says nothing about the item, only about the person looking at it.
- * Refusing to star an imported skin would make the feature useless for exactly
- * the people with the most items.
- *
- * Takes the desired STATE, not a toggle. A toggle route double-fires under a
- * double-click and lands back where it started, and the client already knows
- * which way the heart is pointing.
- */
-app.post<{ Params: { id: string }; Body: { favourite?: boolean } }>(
-  "/api/inventory/:id/favourite",
-  async (request, reply) => {
-    const identity = await getIdentity(request);
-    if (!identity) {
-      return reply.status(401).send({ error: "unauthorized" });
-    }
-    const want = request.body?.favourite === true;
-    const { rowCount } = await pool.query(
-      `UPDATE inventory.owned_items SET favourite = $3 WHERE id = $1 AND steam_id = $2`,
-      [Number(request.params.id), identity.steamId, want],
-    );
-    // Scoped by steam_id, so a miss means "not yours or not there" and the two
-    // are deliberately indistinguishable — answering otherwise would let anyone
-    // probe which instance ids exist.
-    if (!rowCount) {
-      return reply.status(404).send({ error: "no such item" });
-    }
-    return { favourite: want };
-  },
-);
 
 /**
  * The wishlist: catalog items the caller wants but does not own.
@@ -2765,10 +3283,55 @@ function withoutInstanceHandle<T extends { inst?: string | null } | null>(a: T):
 // server that asks, with no credential — and this is the shareable, human-facing
 // form of it. What is NOT public is anything a player merely owns; see the
 // README for why an owned-item list needs a decision before it gets a route.
-app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request, reply) => {
+// Every preset a player has, for a VISITOR. Same rows and same shape the owner
+// sees — id, name, active, filled-slot count — because none of that is private:
+// a preset is an arrangement of items, and this endpoint has always disclosed
+// the active one anyway.
+//
+// It deliberately does NOT call ensureActivePreset the way the owner's list
+// does. That is a read that writes, and a stranger opening a profile must not
+// mint rows in someone else's account. A player who has never equipped anything
+// simply lists empty.
+app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId/presets", async (request, reply) => {
   const steamId = request.params.steamId;
   if (!/^\d{17}$/.test(steamId)) {
     return reply.status(400).send({ error: "invalid steam id" });
+  }
+  return listPresets(steamId);
+});
+
+app.get<{ Params: { steamId: string }; Querystring: { preset?: string } }>(
+  "/api/loadout/:steamId",
+  async (request, reply) => {
+  const steamId = request.params.steamId;
+  if (!/^\d{17}$/.test(steamId)) {
+    return reply.status(400).send({ error: "invalid steam id" });
+  }
+
+  // Which build to read. Absent — and for the ACTIVE preset — that is the live
+  // loadout; a parked preset is its own table. The two carry identical columns
+  // (loadout_preset_slots is inventory.loadout minus steam_id), which is what
+  // lets one SELECT serve both by swapping the FROM rather than duplicating it.
+  //
+  // Ownership is checked, never assumed: `preset` is a bare id from the caller,
+  // so without this a visitor could walk ids and read builds out of accounts
+  // they never asked about. A preset that is not this player's 404s rather than
+  // falling back to the live loadout — quietly answering with a different build
+  // than the one requested is how someone ends up certain they are looking at
+  // something they are not.
+  let parkedId: string | null = null;
+  if (request.query.preset) {
+    if (!/^\d+$/.test(request.query.preset)) {
+      return reply.status(400).send({ error: "invalid preset" });
+    }
+    const { rows: owned } = await pool.query<{ id: string; active: boolean }>(
+      `SELECT id, active FROM inventory.loadout_presets WHERE id = $1 AND steam_id = $2`,
+      [request.query.preset, steamId],
+    );
+    if (!owned.length) {
+      return reply.status(404).send({ error: "no such preset" });
+    }
+    if (!owned[0].active) parkedId = String(owned[0].id);
   }
   const { rows } = await pool.query<{
     team: string; slot: string; item_id: number | null; skinned: boolean;
@@ -2791,10 +3354,10 @@ app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request
        -- their time on, and the part this endpoint used to drop on the floor
        -- while copy-from happily cloned it.
        i.stickers, i.patches, i.charm_id, i.charm_offset
-     FROM inventory.loadout l
+     FROM ${parkedId ? "inventory.loadout_preset_slots" : "inventory.loadout"} l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
-     WHERE l.steam_id = $1`,
-    [steamId],
+     WHERE ${parkedId ? "l.preset_id" : "l.steam_id"} = $1`,
+    [parkedId ?? steamId],
   );
   // Dereference the attachment links against the OWNER's rows — this is their
   // loadout, so their instances are the ones a linked spec points at. Same read
@@ -2820,7 +3383,8 @@ app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request
       item: getItem(row.item_id as number),
     };
   });
-});
+  },
+);
 
 // Clone another player's loadout: copies each equipped skin into the caller's
 // inventory (origin 'copied') and equips it in the same slot.
@@ -4651,7 +5215,7 @@ function cachedDirStats() {
   if (dirStatsMemo && Date.now() - dirStatsMemo.at < DIR_STATS_TTL_MS) return dirStatsMemo.value;
   const modelsDir = path.join(path.dirname(RENDERS_DIR), "models");
   const value = (async () => {
-    const [renders, paints, images, models, composites] = await Promise.all([
+    const [renders, paints, images, models, composites, music] = await Promise.all([
       dirStats(RENDERS_DIR),
       dirStats(PAINTS_DIR, classifyPaintFile),
       dirStats(IMAGES_DIR),
@@ -4661,6 +5225,10 @@ function cachedDirStats() {
       // use rather than from an extraction, so an operator watching disk should
       // be able to see it.
       dirStats(COMPOSITES_DIR),
+      // ~3.5MB per music kit, ~350MB in total — the largest single thing this
+      // mount grew in one version, and the question an operator asks of this
+      // panel is "what is eating the disk". Unlisted, it is 350MB of nothing.
+      dirStats(MUSIC_DIR),
     ]);
     // Totals stay exactly where they were so an older panel keeps working; the
     // breakdown rides alongside as `parts`. A panel that doesn't know about it
@@ -4672,6 +5240,7 @@ function cachedDirStats() {
       images: strip(images),
       models: strip(models),
       composites: strip(composites),
+      music: strip(music),
       parts: { ...models.buckets, ...paints.buckets },
     };
   })();

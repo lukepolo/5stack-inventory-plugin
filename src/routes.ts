@@ -28,12 +28,6 @@ export type Route =
   | { name: "armory" }
   | { name: "item"; id: string; modal: ItemModal }
   | { name: "draft"; skinId: number }
-  /**
-   * Two owned items, one stage, same camera. Both ids in the PATH rather than a
-   * query, because a comparison is not a filter on a screen — it is the screen,
-   * and it is meaningless with one of them missing.
-   */
-  | { name: "compare"; a: string; b: string }
   | { name: "admin"; section: string };
 
 const ITEM_MODALS: Record<string, ItemModal> = { craft: "craft", "3d": "3d" };
@@ -56,10 +50,6 @@ export function parsePath(path: string): Route {
   // Ids stay STRINGS here for the same reason the item route does: the API
   // serves them as strings, and coercing to Number made every `inst.id === id`
   // lookup fail silently.
-  const cmp = path.match(/^\/compare\/([^/]+)\/([^/]+)$/);
-  if (cmp) {
-    return { name: "compare", a: decodeURIComponent(cmp[1]), b: decodeURIComponent(cmp[2]) };
-  }
 
   // Bare /craft is the browser; /craft/<id> is a draft of one particular finish.
   // Checked before the draft pattern so the two can share the segment.
@@ -96,8 +86,6 @@ export function buildPath(route: Route): string {
         : `/items/${encodeURIComponent(route.id)}/${route.modal}`;
     case "draft":
       return `/craft/${route.skinId}`;
-    case "compare":
-      return `/compare/${encodeURIComponent(route.a)}/${encodeURIComponent(route.b)}`;
     case "admin":
       return route.section ? `/admin/${route.section}` : "/admin";
   }
@@ -117,10 +105,6 @@ export function screenFor(route: Route): "grid" | "focus" | "inventory" | "armor
     // An item modal is layered over the inventory; a draft over wherever you
     // were, which is the loadout in every entry point that opens one.
     case "item":
-      return "inventory";
-    // Compare is reached from the inventory's bulk select, so that is what sits
-    // behind it — closing it puts you back where the two were chosen.
-    case "compare":
       return "inventory";
     default:
       return "grid";

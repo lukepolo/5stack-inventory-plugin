@@ -16,7 +16,7 @@
 // playside, so these are not the community's percentages and are never labelled
 // as a tier. The ranking is what transfers — more blue in the atlas is more
 // blue on the gun — and finding the blue ones is the whole job.
-import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { loadPaintDef } from "../paintComposite";
 import {
   cachedScan,
@@ -61,6 +61,8 @@ const emit = defineEmits<{
   preview: [seed: number | null];
 }>();
 
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
+
 const RAIL_H = 40;
 
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -69,6 +71,14 @@ const metric = ref<string | null>(null);
 const scan = shallowRef<PatternScan | null>(null);
 const progress = ref(0);
 const scanning = ref(false);
+
+/** The measurement caption, built in script rather than inline: the sentence
+ *  carries an apostrophe, which a single-quoted template expression cannot. */
+const scanTitle = computed(() =>
+  tr("inventory.pattern.metric_measured", "{metric}: measured over this finish's composited artwork", {
+    metric: scan.value?.label ?? "",
+  }),
+);
 const hover = ref<number | null>(null);
 const dragging = ref(false);
 const editing = ref(false);
@@ -372,7 +382,7 @@ watch(
   <!-- No panel chrome: the host row already draws the card. See PatternRail. -->
   <div>
     <div class="mb-2 flex items-center gap-2">
-      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
 
       <input
         v-if="editing"
@@ -389,7 +399,7 @@ watch(
       <button
         v-else
         class="rounded px-1 font-mono text-f13 tabular-nums text-foreground/90 transition-colors hover:bg-white/5 hover:text-[color:var(--acc)]"
-        title="Type an exact pattern"
+        :title="tr('inventory.pattern.type_exact', 'Type an exact pattern')"
         @click="beginEdit"
       >#{{ seed }}</button>
 
@@ -399,7 +409,7 @@ watch(
       <span
         v-if="scan && current != null"
         class="rounded-sm bg-[color:var(--acc)]/15 px-1 font-mono text-f8 tabular-nums text-[color:var(--acc)]"
-        :title="`${scan.label}: measured over this finish's composited artwork`"
+        :title="scanTitle"
       >{{ current }}% {{ scan.label }}</span>
 
       <!-- The die is the only thing that earns a place beside the number. Every
@@ -408,7 +418,7 @@ watch(
            with analysis nobody asked for yet. -->
       <button
         class="tac-action ml-auto rounded border border-input px-1.5 py-0.5 text-f11 leading-none hover:bg-white/5"
-        :title="`Random pattern between ${min} and ${max}`"
+        :title="tr('inventory.pattern.roll', 'Random pattern between {lo} and {hi}', { lo: min, hi: max })"
         @click="roll"
       >🎲</button>
     </div>
@@ -421,11 +431,11 @@ watch(
       class="mb-1.5 flex items-center gap-2 rounded-sm bg-black/25 px-2 py-1 font-mono text-f8 tabular-nums text-muted-foreground"
     >
       <span class="uppercase tracking-cs1">#{{ pinned }} vs #{{ seed }}</span>
-      <span v-if="diff == null" class="text-muted-foreground/50">measuring…</span>
+      <span v-if="diff == null" class="text-muted-foreground/50">{{ tr('inventory.pattern.measuring', 'measuring…') }}</span>
       <span v-else-if="diff < 0.01" class="text-muted-foreground/70">
-        {{ (diff * 100).toFixed(1) }}% different — all but identical
+        {{ tr('inventory.pattern.diff_identical', '{pct}% different — all but identical', { pct: (diff * 100).toFixed(1) }) }}
       </span>
-      <span v-else class="text-[color:var(--acc)]">{{ (diff * 100).toFixed(1) }}% different</span>
+      <span v-else class="text-[color:var(--acc)]">{{ tr('inventory.pattern.diff', '{pct}% different', { pct: (diff * 100).toFixed(1) }) }}</span>
       <!-- The blink lives HERE, next to the two patterns it alternates, rather
            than up in the header — it only exists once there is a pair, and it
            is meaningless read apart from them. -->
@@ -436,9 +446,9 @@ watch(
             ? 'bg-[color:var(--acc)]/20 text-[color:var(--acc)]'
             : 'text-muted-foreground hover:text-foreground'
         "
-        title="Flip between the two on the model — the eye catches a change that blinks"
+        :title="tr('inventory.pattern.blink', 'Flip between the two on the model — the eye catches a change that blinks')"
         @click="toggleBlink"
-      >{{ blinking ? `showing ${blinkOnPinned ? "A" : "B"} — stop` : "Flip between them" }}</button>
+      >{{ blinking ? tr('inventory.pattern.blink_stop', 'showing {which} — stop', { which: blinkOnPinned ? 'A' : 'B' }) : tr('inventory.pattern.blink_start', 'Flip between them') }}</button>
     </div>
 
     <div
@@ -449,7 +459,7 @@ watch(
       :aria-valuemin="min"
       :aria-valuemax="max"
       :aria-valuenow="seed"
-      aria-label="Weapon pattern"
+      :aria-label="tr('inventory.pattern.weapon_aria', 'Weapon pattern')"
       @pointerdown="onDown"
       @pointermove="onMove"
       @pointerup="onUp"
@@ -474,7 +484,7 @@ watch(
         v-if="scanning"
         class="absolute inset-0 grid place-items-center bg-black/45 font-mono text-f8 tabular-nums uppercase tracking-cs1 text-muted-foreground"
       >
-        <span>Measuring… {{ Math.round(progress * 100) }}%</span>
+        <span>{{ tr('inventory.pattern.measuring_pct', 'Measuring… {pct}%', { pct: Math.round(progress * 100) }) }}</span>
         <span
           class="absolute inset-x-0 bottom-0 h-[2px] bg-[color:var(--acc)] transition-[width] duration-150"
           :style="{ width: progress * 100 + '%' }"
@@ -523,7 +533,7 @@ watch(
       <!-- The peaks, as buttons. Reading a curve tells you where to look; these
            are for when you just want the best one. -->
       <span v-if="scan" class="mx-auto flex items-center gap-1">
-        <span class="uppercase tracking-cs1">Top</span>
+        <span class="uppercase tracking-cs1">{{ tr('inventory.pattern.top', 'Top') }}</span>
         <button
           v-for="s in scan.top"
           :key="s"
@@ -548,7 +558,7 @@ watch(
          every skin that has nothing to hunt for. -->
     <div class="mt-1.5 flex items-center gap-2 text-f8">
       <template v-if="metrics.length">
-        <span class="uppercase tracking-cs1 text-muted-foreground/50">Find</span>
+        <span class="uppercase tracking-cs1 text-muted-foreground/50">{{ tr('inventory.pattern.find', 'Find') }}</span>
         <button
           v-for="(m, i) in metrics"
           :key="m.key"
@@ -560,8 +570,8 @@ watch(
           :disabled="scanning"
           :title="
             canWeight
-              ? `Composite all ${max - min + 1} patterns once and rank them by ${m.label} — a few seconds, measured on the gun`
-              : `Composite all ${max - min + 1} patterns once and rank them by ${m.label}. Open the 3D view first and it can weight the answer by what you actually see.`
+              ? tr('inventory.pattern.find_weighted', 'Composite all {count} patterns once and rank them by {metric} — a few seconds, measured on the gun', { count: max - min + 1, metric: m.label })
+              : tr('inventory.pattern.find_hint', 'Composite all {count} patterns once and rank them by {metric}. Open the 3D view first and it can weight the answer by what you actually see.', { count: max - min + 1, metric: m.label })
           "
           @click="findWith(m.key)"
         >{{ m.hunt }}</button>
@@ -571,11 +581,11 @@ watch(
         :class="pinned != null ? 'text-[color:var(--acc)]' : 'text-muted-foreground hover:text-foreground'"
         :title="
           pinned != null
-            ? `Comparing against #${pinned} — click to stop`
-            : 'Hold this pattern, then move to another to see how they differ'
+            ? tr('inventory.pattern.pin_stop', 'Comparing against #{seed} — click to stop', { seed: pinned })
+            : tr('inventory.pattern.pin_start', 'Hold this pattern, then move to another to see how they differ')
         "
         @click="togglePin"
-      >{{ pinned != null ? "Stop comparing" : "Compare with another" }}</button>
+      >{{ pinned != null ? tr('inventory.pattern.pin_off', 'Stop comparing') : tr('inventory.pattern.pin_on', 'Compare with another') }}</button>
     </div>
   </div>
 </template>

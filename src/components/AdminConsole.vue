@@ -259,6 +259,11 @@ const extractedGroups = computed(() => {
       "paintTextures",
     ]),
     group("images", "Item icons", "Flat catalog art for every item", s.images ?? ZERO, []),
+    // Listed even at zero would be wrong — a mount extracted before v28 has no
+    // music and is not broken — so it appears once there is something to report.
+    ...(s.music && s.music.files
+      ? [group("music", "Music kit previews", "One menu theme per kit, streamed on demand", s.music, [])]
+      : []),
   ];
 });
 // ---- shared asset CDN (opt-in) ----------------------------------------------
@@ -423,6 +428,7 @@ const STEP_LABELS: Record<string, string> = {
   "econ-icons": "Extracting item icons",
   "paint-chain": "Extracting paint chain",
   "sticker-art": "Extracting sticker & decal art",
+  "music-audio": "Extracting music kit audio",
   stamp: "Recording the build",
 };
 

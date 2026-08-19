@@ -168,6 +168,13 @@ if you're looking for it in git history, this section is what it became.
   models mount and served from `/images` and `/paints`. No third-party CDN is in
   the serving path, and a missing asset is an error rather than a silent
   fallback — see `scripts/extract-models.sh`.
+- **Music kit audio** follows exactly that rule, and it is worth stating
+  deliberately because the asset is licensed music rather than artwork: each
+  kit's menu theme is decoded from **this instance's own CS2 install** onto the
+  same mount and served from `/music`. Nothing is redistributed, nothing is
+  fetched from another host, and an instance with no CS2 install simply has no
+  previews. Served with byte ranges, so hearing five seconds costs five seconds
+  of the file rather than all 3.5MB of it.
 - **Loadout model**: one row per `(steam_id, team, slot)` in `inventory.loadout`,
   where `slot` is a weapon model (`ak47`) or a special slot (`knife`, `gloves`,
   `agent`, `zeus`, `c4`, `musickit`, `graffiti`, `collectible`) and `item_id` is

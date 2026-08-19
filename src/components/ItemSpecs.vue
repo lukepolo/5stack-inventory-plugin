@@ -13,15 +13,22 @@
  * Order matches the EDIT form's boxes deliberately: switching between editing
  * and viewing must not reshuffle the panel under the cursor.
  */
-import { computed } from "vue";
+import { computed, inject } from "vue";
 import PatternRail from "./PatternRail.vue";
 import WearBar from "./WearBar.vue";
 import { attachmentsOf, hasScratch, hasWear, wearTier } from "../itemVisuals";
-import type { InventoryItem } from "../api";
+import type { AttachSource } from "../api";
 
 const props = withDefaults(
   defineProps<{
-    inst?: InventoryItem | null;
+    /**
+     * The copy being described. A PUBLIC loadout row is accepted alongside an
+     * owned instance for the same reason ItemBadges accepts one: a visitor holds
+     * no inventory for the player they are looking at, and every fact this panel
+     * prints — the name tag, what is applied, the charm's colour, the float —
+     * rides on that row instead.
+     */
+    inst?: AttachSource | null;
     /**
      * The charm rail's swatch source, and whether it is still resolving.
      *
@@ -43,6 +50,8 @@ const props = withDefaults(
   { inst: null, charmAlbedo: null, charmLoading: false, still: false },
 );
 
+const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
+
 const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : []));
 /** A CHARM's own pattern, as opposed to a weapon's: the seed on a keychain is a
  *  colourway, and the rail renders it as one. */
@@ -55,12 +64,12 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
   <template v-if="inst">
     <!-- Name tag leads, same as the form. -->
     <div v-if="inst.nametag" :class="[box, 'flex items-center gap-2']" :style="still ? {} : { '--i': 0 }">
-      <span :class="label">Name tag</span>
+      <span :class="label">{{ tr('inventory.specs.nametag', 'Name tag') }}</span>
       <span class="min-w-0 flex-1 truncate text-f13 italic">“{{ inst.nametag }}”</span>
     </div>
 
     <div v-if="attachments.length" :class="box" :style="still ? {} : { '--i': 1 }">
-      <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Applied</div>
+      <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.specs.applied', 'Applied') }}</div>
       <div class="flex flex-col gap-1.5">
         <span v-for="(a, k) in attachments" :key="k" class="flex items-center gap-2" :title="a.name ?? undefined">
           <img :src="a.image ?? undefined" alt="" class="h-7 w-7 flex-none object-contain" />
@@ -102,7 +111,7 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
         :loading="charmLoading"
       />
       <template v-else>
-        <span :class="label">Pattern</span>
+        <span :class="label">{{ tr('inventory.specs.pattern', 'Pattern') }}</span>
         <span class="font-mono text-f13">#{{ inst.seed }}</span>
       </template>
     </div>
@@ -114,7 +123,7 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
          own box below, with a number instead of a tier. -->
     <div v-if="inst.wear != null && hasWear(inst.item)" :class="box" :style="still ? {} : { '--i': 3 }">
       <div class="flex items-baseline gap-2">
-        <span :class="label">Wear</span>
+        <span :class="label">{{ tr('inventory.specs.wear', 'Wear') }}</span>
         <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ wearTier(inst.wear) }}</span>
       </div>
       <div class="mt-2"><WearBar :item="inst.item" :wear="inst.wear" /></div>
@@ -124,9 +133,9 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
       :class="[box, 'flex items-baseline gap-2']"
       :style="still ? {} : { '--i': 3 }"
     >
-      <span :class="label">Wear</span>
+      <span :class="label">{{ tr('inventory.specs.wear', 'Wear') }}</span>
       <span class="font-mono text-f13">{{ inst.wear.toFixed(2) }}</span>
-      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">scratched</span>
+      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.specs.scratched', 'scratched') }}</span>
     </div>
 
     <div
@@ -140,7 +149,7 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
              was rendered nowhere; here the item is the subject, so there is room
              for it and a reason to care. -->
         <span v-if="inst.stattrak_count" class="font-mono text-f11 tabular-nums text-[hsl(var(--tac-stattrak))]"
-          >{{ inst.stattrak_count.toLocaleString() }} <span class="text-f9 text-muted-foreground">kills</span></span
+          >{{ inst.stattrak_count.toLocaleString() }} <span class="text-f9 text-muted-foreground">{{ tr('inventory.specs.kills', 'kills') }}</span></span
         >
       </div>
     </div>

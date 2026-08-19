@@ -508,6 +508,24 @@
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
+/* A music kit's transport, drawn ON its cover art rather than on a plate over it.
+   A kit IS its artwork — the thing you are choosing between — so the control has
+   to stop being a box. What replaces the box is a shadow: .art-mark keeps a bare
+   glyph and a bare readout legible over a light sleeve and a dark one alike,
+   which is the only job the plate was really doing.
+
+   drop-shadow, not text-shadow: the same class has to carry an <svg> glyph and a
+   line of text, and text-shadow does nothing to the former. */
+[data-cs2-inventory] .art-mark {
+  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.85)) drop-shadow(0 0 3px rgb(0 0 0 / 0.55));
+}
+
+/* An equaliser lived here, animating in place of the pause glyph while a kit
+   played. Removed rather than parked: it put a readout where the control was, so
+   pausing meant hunting for a button that had turned into a picture. Playing
+   state is carried by the transport's accent colour and by the progress groove
+   along the sleeve's bottom edge. */
 @keyframes cs2FadeOut {
   from { opacity: 1; }
   to { opacity: 0; }

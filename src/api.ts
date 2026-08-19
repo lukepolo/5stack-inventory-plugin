@@ -97,6 +97,8 @@ export interface Skin {
   design?: number;
   /** That variant's colourway ("Cash Green"). */
   tintName?: string;
+  /** MUSIC KITS only: the kit's menu theme, ready to play. See `CatalogItem`. */
+  audio?: string | null;
 }
 
 /** Facet metadata a catalog can ship next to its skins, for the values the
@@ -152,6 +154,14 @@ export interface CatalogItem {
    *  too (the backend resolver fills it), which is what lets the inventory grid
    *  and the loadout sheet sort by collection. */
   collection?: string;
+  /**
+   * MUSIC KITS only: the kit's menu theme, as a fully resolved, playable URL.
+   *
+   * Null or absent means this instance has not extracted the audio (or the item
+   * is not a music kit), and every surface reads that as "draw no player" — the
+   * transport is never rendered against a track that cannot load.
+   */
+  audio?: string | null;
 }
 
 export interface LoadoutEntry {
@@ -239,10 +249,22 @@ export interface InventoryItem {
    *  does not send it, and a mode with nothing to sort on has to degrade rather
    *  than reorder the grid at random. */
   created_at?: string | null;
-  /** Starred by the owner. A personal marker, not a property of the item — which
-   *  is why it is allowed on Steam-imported rows that are otherwise read-only. */
-  favourite?: boolean;
 }
+
+/**
+ * Anything that carries the facts a screen prints ABOUT one copy: an owned
+ * instance, or a public loadout row.
+ *
+ * Both shapes hold the same enriched `stickers`/`patches`/`charm`, the same
+ * StatTrak pair and the same wear/seed/nametag, and every renderer of those
+ * facts (ItemBadges, ItemSpecs, attachmentsOf, the 3D placements builder) reads
+ * only that overlap. It is named here rather than in each of them because the
+ * union is the reason a VISITOR sees anything at all: they hold no inventory for
+ * the player they are looking at, so nothing resolves to an InventoryItem and
+ * every one of those surfaces would otherwise render a gun with none of the work
+ * on it.
+ */
+export type AttachSource = InventoryItem | LoadoutEntry;
 
 // Item artwork lives on our own mount, served under /images by the plugin host
 // — the same origin as /api. The backend emits ROOT-RELATIVE paths because it
@@ -269,10 +291,16 @@ export const assetUrl = (path: string) => withAssetVersion(`${assetOrigin}${path
 /** Rewrite every "/images/..." string in a decoded response body in place.
  *  Item art appears under a dozen different keys (item, skin, stickers[],
  *  patches[], charm, agents, collections...), so a walk is materially safer
- *  than enumerating them and silently missing one the next time a shape grows. */
+ *  than enumerating them and silently missing one the next time a shape grows.
+ *
+ *  "/music/..." joins it for exactly the same reason: a music kit's preview
+ *  arrives on both the catalog listing and the owned item, and a bare path in a
+ *  federated remote resolves against the PANEL's host, not ours. Riding the
+ *  same walk also means the audio picks up the ?v= stamp, which is what lets it
+ *  be cached hard without pinning a browser to one CS2 build's track. */
 function resolveAssetPaths(node: unknown): unknown {
   if (typeof node === "string") {
-    return node.startsWith("/images/") ? assetUrl(node) : node;
+    return node.startsWith("/images/") || node.startsWith("/music/") ? assetUrl(node) : node;
   }
   if (Array.isArray(node)) {
     for (let i = 0; i < node.length; i++) node[i] = resolveAssetPaths(node[i]);
@@ -777,19 +805,6 @@ export const updateInstance = (
     body: JSON.stringify(body),
   });
 
-/**
- * Star or unstar an owned instance.
- *
- * Sends the desired STATE rather than a toggle: a double-click on a toggle route
- * fires twice and lands back where it started, and the caller already knows
- * which way the heart is pointing.
- */
-export const setFavourite = (id: number, favourite: boolean) =>
-  request<{ favourite: boolean }>(`/inventory/${id}/favourite`, {
-    method: "POST",
-    body: JSON.stringify({ favourite }),
-  });
-
 /** One wishlisted CATALOG item — something wanted but not owned, so it has no
  *  instance id and nothing to attach a flag to. See setWishlist. */
 export interface WishlistEntry {
@@ -805,8 +820,20 @@ export const setWishlist = (item_id: number, want: boolean) =>
   });
 
 // Public read-only loadout for any player + clone it into your own.
-export const fetchPlayerLoadout = (steamId: string) =>
-  request<LoadoutEntry[]>(`/loadout/${steamId}`);
+//
+// `preset` picks WHICH of their named builds to read; omitted, that is the one
+// they are wearing. The id is validated server-side against the same steam id,
+// so a preset belonging to anyone else 404s rather than quietly returning the
+// live loadout under the name you asked for.
+export const fetchPlayerLoadout = (steamId: string, preset?: string | null) =>
+  request<LoadoutEntry[]>(
+    `/loadout/${steamId}${preset ? `?preset=${encodeURIComponent(preset)}` : ""}`,
+  );
+
+/** Someone else's named builds. Same shape as your own; nothing here is private
+ *  beyond what the equipped loadout already discloses. */
+export const fetchPlayerPresets = (steamId: string) =>
+  request<LoadoutPreset[]>(`/loadout/${steamId}/presets`);
 export const copyLoadoutFrom = (steamId: string) =>
   request<{ copied: number }>(`/loadout/copy-from/${steamId}`, { method: "POST", body: "{}" });
 
@@ -853,6 +880,9 @@ export type CacheStats = {
   images?: DirStat; // absent on older backends
   models?: DirStat;
   composites?: DirStat; // shared paint composites; absent on older backends
+  /** Music kit previews. ~3.5MB a kit, so it is the one directory an operator
+   *  can be surprised by; absent on a mount extracted before v28. */
+  music?: DirStat;
   /** Per-kind breakdown of `models` and `paints`. Absent on older backends. */
   parts?: Partial<Record<CachePart, DirStat>>;
 };

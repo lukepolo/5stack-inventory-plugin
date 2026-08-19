@@ -15,8 +15,8 @@
 // Skin rendering is a faithful port of CS2's compositing pipeline — see
 // paintComposite.ts for the shader and its provenance.
 import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
-import { FLAGS, NUMBERS, choiceValue, flagValue, numberValue, setFlag, setNumber } from "./devFlags";
-import { DEFAULT_ENVIRONMENT, viewerEnvironment } from "./viewerEnvironments";
+import { CHOICES, FLAGS, NUMBERS, choicesVersion, choiceValue, flagValue, flagsVersion, numberValue, setChoice, setFlag, setNumber } from "./devFlags";
+import { BAKE_ENVIRONMENT, viewerEnvironment } from "./viewerEnvironments";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
 import { tickCharmLiquid } from "./charmLiquid";
@@ -583,6 +583,32 @@ function debugFlag(name: string, dflt = false): boolean {
 }
 
 /**
+ * A pick-one setting from the query string — `?env=warm`.
+ *
+ * The third door onto the same localStorage key, and it has to exist for the
+ * same reason `?bloomstrength=0.8` writes what it reads: otherwise a shared
+ * debug URL renders under one rig while the HUD sits there claiming Studio, and
+ * the two disagreeing is worse than the param not working at all.
+ *
+ * AN UNKNOWN VALUE IS IGNORED RATHER THAN STORED. `choiceValue` already falls
+ * back for a key this build no longer offers, but writing `?env=nonsense`
+ * through would leave that in localStorage to be discarded on every read
+ * forever — including after the typo is off the URL, which is a settings panel
+ * that silently refuses to remember a choice nobody can see they made.
+ */
+function debugChoice(name: string): string {
+  try {
+    const q = new URLSearchParams(location.search).get(name);
+    if (q !== null && CHOICES.find((c) => c.name === name)?.options.some((o) => o.value === q)) {
+      if (choiceValue(name) !== q) setChoice(name, q);
+    }
+  } catch {
+    /* no location/localStorage — fall through to the stored/default read */
+  }
+  return choiceValue(name);
+}
+
+/**
  * A free-text knob from the query string. Neither a switch nor a dial, so it is
  * in neither registry and is deliberately NOT persisted: there is one of these,
  * it names a specific animation clip, and a name you set last week silently
@@ -656,7 +682,11 @@ const PATCH_FLIP_V = debugFlag("patchflipv", false);
  */
 const UV_DECAL = debugFlag("uvdecal", true);
 /** Post-process bloom. `?bloom=0` renders straight to the canvas instead — the
- *  A/B for "is that glow real or is the composer eating my alpha". */
+ *  A/B for "is that glow real or is the composer eating my alpha".
+ *
+ *  The STARTING value only. A live viewer re-reads the switch through
+ *  syncLiveSettings, so this module-level read no longer decides anything past
+ *  the first frame — see setBloom for why it could not stay the only read. */
 const BLOOM = debugFlag("bloom", true);
 
 /**
@@ -2845,13 +2875,25 @@ async function buildViewer(
   //      against its render key, so a preset baked into one is indistinguishable
   //      from a bug — the same argument that already forces bloom off for bakes.
   //   3. the rig the user chose.
-  const rig = viewerEnvironment(opts?.still ? DEFAULT_ENVIRONMENT : choiceValue("env"));
+  // Read HERE, per mount, and re-read afterwards by setEnvironment — a rig is
+  // five intensities and a rotation, all of them assignable on the lights that
+  // are already in the scene, so there was never anything a remount provided
+  // except the re-read itself.
+  const rig = viewerEnvironment(opts?.still ? BAKE_ENVIRONMENT : debugChoice("env"));
   const L = { ...rig.lighting, ...(opts?.lighting ?? {}) };
+  // Which preset those numbers came from, so a live re-light can skip the frames
+  // where nothing changed — the poll runs every frame and the answer is the same
+  // one all but a handful of times in a session.
+  let rigKey = rig.key;
   scene.environmentIntensity = L.env;
   // Theirs too: the HDRI is a real place, so which way it faces decides where the
   // sun and the bright sky sit in every reflection. 3.8 rad is what csgoskins use.
   scene.environmentRotation = new THREE.Euler(0, rig.envRotation, 0);
-  scene.add(new THREE.AmbientLight(0xffffff, L.ambient));
+  // Held rather than dropped into the scene anonymously: every other lamp in this
+  // rig already had a name because something moves it, and the ambient one needs
+  // one for the same reason the others do — a preset change re-assigns all five.
+  const ambient = new THREE.AmbientLight(0xffffff, L.ambient);
+  scene.add(ambient);
   const key = new THREE.DirectionalLight(0xffccb3, L.key);
   key.position.set(2, 3, 4);
   scene.add(key);
@@ -9741,6 +9783,17 @@ async function buildViewer(
   let inspectPlaying = false;
   let inspectLastT = 0;
   /**
+   * Whether the Motion switch is asking for the clip at all.
+   *
+   * Separate from `inspectAction` because the two answer different questions:
+   * this is what the user asked for, that is what the model turned out to have.
+   * Most of the catalogue has no usable clip, so collapsing them would make
+   * "wanted, and there is nothing to play" indistinguishable from "not wanted"
+   * — and the live setter below would then re-run the whole clip measurement on
+   * every frame of every agent, sticker and case in the grid.
+   */
+  let motionOn = debugFlag("inspectanim", true);
+  /**
    * THE PLAY HEAD IS OURS, and the mixer is only ever asked to evaluate the clip
    * where we put it (see applyInspectTime).
    *
@@ -9779,6 +9832,51 @@ async function buildViewer(
   const spotTargetBase = spot.target.position.clone();
   const envBase = new THREE.Quaternion().setFromEuler(scene.environmentRotation);
   const envQuat = new THREE.Quaternion();
+
+  /**
+   * Re-light a LIVE viewer, without rebuilding anything.
+   *
+   * The rig used to be read exactly once, at mount, which made the Lighting
+   * picker a control that changed its own description and nothing else: pick
+   * Showcase, the panel explains what Showcase is, the render comes back pixel
+   * for pixel identical. A preset is five intensities and a rotation and every
+   * one of them is a property of an object already in the scene, so the remount
+   * was never buying anything but the re-read.
+   *
+   * NO LIGHT IS ADDED, REMOVED OR REPLACED, deliberately. applyInspect rotates
+   * this rig as a group and holds each lamp by name, and `*Base` above are the
+   * positions it puts them back to — swapping a light for a new one would leave
+   * the motion driving a lamp nothing renders and the rest of the rig frozen.
+   * Only intensities move here; the geometry of the rig is the framing's.
+   *
+   * `opts.lighting` STILL WINS, exactly as it does at mount: tools/shadertest
+   * sweeps a value to measure it, and a preset silently overwriting the number
+   * under measurement is how a calibration run ends up reporting the rig it was
+   * supposed to be replacing.
+   *
+   * Unreachable from a bake by two separate barriers — this early return, and
+   * the fact that the only caller is the render loop a `still` viewer never
+   * runs. A card is cached forever against its render key, so a preset baked
+   * into one is indistinguishable from a rendering bug.
+   */
+  function setEnvironment(name: string) {
+    if (opts?.still) return;
+    const next = viewerEnvironment(name);
+    if (next.key === rigKey) return;
+    rigKey = next.key;
+    const lit = { ...next.lighting, ...(opts?.lighting ?? {}) };
+    scene.environmentIntensity = lit.env;
+    ambient.intensity = lit.ambient;
+    key.intensity = lit.key;
+    rim.intensity = lit.rim;
+    spot.intensity = lit.spot;
+    // BOTH the live rotation and the rest pose the motion restores to. Writing
+    // only the first would hold for one frame and then be undone by the next
+    // clearInspect, which is the animated viewer quietly reverting to the old
+    // preset's HDRI while its five lamps stayed on the new one.
+    scene.environmentRotation.set(0, next.envRotation, 0);
+    envBase.setFromEuler(scene.environmentRotation);
+  }
 
   /** Turn of a bind→posed delta, in degrees. Same expression the perf HUD prints
    *  poseXform with, so the two numbers are comparable by eye. */
@@ -9861,9 +9959,11 @@ async function buildViewer(
     // the first of the three things that keep a card bake reproducible — see
     // snapshot() for the other two.
     if (opts?.still || opts?.inspect === false) return;
-    // Read per MOUNT, not once at module load, so the dev HUD's Motion switch
-    // means what it says: turn it off, reopen the item, the model is still.
-    if (!debugFlag("inspectanim", true)) return;
+    // The switch, which is now read live — see setInspectMotion, which is also
+    // what calls this a second time when the answer changes. Setup is LAZY as a
+    // result: a viewer mounted with Motion off measures no clips at all, and
+    // pays for the enumeration below only if the user asks for it.
+    if (!motionOn) return;
     // No baked body means no bone was ever identified as carrying it, and an
     // unbaked tree (an agent) is skinned live — moving its bones would move its
     // geometry, which is not what this driver does.
@@ -9925,6 +10025,62 @@ async function buildViewer(
       return;
     }
     mixer.uncacheRoot(object);
+  }
+
+  /**
+   * Hand the clip back, leaving the model exactly as setupInspect found it.
+   *
+   * The mirror of the setup above rather than a pause, because the transport bar
+   * is drawn from `inspect()` — which reports null when there is no action — and
+   * a Motion switch that turned the animation off but left a scrub bar sitting
+   * under a frozen weapon would be the same class of lie the switch had before.
+   */
+  function teardownInspect() {
+    const mixer = inspectMixer;
+    const action = inspectAction;
+    if (!mixer || !action) return;
+    // The eye and the five lamps go back FIRST. They are only ever off their
+    // framed positions across a draw, so this is normally a no-op — but a viewer
+    // left holding a camera the clip rotated is one whose next OrbitControls
+    // update reads that rotation as the user's and spins the model away, and
+    // being one line from that is not worth the ordering argument.
+    clearInspect();
+    // stop() restores the bindings the action wrote, exactly as it does for a
+    // candidate the measurement rejects above: the skeleton returns to the pose
+    // the framing was solved in and the card was baked from.
+    action.stop();
+    mixer.uncacheAction(action.getClip());
+    mixer.uncacheRoot(object);
+    inspectMixer = null;
+    inspectAction = null;
+    inspectBone = null;
+    inspectPlaying = false;
+    inspectStale = false;
+  }
+
+  /**
+   * The Motion switch, on a live viewer.
+   *
+   * It used to be read once per mount, so the HUD promised "reopen the item to
+   * apply" and the switch did nothing where the user was looking. Nothing about
+   * the clip actually needed a rebuild: the animation never touches the mesh
+   * (see applyInspect — it moves the camera and the rig, and the model is baked),
+   * so starting and stopping it is a mixer this function makes and unmakes.
+   *
+   * The bake path is excluded on the same terms setupInspect excludes it, and
+   * for the same reason: a `still` viewer exists to be photographed from the
+   * canonical pose, and it never runs the loop that calls this anyway.
+   */
+  function setInspectMotion(on: boolean) {
+    if (opts?.still || opts?.inspect === false) return;
+    if (on === motionOn) return;
+    motionOn = on;
+    if (on) setupInspect();
+    else teardownInspect();
+    // The other half of the switch. The turntable and the clip are alternatives
+    // (see syncIdleSpin), so turning the clip off has to hand the spin back or
+    // "Motion off" would read as "no motion at all" — which is not what it says.
+    syncIdleSpin();
   }
 
   /**
@@ -10179,9 +10335,42 @@ async function buildViewer(
     c.addPass(new OutputPass());
     return c;
   };
+  /**
+   * Whether this viewer composites, resolved ONCE and then only by setBloom.
+   *
+   * `opts.bloom` is the caller's answer and the live switch never gets to
+   * overrule it: a card bake passes false explicitly, and that false is what
+   * keeps a grid of cards from being half glowing and half not depending on when
+   * each one happened to be baked.
+   */
+  let bloomOn = opts?.bloom ?? BLOOM;
+  /**
+   * The Bloom switch, live.
+   *
+   * The three bloom SLIDERS have always been read per frame, so strength, radius
+   * and threshold moved the picture as they were dragged while the switch above
+   * them insisted on a remount — three controls in one group, one of which was a
+   * lie. Nothing justified the difference: the branch below is per frame anyway,
+   * and all this changes is the variable it reads.
+   *
+   * TURNING IT OFF GIVES THE TARGETS BACK. The composer is five mip levels of
+   * half-float render targets and is built lazily precisely because that is not
+   * free — holding them for a viewer that has been told to stop compositing
+   * would be paying the whole cost of the feature for none of it.
+   *
+   * Callers that stated a preference (`opts.bloom`) are left alone; see above.
+   */
+  function setBloom(on: boolean) {
+    if (opts?.still || opts?.bloom !== undefined || on === bloomOn) return;
+    bloomOn = on;
+    if (on) return;
+    composer?.dispose();
+    composer = null;
+    bloomPass = null;
+  }
   const drawFrame = () => {
     renderer.setSize(cssW, cssH, false);
-    if (opts?.bloom ?? BLOOM) {
+    if (bloomOn) {
       const c = (composer ??= buildComposer());
       if (bloomPass) {
         // Live, so the HUD sliders move the picture as they are dragged.
@@ -10199,9 +10388,42 @@ async function buildViewer(
     viewCtx.clearRect(0, 0, view.width, view.height);
     viewCtx.drawImage(renderer.domElement, 0, 0, view.width, view.height);
   };
+  /**
+   * Pick up settings changed while this viewer is on screen.
+   *
+   * THE ONLY CALLER IS renderLoop, and that is the barrier that keeps every live
+   * setter off the bake path: a `still` viewer runs settleLoop instead and its
+   * snapshot() calls drawFrame directly, so a card and the /admin/tests sweep
+   * render under the canonical rig with bloom off no matter what the HUD says.
+   * Each setter re-states that guard for itself; this is the structural half.
+   *
+   * VERSION-GATED rather than polled, because the reads are not free — each one
+   * parses the query string and hits localStorage, and doing three of those on
+   * every frame of every viewer to catch a change that happens a handful of
+   * times a session is the kind of cost that only shows up on a slow phone. The
+   * counters are already bumped on every write for the HUD's benefit.
+   *
+   * The versions are recorded AFTER the reads, not before: `?bloom=1` in the URL
+   * makes debugFlag write the stored value back on every call, which bumps the
+   * very counter that was just compared — so snapshotting first would leave this
+   * re-reading everything, every frame, for anyone on a shared debug URL.
+   */
+  let flagsAt = flagsVersion.value;
+  let choicesAt = choicesVersion.value;
+  const syncLiveSettings = () => {
+    if (flagsVersion.value === flagsAt && choicesVersion.value === choicesAt) return;
+    setEnvironment(debugChoice("env"));
+    setInspectMotion(debugFlag("inspectanim", true));
+    setBloom(debugFlag("bloom", true));
+    flagsAt = flagsVersion.value;
+    choicesAt = choicesVersion.value;
+  };
   const renderLoop = () => {
     if (disposed) return;
     const t0 = perfHud ? performance.now() : 0;
+    // Before anything reads the rig or the clip this frame — a preset applied
+    // between applyInspect and clearInspect would be reverted by the latter.
+    syncLiveSettings();
     controls.update();
     // The rig rides the clip from here to clearInspect below — deliberately
     // BEFORE the charm steps, because the charm's gravity comes from the camera

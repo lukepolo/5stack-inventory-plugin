@@ -19,7 +19,7 @@
 // when the mounted model turned out to have a usable inspect clip, which most of
 // the catalogue does not: a transport bar over a model that cannot move is worse
 // than no transport at all.
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, inject, onBeforeUnmount, ref, watch } from "vue";
 import Tooltip from "./Tooltip.vue";
 import { isCoarse } from "../responsive";
 import { CONTROL_ICON, CONTROL_ICON_VIEWBOX, TRANSPORT_ICON, TRANSPORT_ICON_VIEWBOX, type ControlIcon } from "../viewerControlIcons";
@@ -52,6 +52,8 @@ const emit = defineEmits<{
   (e: "inspect-play", on: boolean): void;
   (e: "inspect-seek", seconds: number): void;
 }>();
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 /**
  * How often the transport is re-read.
@@ -108,11 +110,13 @@ function onScrub(e: Event) {
 
 /** Names the clip, because "which animation is this" is the first thing anyone
  *  looking at a model that moves wrong will want to know. */
-const playHint = computed(() =>
-  transport.value
-    ? `${transport.value.playing ? "Pause" : "Play"} the model's own inspect animation (${transport.value.clip})`
-    : "",
-);
+const playHint = computed(() => {
+  const t = transport.value;
+  if (!t) return "";
+  return t.playing
+    ? tr("inventory.viewer.controls.pause_clip", "Pause the model's own inspect animation ({clip})", { clip: t.clip })
+    : tr("inventory.viewer.controls.play_clip", "Play the model's own inspect animation ({clip})", { clip: t.clip });
+});
 
 // The one cell in this bar that is pressed rather than read, so it is the one
 // cell that gets a pointer cursor — everything else is deliberately
@@ -138,30 +142,36 @@ const controls = computed<Control[]>(() => {
     {
       key: "spin",
       icon: coarse ? "spinTouch" : "spin",
-      label: "Spin",
-      hint: coarse ? "Drag with one finger to rotate the model" : "Drag to rotate the model",
+      label: tr("inventory.viewer.controls.spin", "Spin"),
+      hint: coarse
+        ? tr("inventory.viewer.controls.spin_hint_touch", "Drag with one finger to rotate the model")
+        : tr("inventory.viewer.controls.spin_hint", "Drag to rotate the model"),
     },
     {
       key: "zoom",
       icon: coarse ? "zoomTouch" : "zoom",
-      label: "Zoom",
-      hint: coarse ? "Pinch to zoom" : "Scroll to zoom",
+      label: tr("inventory.viewer.controls.zoom", "Zoom"),
+      hint: coarse
+        ? tr("inventory.viewer.controls.zoom_hint_touch", "Pinch to zoom")
+        : tr("inventory.viewer.controls.zoom_hint", "Scroll to zoom"),
     },
     {
       key: "pan",
       icon: coarse ? "panTouch" : "pan",
-      label: "Pan",
-      hint: coarse ? "Drag with two fingers to pan" : "Right-drag to pan",
+      label: tr("inventory.viewer.controls.pan", "Pan"),
+      hint: coarse
+        ? tr("inventory.viewer.controls.pan_hint_touch", "Drag with two fingers to pan")
+        : tr("inventory.viewer.controls.pan_hint", "Right-drag to pan"),
     },
   ];
   if (props.edit) {
     out.push({
       key: "move",
       icon: coarse ? "moveTouch" : "move",
-      label: "Move",
+      label: tr("inventory.viewer.controls.move", "Move"),
       // The zoom advice belongs here rather than on Zoom: it only matters once
       // you're placing something, and that's the cell you're looking at.
-      hint: "Drag a sticker or charm to move it — zoom in for fine placement",
+      hint: tr("inventory.viewer.controls.move_hint", "Drag a sticker or charm to move it — zoom in for fine placement"),
       group: true,
     });
     // Touch has no shift key, so this cell used to be hidden there entirely and
@@ -173,8 +183,10 @@ const controls = computed<Control[]>(() => {
       out.push({
         key: "rotate",
         icon: coarse ? "rotateTouch" : "rotate",
-        label: "Turn",
-        hint: coarse ? "Twist two fingers on a sticker to rotate it" : "Shift-drag a sticker to rotate it",
+        label: tr("inventory.viewer.controls.turn", "Turn"),
+        hint: coarse
+          ? tr("inventory.viewer.controls.turn_hint_touch", "Twist two fingers on a sticker to rotate it")
+          : tr("inventory.viewer.controls.turn_hint", "Shift-drag a sticker to rotate it"),
         mod: coarse ? undefined : "shift",
       });
     }
@@ -260,7 +272,7 @@ const controls = computed<Control[]>(() => {
           v-html="TRANSPORT_ICON[transport.playing ? 'pause' : 'play']"
         ></svg>
         <span class="text-f8 uppercase tracking-cs2 text-muted-foreground/70">
-          {{ transport.playing ? 'Pause' : 'Play' }}
+          {{ transport.playing ? tr('inventory.viewer.controls.pause', 'Pause') : tr('inventory.viewer.controls.play', 'Play') }}
         </span>
       </button>
 
@@ -290,7 +302,7 @@ const controls = computed<Control[]>(() => {
         :max="transport.duration"
         step="0.01"
         :value="scrubValue"
-        aria-label="Scrub the inspect animation"
+        :aria-label="tr('inventory.viewer.controls.scrub', 'Scrub the inspect animation')"
         @input="onScrub"
         @change="scrubAt = null"
       />

@@ -13,6 +13,7 @@
 // cannot come back.
 import type { SortDir, SortKind } from "./sortIcons";
 import type { AttachSort } from "./api";
+import { RARITY_META } from "./itemVisuals";
 
 // ---- items you own ----------------------------------------------------------
 
@@ -150,3 +151,17 @@ export const ATTACH_SORT_KIND: Record<AttachSortMode, SortKind> = {
   rarity: "amount",
   name: "alpha",
 };
+
+// ---- the two comparator primitives every grid here sorts through -------------
+// Lifted out of App.vue when the attachment picker became its own component:
+// both the picker's facet axis and App's own sortInstances/sortSkins need them,
+// and a second copy of either is a second place for a tie-break to drift.
+
+/** Name order, null-safe. The tie-break under every other mode, which is why it
+ *  stays A → Z in both directions. */
+export const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
+
+// Its own fallback on purpose: an unrecognised colour sorts FIRST here (0),
+// where the facet lists put it last (8). Sorting a grid, "I don't know what
+// this is" belongs with the commons; listing the tiers, it belongs after them.
+export const sortRarityRank = (hex?: string | null) => (hex && RARITY_META[hex.toLowerCase()]?.rank) || 0;

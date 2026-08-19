@@ -4,15 +4,13 @@ import { cn } from "@5stack/ui";
 import { useI18n } from "./composables/useI18n";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
-  Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Download, CheckSquare, Settings, Box, Clock, CircleDollarSign,
+  Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
-  MoreHorizontal, Heart,
+  MoreHorizontal, Layers,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
   fetchSkins,
-  searchAttachments,
-  type AttachFacet,
   type AttachSort,
   fetchCatalogItems,
   fetchLoadout,
@@ -27,7 +25,6 @@ import {
   type ExtractStatus,
   fetchPlayerLoadout,
   copyLoadoutFrom,
-  setFavourite,
   importSteamInventory,
   fetchSteamSync,
   fetchPriceStatus,
@@ -50,6 +47,7 @@ import {
   swapLoadout,
   unequip,
   fetchPresets,
+  fetchPlayerPresets,
   createPreset,
   renamePreset,
   deletePreset,
@@ -63,6 +61,7 @@ import {
   type SheetFacets,
   type LoadoutEntry,
   type InventoryItem,
+  type AttachSource,
   type AttachSpec,
   fetchStickerGeometry,
   MAX_STICKERS,
@@ -89,8 +88,10 @@ import {
 import AdminConsole from "./components/AdminConsole.vue";
 import DevHud from "./components/DevHud.vue";
 import { activeFlags, flagsVersion } from "./devFlags";
-import CatalogFilters, { type FacetAxis } from "./components/CatalogFilters.vue";
 import Armory from "./components/Armory.vue";
+import InventoryScreen from "./components/InventoryScreen.vue";
+import LoadoutGrid from "./components/LoadoutGrid.vue";
+import AttachmentPicker from "./components/AttachmentPicker.vue";
 import ShareMenu from "./components/ShareMenu.vue";
 import Tooltip from "./components/Tooltip.vue";
 import { MDEBUG, mdebug, setMdebugAmbient, traceLayer } from "./mdebug";
@@ -99,13 +100,13 @@ import ItemName from "./components/ItemName.vue";
 import SlotStatus from "./components/SlotStatus.vue";
 import WearBar from "./components/WearBar.vue";
 import ItemTile from "./components/ItemTile.vue";
+import MusicPlayer from "./components/MusicPlayer.vue";
 import TileActions from "./components/TileActions.vue";
 import FilterDropdown from "./components/FilterDropdown.vue";
 import InfiniteSentinel from "./components/InfiniteSentinel.vue";
 import SortDirection from "./components/SortDirection.vue";
 import PatternRail from "./components/PatternRail.vue";
 import PriceTag from "./components/PriceTag.vue";
-import LoadoutCell from "./components/LoadoutCell.vue";
 import ItemSpecs from "./components/ItemSpecs.vue";
 import ItemBadges from "./components/ItemBadges.vue";
 import PatternScoreRail from "./components/PatternScoreRail.vue";
@@ -121,12 +122,12 @@ import { Z } from "./zLayers";
 import { SORT_DIR_ICON, type SortDir } from "./sortIcons";
 import {
   SORTS, SORTS_WITHOUT_VALUE, DEFAULT_SORT, SORT_NATURAL, SORT_DIR_HINT, SORT_DIR_KIND, needsOwnedItem, type SortMode,
-  ATTACH_SORTS, DEFAULT_ATTACH_SORT, ATTACH_SORT_NATURAL, ATTACH_DIR_HINT, ATTACH_SORT_KIND, type AttachSortMode,
+  byName, sortRarityRank,
 } from "./sortModes";
 import {
   DEFAULT_WEAR, POSITION_GROUPS, START_PISTOLS, isWeaponPos, isSpecial, isShared, isNo3d,
-  type OriginFilter, ORIGIN_FILTERS, ORIGIN_VALUES, WEAPON_GROUPS, GEAR_TYPES, WEAPONISH,
-  categoryOf, prettyModel, matchesOrigin, catsForPos, DEFAULTS, RAIL, EXTRAS, ALL_SPECIALS,
+  type OriginFilter, ORIGIN_FILTERS, ORIGIN_VALUES, WEAPON_GROUPS, GEAR_TYPES,
+  matchesOrigin, catsForPos, DEFAULTS, RAIL, EXTRAS, ALL_SPECIALS,
 } from "./loadoutModel";
 import { useSortControl } from "./composables/useSortControl";
 import { SWIPE_ARM_PX } from "./composables/useSwipeDismiss";
@@ -134,9 +135,12 @@ import { useSlotLongPress } from "./composables/useSlotLongPress";
 import { useAppHeight } from "./composables/useAppHeight";
 import { useBuildCheck } from "./composables/useBuildCheck";
 import { useViewerMount } from "./composables/useViewerMount";
-import { useDebouncedSearch, SEARCH_DEBOUNCE_MS } from "./composables/useDebouncedSearch";
+import { useDebouncedSearch } from "./composables/useDebouncedSearch";
+import { useInventoryView } from "./composables/useInventoryView";
+import { useAttachmentPicker, type PickerRow } from "./composables/useAttachmentPicker";
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
-import { ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
+import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
+import { stackByDesign, TINT_SUFFIX } from "./decks";
 import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
@@ -369,45 +373,8 @@ const gradient = computed(() =>
     ? "linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16))"
     : "linear-gradient(135deg, var(--tac-ct-cta-from, #7ad7ff), var(--tac-ct-cta-to, #35b4e8))",
 );
-// Built on var(--acc) rather than the computed hex so it rides the registered
-// property's crossfade when the team flips (see @property --acc in style.css).
-const accentSoft = "color-mix(in srgb, var(--acc) 16%, transparent)";
 // One class string for the item modal's secondary actions so the row can't
 // drift into three slightly different heights and two text sizes again.
-// BROWSE and SELECT are two toolbars that swap in the same place, and they used
-// to size to their own content — so entering select mode nudged the whole grid.
-// Two halves, BOTH required:
-//   1. h-8 on the search input, so the browse bar's height stops depending on
-//      the input's INHERITED line-height (a free variable this file doesn't
-//      control). Every tall control in that bar is now 32px.
-//   2. this min-height, which pins the shorter select bar to match.
-//
-// The number is 53, not 52, and the border is why. box-sizing is border-box, so
-// min-height INCLUDES the 1px border-b:
-//   browse = 10 (py) + 32 (h-8) + 10 (py) + 1 (border) = 53px  -> natural
-//   select = 10 +  ~26 (py-1.5 + f10) + 10 + 1        = 47px  -> pinned to 53
-// At 52 the browse bar sat one pixel ABOVE the threshold so the min-height
-// never applied to it, while select was pinned to exactly 52 — which is
-// precisely the 1px jump. flex-wrap still lets both grow on narrow viewports.
-// flex-nowrap, NOT flex-wrap: a second row here is worse than a slightly
-// cramped first one — it pushes the grid down by ~40px and the controls that
-// wrapped (rarity, sort) ended up below the search field they qualify. Nothing
-// here overflows now that Sync Steam moved to the header; the search field is
-// the one shrinkable item, and it absorbs whatever's left. Deliberately no
-// overflow-x-auto — the filter dropdowns are absolutely positioned, and a
-// scroll container would clip their menus.
-const INV_TOOLBAR =
-  "flex min-h-[53px] flex-none flex-nowrap items-center gap-2.5 border-b pr-6 py-2.5";
-// The toolbar spans rail + grid, so its left edge has two things it could line
-// up with. Whenever the rail is actually drawn it wins: the search field then
-// sits flush with the rail's Clear button and the filter tiles under it. With
-// no rail (or below `lg`, where it's hidden) it falls back to the grid's p-6.
-const INV_TOOLBAR_PL = computed(() => (invRailShown.value ? "pl-6 lg:pl-2.5" : "pl-6"));
-// Chip shapes for the compact inventory filter sheet. 36px tall — these are the
-// only way to reach these filters on a phone, so they get a real target.
-const INV_CHIP = "flex h-9 items-center rounded-md border px-3 text-f10 uppercase tracking-cs1 transition-colors";
-const INV_CHIP_ON = "border-[color:var(--acc)] text-foreground";
-const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
 // Focus view's action row (Inspect / Share / StatTrak / Unequip): one height,
 // one radius, one type size — they drifted into four slightly different pills.
 //
@@ -422,9 +389,6 @@ const FOCUS_ACTION =
 // Everything in that row is pinned to h-8 instead.
 const FOCUS_STAGE =
   "flex h-8 items-center gap-1.5 rounded-md border px-3 text-f10 uppercase tracking-wider transition-colors";
-function selRing(on: boolean) {
-  return on ? { borderColor: "var(--acc)", boxShadow: "0 0 0 1px var(--acc)" } : {};
-}
 
 // ---- loadout lookup ---------------------------------------------------------
 const loadoutMap = computed(() => {
@@ -477,6 +441,21 @@ function specialDefault(slot: string): CatalogItem | null {
 function specialImage(slot: string): string | undefined {
   return rowFor(slot)?.item?.image ?? specialDefault(slot)?.image ?? undefined;
 }
+/**
+ * The track this slot would play — the equipped kit, else the stock one.
+ *
+ * Same fallback order as specialImage, and for the same reason: the kit slot has
+ * always drawn the default's ART, so leaving the sound out made it a picture of
+ * a record with no player. Everyone is issued the stock kit and most never
+ * change it, which is exactly the case that read as an empty slot.
+ *
+ * Null on any other slot and on an instance without the audio extracted — every
+ * surface gates the transport on the URL rather than offering a button that
+ * 404s, so nothing else has to know which slots make sound.
+ */
+function specialAudio(slot: string): string | null {
+  return rowFor(slot)?.item?.audio ?? specialDefault(slot)?.audio ?? null;
+}
 function specialLabel(slot: string): string {
   const row = rowFor(slot);
   if (row?.item) return itemName(row.item);
@@ -486,6 +465,20 @@ function specialLabel(slot: string): string {
 function specialFallback(slot: string): string {
   if (slot === "agent") return team.value === "CT" ? "SAS (Default)" : "Phoenix (Default)";
   return specialDefault(slot)?.name ?? "Default";
+}
+/**
+ * The extras tiles' tooltip — 70px of tile has room for the slot's name and
+ * nothing else, so the occupant's identity lives here.
+ *
+ * It used to name the occupant only when something was equipped, which left the
+ * stock items anonymous: those tiles draw the DEFAULT's artwork, so an untouched
+ * kit slot was a picture of an item the screen refused to name. Falls through to
+ * the bare slot name for graffiti and pins, where no default exists at all —
+ * "Graffiti · Default" is noise, not an answer.
+ */
+function slotTitle(slot: string, name: string): string {
+  const item = rowFor(slot)?.item ?? specialDefault(slot);
+  return item ? `${name} · ${itemName(item)}` : name;
 }
 function cellImage(pos: string): string | undefined {
   const row = rowFor(pos);
@@ -538,7 +531,19 @@ function cellFacts(pos: string, displayPos: string = pos) {
   return {
     item: weaponSlot ? cellItem(displayPos) : row?.item ?? null,
     inst,
+    // The badge row reads the instance when there is one and the ROW when there
+    // isn't, which is the only case a visitor ever has: the public endpoint
+    // withholds the owner's row handle and sends the enriched stickers, patches
+    // and charm on the loadout row itself. Without the fallback, someone else's
+    // loadout drew every cell as an unmarked gun. Your own is untouched — its
+    // rows carry no attachments (nothing needs them; the instance is right
+    // there), so `inst` still answers for every cell you can edit.
+    badges: inst ?? row ?? null,
     image: (weaponSlot ? cellImage(displayPos) : specialImage(displayPos)) ?? null,
+    // Music kits, and nothing else — the only slot whose occupant is a sound
+    // rather than a thing to look at. Weapon cells never carry one, so the
+    // branch is here rather than a null check thirteen cells deep.
+    audio: weaponSlot ? null : specialAudio(displayPos),
     fallback: weaponSlot ? "Default" : specialFallback(pos),
     strip: weaponSlot,
     teams: cellTeams(displayPos),
@@ -841,17 +846,6 @@ watch([sheetSearch, activeRarity], () => (sheetDesign.value = null));
 // Debounce, mirroring invSearchApplied: clearing is instant, typing waits for you
 // to stop. A settled term means a new list, so the panel goes back to the top.
 
-// Rarity facets for the Inventory grid — over what's OWNED, not a catalog.
-const invRarity = ref<string>("");
-const invRarityFacets = computed(() => {
-  const seen = new Map<string, number>();
-  for (const i of inventory.value) {
-    const r = i.item?.rarity;
-    if (r) seen.set(r, rarityRank(r));
-  }
-  return [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([hex]) => ({ hex, name: rarityName(hex) }));
-});
-
 // ---- sorting ----------------------------------------------------------------
 // One control on the Inventory grid, one on the sheet (Owned + Craft share it),
 // one in the attachment picker. All three are useSortControl over the tables in
@@ -861,22 +855,6 @@ const invRarityFacets = computed(() => {
 // say which end it starts from, and for wear the two ends mean opposite things
 // (a factory-new hunt vs a battle-scarred one).
 
-// Its own fallback on purpose: an unrecognised colour sorts FIRST here (0),
-// where the facet lists put it last (8). Sorting a grid, "I don't know what
-// this is" belongs with the commons; listing the tiers, it belongs after them.
-const sortRarityRank = (hex?: string | null) => (hex && RARITY_META[hex.toLowerCase()]?.rank) || 0;
-
-const invSortCtl = useSortControl<SortMode>({
-  scope: "inv",
-  fallback: DEFAULT_SORT,
-  natural: SORT_NATURAL,
-  hints: SORT_DIR_HINT,
-  kinds: SORT_DIR_KIND,
-});
-// Destructured, including the computeds: a ref nested inside an object is not
-// auto-unwrapped in a template, only a top-level binding is.
-const { mode: invSort, dir: invDir, setMode: setInvSort, kind: invSortKind, hint: invSortHint } = invSortCtl;
-
 const sheetSortCtl = useSortControl<SortMode>({
   scope: "sheet",
   fallback: DEFAULT_SORT,
@@ -884,6 +862,8 @@ const sheetSortCtl = useSortControl<SortMode>({
   hints: SORT_DIR_HINT,
   kinds: SORT_DIR_KIND,
 });
+// Destructured, including the computeds: a ref nested inside an object is not
+// auto-unwrapped in a template, only a top-level binding is.
 const { mode: sheetSort, dir: sheetDir, setMode: setSheetSort, kind: sheetSortKind, hint: sheetSortHint } = sheetSortCtl;
 
 /** The sort list this session offers. "Value" appears only when there are values
@@ -891,7 +871,6 @@ const { mode: sheetSort, dir: sheetDir, setMode: setSheetSort, kind: sheetSortKi
  *  missing feature. */
 const invSorts = computed(() => (pricesOn.value ? SORTS : SORTS_WITHOUT_VALUE));
 
-const byName = (a?: string | null, b?: string | null) => (a ?? "").localeCompare(b ?? "");
 /**
  * Collection order, with the uncollected pinned to the BOTTOM in both
  * directions.
@@ -1019,33 +998,6 @@ const ownedForSheet = computed(() =>
   ),
 );
 /**
- * Fold colour variants of one artwork into a single card.
- *
- * 1,767 of the 2,205 sprays are 93 designs repeated in 19 colourways. As one
- * tile each they bury the 438 that are actually distinct artwork, and finding
- * "the green GGEZ" means reading nineteen near-identical names. Items sharing a
- * `design` become one stacked card that says how many it holds; `drill` is the
- * design being opened, and inside one the variants ARE the cards.
- *
- * Generic over what's being stacked because three grids need it — the craft
- * sheet (catalog skins), the sheet's Owned tab and the inventory page (owned
- * instances). Anything without a `design` — every weapon, knife and glove —
- * comes through one card per item, so nothing outside graffiti changes.
- *
- * A stack survives the filters if ANY variant does, and drilling in shows only
- * the survivors. That's why the colour filter needs no special case: pick one
- * and every stack is down to a single variant, so the grid is flat again.
- */
-interface Stack<T> {
-  key: string | number;
-  /** The item a single card equips, and the art a deck wears. */
-  face: T;
-  /** Two more colourways to fan out behind the face. Empty for a single. */
-  behind: string[];
-  variants: T[];
-}
-const TINT_SUFFIX = / \([^()]+\)\s*$/;
-/**
  * tintName -> colour, for the layers fanned out behind a colour deck.
  *
  * Comes from the SHEET's facets, which are fetched per loadout slot — so this
@@ -1061,57 +1013,6 @@ const TINT_SUFFIX = / \([^()]+\)\s*$/;
  * its own needs an inventory-wide tint facet the API does not expose today.
  */
 const tintColors = computed(() => new Map(sheetFacets.value.tints.map((t) => [t.value, t.color])));
-function stackByDesign<T>(
-  list: T[],
-  drill: number | null,
-  of: (v: T) => { id: number; design?: number; tintName?: string } | null | undefined,
-  // The card's Vue key, and it has to identify the ROW, not the artwork: two
-  // owned copies of one skin share an item id, and a duplicate key inside a
-  // keyed v-for makes Vue's diff patch one node twice and orphan the other —
-  // an already-filtered-out card left sitting in the grid.
-  keyOf: (v: T) => string | number,
-  /** tintName -> colour for the fanned layers. See `tintColors`. */
-  palette: Map<string, string>,
-): Stack<T>[] {
-  const out: Stack<T>[] = [];
-  const byDesign = new Map<number, Stack<T>>();
-  for (const v of list) {
-    const meta = of(v);
-    const design = meta?.design;
-    if (drill != null) {
-      if (design === drill) out.push({ key: keyOf(v), face: v, behind: [], variants: [v] });
-      continue;
-    }
-    if (design == null) {
-      out.push({ key: keyOf(v), face: v, behind: [], variants: [v] });
-      continue;
-    }
-    const stack = byDesign.get(design);
-    if (stack) {
-      stack.variants.push(v);
-      continue;
-    }
-    const next: Stack<T> = { key: `d${design}`, face: v, behind: [], variants: [v] };
-    byDesign.set(design, next);
-    out.push(next);
-  }
-  // Which colourway a deck WEARS. Taking the first survivor made a whole grid
-  // one colour — catalog order puts the same tint first for every design, so 93
-  // stacks all showed up Battle Green. Offsetting by the design id spreads them
-  // across the range, and stays deterministic so the colours don't reshuffle
-  // every time a filter changes.
-  for (const st of out) {
-    const n = st.variants.length;
-    if (n < 2) continue;
-    const at = (k: number) => st.variants[((((of(st.face)?.design ?? 0) + k) % n) + n) % n];
-    st.face = at(0);
-    // Thirds apart, so the two behind never repeat the face or each other.
-    st.behind = [at(Math.floor(n / 3)), at(Math.floor((2 * n) / 3))]
-      .map((v) => palette.get(of(v)?.tintName ?? "") ?? "")
-      .filter(Boolean);
-  }
-  return out;
-}
 
 const ownedStacks = computed(() =>
   stackByDesign(ownedForSheet.value, sheetDesign.value, (i) => i.item, (i) => i.id, tintColors.value),
@@ -1234,6 +1135,29 @@ const presetDraft = ref<string | null>(null);
 const presetInputEl = ref<HTMLInputElement | null>(null);
 
 const activePreset = computed(() => presets.value.find((p) => p.active) ?? null);
+
+/**
+ * Which of THEIR builds a visitor is looking at. Null means the one they are
+ * wearing, which is where every visit starts — the same answer this page gave
+ * before presets existed, so a link to a profile still opens on the live rack.
+ */
+const viewerPreset = ref<string | null>(null);
+
+/**
+ * The build the pill is under. These are two different questions and only look
+ * like one: for the owner it is what they are WEARING, for a visitor it is what
+ * they are READING. Collapsing them would light the pill under the owner's
+ * active build while the grid showed a parked one.
+ */
+/** What the compact button prints. The build on SCREEN, which for a visitor is
+ *  whichever of theirs they are paging through rather than the one they wear. */
+const activePresetName = computed(
+  () => presets.value.find((p) => p.id === shownPresetId.value)?.name ?? "Loadout",
+);
+
+const shownPresetId = computed(() =>
+  (viewerId.value ? viewerPreset.value ?? activePreset.value?.id : activePreset.value?.id) ?? "",
+);
 /**
  * The whole control hides when there is nothing to report. That is not just the
  * signed-out and viewer cases: a backend older than this feature 404s the route
@@ -1244,7 +1168,7 @@ const activePreset = computed(() => presets.value.find((p) => p.active) ?? null)
  * it is what the menu button hangs off — which is also how anyone finds out
  * presets exist at all.
  */
-const showPresets = computed(() => canEdit.value && presets.value.length > 0);
+const showPresets = computed(() => (canEdit.value || !!viewerId.value) && presets.value.length > 0);
 
 /**
  * DISPLAY ONLY — PRESET_LIMIT in backend/src/main.ts is the door, and it answers
@@ -1260,10 +1184,40 @@ async function loadPresets() {
   // images, so this route 404s on a backend that predates presets. That has to
   // read as "this deployment has no presets" — an empty list hides the whole
   // control — and not as a failed page load.
-  presets.value = canEdit.value ? await fetchPresets().catch(() => []) : [];
+  // A visitor reads the owner's list from the public route; it carries the same
+  // id/name/active/count and nothing more. Same swallow for the same reason.
+  presets.value = viewerId.value
+    ? await fetchPlayerPresets(viewerId.value).catch(() => [])
+    : canEdit.value
+      ? await fetchPresets().catch(() => [])
+      : [];
 }
 
 async function switchPreset(id: string) {
+  // A VISITOR is changing what they are LOOKING AT, not what the owner wears.
+  // activatePreset writes to the account that owns the preset, so sending a
+  // visitor down the path below would either 401 or — far worse, if it ever
+  // stopped 401ing — reach into someone else's loadout from a page that only
+  // ever advertised itself as a view. The two meanings of "switch" diverge
+  // here, so they fork here.
+  if (viewerId.value) {
+    if (presetBusy.value || shownPresetId.value === id) return;
+    presetBusy.value = true;
+    const previous = viewerPreset.value;
+    try {
+      loadout.value = await fetchPlayerLoadout(viewerId.value, id);
+      viewerPreset.value = id;
+      queueLoadoutRenders();
+    } catch (e) {
+      fail(e);
+      // The fetch is what decides: the pill only moves once a build is actually
+      // on screen, so a failed switch leaves the strip naming what is drawn.
+      viewerPreset.value = previous;
+    } finally {
+      presetBusy.value = false;
+    }
+    return;
+  }
   if (presetBusy.value || activePreset.value?.id === id) return;
   presetBusy.value = true;
   try {
@@ -1480,6 +1434,13 @@ function onSlotDragOver(pos: string, e: DragEvent) {
   e.preventDefault(); // preventing dragover is what makes a drop target
   if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
   dragOverPos.value = pos;
+}
+// Every cell cleared this inline (`@dragleave="dragOverPos === pos && ..."`)
+// until the grid moved into its own component. Named now, because a highlight
+// may only be cancelled by the slot that owns it — clearing unconditionally
+// would kill the highlight the cell you just dragged ONTO has already set.
+function slotDragLeave(pos: string) {
+  if (dragOverPos.value === pos) dragOverPos.value = null;
 }
 async function onSlotDrop(pos: string) {
   const i = dragInst.value;
@@ -3607,358 +3568,25 @@ watch(
   },
 );
 
-// Sticker/charm picker. Searched, FACETED and paged server-side: stickers and
-// charms are ~10.5k items each, far too many to ship in one response, so the grid
-// scrolls through the match set a page at a time. `pickerTotal` is the full match
-// count, which is both the "N stickers" readout and how the sentinel knows when
-// to stop.
+// Sticker/charm/patch picker. The screen is components/AttachmentPicker.vue and
+// every bit of its state — the paging, the facet cascade, the two shelves — is
+// composables/useAttachmentPicker.ts.
 //
-// Three facets, narrowing left to right (see searchAttachments in the backend for
-// how each is derived):
-//   group      Signatures / Team logos / Community — or, for charms, the split
-//              that matters most: 81 real Charms vs 10,565 Sticker Slabs.
-//   collection the capsule it came in, ~61 of them, in release order.
-//   rarity     the usual hex tiers, named by RARITY_META.
-const PICKER_PAGE = 120;
-/**
- * Which tab each picker OPENS on. A UI decision, so it lives here — the backend
- * just answers whatever it is asked (its GROUPS table owns the tabs themselves).
- *
- * NOT "All", because for both big catalogs "All" is mostly one thing nobody
- * browses by eye: 7,495 of the 10,565 stickers are player autographs, and 10,565
- * of the 10,646 charms are Sticker Slabs. Opening on the smaller half is the
- * difference between a picker and a scroll. Everything is one tab away, counted.
- */
-const PICKER_DEFAULT_GROUP: Record<"sticker" | "charm" | "patch", string> = {
-  sticker: "community", // the Art tab — 965 art stickers, no crests, no autographs
-  charm: "charm",
-  patch: "",
-};
-/** Browsing to ATTACH — a slot on the item being edited is waiting for the
- *  answer. Browsing to CRAFT is a different activity and has its own screen
- *  (see Armory.vue), which is why this one has no mode. */
-const picker = ref<{ kind: "sticker" | "charm" | "patch"; slot: number } | null>(null);
-const pickerQuery = ref("");
-const pickerGroup = ref("");
-const pickerCollection = ref("");
-const pickerRarity = ref("");
-// Remembered across pickers and sessions, like the inventory/sheet sorts — a
-// preference for how to read a catalog isn't per-visit.
-//
-// Sort and direction both re-order the WHOLE match set server-side, so the
-// already-loaded pages stop being the right first pages -- `onChange` restarts
-// from page one, and cancels a debounced search first so a keystroke from a
-// moment ago can't land after and undo the change.
-const pickerSortCtl = useSortControl<AttachSortMode>({
-  scope: "picker",
-  fallback: DEFAULT_ATTACH_SORT,
-  natural: ATTACH_SORT_NATURAL,
-  hints: ATTACH_DIR_HINT,
-  kinds: ATTACH_SORT_KIND,
-  onChange: () => {
-    clearTimeout(pickerTimer);
-    void pickerSearch();
-  },
-});
-const {
-  mode: pickerSort, dir: pickerDir, setMode: setPickerSort, setDir: setPickerDir,
-  kind: pickerSortKind, hint: pickerSortHint,
-} = pickerSortCtl;
-const pickerGroups = ref<AttachFacet[]>([]);
-const pickerCollections = ref<AttachFacet[]>([]);
-const pickerRarities = ref<AttachFacet[]>([]);
-const pickerResults = ref<Skin[]>([]);
-const pickerTotal = ref(0);
-const pickerQueryTotal = ref(0);
-/** The picker's grid, which is also its scroller — see pickerFetch. */
-const pickerScrollEl = ref<HTMLElement | null>(null);
-const pickerLoading = ref(false); // first page — the grid shows a spinner instead
-const pickerLoadingMore = ref(false); // a later page — the grid stays put
-let pickerTimer: ReturnType<typeof setTimeout> | undefined;
-// Every response is checked against this. A search that resolves after the query
-// moved on (or after the picker closed) must not append its rows to a list that
-// is now about something else — the pages would interleave.
-let pickerToken = 0;
-const pickerDone = computed(() => pickerResults.value.length >= pickerTotal.value);
+// Created HERE rather than inside that component because `picker` is load-bearing
+// across this file: the Escape chain unwinds through it, the craft modal's
+// backdrop click closes back to the editor rather than discarding the edit, the
+// deep-link reader opens it, and the 3D editor checks it before mounting.
+const pickerView = useAttachmentPicker({ inventory, attachedName, fail });
+const { picker, openPicker } = pickerView;
 
-/**
- * Which shelf the picker is browsing: the whole catalog, or your own drawer.
- *
- * Owned mode is answered entirely from `inventory` — no fetch, no paging. The
- * client already holds every instance the user owns, and an attachment you own
- * is a few dozen rows next to a catalog of ten thousand.
- */
-const pickerSource = ref<"all" | "owned">("all");
-/** cs2-lib calls a charm a keychain; the picker calls it a charm. */
-const PICKER_TYPE: Record<string, string> = { sticker: "sticker", patch: "patch", charm: "keychain" };
-/**
- * One row shape for both shelves, so the grid renders one loop.
- *
- * `inst` is what separates them: a catalog row has none and gets minted on save,
- * an owned row carries the instance and links to it.
- */
-type PickerRow = {
-  key: string;
-  id: number;
-  name: string;
-  image: string | null;
-  rarity?: string;
-  /** cs2-lib type. Carried so crafting one straight from here gets the right
-   *  form — without it the editor can't tell a sticker from a charm. */
-  type?: string;
-  inst?: string | null;
-  /** What this owned one is already applied to, if anything. */
-  attachedName?: string | null;
-  /** The owned row's own scratch / pattern, so picking it previews truthfully. */
-  wear?: number | null;
-  seed?: number | null;
-};
-const pickerOwned = computed<PickerRow[]>(() => {
-  const p = picker.value;
-  if (!p) return [];
-  const want = PICKER_TYPE[p.kind] ?? p.kind;
-  const q = pickerQuery.value.trim().toLowerCase();
-  return inventory.value
-    .filter((i) => i.item?.type === want && (!q || itemName(i.item).toLowerCase().includes(q)))
-    .map((i) => ({
-      key: `own-${i.id}`,
-      id: i.item!.id,
-      name: itemName(i.item),
-      image: i.item?.image ?? null,
-      rarity: i.item?.rarity,
-      type: i.item?.type,
-      inst: String(i.id),
-      attachedName: attachedName(i),
-      wear: i.wear,
-      seed: i.seed,
-    }))
-    // Spares first: the whole reason to open this shelf is to find one that
-    // isn't already spoken for, and burying those under the applied ones would
-    // make the common case the hard one.
-    .sort((a, b) => Number(!!a.attachedName) - Number(!!b.attachedName) || byName(a.name, b.name));
-});
-const pickerRows = computed<PickerRow[]>(() =>
-  pickerSource.value === "owned"
-    ? pickerOwned.value
-    : pickerResults.value.map((it) => ({
-        key: `cat-${it.id}`,
-        id: it.id,
-        name: it.name,
-        image: it.image,
-        rarity: it.rarity,
-        type: it.type ?? PICKER_TYPE[picker.value?.kind ?? "sticker"],
-      })),
-);
-
-async function pickerFetch(offset: number) {
-  const p = picker.value;
-  if (!p) return;
-  const token = ++pickerToken;
-  const q = pickerQuery.value;
-  if (offset === 0) {
-    // A new search supersedes any page fetch still in flight. Clear its flag
-    // here: that fetch's own `finally` belongs to a dead token and won't, and a
-    // stuck pickerLoadingMore would block loading forever.
-    pickerLoadingMore.value = false;
-    pickerLoading.value = true;
-    // The offset belongs to the list being replaced. Switching a tab left you
-    // part-way down a set you had never scrolled — or past the end of a shorter
-    // one, looking at nothing. Done on the way OUT, while the old results are
-    // still up and dimming, so the arriving page is never scrolled after paint.
-    scrollPanelToTop(pickerScrollEl.value);
-  } else {
-    pickerLoadingMore.value = true;
-  }
-  try {
-    const page = await searchAttachments(p.kind, {
-      q,
-      group: pickerGroup.value,
-      collection: pickerCollection.value,
-      rarity: pickerRarity.value,
-      sort: pickerSort.value,
-      dir: pickerDir.value,
-      offset,
-      limit: PICKER_PAGE,
-    });
-    if (token !== pickerToken) return;
-    // OUR default tab must never hide the USER's search. On "Logos & Art",
-    // typing a player name returned nothing while 39 signatures sat one tab over
-    // — so when the default (and only the default: `pickerFiltered` is false
-    // exactly while nothing has been chosen by hand) is what emptied the grid,
-    // widen to All and let the tabs show where the matches actually live.
-    // Checked before the assignments so the empty grid never flashes. Terminates:
-    // with no group filter, total is queryTotal, which is > 0 here.
-    if (offset === 0 && page.total === 0 && page.queryTotal > 0 && pickerGroup.value && !pickerFiltered.value) {
-      pickerGroup.value = "";
-      // Bumps the token, so this response is abandoned and the `finally` below
-      // leaves the busy flags to the refetch that now owns them.
-      return void pickerFetch(0);
-    }
-    pickerResults.value = offset === 0 ? page.items : [...pickerResults.value, ...page.items];
-    pickerTotal.value = page.total;
-    pickerQueryTotal.value = page.queryTotal;
-    pickerGroups.value = keepFacets(pickerGroups.value, page.groups);
-    pickerCollections.value = keepFacets(pickerCollections.value, page.collections);
-    pickerRarities.value = keepFacets(pickerRarities.value, page.rarities);
-  } catch (e) {
-    fail(e);
-  } finally {
-    // Only the CURRENT request owns the flags — see the token comment above.
-    if (token === pickerToken) {
-      pickerLoading.value = false;
-      pickerLoadingMore.value = false;
-    }
-  }
-}
-const pickerSearch = () => pickerFetch(0);
-function pickerMore() {
-  if (pickerLoading.value || pickerLoadingMore.value || pickerDone.value) return;
-  void pickerFetch(pickerResults.value.length);
-}
-watch(pickerQuery, () => {
-  clearTimeout(pickerTimer);
-  pickerTimer = setTimeout(pickerSearch, SEARCH_DEBOUNCE_MS);
-});
-// Facets are a click, not typing - refetch immediately, and cancel a debounced
-// search so a keystroke from a moment ago can't land after and undo the filter.
-// (Sort and direction do the same via useSortControl's onChange, above.)
-function setPickerFacet(facet: "group" | "collection" | "rarity", value: string) {
-  // Re-picking what is already picked is not a state change, so it must not cost
-  // a round trip. It did: clicking the active tab re-ran the search, and because
-  // the grid remounts its tiles that read as the whole sticker list flickering
-  // and reloading for no reason. Note this has to come BEFORE the cascade below,
-  // which would otherwise clear the finer facets on a no-op click.
-  const currentValue =
-    facet === "group" ? pickerGroup.value : facet === "collection" ? pickerCollection.value : pickerRarity.value;
-  if (currentValue === value) return;
-  clearTimeout(pickerTimer);
-  // Narrowing cascade: a collection only exists within a group and a rarity
-  // within a collection, so picking a coarser facet drops the finer ones. Kept
-  // rather than intersected because the alternative is a filter bar that reads as
-  // set but returns nothing — pick "Charms" while "IEM Katowice" is still on and
-  // there is no such thing.
-  if (facet === "group") {
-    pickerGroup.value = value;
-    pickerCollection.value = "";
-    pickerRarity.value = "";
-  } else if (facet === "collection") {
-    pickerCollection.value = value;
-    pickerRarity.value = "";
-  } else {
-    pickerRarity.value = value;
-  }
-  void pickerSearch();
-}
-// Group tabs as rendered: the catalog's own splits, then All. All goes LAST
-// because it is the fallback, not the starting point — and its count comes from
-// `queryTotal`, since summing the tabs would double-count the union tab.
-const pickerTabs = computed(() =>
-  pickerGroups.value.length
-    ? [...pickerGroups.value, { value: "", label: "All", count: pickerQueryTotal.value }]
-    : [],
-);
-const pickerDefaultGroup = computed(() => (picker.value ? PICKER_DEFAULT_GROUP[picker.value.kind] : ""));
-// "Filtered" means "not how it opened" — so Clear appears when there is something
-// to undo, and the default tab alone doesn't count as a filter to clear.
-const pickerFiltered = computed(
-  () => pickerGroup.value !== pickerDefaultGroup.value || !!pickerCollection.value || !!pickerRarity.value,
-);
-// What the footer count is counting. The group label when one is picked, because
-// "10565 charms" is a poor description of 10565 Sticker Slabs.
-const pickerNoun = computed(() => {
-  const group = pickerGroups.value.find((g) => g.value === pickerGroup.value);
-  if (group?.label) return group.label.toLowerCase();
-  const kind = picker.value?.kind ?? "item";
-  return pickerTotal.value === 1 ? kind : `${kind}s`;
-});
-function clearPickerFacets() {
-  clearTimeout(pickerTimer);
-  pickerGroup.value = pickerDefaultGroup.value; // back to how it opened, not to All
-  pickerCollection.value = "";
-  pickerRarity.value = "";
-  void pickerSearch();
-}
-/**
- * Facet lists survive a query that matches nothing.
- *
- * A zero-result search returns no facet entries at all — correctly, nothing
- * matches — and every control in the bar is drawn `v-if="…length > 1"`. So
- * typing a typo deleted the tabs, the collection dropdown and the rarity
- * dropdown at the exact moment they were the only way out, leaving a bare CLEAR
- * on an empty screen. It also reflowed the toolbar, which is the jerkiness.
- *
- * Keep the OPTIONS and zero the COUNTS: the options are a property of the
- * catalog, which hasn't changed, while the counts belong to the query, which
- * found nothing. Both halves stay honest and the bar stops moving.
- */
-function keepFacets(prev: AttachFacet[], next: AttachFacet[]): AttachFacet[] {
-  if (next.length) return next;
-  return prev.map((f) => ({ ...f, count: 0 }));
-}
+// "1.2k" over "1204" — the compact count badge. It sat beside the attachment
+// picker until that moved out; the sheet's group tabs and the collection facet
+// are what still read it.
 const fmtCount = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
-// "All" first, then the facet's own values with counts. The dropdowns show every
-// option regardless of count because the counts are already narrowed by the
-// facets above — a zero would mean the row shouldn't be there at all.
-/**
- * The picker's narrowing axes, in the order they read.
- *
- * Counts ride INSIDE the label rather than in `count`: the shared bar puts a
- * fixed-width badge on tabs, where the value changes as you type, but a
- * dropdown row is only ever read when it is open and "IEM Katowice (42)" is
- * shorter than the same thing spread across two columns.
- */
-const pickerAxes = computed<FacetAxis[]>(() => {
-  const out: FacetAxis[] = [];
-  if (pickerCollections.value.length > 1) {
-    out.push({
-      key: "collection",
-      label: "Collection",
-      options: pickerCollections.value.map((f) => ({ value: f.value, label: `${f.label ?? f.value} (${f.count})` })),
-    });
-  }
-  if (pickerRarities.value.length > 1) {
-    out.push({
-      key: "rarity",
-      dots: true,
-      options: [...pickerRarities.value]
-        .sort((a, b) => sortRarityRank(b.value) - sortRarityRank(a.value))
-        .map((f) => ({ value: f.value, label: `${rarityName(f.value)} (${f.count})`, color: f.value })),
-    });
-  }
-  return out;
-});
-// Same adjustable-tile treatment as the inventory/loadout grids. Charm and
-// sticker art is small and busy — 92px is a lot of catalog on screen but too
-// little to tell two similar charms apart, so the size is the user's call.
-const attachCardSize = usePersistedNumber("cs2inv.attachCardSize", 92);
-const attachGridStyle = computed(() => ({
-  display: "grid",
-  gridTemplateColumns: `repeat(auto-fill, minmax(${attachCardSize.value}px, 1fr))`,
-  gridAutoRows: `${attachCardSize.value + 12}px`,
-}));
 // Numeric x/y/z/rotation are the escape hatch, not the interface — dragging in
 // 3D is. Off by default; the toggle is remembered for the session so anyone who
 // wants the numbers isn't re-opening it on every craft.
 const advancedPlacement = ref(false);
-function openPicker(kind: "sticker" | "charm" | "patch", slot = 0) {
-  picker.value = { kind, slot };
-  // Always opens on the catalog. Owned is the narrower shelf and is often
-  // empty, and a picker that opened on "no results" would read as broken.
-  pickerSource.value = "all";
-  pickerQuery.value = "";
-  pickerGroup.value = PICKER_DEFAULT_GROUP[kind];
-  pickerCollection.value = "";
-  pickerRarity.value = "";
-  pickerResults.value = [];
-  pickerTotal.value = 0;
-  pickerQueryTotal.value = 0;
-  // Cleared too, not just re-fetched: they belong to whichever catalog was open
-  // last, and a stale Sticker Slabs tab over a patch picker is worse than none.
-  pickerGroups.value = [];
-  pickerCollections.value = [];
-  pickerRarities.value = [];
-  void pickerSearch();
-}
 // ---- Catalog art from the model, for items CS2 ships no picture of ----------
 /**
  * Some catalog items have no artwork ANYWHERE in the game, so their card is
@@ -4245,26 +3873,6 @@ async function clearSlot(pos: string) {
     await refreshAll();
   } catch (e) {
     fail(e);
-  }
-}
-/**
- * Star or unstar an owned item.
- *
- * Optimistic, and it repaints from the row we already hold rather than
- * refetching: the inventory is a few hundred items and a full reload to move one
- * heart would drop the grid's scroll position. On failure the flag goes back and
- * the toast says why, because a heart that silently reverts reads as the click
- * having missed.
- */
-async function toggleFavourite(inst: InventoryItem, want: boolean) {
-  const row = inventory.value.find((i) => i.id === inst.id);
-  const before = row?.favourite ?? false;
-  if (row) row.favourite = want;
-  try {
-    await setFavourite(inst.id, want);
-  } catch (e) {
-    if (row) row.favourite = before;
-    notify((e as Error).message);
   }
 }
 async function toggleStatTrakInstance(inst: InventoryItem) {
@@ -4716,9 +4324,6 @@ const SHEET_COLLAPSED_MIN = 210; // was min-h-[210px]
 const SHEET_COLLAPSED_VH = 34; // was h-[34vh]
 const SHEET_LIFT_PCT = 60; // of the loadout column, NOT of the viewport
 const SHEET_LIFT_MS = 240; // height transition; the reveal below waits it out
-// A little more scroll range than the sheet actually covers, so the LAST slot
-// in a column can sit clear of its top edge instead of flush against it.
-const LIFT_SPACER_PAD = 12;
 const SHEET_COLLAPSED_CSS = `max(${SHEET_COLLAPSED_MIN}px, ${SHEET_COLLAPSED_VH}vh)`;
 
 const sheetLift = usePersistedBool("cs2inv.sheetLift", false);
@@ -5198,33 +4803,12 @@ watch(
   ],
   () => requestAnimationFrame(() => measureSheetScroll(sheetScrollEl)),
 );
-// scrollFade (the ordinary "more below" cue) lives in dom.ts.
-const invFade = scrollFade();
-/**
- * The cell's place in the entrance cascade (`--i`, read by animate-cell-in).
- *
- * The CLASS is not applied per item any more — TransitionGroup owns it, via
- * `appear-active-class` and `enter-active-class`. That matters twice over.
- * TransitionGroup does not animate the initial render at all unless told to
- * `appear`, which is why the first paint used to arrive with no transition; and a
- * class Vue adds is a class Vue REMOVES when the animation ends, so a card stops
- * carrying a spent `animation-delay` around. That leftover delay was what made
- * Vue retire leaving cards one at a time, in index order (see .inv-leave).
- *
- * Only the first window gets a stagger. cs2CellIn is `both`-filled, so a delayed
- * cell sits at opacity 0 while the grid has already grown to fit it — the arrival
- * wave, and equally the scroll jitter if it lands on rows appended under the fold.
- * Past the first window the delay is 0: those cards still fade, they just do it
- * immediately, because nothing about them needs announcing.
- */
-const invCellDelay = (i: number) => (i < WINDOW_FIRST ? i : 0);
-/** Same rule for the sheet's two windowed grids (owned, craft), whose cascade is
- *  `animate-sheet-in`. Both are infinite-scrolled, and both were staggering every
- *  appended row — the `sheet-settled` gate only covers the options column. */
+/** Same rule as the inventory grid's own cascade (invCellDelay, in
+ *  useInventoryView) for the sheet's two windowed grids (owned, craft), whose
+ *  cascade is `animate-sheet-in`. Both are infinite-scrolled, and both were
+ *  staggering every appended row — the `sheet-settled` gate only covers the
+ *  options column. */
 const sheetCellClass = (i: number) => (i < WINDOW_FIRST ? "animate-sheet-in" : "");
-// The watch on the list lengths lives down beside inventoryWindow, NOT here —
-// see the note there. cardSize is watched separately too, where it's declared:
-// it changes row heights, so it changes whether there's more below.
 
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
 // pulls the rail to the category that actually contains it — otherwise the
@@ -5278,149 +4862,34 @@ async function ctxCopy() {
 }
 
 // ---- inventory view ---------------------------------------------------------
-const invSearchCtl = useDebouncedSearch();
-const invSearch = invSearchCtl.term;
-/**
- * What the GRID filters by, a beat behind what the box holds.
- *
- * The input stays on `invSearch` so typing is never laggy, but the filter runs on
- * this. Typing "p90" against a live filter renders three different inventories —
- * "p", "p9", "p90" — and because the grid animates its reflow (`inv-move`, 280ms)
- * you watch every weapon you own slide to a new home twice on the way to the
- * answer, with the animations overlapping. Only the end state is interesting.
- *
- * Clearing is NOT debounced: emptying the box is a decision, not a keystroke on
- * the way to one, and it should snap back instantly. Same reason the picker
- * debounces its own search (see pickerTimer) — this is that treatment, which was
- * missing here.
- */
-const invSearchApplied = invSearchCtl.applied;
-watch(invSearchApplied, () => invFade.toTop());
-// Synced (steam) vs crafted filter + adjustable card size (persisted).
-const invOrigin = ref<OriginFilter>("all");
-/**
- * Show only starred items.
- *
- * A boolean rather than a value in the origin pill: origin answers "where did
- * this come from" and every option there is mutually exclusive, while a
- * favourite cuts ACROSS origin — the whole point is to star a Steam import and a
- * craft and see them together.
- *
- * Not in STICKY_QUERY_KEYS, so it does not ride a shared link. "The ones I
- * starred" is not a view of an inventory anyone else can see.
- */
-const invFavourites = ref(false);
-/**
- * Is the control worth showing at all?
- *
- * A "favourites only" filter on an inventory with nothing starred is a button
- * whose only outcome is an empty grid. Hidden until the first star exists — the
- * same "hide, do not disable, when the control provably cannot do anything" rule
- * the 3D verb follows for a music kit.
- */
-const invHasFavourites = computed(() => inventory.value.some((i) => i.favourite));
-// Multi-select, not one-of: toggling is the whole point of the rail, and
-// "show me my AKs AND my AWPs" is a question people actually have. An item
-// shows if it matches ANY active toggle; nothing active means everything.
-const invModels = ref<string[]>([]); // specific weapon models, e.g. "ak47"
-const invTypes = ref<string[]>([]); // whole categories, e.g. "rifle" or "sticker"
-// Both replace the grid's contents (the render window resets with the filter),
-// so both send it back to the top — the old offset can easily be past the end of
-// the new, shorter list.
-function toggleModel(m: string) {
-  invModels.value = invModels.value.includes(m)
-    ? invModels.value.filter((x) => x !== m)
-    : [...invModels.value, m];
-  invFade.toTop();
-}
-function toggleType(t: string) {
-  invTypes.value = invTypes.value.includes(t)
-    ? invTypes.value.filter((x) => x !== t)
-    : [...invTypes.value, t];
-  invFade.toTop();
-}
-const matchesRail = (i: InventoryItem) => {
-  if (!invModels.value.length && !invTypes.value.length) return true;
-  const m = i.item?.model;
-  return (!!m && invModels.value.includes(m)) || invTypes.value.includes(categoryOf(i));
-};
-// Everything EXCEPT the rail's own filters, so the counts it shows describe
-// what clicking would actually give you rather than counting rows the search
-// box has already excluded.
-const railBase = computed(() => {
-  const q = invSearchApplied.value.trim().toLowerCase();
-  return inventory.value.filter(
-    (i) => (!q || itemName(i.item).toLowerCase().includes(q)) && matchesOrigin(i, invOrigin.value),
-  );
+// The screen itself is components/InventoryScreen.vue; its filters, sort,
+// colour-deck drill-in, render window and select mode are all in
+// composables/useInventoryView.ts.
+//
+// They are created HERE rather than inside that component because App still owns
+// the URL: viewQuery writes five of these refs into the query string and the
+// watchers further down read them back, which is what makes a shared inventory
+// link open on the sender's filters. A screen holding its filters privately
+// could not honour one.
+const invView = useInventoryView({
+  inventory,
+  weapons,
+  tintColors,
+  sort: sortInstances,
 });
-/**
- * The rail's ROWS come from the whole inventory; only its COUNTS come from the
- * filtered set.
- *
- * Both used to come from `railBase`, so a search that matched nothing emptied the
- * maps and the entire left-hand weapon selection disappeared — the layout
- * restructured itself at the exact moment you needed a way back, and the rail
- * reflowed on every keystroke as groups dropped in and out. What you own does not
- * change when you type; only how much of it currently matches does.
- *
- * So a row with `count: 0` is still drawn, disabled (see the template). Nothing
- * about the rail's SHAPE depends on the filters any more.
- */
-const invRail = computed(() => {
-  type RailModel = { model: string; name: string; image: string | null; count: number; cat: string };
-  const models = new Map<string, RailModel>();
-  const types = new Map<string, number>();
-  // Pass 1 — the shape, from everything owned. Counts start at zero.
-  for (const i of inventory.value) {
-    const cat = categoryOf(i);
-    if (!types.has(cat)) types.set(cat, 0);
-    const m = i.item?.model;
-    if (!m || !WEAPONISH.has(cat) || models.has(m)) continue;
-    const base = weapons.value.find((w) => w.model === m);
-    models.set(m, {
-      model: m,
-      name: base?.name ?? prettyModel(m),
-      // The vanilla silhouette, not the first skin that happens to be owned —
-      // a filter tile should say "AK-47", not "AK-47 | Redline".
-      image: base?.image ?? i.item?.image ?? null,
-      count: 0,
-      cat,
-    });
-  }
-  // Pass 2 — the counts, from what the search and origin filters left.
-  for (const i of railBase.value) {
-    const cat = categoryOf(i);
-    types.set(cat, (types.get(cat) ?? 0) + 1);
-    const m = i.item?.model;
-    const hit = m ? models.get(m) : undefined;
-    if (hit) hit.count++;
-  }
-  return {
-    // A group with no OWNED items is still dropped — the rail is a picture of
-    // what you own, and that is a fact about the inventory, not about the query.
-    weapons: WEAPON_GROUPS.map(([key, label]) => ({
-      key,
-      label,
-      count: types.get(key) ?? 0,
-      items: [...models.values()].filter((e) => e.cat === key).sort((a, b) => a.name.localeCompare(b.name)),
-    })).filter((g) => g.items.length),
-    gear: GEAR_TYPES.map(([key, label]) => ({ key, label, count: types.get(key) ?? 0 })).filter((r) =>
-      types.has(r.key),
-    ),
-  };
-});
-// Whether the filter rail is drawn (it also needs `lg:` — see INV_TOOLBAR_PL).
-const invRailShown = computed(
-  () => !!inventory.value.length && invRail.value.weapons.length + invRail.value.gear.length > 1,
-);
-function clearInvFilters() {
-  invSearchCtl.applyNow("");
-  invOrigin.value = "all";
-  invFavourites.value = false;
-  invRarity.value = "";
-  invModels.value = [];
-  invTypes.value = [];
-}
+const {
+  invSearch,
+  invSearchCtl,
+  invSearchEl,
+  invOrigin,
+  invTypes,
+  invModels,
+  invSort,
+  setInvSort,
+  filteredInventory,
+  selectedIds,
+  exitSelectMode,
+} = invView;
 // ---- money ------------------------------------------------------------------
 // Estimated values, off by default until an operator turns the price feed on
 // (Admin → Prices) — and off for each PLAYER until they ask for it, because a
@@ -5883,41 +5352,6 @@ const invValueTip = computed(() => {
   );
 });
 
-// ---- compact: the inventory filter sheet ------------------------------------
-// Same treatment the picker got. The desktop toolbar is a search field, an
-// origin pill, two dropdowns and a sort-direction toggle on one line — it needs
-// ~600px and a phone has ~376, so it scrolled sideways with most of the
-// controls off the edge. The rail carrying the type/model facets is `lg:` only,
-// so on a phone those were not reachable at ALL. One chip, one sheet, every
-// filter in it.
-const invFiltersOpen = ref(false);
-// Sort counts here where it doesn't on the desktop toolbar: down there the
-// dropdown shows its own state, in a closed sheet nothing does.
-const invFilterCount = computed(
-  () =>
-    (invSearch.value.trim() ? 1 : 0) +
-    (invOrigin.value !== "all" ? 1 : 0) +
-    (invFavourites.value ? 1 : 0) +
-    (invRarity.value ? 1 : 0) +
-    (invSort.value !== DEFAULT_SORT ? 1 : 0) +
-    invModels.value.length +
-    invTypes.value.length,
-);
-
-/**
- * Derived from the count rather than restated. These were two separate
- * predicates over the same state that disagreed: this one ignored sort, while
- * `invFilterCount` (the compact sheet's badge) counted it — so the desktop
- * Clear button could be hidden while the phone claimed one active filter.
- *
- * Declared AFTER invFilterCount, which is why this is a getter over it.
- */
-const filtersActive = computed(() => invFilterCount.value > 0);
-function resetInvFilters() {
-  clearInvFilters();
-  invSort.value = DEFAULT_SORT;
-  invDir.value = invSortCtl.loadDir(DEFAULT_SORT);
-}
 // ---- how tall are we, really ------------------------------------------------
 // See composables/useAppHeight.ts. Compact only: desktop's 6rem assumption is
 // correct there and well tested.
@@ -5925,14 +5359,6 @@ const { el: appRootEl, style: appHeightStyle } = useAppHeight(
   () => isCompact.value && !embedMode.value,
 );
 
-const cardSize = usePersistedNumber("cs2inv.cardSize", 164);
-// Resizing the cards re-flows the grid, so the "more below" cue has to re-measure.
-watch(cardSize, () => invFade.remeasure());
-const invGridStyle = computed(() => ({
-  display: "grid",
-  gridTemplateColumns: `repeat(auto-fill, minmax(${cardSize.value}px, 1fr))`,
-  gridAutoRows: `${cardSize.value + CARD_CHROME_PX}px`,
-}));
 
 // ---- view state ↔ query -----------------------------------------------------
 // Team, focused slot and the inventory filters used to be local-only, which
@@ -6017,77 +5443,6 @@ watch(
   },
   { immediate: true },
 );
-const filteredInventory = computed(() => {
-  const q = invSearchApplied.value.trim().toLowerCase();
-  return sortInstances(
-    inventory.value.filter(
-      (i) =>
-        (!q || itemName(i.item).toLowerCase().includes(q)) &&
-        matchesOrigin(i, invOrigin.value) &&
-        (!invFavourites.value || i.favourite === true) &&
-        (!invRarity.value || i.item?.rarity === invRarity.value) &&
-        matchesRail(i),
-    ),
-    invSort.value,
-    invDir.value,
-  );
-});
-// Colour stacks here too — the inventory page is where you LOOK at what you
-// own, and nineteen tints of one spray is the same wall there as in the picker.
-// Its own drill-in state, not the sheet's: the two grids are different screens
-// and being inside a stack on one says nothing about the other.
-const invDesign = ref<number | null>(null);
-const inventoryStacks = computed(() =>
-  stackByDesign(filteredInventory.value, invDesign.value, (i) => i.item, (i) => i.id, tintColors.value),
-);
-const invDesignName = computed(() =>
-  invDesign.value == null
-    ? ""
-    : stripName(
-        inventory.value.find((i) => i.item?.design === invDesign.value)?.item?.name ?? "",
-      ).replace(TINT_SUFFIX, ""),
-);
-// Any filter change drops you out of the stack — you can't stay inside a card
-// the filters just removed. (Entering select mode does too; that watch lives
-// with selectMode, which is declared further down.)
-//
-// The SETTLED search term, not the raw box: invDesign is part of invFilterSig, so
-// firing this on a keystroke rebuilt the grid one keystroke early and defeated the
-// debounce for anyone who happened to be inside a colour stack.
-watch([invSearchApplied, invOrigin, invFavourites, invRarity, invTypes, invModels], () => (invDesign.value = null));
-/**
- * Everything that changes WHICH items the grid shows — one string.
- *
- * Two jobs. It resets the render window (a new list starts at page one), and it
- * is folded into every card's `:key`, which is what stops the grid ANIMATING its
- * way to the answer.
- *
- * TransitionGroup only animates a "move" for children whose keys survive. With
- * stable keys, filtering to five P90s left ~55 survivors that each FLIPped from
- * their old cell to their new one over 280ms — so you watched the grid sift
- * itself, weapon by weapon, while the toolbar had already said 5/153. Worse, the
- * cards carry `content-visibility: auto` (see style.css), so FLIP's before/after
- * getBoundingClientRect on each one forces layout of a subtree the browser had
- * deliberately skipped — dozens of image-bearing cards, spread over many frames.
- * Changing the keys makes a filter a straight swap: every card is new, none
- * moves, no offsets are read, and the result appears filtered and then waves in
- * (animate-cell-in, first window only).
- *
- * `inv-move` still earns its keep for changes that AREN'T filters — crafting an
- * item, deleting one — where the surviving cards genuinely should slide.
- */
-const invFilterSig = computed(() =>
-  [invSearchApplied.value, invOrigin.value, invFavourites.value ? "fav" : "", invRarity.value, invSort.value, invDir.value, invTypes.value.join("."), invModels.value.join("."), invDesign.value].join("|"),
-);
-const inventoryWindow = useRenderWindow(inventoryStacks, () => invFilterSig.value);
-// Down HERE, not up beside invFade where it reads more naturally, because `watch`
-// runs its source getters once at creation to seed the old value — it does that
-// with or without `immediate`. Sitting above these two consts, both getters threw
-// "Cannot access 'inventoryWindow' before initialization" into Vue's error
-// handler, which logs and continues: the watcher was never established, so the
-// "more below" fade silently stopped remeasuring when the list length changed.
-// A visible console error and a dead feature, from declaration order alone.
-watch([() => inventoryWindow.items.value.length, () => inventoryStacks.value.length], invFade.remeasure);
 function canEquipInstance(i: InventoryItem): boolean {
   if (!i.slot) return false;
   if (isShared(i.slot)) return true;
@@ -6417,12 +5772,6 @@ watch([focusModelKey, focusPaint], async ([key]) => {
     if (focus3d.value && wasOn) await mount3d();
   }
 });
-/**
- * Anything that can dress a model: an owned inventory item, or a public loadout
- * row. Both carry the same enriched `stickers`/`patches`/`charm` and the same
- * StatTrak pair, which is all instPlacements ever reads off either.
- */
-type AttachSource = InventoryItem | LoadoutEntry;
 // The equipped instance behind the focused slot. Own loadout only: viewer mode
 // withholds the instance id (it is the owner's row handle), so nothing here can
 // resolve — see focusAttachments for where a visitor's stickers come from.
@@ -6441,6 +5790,22 @@ const focusInstance = computed(() => {
  */
 const focusAttachments = computed<AttachSource | null>(
   () => focusInstance.value ?? focusRow.value ?? null,
+);
+/**
+ * What the panel PRINTS about the focused item: the badge row beside the name,
+ * and the spec column under the stage controls.
+ *
+ * Narrower than focusAttachments, and deliberately so. The 3D stage is happy to
+ * dress a free default with no attachments, but those two surfaces are not: a
+ * default row has no name tag, nothing applied and no float, so standing it in
+ * would render an empty spec column AND hide the dashed Float/Pattern pair at
+ * the foot of the panel, which is the only reading a default slot has. So the
+ * public row deputises for the missing instance exactly where it has something
+ * to say — a crafted cell in someone else's loadout, which is where the stickers
+ * and the charm the visitor came to see actually live.
+ */
+const focusSpecs = computed<AttachSource | null>(() =>
+  focusInstance.value ?? (viewerId.value && isSkinned(focusRow.value) ? focusRow.value ?? null : null),
 );
 // InventoryItem → viewer placement shapes (Focus + loadout 3D overlay).
 /**
@@ -6525,100 +5890,6 @@ async function mount3d() {
           : null,
     };
   });
-}
-
-// ---- Compare: two owned items, ONE stage, ONE camera -------------------------
-//
-// A/B BLINK, not two panes side by side, and that is the whole design.
-//
-// There is exactly one live WebGL viewer at a time — a rule this app enforces
-// everywhere because a second live context is the "gun renders below the pane"
-// orphan. Two panes would mean breaking it. But blink is also simply the better
-// instrument: two images an inch apart are compared by eye across a gap, while
-// two images in the SAME pixels a second apart are compared by change, and the
-// eye is far better at spotting change than at spotting difference.
-//
-// It only works if the camera does not move between the two, which is what
-// ViewerOpts.camera and ViewerHandle.cameraState exist for — the pose is read
-// off the outgoing mount and handed to the incoming one, so the item swaps
-// underneath a camera that stays put.
-const compareShown = ref<"a" | "b">("a");
-const compareEl = ref<HTMLElement | null>(null);
-/** Carried across the swap. Null on the first mount, which frames normally. */
-let compareCam: CameraState | null = null;
-const comparePair = computed(() => {
-  const r = route.value;
-  if (r.name !== "compare") return null;
-  const find = (id: string) => inventory.value.find((i) => String(i.id) === id) ?? null;
-  const a = find(r.a);
-  const b = find(r.b);
-  // Both or neither: half a comparison is not a screen, and a link to an item
-  // the viewer does not own has to say so rather than mount the other one and
-  // look like it worked.
-  return a && b ? { a, b } : null;
-});
-const compareItem = computed(() => (comparePair.value ? comparePair.value[compareShown.value] : null));
-const compareViewer = useViewerMount({
-  label: "compare",
-  host: () => compareEl.value,
-  onError: (e) => fail(e),
-});
-async function mountCompare() {
-  const inst = compareItem.value;
-  const target = inst?.item ? resolveViewerModelSync(inst.item) : null;
-  if (!inst || !target) return;
-  await compareViewer.mount(target.model, async () => {
-    const isWeapon = (target.kind ?? "weapon") === "weapon";
-    // Simpler than the focus stage's payload, and deliberately not shared with
-    // it: focus has to cope with a loadout DEFAULT that has no instance behind
-    // it, so every field there falls back through the row. Compare is only ever
-    // handed owned items, so there is nothing to fall back to and the fallbacks
-    // would be dead branches pretending to be live ones.
-    return {
-      kind: target.kind,
-      paintMaterial: inst.item?.paintMaterial ?? null,
-      legacyPaint: !!inst.item?.legacyPaint,
-      wear: inst.wear ?? undefined,
-      seed: inst.seed ?? undefined,
-      camera: compareCam ?? undefined,
-      ...(isWeapon ? await stickerGeom(target.model) : {}),
-      ...(isWeapon ? instPlacements(inst) : {}),
-      patches:
-        target.kind === "agent" ? (inst.patches ?? []).map((p) => p?.image ?? null) : undefined,
-      stattrak: inst.stattrak ? { count: inst.stattrak_count ?? 0 } : null,
-    };
-  });
-}
-function swapCompare() {
-  // Read the pose BEFORE the swap tears the handle down. `?? compareCam` keeps
-  // the last good one if the read misses (a swap during a mount), so a fast
-  // double-press cannot reset the framing.
-  compareCam = compareViewer.current()?.cameraState() ?? compareCam;
-  compareShown.value = compareShown.value === "a" ? "b" : "a";
-}
-watch(
-  [comparePair, compareShown],
-  () => {
-    if (comparePair.value) void mountCompare();
-    else compareViewer.teardown();
-  },
-  { immediate: true },
-);
-// Leaving the screen forgets the pose. Coming back to a comparison should frame
-// itself the way any other stage does rather than restore an angle from a
-// session the user has stopped thinking about.
-watch(comparePair, (p) => {
-  if (!p) {
-    compareCam = null;
-    compareShown.value = "a";
-  }
-});
-/** Open a comparison of the two selected items. */
-function compareSelected() {
-  const [a, b] = [...selectedIds.value];
-  if (a == null || b == null) return;
-  exitSelectMode();
-  go(buildPath({ name: "compare", a: String(a), b: String(b) }));
 }
 
 // ---- 3D overlay for a DEFAULT weapon (ctx menu → View in 3D) ----------------
@@ -6756,7 +6027,7 @@ onBeforeUnmount(() => {
   clearTimeout(retexTimer);
   clearTimeout(retexRebuild);
   clearTimeout(craftPreviewTimer);
-  clearTimeout(pickerTimer);
+  // (the picker's own debounce is cleared by useAttachmentPicker, with the timer)
   clearTimeout(preview3dRetex);
   peekRO?.disconnect();
 });
@@ -6790,12 +6061,23 @@ async function load() {
   if (!embedMode.value && viewerId.value === props.user?.steam_id) viewerId.value = null;
   try {
     if (viewerId.value) {
-      const [catalog, theirs] = await Promise.all([fetchCatalog(), fetchPlayerLoadout(viewerId.value)]);
+      // Their builds come along with their loadout. Swallowed on failure for the
+      // same reason loadPresets swallows: a backend that predates presets 404s
+      // here, and that has to read as "this deployment has none" rather than
+      // stranding a visitor on the retry screen for a strip they never asked for.
+      const [catalog, theirs, theirPresets] = await Promise.all([
+        fetchCatalog(),
+        fetchPlayerLoadout(viewerId.value),
+        fetchPlayerPresets(viewerId.value).catch(() => []),
+      ]);
       weapons.value = catalog.weapons;
       specialDefaults.value = catalog.defaults ?? null;
       loadout.value = theirs;
       inventory.value = [];
-      presets.value = [];
+      presets.value = theirPresets;
+      // Always the live build on arrival, even when the last profile you looked
+      // at left a preset id sitting here — that id belongs to a different player.
+      viewerPreset.value = null;
     } else if (!signedIn.value) {
       // Signed out. Loadout and inventory both 401, and asking for them anyway
       // is what used to dump anonymous visitors on the retry screen. Catalog is
@@ -6922,8 +6204,8 @@ function onGlobalKey(e: KeyboardEvent) {
     if (next) selectPos(next);
   }
 }
-// "/"-shortcut targets (see onGlobalKey).
-const invSearchEl = ref<HTMLInputElement | null>(null);
+// The sheet's "/"-shortcut target (see onGlobalKey). The inventory grid's own
+// search box is a ref inside useInventoryView, with the rest of that screen.
 const sheetSearchEl = ref<HTMLInputElement | null>(null);
 // `serverBuild` is intentionally not destructured: it was only ever passed to
 // AdminConsole as `:server-build`, which never declared the prop, so the value
@@ -7206,8 +6488,7 @@ async function copyViewedLoadout(source: string) {
   }
 }
 
-// ---- bulk select/delete (inventory view) ----
-const selectMode = ref(false);
+// ---- bulk delete (inventory view) ----
 
 /**
  * Craft something, with no loadout slot involved.
@@ -7239,31 +6520,6 @@ const ownedItemIds = computed(() => new Set(inventory.value.map((i) => i.item_id
 function armoryPick(skin: Skin) {
   modalBackdrop.value = "armory";
   openCraft(skin);
-}
-watch(selectMode, () => {
-  // Bulk actions operate on instances and a colour deck isn't one, so selecting
-  // starts from the flat grid.
-  invDesign.value = null;
-});
-const selectedIds = ref<Set<number>>(new Set());
-function toggleSelected(id: number) {
-  const next = new Set(selectedIds.value);
-  next.has(id) ? next.delete(id) : next.add(id);
-  selectedIds.value = next;
-}
-function exitSelectMode() {
-  selectMode.value = false;
-  selectedIds.value = new Set();
-}
-// "Select all" means all VISIBLE — with a search or origin filter applied,
-// selecting hidden items would delete things you can't see.
-const allVisibleSelected = computed(
-  () => filteredInventory.value.length > 0 && filteredInventory.value.every((i) => selectedIds.value.has(i.id)),
-);
-function toggleSelectAllVisible() {
-  selectedIds.value = allVisibleSelected.value
-    ? new Set()
-    : new Set(filteredInventory.value.map((i) => i.id));
 }
 function deleteSelected() {
   const items = inventory.value.filter((i) => selectedIds.value.has(i.id));
@@ -7410,14 +6666,24 @@ if (MDEBUG) {
     >
     <div v-if="view !== 'admin'" key="loadout-app" class="flex min-h-0 flex-1 flex-col">
     <!-- Header -->
-    <!-- Compact scrolls horizontally rather than wrapping: the five control
-         groups need ~404px and a phone has ~376px, so wrapping costs a whole
-         second row (95px measured, ~12% of an 800px viewport) to show one
-         stray button. Scrolling keeps every control reachable in 42px. -->
+    <!-- Compact runs as TWO rows. It used to scroll sideways instead, on the
+         measurement that wrapping cost a whole second row (95px, ~12% of an
+         800px viewport) to show one stray button — but that was naive wrapping,
+         where each control lands wherever it falls and the second row exists to
+         catch an overflow rather than to hold anything. In use the sideways
+         scroll was worse than the height it saved: a control you cannot see is
+         one you do not know about, and the side/value/tools all competed for the
+         same 376px.
+
+         So the break is PLACED rather than left to overflow — see the spacer
+         below. Row one is what you are looking at (side, preset, focus, value),
+         row two is what you can do about it (tools, then the screen tabs). Two
+         32px rows plus a 4px gap is ~68px against the scroller's 42px, so it
+         costs ~26px, not 95. -->
     <header
       data-role="app-header"
       class="flex flex-none items-center border-b border-border"
-      :class="isCompact ? 'flex-nowrap gap-1.5 overflow-x-auto px-2 py-1' : 'flex-wrap gap-3 px-6 py-3'"
+      :class="isCompact ? 'flex-wrap gap-x-1.5 gap-y-1 px-2 py-1' : 'flex-wrap gap-3 px-6 py-3'"
     >
       <!-- Compact runs the whole header at 32px instead of 36: p-0.5 on the
            pills, h-8 on the buttons. Four pixels a control does not sound like
@@ -7429,6 +6695,7 @@ if (MDEBUG) {
            other end of it. -->
       <PillTabs
         v-if="view === 'grid' || view === 'focus'"
+        :class="isCompact ? 'order-1' : ''"
         :items="(['CT', 'T'] as Team[])"
         :item-key="(t) => t"
         :active="team"
@@ -7445,13 +6712,14 @@ if (MDEBUG) {
            pill is the solid one on purpose (it's a switch, not a filter) and a
            second solid strip next to it would read as two halves of one toggle.
 
-           Never in a profile tab or a viewer's window: showPresets is gated on
-           canEdit, so someone else's page shows the build that is live and says
-           nothing about the drafts behind it. -->
+           Shown to visitors too, read-only: someone else's page opens on the
+           build they are wearing and lets you page through the rest. Only the
+           STRIP crosses over — the cog beside it stays gated on canEdit, because
+           rename/new/delete act on the account that owns the preset. -->
       <div
         v-if="showPresets && (view === 'grid' || view === 'focus')"
         class="flex flex-none items-center"
-        :class="isCompact ? 'gap-1' : 'gap-1.5'"
+        :class="isCompact ? 'order-5 gap-1' : 'gap-1.5'"
       >
         <!-- Rename happens in place, where the name already is. The input
              REPLACES the strip rather than sitting under it: mid-rename the
@@ -7466,13 +6734,33 @@ if (MDEBUG) {
           @keydown.enter.prevent="commitPresetRename"
           @blur="commitPresetRename"
         />
+        <!-- COMPACT: one control, not a strip plus a menu button.
+             Five presets is the cap, and five pills at ~60px each plus a 32px
+             cog is most of a phone's width spent saying which build you are on
+             — a question with one answer. So the name IS the button, and the
+             menu it opens lists the others to switch to above the actions that
+             manage them. That also retires the odd part of the desktop layout:
+             a strip you switch with, sitting next to a button that does
+             everything else to the same thing. -->
+        <button
+          v-else-if="isCompact"
+          class="flex h-8 min-w-0 items-center gap-1.5 rounded-md border border-border px-2 text-f11 uppercase tracking-wider text-muted-foreground tac-action disabled:opacity-60"
+          :disabled="presetBusy"
+          :title="`${activePresetName} — tap to switch or manage`"
+          @click="presetCtx = { x: $event.clientX, y: $event.clientY }"
+        >
+          <Loader2 v-if="presetBusy" class="h-3.5 w-3.5 flex-none animate-spin" />
+          <Layers v-else class="h-3.5 w-3.5 flex-none" />
+          <span class="max-w-[7rem] truncate">{{ activePresetName }}</span>
+          <ChevronDown class="h-3 w-3 flex-none opacity-60" />
+        </button>
         <PillTabs
           v-else
           :items="presets"
           :item-key="(p) => p.id"
           :item-title="(p) => `${p.name} — ${p.slots} slot${p.slots === 1 ? '' : 's'}`"
-          :active="activePreset?.id ?? ''"
-          :button-class="`relative z-[1] flex h-7 max-w-[9rem] items-center rounded-md text-f11 uppercase tracking-wider transition-colors ${isCompact ? 'px-2' : 'px-3'}`"
+          :active="shownPresetId"
+          :button-class="`relative z-[1] flex h-7 max-w-[9rem] items-center rounded-md text-f11 uppercase tracking-wider transition-colors px-3`"
           @select="(id) => switchPreset(id)"
         >
           <template #default="{ item: p }">
@@ -7480,8 +6768,8 @@ if (MDEBUG) {
           </template>
         </PillTabs>
         <button
-          class="grid flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action disabled:opacity-60"
-          :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
+          v-if="canEdit && !isCompact"
+          class="grid h-9 w-9 flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action disabled:opacity-60"
           :disabled="presetBusy"
           title="Loadout presets"
           @click="presetCtx = { x: $event.clientX, y: $event.clientY }"
@@ -7493,7 +6781,7 @@ if (MDEBUG) {
       <button
         v-if="view === 'grid' || view === 'focus'"
         class="tac-action flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
-        :class="[isCompact ? 'h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'tac-on' : 'border-border text-muted-foreground']"
+        :class="[isCompact ? 'order-6 h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'tac-on' : 'border-border text-muted-foreground']"
         :title="view === 'focus' ? 'Focused' : 'Focus'"
         @click="go(view === 'focus' ? '/' : '/focus')"
       >
@@ -7512,9 +6800,15 @@ if (MDEBUG) {
       <!-- Pending: the chip's own outline with a pulsing dash inside it, so the
            number lands in a place the eye is already looking instead of shifting
            the header when it arrives. -->
+      <!-- The order class goes on the PriceTag, NOT on the Tooltip around it.
+           Tooltip renders its trigger `as-child`, so it contributes no element
+           of its own and the flex item here is the PriceTag's root span. A class
+           on the wrapper would have gone nowhere — and an unordered item defaults
+           to order:0, which sorts BEFORE order-1, so the miss would have parked
+           the value chip at the head of row one rather than simply doing nothing. -->
       <Tooltip v-if="pricesOn && (headerValue > 0 || pricesPending)" :text="headerValueTip">
         <PriceTag
-          class="items-center"
+          :class="isCompact ? 'items-center order-2' : 'items-center'"
           frame="spine"
           size="md"
           :label="isCompact ? null : headerValueLabel"
@@ -7524,11 +6818,39 @@ if (MDEBUG) {
         />
       </Tooltip>
 
+      <!-- The row break, and the only reason the compact header is two ROWS
+           rather than however many the widths happen to produce. A full-width
+           zero-height item in a wrapping flex row forces everything after it
+           onto the next line, which is the one way to say "break HERE" without
+           a second container and a duplicated child list.
+
+           WHICH controls fall either side of it is set by `order` on compact,
+           not by their position in this file. Reading order here is the desktop
+           one, where a single row means source order is the only order; the
+           phone wants the split by IMPORTANCE instead:
+
+             row 1  side toggle · value ........ screen tabs
+             row 2  presets · focus ............ tools
+
+           Row one is the primary pair — which side, and which screen — with the
+           side's value sitting against the toggle it belongs to, since the figure
+           only means anything once you know which side it counts. Row two is
+           everything you do to the place you have landed in.
+
+           Ordering rather than moving the markup keeps one child list for both
+           layouts. Two copies of a header this size is how the two drift, and
+           the drift is always the thing only one of them got. -->
+      <span v-if="isCompact" class="order-4 w-full" aria-hidden="true"></span>
+
       <!-- Utility actions sit LEFT of the tabs and are grouped tight, so the
            header reads as "tools | where you are" instead of three things
            floating at equal distance. All three controls are 36px tall (the
-           pill is h-7 + p-1), so they share a baseline. -->
-      <div class="ml-auto flex items-center" :class="isCompact ? 'gap-1.5' : 'gap-3'">
+           pill is h-7 + p-1), so they share a baseline.
+
+           ml-auto only on desktop. On compact these open row two, so pushing
+           them right would strand them against the tabs and leave the row's
+           whole left side empty — the tabs take the ml-auto there instead. -->
+      <div class="flex items-center" :class="isCompact ? 'order-7 ml-auto gap-1.5' : 'ml-auto gap-3'">
         <!-- Embedded on your own profile: the one way out, to the full page
              where the loadout is editable. Stays an <a> with a real href so
              middle-click and "open in new tab" work, but a plain left click
@@ -7653,36 +6975,45 @@ if (MDEBUG) {
             </button>
           </Tooltip>
         </div>
-        <!-- The divider earns its keep at desktop spacing; at compact gaps it's
-             just another 13px between two already-distinct pills. -->
-        <span v-if="user && !isCompact && !embedMode" class="h-5 w-px flex-none bg-border"></span>
-        <!-- Craft is a PEER of the other two, not a button inside the
-             inventory. The three tabs are the three things you do here — wear
-             it, keep it, make it — and burying the third inside the second
-             said it was a mode of managing what you own, which is the opposite
-             of what that screen is for: nothing in it is yours yet.
-             Gated on canEdit like Inventory: with no account to craft into,
-             the tab is a dead end. -->
-        <PillTabs
-          v-if="!embedMode"
-          :items="viewTabs"
-          :item-key="(t) => t.key"
-          :active="view"
-          button-class="relative z-[1] flex h-7 items-center gap-1.5 rounded-md px-3 text-f11 uppercase tracking-wider transition-colors"
-          @select="(k) => go(viewTabs.find((t) => t.key === k)!.to)"
-        >
-          <template #default="{ item: t }">
-            <!-- Compact drops EVERY label, not just the inactive ones. Tabs with
-                 distinct icons and a sliding indicator under the live one say
-                 which is which; the words were ~70px of a ~376px row, which is
-                 what pushed the header into scrolling sideways — and that was
-                 with two of them. -->
-            <component :is="t.icon" class="h-3.5 w-3.5" />
-            <span v-if="!isCompact">{{ t.label }}</span>
-            <span v-if="t.key === 'inventory' && inventory.length" class="font-mono text-f10 text-muted-foreground">{{ inventory.length }}</span>
-          </template>
-        </PillTabs>
       </div>
+
+      <!-- The screen tabs are a HEADER child, not a member of the tools group.
+           They lived inside it because on desktop that group is one right-hand
+           cluster and nesting read as tidy. On compact it is wrong in a way that
+           cannot be styled around: `order` sorts an element among its SIBLINGS,
+           so an order on a tab strip nested one level down reshuffles it against
+           the sync and share buttons and can never lift it out of their row.
+           Flat here, the header orders all five groups against each other. -->
+      <!-- The divider earns its keep at desktop spacing; at compact gaps it's
+           just another 13px between two already-distinct pills. -->
+      <span v-if="user && !isCompact && !embedMode" class="h-5 w-px flex-none bg-border"></span>
+      <!-- Craft is a PEER of the other two, not a button inside the
+           inventory. The three tabs are the three things you do here — wear
+           it, keep it, make it — and burying the third inside the second
+           said it was a mode of managing what you own, which is the opposite
+           of what that screen is for: nothing in it is yours yet.
+           Gated on canEdit like Inventory: with no account to craft into,
+           the tab is a dead end. -->
+      <PillTabs
+        v-if="!embedMode"
+        :class="isCompact ? 'order-3 ml-auto' : ''"
+        :items="viewTabs"
+        :item-key="(t) => t.key"
+        :active="view"
+        button-class="relative z-[1] flex h-7 items-center gap-1.5 rounded-md px-3 text-f11 uppercase tracking-wider transition-colors"
+        @select="(k) => go(viewTabs.find((t) => t.key === k)!.to)"
+      >
+        <template #default="{ item: t }">
+          <!-- Compact drops EVERY label, not just the inactive ones. Tabs with
+               distinct icons and a sliding indicator under the live one say
+               which is which; the words were ~70px of a ~376px row, which is
+               what pushed the header into scrolling sideways — and that was
+               with two of them. -->
+          <component :is="t.icon" class="h-3.5 w-3.5" />
+          <span v-if="!isCompact">{{ t.label }}</span>
+          <span v-if="t.key === 'inventory' && inventory.length" class="font-mono text-f10 text-muted-foreground">{{ inventory.length }}</span>
+        </template>
+      </PillTabs>
     </header>
 
     <!-- No viewer banner. Someone else's loadout is only ever reached from
@@ -7745,608 +7076,31 @@ if (MDEBUG) {
       />
 
       <!-- ============ INVENTORY VIEW ============ -->
-      <div v-else-if="view === 'inventory'" key="inventory" class="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <!-- Toolbar. Two states that never coexist: BROWSE (find things) and
-             SELECT (act on things). The old bar stacked both, so five
-             equally-weighted outlined buttons competed for the same eye. -->
-        <div
-          v-if="selectMode"
-          :class="[INV_TOOLBAR, INV_TOOLBAR_PL]"
-          style="background: hsl(var(--tac-amber, 33 94% 58%) / 0.08); border-bottom-color: hsl(var(--tac-amber, 33 94% 58%) / 0.35)"
-        >
-          <!-- A left rule in the panel's tactical idiom, the same marker the
-               admin console uses for an active section. -->
-          <span
-            class="h-5 w-0.5 flex-none rounded-full bg-[hsl(var(--tac-amber,33_94%_58%))]"
-            style="box-shadow: 0 0 8px hsl(var(--tac-amber, 33 94% 58%) / 0.45)"
-          ></span>
-          <span class="text-f13 font-semibold">
-            <span class="font-mono text-[hsl(var(--tac-amber,33_94%_58%))]">{{ selectedIds.size }}</span> selected
-            <span class="ml-1 font-normal text-muted-foreground">of {{ filteredInventory.length }}</span>
-          </span>
-          <!-- Reads as a toggle, so it takes the filled state when it's on. -->
-          <button
-            class="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-f10 uppercase tracking-wider transition-colors hover:border-[hsl(var(--tac-amber,33_94%_58%))] hover:text-foreground"
-            :class="allVisibleSelected
-              ? 'border-[hsl(var(--tac-amber,33_94%_58%))] text-foreground'
-              : 'border-border bg-background/60 text-muted-foreground'"
-            :style="allVisibleSelected ? { background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.15)' } : {}"
-            @click="toggleSelectAllVisible"
-          >
-            <Check class="h-3 w-3" /> {{ allVisibleSelected ? 'Clear all' : 'Select all' }}
-          </button>
-          <div class="ml-auto flex items-center gap-2">
-            <!-- Exactly two. Comparison has an arity, and a Compare button that
-                 greys out at one or three explains itself less well than one that
-                 appears when the thing it does becomes possible. -->
-            <button
-              v-if="selectedIds.size === 2"
-              class="flex items-center gap-1.5 rounded-md border border-border bg-background/60 px-3.5 py-1.5 text-f10 font-semibold uppercase tracking-wider text-muted-foreground transition-colors hover:border-[hsl(var(--tac-amber,33_94%_58%))] hover:text-foreground"
-              @click="compareSelected"
-            >
-              <Copy class="h-3 w-3" /> Compare
-            </button>
-            <button
-              v-if="selectedIds.size"
-              class="flex items-center gap-1.5 rounded-md border border-[#e04a3a]/60 bg-[#e04a3a]/10 px-3.5 py-1.5 text-f10 font-semibold uppercase tracking-wider text-[#ff7a6a] transition-colors hover:bg-[#e04a3a]/20"
-              @click="deleteSelected"
-            >
-              <Trash2 class="h-3 w-3" /> Delete {{ selectedIds.size }}
-            </button>
-            <button
-              class="rounded-md border border-border bg-background/60 px-3.5 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:border-[hsl(var(--tac-amber,33_94%_58%))] hover:text-foreground"
-              @click="exitSelectMode"
-            >
-              Done
-            </button>
-          </div>
-        </div>
-        <!-- ============ INVENTORY TOOLBAR · COMPACT ============ -->
-        <div v-else-if="isCompact" class="flex min-h-[44px] flex-none items-center gap-2 border-b border-border px-3 py-1.5">
-          <button
-            class="flex h-8 flex-none items-center gap-1.5 rounded-md border px-2.5 text-f10 uppercase tracking-wider transition-colors"
-            :class="invFilterCount ? 'border-[color:var(--acc)] text-foreground' : 'border-border text-muted-foreground'"
-            :style="invFilterCount ? { background: accentSoft } : {}"
-            @click="invFiltersOpen = true"
-          >
-            <Search v-if="invSearch" class="h-3.5 w-3.5" /><SlidersHorizontal v-else class="h-3.5 w-3.5" />
-            Filters
-            <span v-if="invFilterCount" class="font-mono text-f9">{{ invFilterCount }}</span>
-          </button>
-          <span v-if="inventory.length" class="min-w-0 truncate font-mono text-f10 text-muted-foreground/60">
-            {{ filteredInventory.length }}<template v-if="filteredInventory.length !== inventory.length">/{{ inventory.length }}</template>
-          </span>
-          <!-- Only when a filter actually narrows the view. The full total lives
-               in the header now, so repeating it here would be two identical
-               numbers a few pixels apart; what this adds is "…and the twelve on
-               screen are worth this much". Bordered rather than bare mono, because
-               beside the item count in the same weight and colour it read as more
-               of the counter instead of a different fact. -->
-          <Tooltip v-if="pricesOn && filteredValueShown" :text="invValueTip">
-            <PriceTag
-              :class="'flex-none'"
-              frame="spine"
-              :value="inventoryValueInView"
-              suffix="in view"
-            />
-          </Tooltip>
-          <button
-            v-if="inventory.length"
-            class="ml-auto grid h-8 w-8 flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action"
-            title="Select multiple items"
-            @click="selectMode = true"
-          >
-            <CheckSquare class="h-3.5 w-3.5" />
-          </button>
-        </div>
-        <div v-else :class="[INV_TOOLBAR, INV_TOOLBAR_PL, 'border-border']">
-          <!-- The row's only elastic item: everything else is a fixed-width
-               pill or dropdown, so the search field gives up width first. -->
-          <div class="relative w-[240px] min-w-[110px] shrink">
-            <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <input
-              ref="invSearchEl"
-              v-model="invSearch"
-              placeholder="Search inventory…"
-              class="h-8 w-full rounded-md border border-border bg-background pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
-            />
-            <button
-              v-if="invSearch"
-              class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
-              title="Clear search"
-              @click="invSearch = ''; invSearchEl?.focus()"
-            ><X class="h-3.5 w-3.5" /></button>
-          </div>
-          <!-- Origin filter: same sliding-pill animated tabs as the
-               Loadout/Inventory switcher, so filters read as filters, not actions. -->
-          <PillTabs
-            :items="ORIGIN_FILTERS"
-            :item-key="(f) => f[0]"
-            :active="invOrigin"
-            list-class="shrink-0"
-            button-class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
-            @select="(v) => (invOrigin = v as OriginFilter)"
-          >
-            <!-- The money rides on the ORIGIN TABS rather than in a readout of
-                 its own, because the tabs already are the question: "Synced" is
-                 what you actually own on Steam, "Crafted" is what you built
-                 here. Attaching the figure to the switch makes the comparison
-                 structural instead of another number to correlate.
-                 Desktop only — at compact width the pills are 54px and a
-                 second figure inside one would truncate the label it belongs
-                 to. -->
-            <template #default="{ item: f }"
-              >{{ f[1]
-              }}<span
-                v-if="pricesOn && !isCompact && valueByOrigin[f[0] as OriginFilter]"
-                class="ml-1.5 font-mono text-f9 normal-case tracking-normal text-[hsl(var(--tac-value))]/70"
-                >{{ formatPrice(valueByOrigin[f[0] as OriginFilter]) }}</span
-              ></template
-            >
-          </PillTabs>
-          <!-- Favourites. A single toggle rather than a fourth origin pill: the
-               pills are mutually exclusive and starring cuts across them. Hidden
-               entirely until something is starred, so it is not a dead control on
-               a fresh inventory. -->
-          <button
-            v-if="invHasFavourites"
-            type="button"
-            class="flex h-6 shrink-0 items-center gap-1 rounded-md border px-2 text-f10 uppercase tracking-wider transition-colors"
-            :class="invFavourites ? 'border-[color:var(--acc)] text-foreground' : 'border-border/60 text-muted-foreground hover:text-foreground'"
-            :style="invFavourites ? { background: accentSoft } : {}"
-            :aria-pressed="invFavourites"
-            :title="invFavourites ? 'Showing favourites only' : 'Show favourites only'"
-            @click="invFavourites = !invFavourites"
-          >
-            <Heart class="h-3 w-3" :class="invFavourites ? 'fill-current' : ''" />
-          </button>
-          <FilterDropdown
-            v-if="invRarityFacets.length"
-            v-model="invRarity"
-            dots
-            class="shrink-0"
-            :options="[{ value: '', label: 'All rarities' }, ...invRarityFacets.map((r) => ({ value: r.hex, label: r.name, color: r.hex }))]"
-          />
-          <FilterDropdown
-            :model-value="invSort"
-            prefix="Sort"
-            class="shrink-0"
-            :options="invSorts.map((s) => ({ value: s[0], label: s[0] === 'default' ? 'Newest' : s[1] }))"
-            @update:model-value="setInvSort"
-          />
-          <SortDirection v-model="invDir" :kind="invSortKind" :hint="invSortHint" />
-          <button
-            v-if="filtersActive"
-            class="flex h-8 shrink-0 items-center gap-1 rounded-md px-2 text-f10 uppercase tracking-wider text-muted-foreground transition-colors hover:text-foreground"
-            title="Clear all filters"
-            @click="resetInvFilters"
-          >
-            <X class="h-3 w-3" /> Clear
-          </button>
-          <span v-if="inventory.length" class="shrink-0 font-mono text-f10 text-muted-foreground/60">
-            {{ filteredInventory.length }}<template v-if="filteredInventory.length !== inventory.length">/{{ inventory.length }}</template>
-          </span>
-          <!-- Same object as the compact toolbar's, same reasoning. -->
-          <Tooltip v-if="pricesOn && filteredValueShown" :text="invValueTip">
-            <PriceTag
-              :class="'shrink-0'"
-              frame="spine"
-              :value="inventoryValueInView"
-              suffix="in view"
-            />
-          </Tooltip>
-
-          <div class="ml-auto flex shrink-0 items-center gap-2">
-            <!-- Card size is the first thing to go when the row gets tight:
-                 it tunes the view, it doesn't filter it, and the grid is
-                 legible at any of its steps. -->
-            <div class="hidden items-center gap-2 text-muted-foreground xl:flex" title="Card size">
-              <LayoutGrid class="h-3.5 w-3.5" />
-              <input v-model.number="cardSize" type="range" min="132" max="280" step="4" class="w-24 accent-[#e0a24a]" />
-            </div>
-            <span class="hidden h-5 w-px flex-none bg-border xl:block"></span>
-            <button
-              v-if="inventory.length"
-              class="grid h-8 w-8 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-              title="Select multiple items"
-              @click="selectMode = true"
-            >
-              <CheckSquare class="h-3.5 w-3.5" />
-            </button>
-          </div>
-        </div>
-
-        <!-- ============ INVENTORY FILTER SHEET (compact) ============
-             Deliberately the same sheet as the picker's, down to the chip
-             styling — "filters" should mean one thing in this plugin. It also
-             carries the type/model facets, which live in the `lg:` rail and so
-             had no mobile home at all before this. -->
-        <FilterSheet
-          :open="invFiltersOpen"
-          :active-count="invFilterCount"
-          @close="invFiltersOpen = false"
-          @reset="resetInvFilters"
-        >
-          <template #title>Filter inventory</template>
-              <div class="relative">
-                <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <input
-                  v-model="invSearch"
-                  placeholder="Search inventory…"
-                  class="h-10 w-full rounded-md border border-border bg-background pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
-                />
-                <button
-                  v-if="invSearch"
-                  class="absolute right-1 top-1/2 grid h-8 w-8 -translate-y-1/2 place-items-center rounded text-muted-foreground"
-                  title="Clear search"
-                  @click="invSearch = ''"
-                ><X class="h-3.5 w-3.5" /></button>
-              </div>
-
-              <section class="flex flex-col gap-2">
-                <div class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Origin</div>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    v-for="f in ORIGIN_FILTERS"
-                    :key="f[0]"
-                    :class="[INV_CHIP, invOrigin === f[0] ? INV_CHIP_ON : INV_CHIP_OFF]"
-                    :style="invOrigin === f[0] ? { background: accentSoft } : {}"
-                    @click="invOrigin = f[0]"
-                  >{{ f[1] }}</button>
-                  <!-- Same row as origin, because on a phone a section heading
-                       per single toggle costs more height than the control. -->
-                  <button
-                    v-if="invHasFavourites"
-                    :class="[INV_CHIP, 'gap-1.5', invFavourites ? INV_CHIP_ON : INV_CHIP_OFF]"
-                    :style="invFavourites ? { background: accentSoft } : {}"
-                    :aria-pressed="invFavourites"
-                    @click="invFavourites = !invFavourites"
-                  >
-                    <Heart class="h-3 w-3" :class="invFavourites ? 'fill-current' : ''" />
-                    Starred
-                  </button>
-                </div>
-              </section>
-
-              <section v-if="invRarityFacets.length" class="flex flex-col gap-2">
-                <div class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Rarity</div>
-                <div class="flex flex-wrap gap-2">
-                  <button :class="[INV_CHIP, !invRarity ? INV_CHIP_ON : INV_CHIP_OFF]" @click="invRarity = ''">All</button>
-                  <button
-                    v-for="r in invRarityFacets"
-                    :key="r.hex"
-                    :class="[INV_CHIP, 'gap-1.5', invRarity === r.hex ? INV_CHIP_ON : INV_CHIP_OFF]"
-                    @click="invRarity = invRarity === r.hex ? '' : r.hex"
-                  >
-                    <span class="h-2 w-2 flex-none rounded-full" :style="{ background: r.hex }"></span>{{ r.name }}
-                  </button>
-                </div>
-              </section>
-
-              <section class="flex flex-col gap-2">
-                <div class="flex items-center gap-2">
-                  <span class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Sort</span>
-                  <SortDirection v-model="invDir" :kind="invSortKind" :hint="invSortHint" class="ml-auto" />
-                </div>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    v-for="s in invSorts"
-                    :key="s[0]"
-                    :class="[INV_CHIP, invSort === s[0] ? INV_CHIP_ON : INV_CHIP_OFF]"
-                    @click="setInvSort(s[0])"
-                  >{{ s[0] === 'default' ? 'Newest' : s[1] }}</button>
-                </div>
-              </section>
-
-              <!-- The rail's facets. Groups toggle the whole category, the
-                   tiles under them toggle one model — same additive rule as the
-                   desktop rail, just laid out as chips. -->
-              <!-- Same rule as the desktop rail: empty means disabled, never
-                   removed. A sheet that reflows while you type is worse than the
-                   desktop rail doing it, because it can move the control under
-                   your thumb between the touch and the release. -->
-              <section v-for="grp in invRail.weapons" :key="grp.key" class="flex flex-col gap-2">
-                <button
-                  class="flex items-center gap-2 text-left transition-opacity duration-200"
-                  :class="!grp.count && !invTypes.includes(grp.key) ? 'pointer-events-none opacity-60' : ''"
-                  :disabled="!grp.count && !invTypes.includes(grp.key)"
-                  @click="toggleType(grp.key)"
-                >
-                  <span class="text-f9 uppercase tracking-cs2" :class="invTypes.includes(grp.key) ? 'text-[color:var(--acc)]' : 'text-muted-foreground/60'">{{ grp.label }}</span>
-                  <span class="font-mono text-f9 text-muted-foreground/50">{{ grp.count }}</span>
-                </button>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    v-for="it in grp.items"
-                    :key="it.model"
-                    :class="[
-                      INV_CHIP,
-                      'gap-1.5 transition-opacity duration-200',
-                      invModels.includes(it.model) ? INV_CHIP_ON : INV_CHIP_OFF,
-                      !it.count && !invModels.includes(it.model) ? 'pointer-events-none opacity-30' : '',
-                    ]"
-                    :disabled="!it.count && !invModels.includes(it.model)"
-                    @click="toggleModel(it.model)"
-                  >
-                    {{ it.name }}<span class="font-mono text-f8 text-muted-foreground/50">{{ it.count }}</span>
-                  </button>
-                </div>
-              </section>
-
-              <section v-if="invRail.gear.length" class="flex flex-col gap-2">
-                <div class="text-f9 uppercase tracking-cs2 text-muted-foreground/60">Gear</div>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    v-for="row in invRail.gear"
-                    :key="row.key"
-                    :class="[
-                      INV_CHIP,
-                      'gap-1.5 transition-opacity duration-200',
-                      invTypes.includes(row.key) ? INV_CHIP_ON : INV_CHIP_OFF,
-                      !row.count && !invTypes.includes(row.key) ? 'pointer-events-none opacity-30' : '',
-                    ]"
-                    :disabled="!row.count && !invTypes.includes(row.key)"
-                    @click="toggleType(row.key)"
-                  >
-                    {{ row.label }}<span class="font-mono text-f8 text-muted-foreground/50">{{ row.count }}</span>
-                  </button>
-                </div>
-              </section>
-
-              <button
-                class="mt-1 w-full rounded-md border border-[color:var(--acc)] py-2.5 text-f11 font-semibold uppercase tracking-cs2 text-foreground"
-                :style="{ background: accentSoft }"
-                @click="invFiltersOpen = false"
-              >
-                Show {{ filteredInventory.length }} item{{ filteredInventory.length === 1 ? '' : 's' }}
-              </button>
-        </FilterSheet>
-
-        <div class="flex min-h-0 flex-1 overflow-hidden">
-        <!-- Filter rail: the same visual language as the focus view's slot rail,
-             because it answers the same question — "which of my things?" — and
-             answering it by reading tiles beats picking from a dropdown that
-             hides the taxonomy. Toggles are additive; counts come from railBase
-             so they describe what a click would actually give you. Hidden until
-             there's more than one thing to choose between. -->
-        <nav
-          v-if="inventory.length && (invRail.weapons.length + invRail.gear.length) > 1"
-          class="hidden w-[168px] flex-none flex-col gap-3 overflow-y-auto border-r border-border px-2.5 py-3 lg:flex"
-        >
-          <!-- Fixed-height header slot. The Clear button used to mount and
-               unmount, which shoved the entire rail down a row the instant you
-               picked your first filter — the jump landed on the tiles you were
-               aiming at. It now always occupies the slot and only changes what
-               it says. -->
-          <div class="flex h-6 flex-none items-center">
-            <button
-              v-if="invModels.length || invTypes.length"
-              class="flex h-full w-full items-center justify-center gap-1 rounded-md border border-border text-f9 uppercase tracking-wider text-muted-foreground tac-action"
-              @click="invModels = []; invTypes = []"
-            >
-              <X class="h-3 w-3" /> Clear {{ invModels.length + invTypes.length }}
-            </button>
-            <span v-else class="px-0.5 text-f8 uppercase tracking-cs3 text-muted-foreground/40">Filters</span>
-          </div>
-
-          <section v-for="grp in invRail.weapons" :key="grp.key" class="flex flex-none flex-col gap-1.5">
-            <!-- The header is itself a toggle: "all rifles" is one click. -->
-            <!-- Dimmed less than the tiles when empty: this one is also the group's
-                 LABEL, and fading it out would take the rail's structure with it. -->
-            <button
-              class="flex items-center justify-between px-0.5 text-f8 uppercase tracking-cs3 transition-[color,opacity] duration-200"
-              :class="[
-                invTypes.includes(grp.key) ? 'text-[color:var(--acc)]' : 'text-muted-foreground/60',
-                !grp.count && !invTypes.includes(grp.key) ? 'pointer-events-none opacity-60' : 'hover:text-foreground',
-              ]"
-              :disabled="!grp.count && !invTypes.includes(grp.key)"
-              :title="grp.count ? `Show all ${grp.label.toLowerCase()}` : `No ${grp.label.toLowerCase()} match the current filters`"
-              @click="toggleType(grp.key)"
-            >
-              <span>{{ grp.label }}</span>
-              <span class="font-mono">{{ grp.count }}</span>
-            </button>
-            <!-- A model with nothing left after the search is DISABLED, not
-                 removed: the rail keeps its geometry, so typing never restructures
-                 the page out from under you. `disabled` keeps it off the tab order
-                 too. Still drawn when it is the ACTIVE filter, and still clickable
-                 then, or turning a filter on could strand you with no way to turn
-                 it back off. -->
-            <div class="grid grid-cols-2 gap-1.5">
-              <button
-                v-for="it in grp.items"
-                :key="it.model"
-                class="group relative grid aspect-square place-items-center overflow-hidden rounded-md border transition-[color,background-color,border-color,opacity] duration-200"
-                :class="[
-                  invModels.includes(it.model)
-                    ? 'border-[color:var(--acc)] bg-secondary/70'
-                    : 'border-border/60 bg-secondary/30',
-                  !it.count && !invModels.includes(it.model)
-                    ? 'pointer-events-none opacity-30'
-                    : 'hover:border-muted-foreground/40 hover:bg-secondary/60',
-                ]"
-                :disabled="!it.count && !invModels.includes(it.model)"
-                :style="selRing(invModels.includes(it.model))"
-                :title="it.count ? `${it.name} · ${it.count}` : `${it.name} — none match the current filters`"
-                @click="toggleModel(it.model)"
-              >
-                <img
-                  v-if="it.image"
-                  :src="it.image"
-                  alt=""
-                  :class="cn(
-                    'relative z-[2] max-h-full max-w-full object-contain p-1 transition-opacity',
-                    !invModels.includes(it.model) && 'opacity-60 group-hover:opacity-90',
-                  )"
-                />
-                <span v-else class="relative z-[2] px-0.5 text-center text-f8 uppercase leading-tight text-muted-foreground/60">
-                  {{ it.name }}
-                </span>
-                <span class="absolute bottom-0.5 right-1 z-[3] font-mono text-f8 text-muted-foreground">{{ it.count }}</span>
-              </button>
-            </div>
-          </section>
-
-          <section v-if="invRail.gear.length" class="flex flex-none flex-col gap-1.5">
-            <div class="px-0.5 text-f8 uppercase tracking-cs3 text-muted-foreground/60">Other</div>
-            <button
-              v-for="row in invRail.gear"
-              :key="row.key"
-              class="flex items-center justify-between rounded-md border px-2 py-1.5 text-f9 uppercase tracking-wider transition-[color,background-color,border-color,opacity] duration-200"
-              :class="[
-                invTypes.includes(row.key)
-                  ? 'border-[color:var(--acc)] bg-secondary/70 text-foreground'
-                  : 'border-border/60 bg-secondary/30 text-muted-foreground',
-                !row.count && !invTypes.includes(row.key)
-                  ? 'pointer-events-none opacity-30'
-                  : 'hover:border-muted-foreground/40 hover:text-foreground',
-              ]"
-              :disabled="!row.count && !invTypes.includes(row.key)"
-              @click="toggleType(row.key)"
-            >
-              <span>{{ row.label }}</span>
-              <span class="font-mono text-muted-foreground">{{ row.count }}</span>
-            </button>
-          </section>
-        </nav>
-
-        <!-- TransitionGroup: filter/search changes slide the surviving cards
-             into their new spots instead of reflowing in one frame. Leaving
-             cards go instantly (no leave classes) so the grid never jams. -->
-        <!-- Wrapper exists purely to anchor the fade: the grid itself is the
-             scroller, so the overlay cannot live inside it (it would scroll
-             with the content) and the row above holds the filter rail too. -->
-        <div :ref="invFade.setHost" class="relative flex min-w-0 flex-1 flex-col">
-        <!-- Inside a colour stack. Above the grid rather than in it: the grid's
-             rows are a fixed card height, so a col-span-full header reserves a
-             whole card-tall row for an 8px button. -->
-        <div
-          v-if="invDesign !== null"
-          class="flex flex-none items-center gap-3 border-b border-border px-6 py-2.5"
-        >
-          <button
-            class="flex h-8 flex-none items-center gap-1.5 rounded-md border px-3 text-f10 font-semibold uppercase tracking-cs1 text-foreground transition-colors"
-            :style="{
-              borderColor: 'hsl(var(--tac-amber, 33 94% 58%) / 0.55)',
-              background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-            }"
-            @click="invDesign = null"
-          >
-            <ChevronLeft class="h-4 w-4" />
-            Back
-          </button>
-          <span class="min-w-0 truncate text-f11 uppercase tracking-cs2 text-foreground">{{ invDesignName }}</span>
-          <span class="flex-none text-f9 uppercase tracking-cs1 text-muted-foreground">
-            <span class="font-mono text-foreground">{{ inventoryStacks.length }}</span>
-            {{ inventoryStacks.length === 1 ? 'color' : 'colors' }}
-          </span>
-        </div>
-        <TransitionGroup
-          data-scroller
-          tag="div"
-          class="min-h-0 min-w-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto p-6"
-          :style="invGridStyle"
-          move-class="inv-move"
-          appear
-          appear-active-class="animate-cell-in"
-          enter-active-class="animate-cell-in"
-          leave-active-class="inv-leave"
-          leave-from-class="inv-leave"
-          leave-to-class="inv-leave"
-          @scroll.passive="invFade.onScroll"
-        >
-          <div v-if="!inventory.length" key="empty" class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground">
-            <Package class="h-8 w-8 opacity-40" />
-            <div>Your inventory is empty.</div>
-            <!-- Points at the armory, not the loadout. Sending someone to pick a
-                 loadout slot first was the detour that screen exists to remove,
-                 and this is the one place in the app that gets read by someone
-                 who owns nothing yet. -->
-            <div class="text-f13">Open the <b class="text-foreground">Armory</b> and craft your first item.</div>
-            <button
-              class="mt-2 flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
-              @click="openArmory()"
-            >
-              <Hammer class="h-3.5 w-3.5" /> Browse the Armory
-            </button>
-          </div>
-          <div
-            v-else-if="!inventoryStacks.length"
-            key="no-match"
-            class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground"
-          >
-            <Search class="h-8 w-8 opacity-40" />
-            <div>Nothing matches those filters.</div>
-            <button
-              v-if="filtersActive"
-              class="rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-wider tac-action"
-              @click="resetInvFilters"
-            >
-              Clear filters
-            </button>
-          </div>
-          <!-- A click OPENS the item (see it big, then decide). Equipping moved
-               into the detail modal so a stray click can't re-equip a slot.
-               The entrance is TransitionGroup's (`appear` + enter classes above);
-               each card only contributes its place in the cascade via `--i`. See
-               invCellDelay for why the class is not applied per item. -->
-          <template v-for="(st, i) in inventoryWindow.items.value" :key="st.key + '|' + invFilterSig">
-            <!-- A deck is not an item: no single instance to open, select or
-                 act on, so its only verb is "open me". Selecting is done inside
-                 it, where the instances are. -->
-            <DeckCard
-              v-if="st.variants.length > 1"
-              class="cv-tile"
-              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
-              :face="st.face"
-              :behind="st.behind"
-              :count="st.variants.length"
-              role="inv-item"
-              :strip-suffix="TINT_SUFFIX"
-              @open="invDesign = st.face.item?.design ?? null"
-            />
-            <ItemTile
-              v-else
-              class="cv-tile"
-              :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
-              :inst="st.face"
-              :attached-name="attachedName(st.face)"
-              :show-price="pricesOn"
-              :price-pending="pricesPending"
-              :price-source="priceSourceLabel"
-              show-header
-              :selected="selectMode && selectedIds.has(st.face.id)"
-              :hide-actions="selectMode"
-              :title="selectMode ? 'Toggle selection' : itemName(st.face.item) || 'View item'"
-              @click="selectMode ? toggleSelected(st.face.id) : openDetail(st.face)"
-              @contextmenu.prevent="openItemCtx(st.face, $event)"
-              @longpress="openItemCtxFor(st.face)"
-              @view3d="view3dForInstance(st.face)"
-              @inspect="openInspectLink(st.face.id)"
-              @edit="openEdit(st.face)"
-              @duplicate="openEdit(st.face)"
-              @remove="deleteOwned(st.face)"
-              @favourite="(v) => toggleFavourite(st.face, v)"
-            />
-          </template>
-          <!-- Keyed: TransitionGroup requires it, and a stable key keeps the
-               sentinel out of the move/enter animations. -->
-          <InfiniteSentinel
-            key="more"
-            :count="inventoryWindow.items.value.length"
-            :done="inventoryWindow.done.value"
-            @hit="inventoryWindow.grow"
-          />
-        </TransitionGroup>
-        <!-- Same cue as the picker sheet: the grid runs off the edge rather
-             than ending flush against it, and the fade clears at the bottom. -->
-        <div
-          v-if="invFade.more.value"
-          class="pointer-events-none absolute inset-x-0 bottom-0 z-[2] h-12 bg-gradient-to-t from-background via-background/70 to-transparent"
-        ></div>
-        </div>
-        </div>
-      </div>
+      <InventoryScreen
+        v-else-if="view === 'inventory'"
+        key="inventory"
+        :inv="invView"
+        :inventory="inventory"
+        :inv-sorts="invSorts"
+        :prices-on="pricesOn"
+        :prices-pending="pricesPending"
+        :price-source-label="priceSourceLabel"
+        :inventory-value-in-view="inventoryValueInView"
+        :filtered-value-shown="filteredValueShown"
+        :inv-value-tip="invValueTip"
+        :value-by-origin="valueByOrigin"
+        :attached-name="attachedName"
+        @armory="openArmory"
+        @detail="openDetail"
+        @item-ctx="openItemCtx"
+        @item-ctx-for="openItemCtxFor"
+        @view3d="view3dForInstance"
+        @inspect="openInspectLink"
+        @edit="openEdit"
+        @duplicate="openEdit"
+        @remove="deleteOwned"
+        @delete-selected="deleteSelected"
+      />
 
       <!-- ============ LOADOUT / FOCUS ============ -->
       <!-- `relative` makes this the containing block for the desktop picker
@@ -8423,281 +7177,51 @@ if (MDEBUG) {
           </section>
         </nav>
 
-        <!-- ============ LOADOUT GRID · COMPACT ============ -->
-        <!-- One category at a time behind a sticky rail. This is a separate
-             tree rather than a restyle of the desktop grid on purpose: the two
-             have different DOM (and the focus view mounts a WebGL viewer), so
-             rendering both and hiding one would double the slot count and, in
-             focus mode, cost a second GL context. -->
-        <div
-          v-if="view === 'grid' && isCompact"
-          class="animate-grid-in flex min-h-0 flex-1 flex-col"
-          @pointerdown="onSlotPointerDown"
-          @pointermove="onSlotPointerMove"
-          @pointerup="cancelLongPress"
-          @pointercancel="cancelLongPress"
-          @click.capture="onSlotClickCapture"
-        >
-          <nav class="flex flex-none gap-1 overflow-x-auto border-b border-border px-2 py-0.5" data-role="compact-rail">
-            <button
-              v-for="c in compactCats"
-              :key="c.key"
-              class="flex min-h-[30px] flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-md border px-2 text-f10 font-semibold uppercase tracking-cs1 transition-colors"
-              :class="compactCat === c.key
-                ? 'border-[color:var(--acc)] text-foreground'
-                : 'border-border/60 text-muted-foreground'"
-              :style="compactCat === c.key ? { background: accentSoft } : {}"
-              @click="compactCat = c.key"
-            >
-              {{ c.short }}
-              <span class="font-mono text-f9 text-muted-foreground/70">{{ c.skinned }}/{{ c.total }}</span>
-            </button>
-          </nav>
-
-          <div class="min-h-0 flex-1 overflow-y-auto px-3 pb-4 pt-3">
-            <!-- Equipment: agent spans both columns as the identity piece. -->
-            <div v-if="compactCat === 'equipment'" class="grid grid-cols-2 gap-2">
-              <LoadoutCell
-                v-for="(s, si) in compactEquipment"
-                :key="s.slot"
-                :data-slot="s.slot" data-role="rail"
-                :class="[
-                  s.slot === 'agent' ? 'col-span-2 min-h-[132px]' : 'min-h-[96px]',
-                  // Agent already eats two cells, so the row parity flips on an
-                  // EVEN item count — then the last tile takes the full width
-                  // instead of sitting alone next to a gap.
-                  compactEquipment.length % 2 === 0 && si === compactEquipment.length - 1 && 'col-span-2',
-                  selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
-                  pulsePos === s.slot && 'animate-equip-pulse',
-                ]"
-                :style="[selRing(selected === s.slot), rowFor(s.slot)?.item?.rarity ? { borderLeft: `3px solid ${rowFor(s.slot)!.item!.rarity}` } : {}, dropStyle(s.slot)]"
-                :label="s.slot === 'agent' ? `Agent · ${team}` : s.name"
-                :index="si"
-                :art-key="team"
-                :fade-art="s.slot === 'agent'"
-                pad-art
-                v-bind="cellFacts(s.slot)"
-                @click="selectPos(s.slot)"
-                @contextmenu.prevent="openCtx(s.slot, $event)"
-                @dragover="onSlotDragOver(s.slot, $event)"
-                @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
-                @drop.prevent="onSlotDrop(s.slot)"
-                @view3d="cellActions(s.slot).view3d()"
-                @inspect="cellActions(s.slot).inspect()"
-                @edit="cellActions(s.slot).edit()"
-                @duplicate="cellActions(s.slot).duplicate()"
-                @remove="cellActions(s.slot).remove()"
-              />
-            </div>
-
-            <!-- Weapon categories: a flat 2-up of the group's five slots. -->
-            <div v-else class="grid grid-cols-2 gap-2">
-              <LoadoutCell
-                v-for="(cell, ci) in compactCells"
-                :key="cell.pos"
-                :data-slot="cell.pos" data-role="weapon"
-                class="min-h-[118px] !p-2"
-                :class="[
-                  selected === cell.pos ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40',
-                  pulsePos === cell.pos && 'animate-equip-pulse',
-                ]"
-                :style="[
-                  selRing(selected === cell.pos),
-                  rarityOf(cell.pos) ? { borderLeft: `3px solid ${rarityOf(cell.pos)}` } : {},
-                  dropStyle(cell.pos),
-                ]"
-                :label="cell.weapon?.name ?? cell.pos"
-                :index="ci"
-                :art-key="team + ':' + occupantModel(cell.pos)"
-                focus-action
-                v-bind="cellFacts(cell.pos)"
-                @click="selectPos(cell.pos)"
-                @contextmenu.prevent="openCtx(cell.pos, $event)"
-                @dragover="onSlotDragOver(cell.pos, $event)"
-                @dragleave="dragOverPos === cell.pos && (dragOverPos = null)"
-                @drop.prevent="onSlotDrop(cell.pos)"
-                @focus="cellActions(cell.pos).focus()"
-                @view3d="cellActions(cell.pos).view3d()"
-                @inspect="cellActions(cell.pos).inspect()"
-                @edit="cellActions(cell.pos).edit()"
-                @duplicate="cellActions(cell.pos).duplicate()"
-                @remove="cellActions(cell.pos).remove()"
-              />
-            </div>
-
-            <!-- Permanent, not retired-after-first-use. It used to hide itself
-                 the moment you long-pressed once, on the theory that a standing
-                 hint costs a row of scroll — but long-press has no other
-                 affordance, so the one time it showed was the one time you
-                 weren't looking for it. One dim 9px line is a cheap price for
-                 the only place the gesture is ever named. -->
-            <p class="px-1 pt-2 text-center text-f9 uppercase tracking-cs2 text-muted-foreground/50">
-              Tap to select · hold for options
-            </p>
-          </div>
-        </div>
-
-        <!-- ============ LOADOUT GRID ============ -->
-        <template v-else-if="view === 'grid'">
-          <!-- Identity column: gloves + knife (prominent) and a compact agent -->
-          <!-- The inner wrapper exists so the lift spacer can be a SIBLING of
-               the cards rather than padding on the scroller: padding would come
-               out of the flex line and squeeze every flex-1 card toward its
-               min-height, which is the reflow the floating sheet exists to
-               avoid. min-h-full keeps the cards stretching exactly as before. -->
-          <aside class="animate-grid-in flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col overflow-y-auto py-3 pl-4 pr-1" :style="liftScrollStyle">
-            <div class="flex min-h-full flex-col gap-2.5">
-            <div class="px-1 text-f9 uppercase tracking-cs3 text-muted-foreground/70">Equipment</div>
-            <LoadoutCell
-              v-for="(s, si) in [RAIL[2], RAIL[1]]"
-              :key="s.slot"
-              class="min-h-[96px] flex-1"
-              :class="[
-                selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
-                pulsePos === s.slot && 'animate-equip-pulse',
-              ]"
-              :style="[selRing(selected === s.slot), rowFor(s.slot)?.item?.rarity ? { borderLeft: `3px solid ${rowFor(s.slot)!.item!.rarity}` } : {}, dropStyle(s.slot)]"
-              :data-slot="s.slot" data-role="rail"
-              :label="s.name"
-              :index="si"
-              :art-key="team"
-              v-bind="cellFacts(s.slot)"
-              @click="selectPos(s.slot)"
-              @contextmenu.prevent="openCtx(s.slot, $event)"
-              @dragover="onSlotDragOver(s.slot, $event)"
-              @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
-              @drop.prevent="onSlotDrop(s.slot)"
-              @view3d="cellActions(s.slot).view3d()"
-              @inspect="cellActions(s.slot).inspect()"
-              @edit="cellActions(s.slot).edit()"
-              @duplicate="cellActions(s.slot).duplicate()"
-              @remove="cellActions(s.slot).remove()"
-            />
-            <LoadoutCell
-              class="min-h-[132px] flex-[1.6]"
-              :class="[
-                selected === 'agent' ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
-                pulsePos === 'agent' && 'animate-equip-pulse',
-              ]"
-              :style="[selRing(selected === 'agent'), dropStyle('agent')]"
-              data-slot="agent" data-role="agent"
-              :label="`Agent · ${team}`"
-              :index="2"
-              :art-key="team"
-              fade-art
-              pad-art
-              v-bind="cellFacts('agent')"
-              @click="selectPos('agent')"
-              @contextmenu.prevent="openCtx('agent', $event)"
-              @dragover="onSlotDragOver('agent', $event)"
-              @dragleave="dragOverPos === 'agent' && (dragOverPos = null)"
-              @drop.prevent="onSlotDrop('agent')"
-              @view3d="cellActions('agent').view3d()"
-              @inspect="cellActions('agent').inspect()"
-              @edit="cellActions('agent').edit()"
-              @duplicate="cellActions('agent').duplicate()"
-              @remove="cellActions('agent').remove()"
-            />
-            <div class="grid flex-none grid-cols-2 gap-2">
-              <LoadoutCell
-                v-for="(s, si) in EXTRAS"
-                :key="s.slot"
-                class="h-[70px] items-center justify-between !p-1.5"
-                :class="[
-                  selected === s.slot ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
-                  pulsePos === s.slot && 'animate-equip-pulse',
-                  // Odd count in a two-column grid: the last tile takes the whole
-                  // row rather than leaving a half-width orphan beside a gap.
-                  EXTRAS.length % 2 === 1 && si === EXTRAS.length - 1 && 'col-span-2',
-                ]"
-                :style="[selRing(selected === s.slot), dropStyle(s.slot)]"
-                :data-slot="s.slot" data-role="rail"
-                :title="s.name + (rowFor(s.slot)?.item ? ' · ' + itemName(rowFor(s.slot)!.item) : '')"
-                :label="s.name"
-                :index="3 + si"
-                :art-key="team"
-                compact
-                v-bind="cellFacts(s.slot)"
-                fallback="—"
-                @click="selectPos(s.slot)"
-                @contextmenu.prevent="openCtx(s.slot, $event)"
-                @dragover="onSlotDragOver(s.slot, $event)"
-                @dragleave="dragOverPos === s.slot && (dragOverPos = null)"
-                @drop.prevent="onSlotDrop(s.slot)"
-                @view3d="cellActions(s.slot).view3d()"
-                @inspect="cellActions(s.slot).inspect()"
-                @edit="cellActions(s.slot).edit()"
-                @duplicate="cellActions(s.slot).duplicate()"
-                @remove="cellActions(s.slot).remove()"
-              />
-            </div>
-            </div>
-            <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
-          </aside>
-
-          <!-- Positional weapon columns (CS2: 5 slots each) -->
-          <div class="animate-grid-in flex flex-1 gap-3 overflow-x-auto px-4 pb-4 pt-3">
-            <section
-              v-for="(g, gi) in columnsView"
-              :key="g.key"
-              data-role="column"
-              class="flex min-w-[212px] max-w-[460px] flex-1 flex-col"
-            >
-              <header class="flex items-baseline gap-2 border-b border-border/60 px-1 pb-2">
-                <span class="text-f11 font-semibold uppercase tracking-cs2 text-muted-foreground">{{ g.label }}</span>
-                <span class="ml-auto font-mono text-f9 text-muted-foreground/60">{{ g.skinned }}/{{ g.positions.length }}</span>
-              </header>
-              <!-- Wrapper + spacer, same shape as the identity column: the
-                   spacer is what gives this scroller somewhere to scroll when
-                   the lifted sheet is covering its bottom, without padding
-                   stealing height from the flex-1 cells. -->
-              <div class="flex flex-1 flex-col overflow-y-auto pt-2" :style="liftScrollStyle">
-                <div class="flex min-h-full flex-col gap-2">
-                <!-- Every pos-derived display below reads through
-                     previewPos(): during a reorder hover the two cells render
-                     each other's contents — the drop confirms what you see. -->
-                <LoadoutCell
-                  v-for="(cell, ci) in g.cells"
-                  :key="cell.pos"
-                  class="min-h-[96px] flex-1"
-                  :data-slot="cell.pos" data-role="weapon"
-                  :draggable="canEdit"
-                  :class="[
-                    selected === cell.pos ? 'border-[color:var(--acc)] bg-secondary/70' : 'border-border/60 bg-secondary/40 hover:bg-secondary/70',
-                    pulsePos === cell.pos && 'animate-equip-pulse',
-                  ]"
-                  :style="[
-                    selRing(selected === cell.pos),
-                    rarityOf(previewPos(cell.pos)) ? { borderLeft: `3px solid ${rarityOf(previewPos(cell.pos))}` } : {},
-                    dropStyle(cell.pos),
-                    reorderStyle(cell.pos),
-                  ]"
-                  :label="occupantWeapon(previewPos(cell.pos))?.name ?? cell.pos"
-                  :index="ci * 3 + gi"
-                  :art-key="team + ':' + occupantModel(cell.pos)"
-                  focus-action
-                  fade-status-on-hover
-                  v-bind="cellFacts(cell.pos, previewPos(cell.pos))"
-                  @click="selectPos(cell.pos)"
-                  @contextmenu.prevent="openCtx(cell.pos, $event)"
-                  @dragstart="onCellDragStart(cell.pos, $event)"
-                  @dragend="onCellDragEnd"
-                  @dragover="onCellDragOver(cell.pos, $event)"
-                  @dragleave="onCellDragLeave(cell.pos)"
-                  @drop.prevent="onCellDrop(cell.pos)"
-                  @focus="cellActions(cell.pos).focus()"
-                  @view3d="cellActions(cell.pos).view3d()"
-                  @inspect="cellActions(cell.pos).inspect()"
-                  @edit="cellActions(cell.pos).edit()"
-                  @duplicate="cellActions(cell.pos).duplicate()"
-                  @remove="cellActions(cell.pos).remove()"
-                />
-                </div>
-                <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
-              </div>
-            </section>
-          </div>
-        </template>
+        <!-- ============ LOADOUT GRID ============
+             Both shapes of it — the desktop columns and the compact
+             one-category rail — are components/LoadoutGrid.vue.
+             Deliberately plain props rather than a composable: nothing the grid
+             draws is its own state. Every fact comes off the loadout held here
+             and every verb ends in a mutation or a route change, so the model
+             goes in named and the prop list IS the audit of that coupling. -->
+        <LoadoutGrid
+          v-if="view === 'grid'"
+          v-model:compact-cat="compactCat"
+          :can-edit="canEdit"
+          :team="team"
+          :selected="selected"
+          :compact-cats="compactCats"
+          :compact-cells="compactCells"
+          :compact-equipment="compactEquipment"
+          :columns-view="columnsView"
+          :cell-facts="cellFacts"
+          :cell-actions="cellActions"
+          :row-for="rowFor"
+          :slot-title="slotTitle"
+          :occupant-weapon="occupantWeapon"
+          :occupant-model="occupantModel"
+          :rarity-of="rarityOf"
+          :preview-pos="previewPos"
+          :drop-style="dropStyle"
+          :reorder-style="reorderStyle"
+          :pulse-pos="pulsePos"
+          :select-pos="selectPos"
+          :open-ctx="openCtx"
+          :on-slot-drag-over="onSlotDragOver"
+          :on-slot-drop="onSlotDrop"
+          :on-cell-drag-start="onCellDragStart"
+          :on-cell-drag-end="onCellDragEnd"
+          :on-cell-drag-over="onCellDragOver"
+          :on-cell-drag-leave="onCellDragLeave"
+          :on-cell-drop="onCellDrop"
+          :on-slot-pointer-down="onSlotPointerDown"
+          :on-slot-pointer-move="onSlotPointerMove"
+          :cancel-long-press="cancelLongPress"
+          :on-slot-click-capture="onSlotClickCapture"
+          :lift-intrusion="liftIntrusion"
+          :lift-scroll-style="liftScrollStyle"
+          @slot-drag-leave="slotDragLeave"
+        />
 
         <!-- ============ FOCUS VIEW ============ -->
         <div v-else data-role="focus" class="animate-view-in flex flex-1 flex-col overflow-hidden" :class="isCompact ? 'p-2' : 'p-5'">
@@ -8721,7 +7245,7 @@ if (MDEBUG) {
                        tiles and the loadout cells use. This line used to spell
                        "· StatTrak™" by hand and show nothing at all about the
                        stickers or the charm. -->
-                  <ItemBadges :inst="focusInstance" :max="6" count />
+                  <ItemBadges :inst="focusSpecs" :max="6" count />
                   <!-- Rarity rides with the name it describes, not the stage
                        controls on the far side of the panel. -->
                   <span
@@ -8805,8 +7329,8 @@ if (MDEBUG) {
                 />
               </div>
               <ItemSpecs
-                v-if="focusInstance && !isCompact"
-                :inst="focusInstance"
+                v-if="focusSpecs && !isCompact"
+                :inst="focusSpecs"
                 still
                 class="w-[210px] gap-1.5"
               />
@@ -8838,6 +7362,16 @@ if (MDEBUG) {
                     :image="isSpecial(selected) ? focusRow?.item?.image : cellImage(selected)"
                     :class="cn('w-[min(64%,520px)] object-contain animate-float motion-reduce:animate-none', !isSkinned(focusRow) && 'opacity-50')"
                     style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
+                  />
+                  <!-- A second grid row under the art, and only for a music kit.
+                       This stage has no 3D for one (isNo3d), so the flat icon was
+                       the entire focus view of an item whose whole content is a
+                       sound. Wider than the tile's copy because there is room:
+                       this is the screen you land on to study one item. -->
+                  <MusicPlayer
+                    v-if="focusRow?.item?.audio"
+                    :src="focusRow.item.audio"
+                    class="w-[min(80%,420px)]"
                   />
                 </div>
               </Transition>
@@ -8888,7 +7422,12 @@ if (MDEBUG) {
                    reading: a spray has no float and no pattern, and "—" under a
                    Float heading still says the item HAS one and we don't know
                    it. -->
-              <template v-if="isCompact || !focusInstance">
+              <!-- Keyed to the same source as the spec column, not to the owned
+                   instance: viewing someone else's crafted slot now fills that
+                   column from the public row, and a `!focusInstance` guard here
+                   printed the float and the pattern a second time three inches
+                   away. -->
+              <template v-if="isCompact || !focusSpecs">
                 <div v-if="hasWear(focusRow?.item)" class="flex flex-col gap-1">
                   <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Float</span>
                   <span class="font-mono text-f13">{{ focusRow?.wear != null ? focusRow.wear.toFixed(4) : '—' }}</span>
@@ -9457,7 +7996,6 @@ if (MDEBUG) {
                 @edit="openEdit(st.face)"
                 @duplicate="openEdit(st.face)"
                 @remove="deleteOwned(st.face)"
-                @favourite="(v) => toggleFavourite(st.face, v)"
               />
             </template>
             <InfiniteSentinel
@@ -9543,6 +8081,11 @@ if (MDEBUG) {
                     />
                   </div>
                   <ItemName :item="st.card" strip class="relative z-[2]" />
+                  <!-- THE screen this feature is for: this is the grid you pick
+                       a music kit from, and until now every card on it was a
+                       name and a disc. The player is a <span> tree precisely so
+                       it can live inside this <button> — see MusicPlayer. -->
+                  <MusicPlayer v-if="st.card.audio" :src="st.card.audio" class="relative z-[2] mt-1.5" />
                 </button>
               </div>
               <InfiniteSentinel
@@ -10581,64 +9124,6 @@ if (MDEBUG) {
          to /items/<id>/3d instead, which opens the craft modal in view mode —
          so there's no spec strip and no Edit/Inspect/Share here: a default
          weapon is a model, not an item anyone owns. -->
-    <!-- ============ COMPARE ============ -->
-    <!-- One stage, one camera, two items swapping underneath it. See the script
-         block for why this is a blink rather than two panes. -->
-    <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-      <div
-        v-if="comparePair"
-        class="fixed inset-0 flex items-center justify-center bg-background" :style="{ zIndex: Z.stage }"
-        role="dialog" aria-modal="true" aria-label="Compare two items"
-        :class="isCompact ? 'p-0' : 'p-6'"
-      >
-        <div
-          class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
-          :class="isCompact ? 'h-full w-full' : 'h-[min(88vh,900px)] w-[min(96vw,1400px)] rounded-lg border border-border'"
-        >
-          <div class="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
-            <!-- Both names always, with the one on screen lit. The pair IS the
-                 context: a single title would make the blink ambiguous, because
-                 the whole point is that you stop being able to tell which you are
-                 looking at without being told. -->
-            <div class="flex min-w-0 items-center gap-2 text-f11 uppercase tracking-cs3">
-              <span class="truncate" :class="compareShown === 'a' ? 'text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground/50'">
-                {{ itemName(comparePair.a.item) }}
-              </span>
-              <span class="flex-none text-muted-foreground/40">vs</span>
-              <span class="truncate" :class="compareShown === 'b' ? 'text-[hsl(var(--tac-amber,33_94%_58%))]' : 'text-muted-foreground/50'">
-                {{ itemName(comparePair.b.item) }}
-              </span>
-            </div>
-            <div class="flex flex-none items-center gap-2">
-              <button
-                v-if="!compareViewer.busy.value"
-                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
-                title="Save this view as a PNG"
-                @click="downloadStageImage(compareViewer, itemName(compareItem?.item) || 'item')"
-              >
-                <Download class="h-3 w-3" /> Save
-              </button>
-              <button
-                class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground tac-action"
-                title="Swap which item is on the stage — the camera stays put"
-                @click="swapCompare"
-              >
-                <RotateCcw class="h-3 w-3" /> Swap
-              </button>
-              <button class="flex-none rounded p-1 text-muted-foreground transition-colors hover:text-foreground" title="Close" aria-label="Close" @click="go(buildPath({ name: 'inventory' }))">
-                <X class="h-4 w-4" />
-              </button>
-            </div>
-          </div>
-          <div class="relative min-h-0 flex-1">
-            <div ref="compareEl" class="h-full w-full"></div>
-            <div v-if="compareViewer.busy.value" class="pointer-events-none absolute inset-0 grid place-items-center">
-              <Loader2 class="h-6 w-6 animate-spin text-muted-foreground" />
-            </div>
-          </div>
-        </div>
-      </div>
-    </Transition>
 
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
       <!-- Edge to edge on compact, same reasoning as the craft modal above. -->
@@ -10701,202 +9186,11 @@ if (MDEBUG) {
 
     <!-- Sticker / charm picker -->
     <Transition enter-active-class="animate-fade-in" leave-active-class="animate-fade-out">
-    <!-- fixed + above the 3D overlay (z-1200): the picker is reachable from
-         both the form and the 3D editor, and must cover whichever is up. -->
-    <div v-if="picker" class="fixed inset-0 flex flex-col bg-card/[0.985] p-4" :style="{ zIndex: Z.picker }" role="dialog" aria-modal="true" aria-label="Pick an attachment">
-      <div class="mb-3 flex items-center gap-3">
-        <span class="text-f11 font-semibold uppercase tracking-cs1">Pick a {{ picker.kind }}</span>
-        <!-- Catalog vs your own drawer. Owned counts the SPARES, not the
-             total: the question this shelf answers is "have I got one going
-             spare", and a badge counting ones already stuck to a gun would
-             answer a different one. -->
-        <div class="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5">
-          <button
-            v-for="src in (['all', 'owned'] as const)"
-            :key="src"
-            class="flex items-center gap-1.5 rounded px-2.5 py-1 text-f10 uppercase tracking-cs1 transition-colors"
-            :class="pickerSource === src ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'"
-            :title="src === 'all' ? 'Browse every ' + picker.kind + ' in the game' : 'Only ' + picker.kind + 's you own'"
-            @click="pickerSource = src"
-          >
-            {{ src === 'all' ? 'Catalog' : 'Owned' }}
-            <span
-              v-if="src === 'owned' && pickerOwned.length"
-              class="rounded bg-background/70 px-1 font-mono text-f8"
-            >{{ pickerOwned.filter((r) => !r.attachedName).length }}</span>
-          </button>
-        </div>
-        <div class="ml-auto flex flex-none items-center gap-2 text-muted-foreground" title="Card size">
-          <LayoutGrid class="h-3.5 w-3.5" />
-          <input v-model.number="attachCardSize" type="range" min="72" max="200" step="4" class="w-24 accent-[#e0a24a]" />
-        </div>
-        <div class="relative w-[240px]">
-          <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <input
-            v-model="pickerQuery"
-            placeholder="Search…"
-            class="w-full rounded-md border border-border bg-background py-2 pl-9 pr-8 text-f13 outline-none focus:border-[color:var(--acc)]"
-            autofocus
-          />
-          <button
-            v-if="pickerQuery"
-            class="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
-            title="Clear search"
-            @click="pickerQuery = ''"
-          ><X class="h-3.5 w-3.5" /></button>
-        </div>
-        <!-- Says where it goes. A bare ✕ in the same corner as the craft
-             modal's own ✕ reads as "close everything", which is the one thing
-             it must not do — the edit underneath is unsaved. -->
-        <button
-          class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground tac-action"
-          title="Back to the editor — nothing is applied"
-          @click="picker = null"
-        >
-          <X class="h-3.5 w-3.5" /> Back
-        </button>
-      </div>
-
-      <!-- Facets. THE shared bar — same component the armory uses, so a rarity
-           dropdown behaves identically wherever you meet it.
-           The cascade and the no-op guard stay here in setPickerFacet: they are
-           this catalog's rules (a collection only exists within a group), not
-           the bar's, and the bar only reports what was clicked.
-           Catalog only: every facet is a slice of the CATALOG query, and the
-           owned shelf is a local list of a few dozen rows that ignores all of
-           them. Leaving them up would offer controls that silently do nothing. -->
-      <CatalogFilters
-        v-if="pickerSource === 'all'"
-        class="mb-3"
-        :tabs="pickerTabs.map((t) => ({ value: t.value, label: t.label ?? t.value, count: t.count }))"
-        :tab="pickerGroup"
-        :axes="pickerAxes"
-        :axis-values="{ collection: pickerCollection, rarity: pickerRarity }"
-        :sorts="ATTACH_SORTS"
-        :sort="pickerSort"
-        :dir="pickerDir"
-        :sort-kind="pickerSortKind"
-        :dir-hint="pickerSortHint"
-        :default-tab="pickerDefaultGroup"
-        :compact="isCompact"
-        @update:tab="setPickerFacet('group', $event)"
-        @update:axis="(k, v) => setPickerFacet(k as 'collection' | 'rarity', v)"
-        @update:sort="setPickerSort"
-        @update:dir="setPickerDir"
-        @clear="clearPickerFacets"
-      />
-
-      <!-- The results are NOT unmounted while the next set loads. They used to
-           be — `v-if="pickerLoading"` swapped the whole grid for a centred
-           "Searching…" — so every keystroke collapsed the grid to one line,
-           jumped the scroll height and popped it back. Now the outgoing set
-           dims in place and the incoming one waves in over it, which is the
-           same treatment the inventory grid gives a filter change. -->
-      <div
-        ref="pickerScrollEl"
-        data-scroller
-        class="flex-1 content-start gap-2 overflow-y-auto transition-opacity duration-200 ease-out"
-        :class="pickerLoading ? 'opacity-45' : 'opacity-100'"
-        :style="attachGridStyle"
-      >
-        <!-- Rarity is read the same way as on a weapon card: the tier's colour
-             as a bottom rule plus a soft glow behind the art. Without it the
-             grid is a wall of identical grey boxes and the one attribute that
-             sorts them is invisible. -->
-        <!-- animate-cell-in is the loadout grid's stagger, reused — but ONLY
-             for the first page. cs2CellIn is `both`-filled with a delay, so an
-             appended tile holds opacity 0 for up to 420ms while the grid has
-             ALREADY grown to fit it: you scroll, the layout jumps down, and
-             the stickers fade in afterwards. That is the infinite-scroll jank.
-             Pages after the first appear immediately; there is nothing to
-             announce, they were prefetched below the fold on purpose.
-             Honours prefers-reduced-motion via the global animate-* rule. -->
-        <button
-          v-for="(it, i) in pickerRows"
-          :key="it.key"
-          class="cv-tile group relative flex h-full flex-col items-center overflow-hidden rounded-md border border-border bg-background p-1.5 transition-colors hover:border-[color:var(--acc)]"
-          :class="i < PICKER_PAGE ? 'animate-cell-in' : ''"
-          :style="{ ...(it.rarity ? { borderBottom: `3px solid ${it.rarity}` } : {}), '--i': i, '--cis': attachCardSize + 12 + 'px' }"
-          :title="it.attachedName ? it.name + ' — applied to ' + it.attachedName : it.name"
-          @click="pickAttachment(it)"
-        >
-          <span class="pointer-events-none absolute inset-0" :style="glowStyle(it.rarity, 0.22)"></span>
-          <!-- Already on something. Not disabled: picking it is legal and
-               means "move it here", which the save confirms before doing —
-               so this marks the cost rather than blocking the choice. -->
-          <span
-            v-if="it.attachedName"
-            class="pointer-events-none absolute left-1 top-1 z-[3] flex items-center rounded bg-background/90 p-0.5 text-[color:var(--acc)]"
-          ><Link2 class="h-3 w-3" /></span>
-          <!-- Inspect before committing. A `button` inside the tile's button
-               is invalid HTML, so this is a span with a click that stops
-               propagation — otherwise picking is the only thing a tile can
-               do, and choosing a holo sticker from a flat icon is a guess. -->
-          <span
-            role="button"
-            tabindex="0"
-            class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground tac-action group-hover:flex"
-            :title="`View ${it.name} in 3D`"
-            @click.stop="openPreview3d(it, picker?.kind ?? 'sticker')"
-            @keydown.enter.stop.prevent="openPreview3d(it, picker?.kind ?? 'sticker')"
-          ><Box class="h-3.5 w-3.5" /></span>
-          <div :class="CARD_ART" class="relative z-[2]">
-            <!-- decoding="async" keeps the decode off the main thread. With
-                 `lazy`, a fast scroll brings dozens of images into view at
-                 once and the default synchronous decode lands all of them in
-                 the scroll frames — the "logos rendering in" stutter. -->
-            <img :src="it.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-110" />
-          </div>
-          <span class="relative z-[2] w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm|Sticker Slab) \| /, '') }}</span>
-        </button>
-        <div v-if="!pickerLoading && !pickerRows.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
-          <template v-if="pickerSource === 'owned' && !pickerQuery">
-            You don't own any {{ picker.kind }}s yet — pick one from the catalog and it's
-            yours once you save.
-          </template>
-          <template v-else>No results — try a different search.</template>
-        </div>
-        <!-- Scrolling to the bottom pulls the next page. `done` also carries
-             the first-page spinner: without it the sentinel is on screen
-             under an empty grid and would fire a second, duplicate page.
-             A deeper rootMargin than the 500px default: one page is 120 tiles,
-             which at any card size is several screens, so firing further ahead
-             costs one request that was coming anyway and buys the page landing
-             before you reach the end — the difference between infinite scroll
-             and scroll-then-wait. -->
-        <!-- Catalog only. The owned shelf is already whole — it came out of
-             memory, not a paged endpoint. -->
-        <InfiniteSentinel
-          v-if="pickerSource === 'all'"
-          :count="pickerResults.length"
-          :done="pickerDone || pickerLoading"
-          root-margin="1200px"
-          @hit="pickerMore"
-        />
-      </div>
-      <!-- OUTSIDE the scroller, and a fixed height that is always present.
-           This row used to be the last cell of the grid, so it was pushed down
-           by every appended page and its own content swaps ("Loading more…"
-           has a spinner, "1200 of 10565" does not) resized it mid-scroll. A
-           loading state must not be able to move anything: as a sibling of the
-           scroll area it is outside the grid's layout entirely, it reserves
-           its space whether or not there is anything to say, and the status
-           text now stays visible instead of scrolling away. -->
-      <div class="flex h-11 flex-none items-center justify-center gap-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
-        <template v-if="pickerLoading"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Searching…</template>
-        <template v-else-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
-        <!-- Nothing to say on an empty result set; `h-11` holds the space
-             regardless, so the grid above never resizes either way. -->
-        <template v-else-if="!pickerRows.length"></template>
-        <!-- Owned counts spares against the total, because "3 of 11 spare"
-             is the number you are actually shopping against. -->
-        <template v-else-if="pickerSource === 'owned'">
-          {{ pickerOwned.filter((r) => !r.attachedName).length }} spare of {{ pickerOwned.length }} owned
-        </template>
-        <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
-        <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
-      </div>
-    </div>
+    <!-- v-if HERE, not only on the component's own root: <Transition> drives
+         enter/leave off its child mounting and unmounting, and a component that
+         is always mounted with the v-if inside it would toggle the panel with
+         no fade at all. -->
+    <AttachmentPicker v-if="picker" :view="pickerView" @pick="pickAttachment" @preview="openPreview3d" />
     </Transition>
 
     <!-- Attachment preview — a SIBLING of the picker's Transition, not a
@@ -11115,13 +9409,44 @@ if (MDEBUG) {
         </button>
     </ContextMenu>
 
-    <!-- Preset menu: everything you can do to a loadout that isn't switching to
-         it. The same ContextMenu as the two above rather than a bespoke
+    <!-- Preset menu. The same ContextMenu as the two above rather than a bespoke
          dropdown — on a phone it becomes a bottom sheet with touch-sized rows,
-         which a popover anchored to a 32px header button never would. -->
+         which a popover anchored to a 32px header button never would.
+
+         On compact it also does the SWITCHING, because there is no pill strip
+         there to do it — the header collapses to one button, and a control that
+         opened a menu with everything except the thing you most wanted would be
+         worse than the strip it replaced. Desktop keeps the strip, so listing
+         the same builds here would be two ways to do one thing a centimetre
+         apart. -->
     <ContextMenu :at="presetCtx" @close="presetCtx = null">
-      <template #title>{{ activePreset?.name ?? 'Loadout' }}</template>
-      <button :class="MENU_ROW" @click="presetCtx = null; startPresetRename()">
+      <template #title>{{ activePresetName }}</template>
+      <template v-if="isCompact">
+        <button
+          v-for="p in presets"
+          :key="p.id"
+          :class="[MENU_ROW, p.id === shownPresetId && 'text-foreground']"
+          :disabled="presetBusy"
+          @click="presetCtx = null; switchPreset(p.id)"
+        >
+          <!-- The tick holds its column on every row, so the names line up and
+               the list reads as a set with one chosen rather than as one odd row
+               indented past the others. -->
+          <Check class="h-3.5 w-3.5 flex-none" :class="p.id === shownPresetId ? '' : 'opacity-0'" />
+          <span class="min-w-0 flex-1 truncate">{{ p.name }}</span>
+          <span class="flex-none font-mono text-f9 text-muted-foreground/50">{{ p.slots }}</span>
+        </button>
+      </template>
+      <!-- MANAGING is owner-only, switching is not.
+           These four used to need no guard: the only way in was the cog, and the
+           cog was already gated on canEdit. Compact changed that — its collapsed
+           button opens this menu for anyone, because a visitor has to be able to
+           page through someone's builds — so the gate has to move here, onto the
+           rows that write. Without it a stranger gets Rename and Delete on an
+           account that is not theirs, one tap from a header that only ever
+           advertised itself as a view. -->
+      <template v-if="canEdit">
+      <button :class="[MENU_ROW, isCompact && 'border-t border-border']" @click="presetCtx = null; startPresetRename()">
         <Pencil class="h-3.5 w-3.5" /> Rename…
       </button>
       <!-- Duplicate leads over "new empty": rebuilding 15 craft-gated slots by
@@ -11152,6 +9477,7 @@ if (MDEBUG) {
       >
         <Trash2 class="h-3.5 w-3.5" /> Delete this loadout
       </button>
+      </template>
     </ContextMenu>
   </div>
   </div>

@@ -13,13 +13,19 @@
  * first; gear slots hold instances the same way, so they get the identical mark
  * rather than a lookalike."
  */
-import { computed } from "vue";
+import { computed, inject } from "vue";
 import { attachmentsOf } from "../itemVisuals";
-import type { InventoryItem } from "../api";
+import type { AttachSource } from "../api";
 
 const props = withDefaults(
   defineProps<{
-    inst?: InventoryItem | null;
+    /**
+     * The copy being described: an owned instance, or a PUBLIC loadout row when
+     * the screen is showing someone else's loadout and there is no instance to
+     * resolve. Both carry the same StatTrak pair and the same enriched
+     * attachments, and this component reads nothing else off either.
+     */
+    inst?: AttachSource | null;
     /**
      * How many thumbnails fit. The caller knows its own width: four across a
      * 68px list row, six on a card, three in a loadout cell footer that is
@@ -40,6 +46,8 @@ const props = withDefaults(
   }>(),
   { inst: null, max: 4, compact: false, count: false },
 );
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : []));
 const stattrak = computed(() => props.inst?.stattrak === true);
@@ -63,7 +71,7 @@ const overflow = computed(() => Math.max(0, attachments.value.length - props.max
     <span
       v-if="stattrak"
       class="font-mono text-f8 leading-none text-[hsl(var(--tac-stattrak))]"
-      :title="count && kills ? `StatTrak™ — ${kills.toLocaleString()} kills` : 'StatTrak™'"
+      :title="count && kills ? tr('inventory.badges.stattrak_kills', 'StatTrak™ — {kills} kills', { kills: kills.toLocaleString() }) : 'StatTrak™'"
       >ST™<template v-if="count && kills"> {{ kills.toLocaleString() }}</template></span
     >
     <span v-if="shown.length" class="flex items-center gap-0.5">

@@ -15,6 +15,8 @@ import {
   CS2_WEAR_FACTOR,
   truncateToFactor,
 } from "@ianlucas/cs2-lib";
+import { readFileSync, statSync } from "node:fs";
+import path from "node:path";
 import { patchSlotsSync } from "./agentPatchSlots.ts";
 import { english } from "@ianlucas/cs2-lib/translations/english";
 
@@ -100,6 +102,14 @@ export interface CatalogSkin {
   tint?: number;
   /** That colourway's name ("Cash Green"). */
   tintName?: string;
+  /**
+   * MUSIC KITS only: the kit's menu theme, as a root-relative asset path.
+   *
+   * Null when this instance has not extracted the audio yet, and the UI reads
+   * that as "draw no player" — a transport control that cannot play anything is
+   * worse than the silence it replaced.
+   */
+  audio?: string | null;
   // ---- per-item attribute facts, for the craft editor's controls ------------
   // Only the paintable listings carry these; see wearRange below for why they
   // are not derivable from `type`.
@@ -324,7 +334,58 @@ export function getKnives(): CatalogSkin[] {
   return items.filter((i) => i.type === "melee").map(paintedListing);
 }
 
+// ---- Music kit audio --------------------------------------------------------
+//
+// A kit's menu theme, decoded onto the mount by extract-models.sh step 5b.
+//
+// KEYED BY `variantIndex`, NOT `definitionIndex`. definitionIndex is 1314 for
+// every music kit — it says "this is a music kit", not which one — so keying on
+// it would give all 100 kits the same track.
+//
+// Read from the mount rather than derived, because the sound folder's name
+// exists only in items_game.txt: nothing in cs2-lib knows that "Daniel Sadowski,
+// Crimson Assault" is `danielsadowski_01`. The manifest lives WITH the audio
+// rather than in models/, so the extraction's atomic directory swap publishes it
+// and the files it names together — a manifest that arrived ahead of its files
+// would advertise previews that 404.
+const MUSIC_DIR = process.env.MUSIC_DIR ?? "/cs2-models/music";
+const MUSIC_INDEX = path.join(MUSIC_DIR, "music-kits.json");
+// The value becomes a public URL, so it is validated here rather than trusted —
+// the extractor writes this file, but this is the point where it stops being
+// our data and starts being a path.
+const MUSIC_FILE = /^[\w.-]+\.(mp3|wav)$/;
+let musicCache: { mtimeMs: number; map: Record<string, string> } | null = null;
+
+/** variantIndex -> audio filename, or {} on a mount without the step. */
+function musicIndex(): Record<string, string> {
+  try {
+    const { mtimeMs } = statSync(MUSIC_INDEX);
+    if (musicCache?.mtimeMs === mtimeMs) return musicCache.map;
+    const doc = JSON.parse(readFileSync(MUSIC_INDEX, "utf8")) as Record<string, unknown>;
+    const map: Record<string, string> = {};
+    for (const [index, file] of Object.entries(doc)) {
+      if (typeof file === "string" && MUSIC_FILE.test(file)) map[index] = file;
+    }
+    musicCache = { mtimeMs, map };
+    return map;
+  } catch {
+    // No mount, or one extracted before v28. Every kit answers null, and the UI
+    // simply doesn't grow a player — the same way it gates 3D on the models
+    // being there rather than offering a button that fails.
+    return {};
+  }
+}
+
+/** Root-relative preview URL for one kit, or null when it isn't extracted. */
+function musicAudio(index: Record<string, string>, variantIndex: unknown): string | null {
+  const file = typeof variantIndex === "number" ? index[String(variantIndex)] : undefined;
+  return file ? `/music/${file}` : null;
+}
+
 export function getMusicKits(): CatalogSkin[] {
+  // Read once for the whole listing rather than per kit: this is a stat plus a
+  // parse, and it is the same answer for all 100 rows.
+  const audio = musicIndex();
   return items
     .filter((i) => i.type === "musickit")
     .map((m) => ({
@@ -334,6 +395,7 @@ export function getMusicKits(): CatalogSkin[] {
       image: img(m.imagePath),
       type: m.type,
       def: m.definitionIndex,
+      audio: musicAudio(audio, m.variantIndex),
     }));
 }
 
@@ -995,7 +1057,22 @@ export function getRenderTestCatalog(): RenderTestItem[] {
 // Knives/gloves/agents differ per team; Zeus/C4/music kit are global.
 export function getDefaults() {
   const lite = (i?: (typeof items)[number]) =>
-    i ? { id: i.id, name: i.name, image: img(i.imagePath) } : null;
+    i
+      ? {
+          id: i.id,
+          name: i.name,
+          image: img(i.imagePath),
+          // Music kits only — the one default that needs more than a name and an
+          // icon. A default is normally a caption under a picture, but a kit's
+          // whole content is a sound, and the icon on its own is a logo for a
+          // track with no way to hear it. Everyone starts with the stock kit and
+          // most players never change it, so the loadout's kit slot draws THIS
+          // far more often than it draws anything crafted. Same guard and same
+          // resolver the owned-item shape uses, so the two can't disagree about
+          // which track belongs to which kit.
+          audio: i.type === "musickit" ? musicAudio(musicIndex(), i.variantIndex) : undefined,
+        }
+      : null;
   const perTeam = (type: string) => {
     const frees = items.filter((i) => i.type === type && i.isDefault);
     const forTeam = (team: "CT" | "T") =>
@@ -1016,6 +1093,8 @@ export function getDefaults() {
     agent: { CT: agentDefault("CT"), T: agentDefault("T") },
     zeus: lite(items.find((i) => i.type === "weapon" && i.modelKey === "taser" && !i.variantIndex)),
     c4: lite(items.find((i) => i.type === "weapon" && i.loadoutCategory === "c4" && !i.variantIndex)),
+    // Two kits carry `isDefault` — the CS2 theme and the CS:GO one it replaced —
+    // and the first is the one the game actually issues.
     musickit: lite(items.find((i) => i.type === "musickit" && i.isDefault)),
   };
 }
@@ -1324,6 +1403,10 @@ export function getItem(id: number) {
       tintName: i.type === "graffiti" ? /\(([^()]+)\)\s*$/.exec(i.name)?.[1] : undefined,
       paintMaterial: i.materialPath ?? null,
       legacyPaint: !!i.isLegacyModel,
+      // Music kits only. This is the resolver every OWNED instance comes
+      // through, so without it a kit would preview in the picker (which reads
+      // the catalog listing) and fall silent the moment it was yours.
+      audio: i.type === "musickit" ? musicAudio(musicIndex(), i.variantIndex) : undefined,
       // This is the resolver every OWNED instance comes through, so it is what
       // lets the inventory grid and the loadout sheet sort by collection at all
       // — the catalog listings alone only cover things you haven't crafted yet.

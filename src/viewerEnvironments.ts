@@ -42,8 +42,24 @@ export interface ViewerEnvironment {
  * key, so a preset baked into it would give everyone a grid of cards lit
  * differently with no way to tell why. Exactly the argument that already forces
  * bloom off for bakes.
+ *
+ * SEPARATE from DEFAULT_ENVIRONMENT below, and it has to stay that way. These
+ * were one constant until the viewer default moved to Showcase; moving the pin
+ * with it would have re-baked new cards under Showcase while every card already
+ * on disk kept its Studio lighting — and the render key carries the extraction
+ * version, not the rig, so nothing would ever invalidate the old ones. The grid
+ * would be permanently half-lit one way and half the other, which reads as a
+ * rendering bug rather than a settings change.
  */
-export const DEFAULT_ENVIRONMENT = "studio";
+export const BAKE_ENVIRONMENT = "studio";
+
+/**
+ * What a LIVE viewer opens under when the user has not picked. Showcase: the
+ * brighter rig with the harder overhead spot, because most people open the 3D
+ * view to look at a skin rather than to grade it. Judging a finish is what
+ * Studio is for, and it is one click away.
+ */
+export const DEFAULT_ENVIRONMENT = "showcase";
 
 export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
   {
@@ -88,6 +104,6 @@ export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
 export function viewerEnvironment(key: string | null | undefined): ViewerEnvironment {
   return (
     VIEWER_ENVIRONMENTS.find((e) => e.key === key) ??
-    VIEWER_ENVIRONMENTS.find((e) => e.key === DEFAULT_ENVIRONMENT)!
+    VIEWER_ENVIRONMENTS.find((e) => e.key === BAKE_ENVIRONMENT)!
   );
 }

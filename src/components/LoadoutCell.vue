@@ -21,9 +21,12 @@
  * untouched. That is deliberate: the drag-to-equip, drag-to-reorder and
  * long-press wiring is the most delicate code in the app, and it did not move.
  */
+import { computed, inject } from "vue";
 import ItemArt from "./ItemArt.vue";
 import ItemBadges from "./ItemBadges.vue";
 import ItemName from "./ItemName.vue";
+import MusicPlayer from "./MusicPlayer.vue";
+import { formatDuration, musicPreview } from "../musicPreview";
 import PriceTag from "./PriceTag.vue";
 import SlotStatus from "./SlotStatus.vue";
 import TileActions from "./TileActions.vue";
@@ -31,61 +34,17 @@ import WearBar from "./WearBar.vue";
 import { Clock, Loader2 } from "lucide-vue-next";
 import { cn } from "@5stack/ui";
 import { ART_FADE_B, CARD_ART, glowStyle } from "../itemVisuals";
-import type { CatalogItem, InventoryItem, Team } from "../api";
+import type { LoadoutCellProps } from "./loadoutCellProps";
 
-withDefaults(
-  defineProps<{
-    /** The slot's own caption — "AK-47", "Agent · CT", "Music Kit". */
-    label?: string;
-    item?: CatalogItem | null;
-    /** The owned instance, or null for a free default. Drives the marks, the
-     *  hover actions and the badges. */
-    inst?: InventoryItem | null;
-    image?: string | null;
-    /** Muted text when the slot holds nothing crafted. */
-    fallback?: string;
-    /** Drop the weapon prefix — weapon cells already say "AK-47" above. */
-    strip?: boolean;
-    teams?: Team[] | null;
-    value?: number | null;
-    valueTip?: string;
-    /** The slot holds something the mirror couldn't price — see PriceTag. */
-    valueMissing?: boolean;
-    wear?: number | null;
-    seed?: number | null;
-    /** Rarity colour for the glow wash. The border stripe is the parent's, since
-     *  it rides on the same style binding as the selection ring. */
-    rarity?: string | null;
-    /** Default/unskinned art sits back so a crafted slot reads as the filled one. */
-    dim?: boolean;
-    /** A card render is in flight for this instance. */
-    baking?: boolean;
-    queued?: boolean;
-    /** Entrance stagger index, and the key that re-runs it — switching sides or
-     *  replacing the weapon should sweep, not teleport. */
-    index?: number;
-    artKey?: string;
-    /** Agents are waist-cropped and need the bottom feather. */
-    fadeArt?: boolean;
-    /** Equipment cells breathe a little more around the art. */
-    padArt?: boolean;
-    /** Weapon cells offer "focus" in the hover cluster; gear slots don't. */
-    focusAction?: boolean;
-    /** Weapon cells put the hover actions in the same corner as the marks, so
-     *  the marks step aside on hover. */
-    fadeStatusOnHover?: boolean;
-    /** The tiny extras tiles: marks only, identity in the title attribute. */
-    compact?: boolean;
-    showName?: boolean;
-    showWear?: boolean;
-    showPrice?: boolean;
-    showBadges?: boolean;
-  }>(),
+const props = withDefaults(
+  defineProps<LoadoutCellProps>(),
   {
     label: "",
     item: null,
     inst: null,
+    badges: null,
     image: null,
+    audio: null,
     fallback: "Default",
     strip: false,
     teams: null,
@@ -111,6 +70,22 @@ withDefaults(
     showBadges: true,
   },
 );
+
+/**
+ * The kit's length for the caption, or "" while it is unknown.
+ *
+ * Read straight off the shared cache rather than plumbed down as a prop: the
+ * length is a fact about the FILE, discovered asynchronously once the player
+ * scrolls into view, and threading that back up through cellFacts would make
+ * every loadout cell re-render each time any kit on the page measured itself.
+ * Empty until known — a blank caption is right, "0:00" is a lie.
+ */
+const audioLength = computed(() => {
+  const seconds = props.audio ? musicPreview.durationOf(props.audio) : 0;
+  return seconds > 0 ? formatDuration(seconds) : "";
+});
+
+const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
 
 defineEmits<{
   (e: "view3d" | "inspect" | "edit" | "duplicate" | "remove" | "focus"): void;
@@ -152,7 +127,28 @@ defineEmits<{
          shrank every weapon in the loadout. Money is an overlay on an item, and
          turning an overlay on must not resize the thing underneath it. -->
     <div v-if="!compact" class="relative z-[2] min-w-0">
-      <span class="block truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ label }}</span>
+      <!-- The slot name steps aside on hover, exactly as the status marks do
+           (see fadeStatusOnHover) — the action cluster sits at the top-right of
+           this same row, and on a short cell the two meet in the middle, leaving
+           a truncated word wedged under three buttons.
+
+           FADED, not moved. Sliding the name down would push into CARD_ART,
+           which is flex-1 — the same mistake the price above is absolute to
+           avoid, and it would resize the art on every hover. It would also make
+           a grid of cells twitch as the cursor crosses them, which reads as the
+           page being unstable rather than as room being made.
+
+           Only the NAME goes. The price sits below this line on its own overlay
+           and is the thing people hover to read, so it stays put and stays
+           legible; what disappears is a label the cell was already truncating.
+
+           Gated on there being a cluster at all: a slot with no actions has
+           nothing to make room for, and a name that fades for no reason reads
+           as a rendering fault. -->
+      <span
+        class="block truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70"
+        :class="(inst || focusAction) && 'transition-opacity duration-100 group-hover:opacity-0'"
+      >{{ label }}</span>
       <PriceTag
         v-if="showPrice"
         class="absolute left-0 top-full z-[2]"
@@ -175,20 +171,49 @@ defineEmits<{
         :class="cn('max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105', fadeArt && ART_FADE_B, dim && 'opacity-60')"
       />
       <span v-else class="text-f10 uppercase text-muted-foreground/50">{{ fallback }}</span>
+      <!-- Steps aside on hover, like the name and the status marks. On a short
+           cell this chip and the action cluster end up a few pixels apart in the
+           same corner of the eye, and "queued" is a thing you glance at rather
+           than a thing you are reaching for — so it yields to the buttons and
+           comes back when the cursor leaves. -->
       <span
         v-if="baking || queued"
-        class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
+        class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)] transition-opacity duration-100 group-hover:opacity-0"
         ><Loader2 v-if="baking" class="h-3 w-3 animate-spin" /><Clock v-else class="h-3 w-3" />
-        <template v-if="!compact">{{ baking ? "baking" : "queued" }}</template></span
+        <template v-if="!compact">{{ baking ? tr('inventory.tile.baking', 'baking') : tr('inventory.tile.queued', 'queued') }}</template></span
       >
+      <!-- Hear the kit you have on, from the rack itself.
+           An OVERLAY on the art rather than a row of its own: the kit lives in
+           the extras strip, and those tiles are 70px tall with every pixel of it
+           already spoken for — a transport in flow would come straight out of
+           CARD_ART, paying for the sound with the only thing that identifies the
+           slot.
+
+           No chip, unlike the bake badge above. That badge is a word about an
+           item; this is the control FOR the artwork it was covering. At 70px a
+           bordered plate with a button and a clock in it was most of the sleeve,
+           so the thing meant to represent a kit was hiding the only part of the
+           cell that tells one kit from another. MusicPlayer's overlay mode draws
+           into the corners instead and leaves the middle alone — see it for how
+           it stays legible without a background.
+
+           It can live inside this <button> because every element in it is a
+           <span> — see MusicPlayer. -->
+      <MusicPlayer v-if="audio" :src="audio" overlay />
     </div>
 
-    <!-- The centred caption the small rail tiles carry instead of a footer. -->
+    <!-- The centred caption the small rail tiles carry instead of a footer.
+         A kit's LENGTH rides here rather than on the artwork: it is a fact about
+         the item in the same way the slot name is, and printing it over the
+         sleeve was the last thing still competing with the only part of the cell
+         that tells one kit from another. -->
     <div
       v-if="compact"
       class="relative z-[2] w-full truncate text-center text-f8 uppercase tracking-cs1 text-muted-foreground/70"
     >
-      {{ label }}
+      {{ label
+      }}<span v-if="audioLength" class="font-mono tabular-nums text-muted-foreground/45">
+        · {{ audioLength }}</span>
     </div>
 
     <div v-else-if="showName || showWear" class="relative z-[2] flex items-end justify-between gap-2">
@@ -196,7 +221,7 @@ defineEmits<{
         <ItemName :item="item" :strip="strip" :fallback="fallback" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
         <!-- StatTrak and what's applied. The loadout showed neither until this
              component existed; the inventory grid has shown both all along. -->
-        <ItemBadges v-if="showBadges" :inst="inst" :max="3" compact />
+        <ItemBadges v-if="showBadges" :inst="badges ?? inst" :max="3" compact />
       </span>
       <WearBar v-if="showWear" :item="item" :wear="wear" :seed="seed" mini class="mb-1" />
     </div>

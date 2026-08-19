@@ -19,7 +19,7 @@
 // is what the shader grades, but the viewer lights that afterwards — so expect
 // the rail to read flatter than the charm. It is a map for finding the band; the
 // 3D charm beside it is the truth.
-import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { API_ORIGIN } from "../api";
 import {
   charmAdjustSrgb,
@@ -100,6 +100,8 @@ const emit = defineEmits<{
  *  to. The one question worth asking when a band comes out the wrong colour:
  *  matching the wrong entry and matching none look identical on screen. */
 const PATTERN_LOG = typeof location !== "undefined" && /[?&]patternlog=1/.test(location.search);
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 const RAIL_H = 40;
 /** Downsample width/height of the albedo sample. 16x16 is 256 pixels — enough
@@ -662,7 +664,7 @@ watch(
         class="h-5 w-5 flex-none rounded-sm ring-1 ring-inset ring-white/15"
         :style="{ background: swatch, boxShadow: `0 0 10px -2px ${swatch}` }"
       ></span>
-      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
       <span class="font-mono text-f13 tabular-nums">#{{ seed.toLocaleString() }}</span>
     </div>
 
@@ -698,7 +700,7 @@ watch(
             transition: 'background 220ms linear, box-shadow 220ms linear',
           }"
         ></span>
-        <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+        <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
 
         <!-- Click-to-edit. The field is gone from the row because a coordinate
              is only worth typing once you know where you are going — but a
@@ -718,7 +720,7 @@ watch(
         <button
           v-else
           class="rounded px-1 font-mono text-f13 tabular-nums text-foreground/90 transition-colors hover:bg-white/5 hover:text-[color:var(--acc)]"
-          title="Type an exact pattern"
+          :title="tr('inventory.pattern.type_exact', 'Type an exact pattern')"
           @click="beginEdit"
         >#{{ seed.toLocaleString() }}</button>
 
@@ -742,15 +744,15 @@ watch(
             "
             :title="
               zoomLevel < ZOOM_STEPS.length
-                ? `Showing ${spanLabel} patterns — click to zoom in`
-                : 'Narrowest band — click for the full range'
+                ? tr('inventory.pattern.zoom_in', 'Showing {span} patterns — click to zoom in', { span: spanLabel })
+                : tr('inventory.pattern.zoom_full', 'Narrowest band — click for the full range')
             "
             @click="cycleZoom"
           >{{ spanLabel }}</button>
           <span class="w-px flex-none self-stretch" :class="zoom ? 'bg-[color:var(--acc)]/40' : 'bg-input'"></span>
           <button
             class="px-1.5 py-0.5 text-f11 leading-none transition-colors hover:bg-white/5"
-            :title="`Random pattern between ${lo.toLocaleString()} and ${hi.toLocaleString()}`"
+            :title="tr('inventory.pattern.roll', 'Random pattern between {lo} and {hi}', { lo: lo.toLocaleString(), hi: hi.toLocaleString() })"
             @click="roll"
           >🎲</button>
         </div>
@@ -766,7 +768,7 @@ watch(
         :aria-valuemin="lo"
         :aria-valuemax="hi"
         :aria-valuenow="seed"
-        aria-label="Charm pattern"
+        :aria-label="tr('inventory.pattern.charm_aria', 'Charm pattern')"
         @pointerdown="onDown"
         @pointermove="onMove"
         @pointerup="onUp"
@@ -783,7 +785,7 @@ watch(
           v-if="shown === 'unavailable'"
           class="absolute inset-0 grid place-items-center bg-secondary/70 text-f8 uppercase tracking-cs1 text-muted-foreground/70"
         >
-          Drag to browse
+          {{ tr('inventory.pattern.drag_browse', 'Drag to browse') }}
         </div>
 
         <!-- Ticks. Major rules carry a number; minors are hairlines. -->
@@ -842,7 +844,7 @@ watch(
            of what the old Lock button was trying to mean. -->
       <div class="mt-1 flex items-baseline font-mono text-f8 tabular-nums text-muted-foreground/60">
         <span>{{ lo.toLocaleString() }}</span>
-        <span v-if="zoom" class="mx-auto uppercase tracking-cs1 text-[color:var(--acc)]/80">🎲 rolls in here</span>
+        <span v-if="zoom" class="mx-auto uppercase tracking-cs1 text-[color:var(--acc)]/80">{{ tr('inventory.pattern.roll_range', '🎲 rolls in here') }}</span>
         <span class="ml-auto">{{ hi.toLocaleString() }}</span>
       </div>
     </div>

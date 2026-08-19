@@ -3,9 +3,12 @@
 // cluster next to the Steam-synced mark — both answer "what's the state of this
 // item?", so they read as one group instead of being split across two corners,
 // and the dots stop costing a whole line under the model name.
+import { inject } from "vue";
 import type { Team } from "../api";
 
 defineProps<{ teams?: readonly Team[] | null }>();
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 const COLOR: Record<Team, string> = { CT: "#7ea6ff", T: "#f2c14e" };
 </script>
@@ -17,7 +20,7 @@ const COLOR: Record<Team, string> = { CT: "#7ea6ff", T: "#f2c14e" };
       :key="i"
       class="h-1.5 w-1.5 rounded-full"
       :style="{ background: COLOR[t], boxShadow: `0 0 5px ${COLOR[t]}` }"
-      :title="`Equipped on ${t}`"
+      :title="tr('inventory.status.equipped_on', 'Equipped on {team}', { team: t })"
     ></span>
   </span>
 </template>

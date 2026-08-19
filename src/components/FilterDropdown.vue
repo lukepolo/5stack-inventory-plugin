@@ -3,7 +3,7 @@
 // menu — visibly foreign next to the app's own popovers — and every toolbar
 // control had drifted to its own height. One h-8 button + the same bordered
 // card menu the context menus use, for all of them.
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Check, ChevronDown, Search, X } from "lucide-vue-next";
 
 const props = defineProps<{
@@ -15,6 +15,8 @@ const props = defineProps<{
   dots?: boolean;
 }>();
 const emit = defineEmits<{ (e: "update:modelValue", v: string): void }>();
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 const open = ref(false);
 const current = computed(() => props.options.find((o) => o.value === props.modelValue));
@@ -104,14 +106,14 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
         <input
           ref="searchEl"
           v-model="q"
-          :placeholder="`Filter ${options.length} …`"
+          :placeholder="tr('inventory.filters.search', 'Filter {count} …', { count: options.length })"
           class="h-7 w-full rounded border border-border bg-background pl-8 pr-7 text-f11 outline-none focus:border-[color:var(--acc)]"
           @keydown.enter.prevent="onEnter"
         />
         <button
           v-if="q"
           class="absolute right-2 top-1/2 grid h-5 w-5 -translate-y-1/2 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
-          title="Clear filter"
+          :title="tr('inventory.filters.search_clear', 'Clear filter')"
           @click="q = ''; searchEl?.focus()"
         ><X class="h-3 w-3" /></button>
       </div>
@@ -147,7 +149,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
       </button>
       <!-- Says so, rather than showing an empty card that reads as a hung menu. -->
       <div v-if="!shown.length" class="px-3 py-2 text-f11 uppercase tracking-wide text-muted-foreground">
-        No match
+        {{ tr('inventory.filters.no_match', 'No match') }}
       </div>
       </div>
     </div>

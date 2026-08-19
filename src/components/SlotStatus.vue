@@ -3,6 +3,7 @@
 // equipped, plus the Steam-synced mark. Weapon cells grew this first; gear
 // slots (knife, gloves, agent, zeus, C4, music kit, graffiti) hold instances
 // the same way, so they get the identical mark rather than a lookalike.
+import { inject } from "vue";
 import { Link2, RefreshCw } from "lucide-vue-next";
 import TeamDots from "./TeamDots.vue";
 import type { InventoryItem, Team } from "../api";
@@ -35,6 +36,8 @@ withDefaults(
   }>(),
   { teams: null, inst: null, compact: false, attachedName: null, inline: false },
 );
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 </script>
 
 <template>
@@ -54,14 +57,14 @@ withDefaults(
       v-if="attachedName"
       class="flex-none text-[color:var(--acc)]"
       :class="compact ? 'h-2.5 w-2.5' : 'h-3 w-3'"
-      :title="'Applied to ' + attachedName"
+      :title="tr('inventory.status.applied_to', 'Applied to {name}', { name: attachedName })"
     />
     <RefreshCw
       v-if="inst?.origin === 'steam'"
       :class="compact ? 'h-2.5 w-2.5' : 'h-3 w-3'"
       class="flex-none"
       :style="{ color: STEAM_BLUE }"
-      title="Synced from your Steam inventory (read-only)"
+      :title="tr('inventory.status.steam_synced', 'Synced from your Steam inventory (read-only)')"
     />
   </span>
 </template>

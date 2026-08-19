@@ -60,30 +60,6 @@ and in the panel, same slot.
 
 ---
 
-## `copy-from` copies the sticker, not the placement
-
-**Status: newly reachable, and the two defects below predate it.**
-
-`POST /api/loadout/copy-from/:steamId` had no UI until the Copy loadout button
-landed in the viewer header, so nothing exercised it. Two things it gets wrong,
-both in the `INSERT INTO inventory.owned_items` at `backend/src/main.ts`:
-
-1. **`charm_offset` is not in the column list.** `charm_id` is, so a copied gun
-   gets the charm — hanging at the default offset, at the default pattern. The
-   seed rides in that same jsonb (see the `ItemRow.charm_offset` comment), so a
-   Butane Buddy copies across as a differently-graded one.
-2. **The source user's `inst` handles are copied verbatim** inside the
-   `stickers`/`patches` jsonb. They resolve to nothing on the copier's side —
-   `instFactsFor` scopes its lookup to the owner, which is what stops it being a
-   read of someone else's rows — so the sticker falls back to its inline wear.
-   But the dead handle is now stored, and `enrichAttachments` hands it to the
-   copier's UI, which sends it straight back on the next save.
-
-Deferred rather than folded into the public-showcase work: the fix belongs with
-the wider attachment-fidelity pass, and copying a placement correctly wants the
-same "what does the copy own?" answer as minting one does. The confirm dialog is
-written to what the copy actually delivers today — the skins and the stickers on
-them — and promises nothing about the charm's placement.
 ## Loadout presets: sharing, and the delete that reaches builds you can't see
 
 **Status: presets landed; two follow-ups deliberately left out of that change.**
@@ -194,3 +170,34 @@ the GPU, which is cheaper per frame than the bake it replaces — but it moves t
 body in world space, and every world-space measurement listed above would have
 to move with it. Do not start this as "just don't call bakePose": start by
 listing what reads world coordinates after the mount.
+
+---
+
+## Music kit previews: one track per kit, live verification outstanding
+
+**Status: extraction, serving and player all landed (EXTRACT_VERSION 28). Nothing
+here is blocking — this is the shape of what was deliberately left out.**
+
+### Only `mainmenu` is extracted
+
+A kit ships 13–22 tracks (`bombplanted`, `deathcam`, `roundmvpanthem`,
+`startround`…) and only the menu theme is decoded, because it is the one people
+recognise and 101 x 3.5MB is already ~350MB on the mount. The extraction step
+resolves the FOLDER per kit, so adding a second track is one more filename in
+`wanted` plus a manifest that maps a kit to several files rather than one — the
+value side of `music-kits.json` would become a list. Worth doing only alongside a
+reason to play more than one, since it multiplies the mount cost directly.
+
+### What still needs a live run
+
+Nothing here can be exercised without a CS2 install, so it is all first-run
+verification rather than known breakage:
+
+1. `ONLY_STEPS=music-audio ./scripts/extract-models.sh` — it needs no decompile,
+   only the already-cached `items_game.txt`. Expect ~101 folders resolved and
+   ~350MB under `<mount>/music`, plus `music-kits.json` beside it.
+2. `curl -sI -H 'Range: bytes=0-1000' https://<host>/music/valve_cs2_01.mp3`
+   against BOTH the nginx frontend and a hot-swap pod (which runs `serve.mjs` and
+   has no nginx at all) — a 206 with `Content-Range` from each, not a 200.
+3. The other tracks and the graffiti/pin flat presentation from
+   `ideas/inventory-music-kit-preview.md` are untouched and stay parked.
