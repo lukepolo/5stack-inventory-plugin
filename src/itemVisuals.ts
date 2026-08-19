@@ -2,7 +2,7 @@
 // App.vue only, which is how the inventory grid and the loadout sheet ended up
 // drawing the same item two different ways — keep new tile chrome in here (or
 // in ItemTile) rather than re-deriving it per view.
-import type { InventoryItem } from "./api";
+import type { AttachSource, InventoryItem } from "./api";
 
 // The CS2 wear scale. The hard stops aren't decoration — they're the real tier
 // boundaries, which is why the ramp is worth drawing at all: it says "this
@@ -31,6 +31,37 @@ const stopFor = (wear: number) => WEAR_STOPS.find((s) => wear < s.max) ?? WEAR_S
 export const wearColor = (wear: number) => stopFor(wear).color;
 export const wearTier = (wear: number) => stopFor(wear).tier;
 
+/**
+ * Where a float sits INSIDE its own bracket — 0 is the best copy the bracket can
+ * hold, 1 the worst.
+ *
+ * The number a price cannot carry. A market lists one figure per bracket, but
+ * Factory New spans 0.00 to 0.07 and a 0.0001 Karambit and a 0.069 one are not
+ * the same item to anyone buying. This says which end of its own bracket a copy
+ * is at; what that is WORTH is a separate question and deliberately not answered
+ * here — see the sale spread from /api/prices/detail, which bounds it with real
+ * sales instead of a guess.
+ */
+export function wearPositionInTier(wear: number): { tier: string; pct: number } {
+  const found = WEAR_STOPS.findIndex((s) => wear < s.max);
+  // No bracket matched means the float is off the TOP of the scale, so it falls
+  // back to the last stop — the same direction stopFor above falls. The old
+  // `Math.max(0, …)` turned findIndex's -1 into index 0 and reported those as
+  // Factory New, the two helpers disagreeing about the same float. While the last stop's max
+  // is Infinity only a non-finite wear can get here, and that one also drove the
+  // percentage to NaN, which the craft panel printed as "top NaN% of Factory
+  // New"; the moment a real ceiling replaces Infinity it would be every
+  // Battle-Scarred item.
+  const index = found === -1 ? WEAR_STOPS.length - 1 : found;
+  const stop = WEAR_STOPS[index];
+  const low = index === 0 ? 0 : WEAR_STOPS[index - 1].max;
+  const high = Number.isFinite(stop.max) ? stop.max : 1;
+  const pct = (wear - low) / (high - low);
+  // A float that is not a number sits at the WORST end of the worst bracket:
+  // whatever it is, it is not evidence of a good one.
+  return { tier: stop.tier, pct: Number.isFinite(pct) ? Math.min(1, Math.max(0, pct)) : 1 };
+}
+
 // Steam blue — the one colour that means "this came from your Steam inventory".
 export const STEAM_BLUE = "#66c0f4";
 
@@ -55,6 +86,10 @@ export const CARD_ART =
 // the art at small sizes the moment the footer grew.
 export const CARD_CHROME_PX = 78;
 
+// NB: prices deliberately cost this budget NOTHING. They render as an overlay
+// under the model label, because paying for them in flow meant switching values
+// on resized every card and cell in the app — see PriceTag's call sites.
+
 // Bottom feather for waist-cropped art — see `.art-fade-b` in style.css for
 // what it does and why it's per-item. Agents are the only type that needs it;
 // everything else is a whole object with air under it.
@@ -73,8 +108,13 @@ export function glowStyle(color?: string | null, opacity = 0.42) {
  *  The kind used to be flattened away, which left a tile rendering the charm as
  *  a fifth sticker at sticker size — and a charm is one per weapon, chosen
  *  separately, so it deserves to read as its own thing rather than get lost in
- *  the row. Callers that only want images can still ignore it. */
-export function attachmentsOf(i: InventoryItem) {
+ *  the row. Callers that only want images can still ignore it.
+ *
+ *  Takes an AttachSource, not an InventoryItem: a public loadout row carries the
+ *  identical enriched arrays, and it is the ONLY thing a visitor has — narrowed
+ *  to the owned shape, this helper was the reason someone else's loadout listed
+ *  no stickers even once the endpoint started sending them. */
+export function attachmentsOf(i: AttachSource) {
   const tag = <T,>(list: (T | null | undefined)[], kind: "sticker" | "patch" | "charm") =>
     list.filter((x): x is NonNullable<T> => !!x).map((x) => ({ ...x, kind }));
   return [
@@ -226,3 +266,19 @@ export const isCustomizable = (item?: { type?: string | null } | null) =>
  * listing carries `def` for exactly this.
  */
 export const canInspect = (item?: { def?: number | null } | null) => item?.def != null;
+
+/**
+ * The team accent at 16% — the fill every "this one is on" control wears.
+ *
+ * Built on var(--acc) rather than the computed hex so it rides the registered
+ * property's crossfade when the team flips (see @property --acc in style.css).
+ * Lives here rather than in App.vue because the screens extracted out of that
+ * file all paint their active chips with it, and a second copy of the string is
+ * a second place for the percentage to drift.
+ */
+export const accentSoft = "color-mix(in srgb, var(--acc) 16%, transparent)";
+
+/** The selected-tile ring: a border plus a 1px outer glow in the team accent. */
+export function selRing(on: boolean) {
+  return on ? { borderColor: "var(--acc)", boxShadow: "0 0 0 1px var(--acc)" } : {};
+}

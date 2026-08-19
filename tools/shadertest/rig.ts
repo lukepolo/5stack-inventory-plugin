@@ -205,7 +205,12 @@ export async function runViewer(
   try {
     const handle = await mountViewer(host, model, {
       paintMaterial: pm, wear, seed,
-      legacyPaint: !!opts.legacyPaint, interactive: false, lighting: opts.lighting,
+      // `inspect: false` — no animation. This waits a fixed two seconds and
+      // photographs whatever is on screen, and a comparison between two renders
+      // is worth nothing unless the camera was in the same place for both.
+      // (The idle turntable is a smaller version of the same problem and is
+      // already here; this at least does not add a second moving part.)
+      legacyPaint: !!opts.legacyPaint, interactive: false, inspect: false, lighting: opts.lighting,
     } as any);
     await new Promise((r) => setTimeout(r, 2000)); // let textures land + a few frames draw
     const blob = await handle.snapshot();

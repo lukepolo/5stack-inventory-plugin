@@ -19,6 +19,8 @@ import {
   ChevronRight,
   Minus,
   Plus,
+  CircleDollarSign,
+  RefreshCw,
 } from "lucide-vue-next";
 import SkinTests from "./SkinTests.vue";
 import { FLAGS, activeFlags, flagValue, flagsVersion, setFlag } from "../devFlags";
@@ -30,6 +32,13 @@ import {
   clearCache,
   fetchAssetCdn,
   setAssetCdn,
+  fetchPriceAdmin,
+  savePriceAdmin,
+  syncPricesNow,
+  clearPrices,
+  formatPrice,
+  PRICE_WINDOW_LABEL,
+  PRICE_SOURCE_LABEL,
   fetchExtractStatus,
   startExtractJob,
   setExtractJobs,
@@ -39,6 +48,8 @@ import {
   type CfgSyncResult,
   type DirStat,
   type ExtractStatus,
+  type PriceAdminStatus,
+  type PriceSource,
 } from "../api";
 
 const props = defineProps<{
@@ -75,6 +86,7 @@ const fail = (e: unknown) => emit("notify", e instanceof Error ? e.message : Str
 const TABS = [
   { key: "", label: "Game Server" },
   { key: "assets", label: "Asset Cache" },
+  { key: "prices", label: "Prices" },
   { key: "models", label: "3D Models" },
   { key: "tests", label: "Skin Tests" },
   { key: "dev", label: "Developer" },
@@ -247,6 +259,11 @@ const extractedGroups = computed(() => {
       "paintTextures",
     ]),
     group("images", "Item icons", "Flat catalog art for every item", s.images ?? ZERO, []),
+    // Listed even at zero would be wrong — a mount extracted before v28 has no
+    // music and is not broken — so it appears once there is something to report.
+    ...(s.music && s.music.files
+      ? [group("music", "Music kit previews", "One menu theme per kit, streamed on demand", s.music, [])]
+      : []),
   ];
 });
 // ---- shared asset CDN (opt-in) ----------------------------------------------
@@ -411,6 +428,7 @@ const STEP_LABELS: Record<string, string> = {
   "econ-icons": "Extracting item icons",
   "paint-chain": "Extracting paint chain",
   "sticker-art": "Extracting sticker & decal art",
+  "music-audio": "Extracting music kit audio",
   stamp: "Recording the build",
 };
 
@@ -632,6 +650,143 @@ async function commitWorkers(jobs: number, from: number) {
 
 // Each tab fetches what it shows, when you land on it — so nothing polls for a
 // section that isn't on screen.
+// Declared ABOVE the activeKey watcher on purpose. That watcher is
+// `{ immediate: true }`, so on a direct load of /admin/prices its callback runs
+// synchronously during setup and calls refreshPrices() — which reads these refs.
+// Sitting below it, the consts were still in their temporal dead zone and the
+// whole console died on load with a minified "cannot access before
+// initialization". Every other tab's state already lives up here; this is not a
+// special case, it was the odd one out.
+// ---- prices: the market feed -------------------------------------------------
+// Off by default. Two settings, deliberately separate: WHETHER to mirror a price
+// feed, and WHICH one. The second exists because the default is a 5stack host —
+// fine as a default, wrong as an obligation — and an operator who would rather
+// mirror the public source themselves needs somewhere to say so.
+const prices = ref<PriceAdminStatus | null>(null);
+const pricesBusy = ref(false);
+const priceSyncBusy = ref(false);
+// The field is a DRAFT until saved: typing a URL must not start hourly fetches
+// at half a hostname. Re-seeded from the server on every refresh, except while
+// the operator is mid-edit.
+const feedDraft = ref("");
+const feedDirty = ref(false);
+
+async function refreshPrices(seedDraft = true) {
+  if (!isAdmin.value) return;
+  try {
+    prices.value = await fetchPriceAdmin();
+    if (seedDraft && !feedDirty.value) feedDraft.value = prices.value.custom ? prices.value.base : "";
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function togglePrices(enabled: boolean) {
+  if (pricesBusy.value) return;
+  pricesBusy.value = true;
+  try {
+    await savePriceAdmin({ enabled });
+    // Enabling kicks off a first sync server-side when the mirror is empty, so
+    // the panel would otherwise sit on "0 listings" until the top of the hour.
+    await refreshPrices();
+    emit("notify", enabled ? "Price feed enabled." : "Price feed disabled.", "success");
+    if (enabled) void pollPricesUntilSynced();
+  } catch (e) {
+    fail(e);
+  } finally {
+    pricesBusy.value = false;
+  }
+}
+
+/** Switching source empties the table server-side — a market's reference price
+ *  and a feed's 7-day average live in different columns, so the old rows would
+ *  resolve to nothing rather than to something wrong. Re-sync immediately so the
+ *  operator never sees the empty middle. */
+async function setPriceSource(source: PriceSource) {
+  if (pricesBusy.value || prices.value?.source === source) return;
+  pricesBusy.value = true;
+  try {
+    await savePriceAdmin({ source });
+    await refreshPrices();
+    // NOT a sync here. Switching source empties the table, and the PUT handler
+    // sees that and starts one itself — asking for a second immediately after
+    // hits the "already running" guard and shows the operator a red error on the
+    // ordinary path of picking a provider. Poll for the one already in flight.
+    if (prices.value?.enabled) void pollPricesUntilSynced();
+  } catch (e) {
+    fail(e);
+  } finally {
+    pricesBusy.value = false;
+  }
+}
+
+async function saveFeedUrl() {
+  if (pricesBusy.value) return;
+  pricesBusy.value = true;
+  try {
+    await savePriceAdmin({ base: feedDraft.value.trim() });
+    feedDirty.value = false;
+    await refreshPrices();
+    emit("notify", "Feed URL saved. Sync now to test it.", "success");
+  } catch (e) {
+    fail(e);
+  } finally {
+    pricesBusy.value = false;
+  }
+}
+
+async function doSyncPrices() {
+  if (priceSyncBusy.value) return;
+  priceSyncBusy.value = true;
+  try {
+    const result = await syncPricesNow();
+    await refreshPrices();
+    emit("notify", `Mirrored ${result.rows.toLocaleString()} listings (${result.unmatched.toLocaleString()} unmatched).`, "success");
+  } catch (e) {
+    // The failure text is the whole diagnostic — an HTTP status, a JSON parse
+    // error or "mapped to zero rows" each point somewhere completely different.
+    fail(e);
+    await refreshPrices();
+  } finally {
+    priceSyncBusy.value = false;
+  }
+}
+
+async function doClearPrices() {
+  if (pricesBusy.value) return;
+  pricesBusy.value = true;
+  try {
+    await clearPrices();
+    await refreshPrices();
+    emit("notify", "Mirrored prices deleted.", "success");
+  } catch (e) {
+    fail(e);
+  } finally {
+    pricesBusy.value = false;
+  }
+}
+
+/** The first sync after enabling runs in the background — watch it land rather
+ *  than leaving the operator to guess whether it worked. */
+async function pollPricesUntilSynced() {
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    await refreshPrices();
+    if (!prices.value?.syncing && (prices.value?.listings || prices.value?.failedAt)) return;
+  }
+}
+
+const priceAge = computed(() => {
+  const at = prices.value?.syncedAt;
+  if (!at) return null;
+  const mins = Math.round((Date.now() - new Date(at).getTime()) / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+});
+
+
 watch(
   activeKey,
   (key) => {
@@ -646,6 +801,8 @@ watch(
     } else if (key === "models") {
       refreshExtractStatus();
       refreshCacheStats(); // for the on-disk size of what's already extracted
+    } else if (key === "prices") {
+      refreshPrices();
     }
     if (key !== "models" && key !== "assets") stopPoll();
   },
@@ -991,7 +1148,7 @@ const BTN_DANGER =
                   <span v-else-if="!assetCdn.origin" class="text-muted-foreground">
                     The CDN is not reachable or has nothing published.
                   </span>
-                  <span v-else-if="assetCdn.available === true" class="text-[hsl(var(--tac-cyan))]">
+                  <span v-else-if="assetCdn.available === true" class="text-[hsl(var(--tac-value))]">
                     ✓ Serving <span class="font-mono">v{{ assetCdn.extractVersion }}-{{ assetCdn.gameBuild }}</span> —
                     <template v-if="assetCdn.buildUnknown">pipeline matches; no CS2 install here to verify the build against.</template>
                     <template v-else-if="assetCdn.projected">matches what this server would extract.</template>
@@ -1011,6 +1168,279 @@ const BTN_DANGER =
                 This server's own extracted files stay on disk and are used again the moment this is turned off.
               </p>
             </div>
+          </div>
+        </section>
+
+        <!-- Prices. A mirrored Steam market feed — what an item is worth, next
+             to the item. Its own tab rather than a row under Asset Cache: it is
+             the one setting here that changes what PLAYERS see, and burying it
+             with the disk-usage tooling is how a switch stays undiscovered. -->
+        <section v-else-if="activeKey === 'prices'" :class="CARD">
+          <div class="space-y-6 p-6">
+            <div class="flex items-start gap-3">
+              <span :class="RULE" />
+              <div class="min-w-0 flex-1 space-y-0.5">
+                <h3 class="text-sm font-semibold uppercase tracking-wider text-foreground">Market prices</h3>
+                <p class="text-sm text-muted-foreground">
+                  Mirror a Steam market price feed so items show what they're worth — real inventory value, and
+                  what a craft would cost to buy for real.
+                </p>
+              </div>
+            </div>
+
+            <template v-if="prices">
+              <!-- The switch. Off by default and explicit for the same reason as
+                   the asset CDN: enabling it makes this server fetch from a host
+                   outside the operator's network, once an hour. -->
+              <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Price feed</p>
+                <div class="rounded-md border border-border">
+                  <div class="flex items-start justify-between gap-4 px-4 py-3">
+                    <span class="min-w-0">
+                      <span class="block text-sm text-foreground">Mirror market prices</span>
+                      <span class="block text-xs text-muted-foreground">
+                        This server fetches
+                        <span class="font-mono break-all">{{ prices.url }}</span>
+                        every {{ prices.intervalMinutes }} minutes and stores it locally. Players' browsers never talk
+                        to {{ PRICE_SOURCE_LABEL[prices.source] }} — prices reach the UI through this API.
+                      </span>
+                    </span>
+                    <button :class="BTN" :disabled="pricesBusy" @click="togglePrices(!prices.enabled)">
+                      <Loader2 v-if="pricesBusy" class="h-3.5 w-3.5 animate-spin" />
+                      {{ prices.enabled ? "Disable" : "Enable" }}
+                    </button>
+                  </div>
+                  <!-- Three states that look identical from a blank price column
+                       and have completely different fixes: never ran, ran and
+                       failed, ran fine. Never make an operator guess which. -->
+                  <div class="border-t border-border px-4 py-2.5 text-xs">
+                    <span v-if="prices.failure" class="text-destructive">
+                      Last sync failed{{ prices.failedAt ? ` (${new Date(prices.failedAt).toLocaleString()})` : "" }} —
+                      <span class="font-mono">{{ prices.failure }}</span>
+                      <template v-if="prices.listings">
+                        . The {{ prices.listings.toLocaleString() }} listings already mirrored are still being served.
+                      </template>
+                      <!-- The fix for a provider being down is another provider,
+                           and it is one click away. Say so at the point of
+                           failure rather than leaving it to be discovered. -->
+                      Pick a different source below if {{ PRICE_SOURCE_LABEL[prices.source] }} stays unreachable.
+                    </span>
+                    <span v-else-if="prices.syncing" class="text-[hsl(var(--tac-amber))]">
+                      Syncing now — this takes a few seconds.
+                    </span>
+                    <!-- Louder than "synced fine", because it looks exactly like
+                         success from here: rows in the table, a recent sync time,
+                         and not a single price anywhere in the app. -->
+                    <span v-else-if="prices.stale" class="text-[hsl(var(--tac-amber))]">
+                      The {{ prices.listings.toLocaleString() }} mirrored rows came from a different source
+                      <template v-if="prices.syncedSource">({{ PRICE_SOURCE_LABEL[prices.syncedSource] }})</template>
+                      than the one selected now, so none of them can be read — each source stores its prices in its
+                      own columns. Hit Sync now to replace them.
+                    </span>
+                    <span v-else-if="prices.listings" class="text-[hsl(var(--tac-value))]">
+                      ✓ {{ prices.listings.toLocaleString() }} listings mirrored{{ priceAge ? ` — synced ${priceAge}` : "" }}
+                      <template v-if="prices.sourceDate">
+                        (source dated {{ new Date(prices.sourceDate).toLocaleDateString() }})
+                      </template>
+                      . Shown as the {{ PRICE_WINDOW_LABEL[prices.window].toLowerCase() }}.
+                    </span>
+                    <span v-else-if="prices.enabled" class="text-muted-foreground">
+                      Enabled, nothing mirrored yet. The first sync runs on its own; "Sync now" doesn't wait for it.
+                    </span>
+                    <span v-else class="text-muted-foreground">
+                      Off — no prices anywhere in the app, and nothing is fetched.
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Where the numbers come from. Every option is THIS server
+                   pulling for itself; there is no 5stack price CDN, on purpose —
+                   a number about someone's money should come from a source the
+                   operator picked. -->
+              <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Source</p>
+                <div class="divide-y divide-border rounded-md border border-border">
+                  <!-- Driven by the server's list, not a copy of it here: which
+                       providers exist, and what each is good for, is a backend
+                       fact. Adding one should not need a frontend release. -->
+                  <button
+                    v-for="option in prices.providers"
+                    :key="option.id"
+                    class="flex w-full items-start gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/30"
+                    :disabled="pricesBusy"
+                    @click="setPriceSource(option.id)"
+                  >
+                    <span
+                      class="mt-0.5 h-3.5 w-3.5 shrink-0 rounded-full border"
+                      :class="prices.source === option.id
+                        ? 'border-[hsl(var(--tac-amber))] bg-[hsl(var(--tac-amber))]'
+                        : 'border-input'"
+                    />
+                    <span class="min-w-0 flex-1">
+                      <span class="flex flex-wrap items-baseline gap-x-2">
+                        <span class="text-sm text-foreground">{{ option.label }}</span>
+                        <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">
+                          {{ PRICE_WINDOW_LABEL[option.window] }}
+                        </span>
+                        <span
+                          v-if="prices.syncedSource === option.id && prices.listings"
+                          class="text-f10 uppercase tracking-cs4 text-[hsl(var(--tac-value))]"
+                        >
+                          {{ prices.listings.toLocaleString() }} mirrored
+                        </span>
+                      </span>
+                      <span class="block text-xs text-muted-foreground">{{ option.blurb }}</span>
+                      <span v-if="option.url" class="block truncate font-mono text-f10 text-muted-foreground/70">
+                        {{ option.url }}
+                      </span>
+                    </span>
+                  </button>
+                </div>
+                <!-- The reason five exist. A provider going down should be a
+                     setting change, not an outage — and they genuinely differ in
+                     what they cover, so switching is also how you improve it. -->
+                <p class="text-xs text-muted-foreground">
+                  All five are switchable at any time — if one goes down or starts refusing requests, pick another and
+                  hit Sync. They cover the catalog differently (sticker coverage in particular ranges from about half
+                  to nearly all of it), and only some price Doppler phases separately, so it is worth trying a couple.
+                </p>
+
+                <!-- Say plainly why Steam is not on this list. It is the obvious
+                     thing to reach for and it is measurably a trap. -->
+                <p class="text-xs text-muted-foreground">
+                  Steam's own market isn't offered: <span class="font-mono">priceoverview</span> 429s after about six
+                  requests and stays blocked for minutes, and market search pins its page size to 10 — a full sweep is
+                  ~3,500 requests, hours long, every day. It also shares an IP budget with the Steam inventory import
+                  this app already depends on, so a crawler that gets throttled takes that down too.
+                </p>
+              </div>
+
+              <!-- Only the JSON-feed source has a URL to set. Skinport's endpoint
+                   is fixed, so showing an editable box for it would be a lie. -->
+              <div v-if="prices.source === 'feed'" class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Feed URL</p>
+                <div class="space-y-2 rounded-md border border-border px-4 py-3">
+                  <label class="block text-sm text-foreground" for="price-feed-url">Feed base URL</label>
+                  <div class="flex flex-wrap items-center gap-2">
+                    <input
+                      id="price-feed-url"
+                      v-model="feedDraft"
+                      :placeholder="prices.defaultBase"
+                      spellcheck="false"
+                      autocomplete="off"
+                      class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-sm text-foreground outline-none transition-colors focus:border-[hsl(var(--tac-amber))]"
+                      @input="feedDirty = true"
+                    />
+                    <button :class="BTN" :disabled="pricesBusy || !feedDirty" @click="saveFeedUrl()">
+                      <Loader2 v-if="pricesBusy" class="h-3.5 w-3.5 animate-spin" />
+                      Save
+                    </button>
+                    <button
+                      :class="BTN"
+                      :disabled="pricesBusy || (!feedDraft && !prices.custom)"
+                      @click="feedDraft = ''; feedDirty = true"
+                    >
+                      Reset to default
+                    </button>
+                  </div>
+                  <p class="text-xs text-muted-foreground">
+                    Blank uses <span class="font-mono break-all">{{ prices.defaultBase }}</span> — the public
+                    cs2-prices-tracker project, which is somebody else's repository.
+                    <code class="font-mono">/latest.json</code> is appended to whatever you set, so point this at your
+                    own mirror if you'd rather not depend on it.
+                  </p>
+                </div>
+              </div>
+
+              <!-- Sync + prune. "Sync now" ignores the switch: an operator asking
+                   for a sync IS the opt-in, and it is how you test a URL before
+                   committing to it. -->
+              <div class="space-y-2">
+                <div class="flex flex-wrap gap-2">
+                  <button :class="BTN_PRIMARY" :disabled="priceSyncBusy" @click="doSyncPrices()">
+                    <Loader2 v-if="priceSyncBusy" class="h-3.5 w-3.5 animate-spin" />
+                    <RefreshCw v-else class="h-3.5 w-3.5" />
+                    Sync now
+                  </button>
+                  <button :class="BTN_DANGER" :disabled="pricesBusy || !prices.listings" @click="doClearPrices()">
+                    <Trash2 class="h-3.5 w-3.5" />
+                    Delete mirrored prices
+                  </button>
+                </div>
+                <p class="text-xs text-muted-foreground">
+                  Syncing replaces the whole table in one transaction, so a failed fetch leaves the previous prices
+                  exactly where they were. Testing a URL this way works with the switch off.
+                </p>
+              </div>
+
+              <!-- Unmatched names. The early warning: it is small and boring
+                   while the name -> catalog mapping works, and steps up the day
+                   an upstream rename breaks it. Without it, a whole family
+                   losing its prices looks exactly like a family that stopped
+                   trading. -->
+              <div v-if="prices.listings" class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Coverage</p>
+                <div class="divide-y divide-border rounded-md border border-border">
+                  <div class="flex items-center justify-between gap-4 px-4 py-3">
+                    <span class="min-w-0">
+                      <span class="block text-sm text-foreground">Listings mirrored</span>
+                      <span class="block text-xs text-muted-foreground">Name + wear + StatTrak + Souvenir, each priced separately.</span>
+                    </span>
+                    <span class="whitespace-nowrap font-mono text-sm">{{ prices.listings.toLocaleString() }}</span>
+                  </div>
+                  <div class="flex items-center justify-between gap-4 px-4 py-3">
+                    <span class="min-w-0">
+                      <span class="block text-sm text-foreground">Unmatched names</span>
+                      <span class="block text-xs text-muted-foreground">
+                        Listings this catalog has no entry for — mostly viewer passes and event capsules. A few percent
+                        is normal; a jump means the feed renamed something.
+                      </span>
+                    </span>
+                    <span class="whitespace-nowrap font-mono text-sm">{{ prices.unmatched.toLocaleString() }}</span>
+                  </div>
+                </div>
+                <!-- The sale-history cache. Its own row because the number it
+                     protects is a RATE BUDGET: the source allows a handful of
+                     calls per five minutes, so every listing already looked up is
+                     one nobody has to spend a request on for a week. -->
+                <div v-if="prices.history?.listings" class="flex items-center justify-between gap-4 rounded-md border border-border px-4 py-3">
+                  <span class="min-w-0">
+                    <span class="block text-sm text-foreground">Sale history cached</span>
+                    <span class="block text-xs text-muted-foreground">
+                      {{ prices.history.withData.toLocaleString() }} with recent sales; the rest are recorded as having
+                      none, so they aren't looked up again. Refreshed after
+                      {{ prices.history.staleAfterDays }} days.
+                    </span>
+                  </span>
+                  <span class="whitespace-nowrap font-mono text-sm">{{ prices.history.listings.toLocaleString() }}</span>
+                </div>
+                <details v-if="prices.unmatchedSample.length" class="rounded-md border border-border px-4 py-2.5">
+                  <summary class="cursor-pointer text-xs text-muted-foreground">Sample of unmatched names</summary>
+                  <ul class="mt-2 space-y-0.5 font-mono text-xs text-muted-foreground">
+                    <li v-for="name in prices.unmatchedSample" :key="name">{{ name }}</li>
+                  </ul>
+                </details>
+              </div>
+
+              <!-- What the number is and is not. Cheaper to say here once than to
+                   answer forever: these are Steam sale averages per wear bracket,
+                   so they cannot know about float, pattern or Doppler phase. -->
+              <div class="flex items-start gap-2 rounded-md border border-border bg-muted/20 px-4 py-3">
+                <CircleDollarSign class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <p class="text-xs text-muted-foreground">
+                  <span class="text-foreground">These are rough estimates, not sale prices.</span> Every number is a
+                  whole-wear-bracket figure, so it can't account for float, pattern (blue gems, fades) or Doppler
+                  phase — the market lists those under one name too. Applied stickers and charms are priced as
+                  separate lines at their own market value, never folded into the weapon: applying a sticker destroys
+                  its listing, and how much value survives is opinion, not data. Treat a total as a ballpark for
+                  bragging rights, never as what an inventory would fetch.
+                </p>
+              </div>
+            </template>
+            <p v-else class="text-sm text-muted-foreground">
+              Price status unavailable — older backend, or this server can't reach its database.
+            </p>
           </div>
         </section>
 
@@ -1197,9 +1627,9 @@ const BTN_DANGER =
                    look like two separate problems. -->
               <div
                 v-if="extractStatus.gameUpdated && !extractStatus.stale"
-                class="flex items-start gap-3 rounded-md border border-[hsl(var(--tac-cyan)/0.4)] bg-[hsl(var(--tac-cyan)/0.08)] px-3 py-2.5"
+                class="flex items-start gap-3 rounded-md border border-[hsl(var(--tac-value)/0.4)] bg-[hsl(var(--tac-value)/0.08)] px-3 py-2.5"
               >
-                <Info class="mt-0.5 h-3.5 w-3.5 flex-none text-[hsl(var(--tac-cyan))]" />
+                <Info class="mt-0.5 h-3.5 w-3.5 flex-none text-[hsl(var(--tac-value))]" />
                 <div class="min-w-0 space-y-1">
                   <p class="text-sm font-medium text-foreground">
                     {{ extractStatus.gameBuild != null ? "Game updated since last extract" : "Game version not recorded" }}

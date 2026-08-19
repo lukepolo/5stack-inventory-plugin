@@ -1,0 +1,123 @@
+# Correctness checks. Deliberately SEPARATE from build.yml: that workflow pushes
+# images to ghcr and needs `packages: write`, which a pull request from a fork
+# cannot have. Splitting them is what lets these run on every PR.
+#
+# What runs here is not a test suite — it is six standalone verification tools
+# that already existed in tools/ and were never wired to anything. Each was
+# written after a specific silent regression reached production:
+#
+#   slot-whitelist-check   'graffiti' equips wiped on every backend restart
+#   steam-sync-coverage    the cs2-lib 9.0.0 renames blanked ~16,500 textures
+#   inspect-roundtrip      sticker rotation clamped where it must wrap
+#   stattrak-digits        leading-zero bugs invisible at card size
+#   i18n-check             two Armory keys called and absent from en.json, so
+#                          those controls were unreachable to any translator
+#   sort-modes-check       a sort mode can exist, sort correctly, and never be
+#                          offered — the grid just looks unchanged
+#
+# The shared failure mode is silence: nothing crashes, the data is just quietly
+# wrong. That is why these are worth CI minutes.
+#
+# An unwired verifier is the same failure one step up: it only runs when someone
+# remembers it. i18n-check and sort-modes-check both sat in tools/ passing and
+# uninvoked, which is why they are here now.
+name: checks
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # 22 for `--experimental-strip-types`: every tool here is TypeScript
+          # run directly, with no build step. Matches codepier.yaml's node:22.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+
+      # `npm ci` rather than `npm install` on purpose. The tools read the
+      # economy through backend/src/catalog.ts, so a node_modules that has
+      # drifted from the lockfile tests a different cs2-lib than production
+      # ships — which is not hypothetical: a local tree sitting on 8.2.0 while
+      # the lockfile pinned 9.0.0 made every weapon look un-importable.
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install backend dependencies
+        run: npm ci
+        working-directory: backend
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Loadout slot whitelists agree
+        run: npm run check:slots
+
+      - name: Steam import covers the economy
+        run: npm run check:steam-sync
+
+      - name: Inspect link round-trips
+        run: npm run check:inspect
+
+      - name: StatTrak digits match the shader
+        run: npm run check:stattrak
+
+      # The five below catch classes of break `npm run typecheck` is
+      # structurally blind to, which is the whole reason they exist:
+      #   prices — the name→catalog join fails SILENTLY, per item, forever
+      #   sfc    — vue-tsc recovers from template breaks that fail `vite build`
+      #   schema — schema.sql applies on EVERY boot, so a bad identifier is not
+      #            a failed migration, it is a backend that will not start
+      #   i18n   — tr(key, fallback) is TOTAL, so a key the catalogue lacks
+      #            renders its English fallback and the screen looks correct
+      #   sorts  — SORT_NATURAL and friends are Record<SortMode, …> and do fail
+      #            to compile, but the SORTS menu is an ARRAY, so tsc cannot
+      #            tell that a mode is never offered
+      # All five have already caught real breaks in this tree.
+      - name: Prices reach the items people own
+        run: npm run check:prices
+
+      - name: Every .vue file parses
+        run: npm run check:sfc
+
+      - name: Schema has no reserved-word columns
+        run: npm run check:schema
+
+      - name: Translation keys match the catalogue
+        run: npm run check:i18n
+
+      # Bundled with esbuild rather than run through --experimental-strip-types.
+      # sortModes.ts used to import only TYPES, which type-stripping erases, so
+      # node could load it directly. The moment it grew a real runtime import
+      # (RARITY_META from ./itemVisuals) that stopped being true: src/ imports are
+      # extensionless for Vite's bundler resolution, and node's ESM loader cannot
+      # resolve those. Bundling first makes the tool immune to whatever the module
+      # imports next, instead of bending app code to suit the checker.
+      - name: Every sort mode is reachable
+        run: npm run check:sorts
+
+  # NOT in the job above: tools/charmsim-check.ts needs a directory of
+  # *.phys.json from the extracted CS2 assets, which no clean runner has. Run it
+  # by hand against a mount with `npm run check:charmsim -- <dir>`. Splitting it
+  # out is deliberate — the useful half runs on every PR rather than nothing
+  # running because one check needs 5.5GB of decompiled game data.

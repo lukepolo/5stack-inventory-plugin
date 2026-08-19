@@ -131,7 +131,24 @@ export type ControlIcon =
   | "spinTouch"
   | "zoomTouch"
   | "panTouch"
-  | "moveTouch";
+  | "moveTouch"
+  | "rotateTouch";
+
+/**
+ * Transport glyphs, which deliberately break the grammar above.
+ *
+ * Every other icon here is a SENTENCE — verb plus device, "these arcs with that
+ * button" — because the legend describes gestures you perform elsewhere. Play
+ * and pause are not gestures; they are the button itself, and the universal
+ * shapes for them carry no device half and need none. So they get their own
+ * square canvas and are filled rather than stroked, which is also what stops a
+ * 6px triangle reading as a stray hairline next to the reticle-weight glyphs.
+ */
+export const TRANSPORT_ICON_VIEWBOX = "0 0 16 16";
+export const TRANSPORT_ICON = {
+  play: '<path d="M5 3.4 12.2 8 5 12.6Z" fill="currentColor" stroke="none"/>',
+  pause: '<path d="M4.6 3.6h2.3v8.8H4.6ZM9.1 3.6h2.3v8.8H9.1Z" fill="currentColor" stroke="none"/>',
+};
 
 export const CONTROL_ICON: Record<ControlIcon, string> = {
   spin: V_SPIN + mouse("left"),
@@ -143,4 +160,8 @@ export const CONTROL_ICON: Record<ControlIcon, string> = {
   zoomTouch: V_PINCH + TWO_FINGERS,
   panTouch: V_CROSS + TWO_FINGERS,
   moveTouch: V_CROSS_ITEM + ONE_FINGER,
+  // The twist. Same verb as the mouse's shift-drag — one sweep, the thing
+  // turning rather than the camera going round it — because it IS the same
+  // gesture; only the device half changes.
+  rotateTouch: V_TURN + TWO_FINGERS,
 };

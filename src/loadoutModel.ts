@@ -120,3 +120,18 @@ export const EXTRAS = [
   { slot: "collectible", name: "Pin / Medal" },
 ];
 export const ALL_SPECIALS = [...RAIL, ...EXTRAS];
+
+/**
+ * The order a preset deck card fans a build's items: signature pieces first
+ * (knife, gloves), then rifles, mid-tier, pistols, the agent last. Skinned rows
+ * sort ahead of free defaults within it. Applied to every card's rows alike,
+ * shown or parked, so the cards agree.
+ */
+export const PREVIEW_ORDER = [
+  "knife", "gloves", "r1", "r2", "r3", "r4", "r5", "m1", "m2", "m3", "m4", "m5", "sp", "p1", "p2", "p3", "p4", "agent",
+];
+export function sortPreview<T extends { slot: string; skinned: boolean }>(rows: T[]): T[] {
+  return rows
+    .filter((r) => PREVIEW_ORDER.includes(r.slot))
+    .sort((a, b) => Number(b.skinned) - Number(a.skinned) || PREVIEW_ORDER.indexOf(a.slot) - PREVIEW_ORDER.indexOf(b.slot));
+}

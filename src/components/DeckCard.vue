@@ -10,6 +10,7 @@
 // The inventory grid and the loadout sheet rendered this as two copies of the
 // same markup, differing only in `data-role`, whether they carried a `title`,
 // and which drill-down ref the click wrote to.
+import { inject } from "vue";
 import type { InventoryItem } from "../api";
 import { CARD_ART, glowStyle } from "../itemVisuals";
 import { Palette } from "lucide-vue-next";
@@ -34,6 +35,8 @@ defineProps<{
 }>();
 
 const emit = defineEmits<{ (e: "open"): void }>();
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 </script>
 
 <template>
@@ -43,7 +46,7 @@ const emit = defineEmits<{ (e: "open"): void }>();
       :data-role="role"
       class="group relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-border bg-card px-2.5 py-2.5 text-left transition-colors hover:border-[color:var(--acc)]"
       :style="face.item?.rarity ? { borderBottom: `3px solid ${face.item.rarity}` } : {}"
-      :title="`${count} colours — open`"
+      :title="tr('inventory.deck.open', '{count} colours — open', { count })"
       @click="emit('open')"
     >
       <span class="pointer-events-none absolute inset-0" :style="glowStyle(face.item?.rarity, 0.22)"></span>

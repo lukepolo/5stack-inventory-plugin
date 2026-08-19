@@ -47,13 +47,18 @@ const displayedStickerIdOf = (i) => i.displayedStickerId ?? i.stickerId;
 // missing one it is a cosmetic delay — not a blank card. Everything else has NO
 // second source, so a miss there is a permanently empty tile. The extractor
 // reports the two separately; don't collapse them.
-// NOT widened when gloves/agents/charms gained 3D views: this set means "the
-// icon is a placeholder while a card bakes", and those types render 3D ON DEMAND
-// only — their grid card IS the flat icon. Marking them here would downgrade a
+// The rule is "does an OWNED one of these bake a card", not "does it have a 3D
+// view" — marking a type that only renders on demand would downgrade a
 // permanently blank tile to a "cosmetic delay" in the extractor's report, which
-// is the opposite of true. Add a type here when it starts baking cards, not when
-// it starts rendering.
-const RENDERED_IN_3D = new Set(["weapon", "melee"]);
+// is the opposite of true.
+//
+// `keychain` and `glove` earn their place: a charm's whole look is its pattern
+// and a glove's is its pattern and its wear, so in both cases the icon is one
+// frozen sample and owned ones bake cards of their own (CARD_BAKE_KINDS in
+// src/App.vue). Agents and stickers are still out — their icons only stop being
+// true once a patch or a scuff lands, which is a per-item question, not a type
+// one.
+const RENDERED_IN_3D = new Set(["weapon", "melee", "keychain", "glove"]);
 
 // ---- sticker kit id, the ONLY thing that tells two same-named decals apart ---
 //

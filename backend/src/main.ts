@@ -1,15 +1,21 @@
-import { readFileSync, createWriteStream } from "node:fs";
+import { readFileSync, createReadStream, createWriteStream } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Fastify, { LogController } from "fastify";
+// Type-only, so node's type stripping erases it — "pg" is CJS and has no such
+// runtime export to import.
+import type { PoolClient } from "pg";
 import { pool } from "./db.ts";
+// Shared with scripts/serve.mjs — see the module header for why it is .mjs.
+import { parseByteRange } from "./byteRange.mjs";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
 import {
   getStickerMarkup,
+  slotCount,
   getCharmMarkup,
   charmBounds,
   getCharmModels,
@@ -17,6 +23,34 @@ import {
   getPatchMaterials,
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
+import {
+  itemDescription,
+  itemTitle,
+  parseShareTarget,
+  pngPixelSize,
+  renderUnfurl,
+  requestOrigin,
+  truncate,
+  type ItemFacts,
+  type ShareTarget,
+} from "./share.ts";
+import {
+  pickPrice,
+  priceTargetKey,
+  quoteItem,
+  wearTierSql,
+  PRICE_FEED_BASE,
+  PRICE_PROVIDERS,
+  PRICE_SOURCES,
+  PRICE_WINDOWS,
+  DEFAULT_PRICE_SOURCE,
+  DEFAULT_WINDOW,
+  providerUrl,
+  type PriceSource,
+  type PricePoint,
+  type PriceWindow,
+  type Quote,
+} from "./prices.ts";
 import {
   getWeapons,
   getDefaults,
@@ -26,6 +60,8 @@ import {
   getGloves,
   getMusicKits,
   getCollectibles,
+  getCollections,
+  getCollection,
   searchAttachments,
   type AttachKind,
   type AttachQuery,
@@ -34,6 +70,10 @@ import {
   getItemsByIds,
   getItem,
   getItemIdByName,
+  catalogSummary,
+  priceGroupId,
+  wearTierIndex,
+  wearTierOf,
   parseSteamMarketName,
   isOwnable,
   slotForItem,
@@ -296,12 +336,19 @@ const COMPOSITE_MAX_BYTES = 48 * 1024 * 1024;
 const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
 const MODELS_DIR = process.env.MODELS_DIR ?? "/cs2-models/models";
+const MUSIC_DIR = process.env.MUSIC_DIR ?? "/cs2-models/music";
 const ASSET_TYPES: Record<string, string> = {
   ".json": "application/json",
   ".webp": "image/webp",
   ".png": "image/png",
   ".glb": "model/gltf-binary",
+  // Music kit menu themes. Both containers, because the extractor probes what
+  // Source2Viewer actually wrote rather than assuming mp3 — the format follows
+  // the codec inside the .vsnd_c.
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
 };
+
 // Static asset mounts, populated ONLY by our own extractor from the instance's
 // own CS2 install (scripts/extract-models.sh). A miss is a 404 and stays a
 // 404: there is no upstream to fall back to by design, so an unpopulated or
@@ -316,24 +363,58 @@ function serveAssetDir(routePrefix: string, dir: string) {
       return reply.status(404).send({ error: "not found" });
     }
     reply.header("Access-Control-Allow-Origin", "*");
+    // On EVERY reply, not just ranged ones: a browser only attempts a range
+    // request after an ordinary response told it ranges are available, so an
+    // <audio> element that never sees this header treats the track as
+    // unseekable and downloads all 3.5MB before the first note.
+    reply.header("Accept-Ranges", "bytes");
+    const file = path.join(dir, rel);
+    // Two very different lifetimes behind one route:
+    //
+    //  - TEXTURES and ICONS carry a content hash in the filename, so a given
+    //    URL never changes meaning. Cache them hard.
+    //  - MATERIAL JSON does NOT: the filename comes from cs2-lib and is fixed,
+    //    while the content (and the texture names it points at) is rewritten
+    //    by every extraction. Caching those for a day meant a browser kept a
+    //    material referencing textures the new run had renamed — every one
+    //    404'd and the skin rendered white long after the mount was correct.
+    //  - MUSIC is the material case again: `valve_cs2_01.mp3` is a name the
+    //    extractor reuses every run, so it is NOT self-versioning either, and
+    //    treating it as immutable on filename alone would pin a browser to one
+    //    CS2 build's audio forever.
+    //
+    // So both are only immutable once the client has stamped the extraction
+    // version on them (see withAssetVersion). Unversioned requests still
+    // revalidate, which keeps old clients and hand-typed URLs correct.
+    // Set on the SUCCESS paths only, never up here. A miss on this route is a
+    // 404, and the extractor's atomic directory swap makes misses real: for the
+    // instant between its two renames the live directory does not exist, and a
+    // pod whose mount is a run behind answers 404 for longer than that. A 404
+    // that goes out `immutable` is a 404 the browser and Cloudflare keep for a
+    // year against a URL whose content now exists, so the skin stays white long
+    // after the mount is correct — the exact trap /images had to be fixed for
+    // once already. Errors carry no Cache-Control and revalidate every time.
+    const versioned = (request.query as { v?: string } | undefined)?.v != null;
+    const selfVersioning = type !== "application/json" && !type.startsWith("audio/");
+    const cacheControl = selfVersioning || versioned ? "public, max-age=31536000, immutable" : "no-cache";
     try {
-      const buf = await fs.readFile(path.join(dir, rel));
-      // Two very different lifetimes behind one route:
-      //
-      //  - TEXTURES and ICONS carry a content hash in the filename, so a given
-      //    URL never changes meaning. Cache them hard.
-      //  - MATERIAL JSON does NOT: the filename comes from cs2-lib and is fixed,
-      //    while the content (and the texture names it points at) is rewritten
-      //    by every extraction. Caching those for a day meant a browser kept a
-      //    material referencing textures the new run had renamed — every one
-      //    404'd and the skin rendered white long after the mount was correct.
-      //
-      // So a material is only immutable once the client has stamped the
-      // extraction version on it (see withAssetVersion). Unversioned requests
-      // still revalidate, which keeps old clients and hand-typed URLs correct.
-      const versioned = (request.query as { v?: string } | undefined)?.v != null;
-      const immutable = type !== "application/json" || versioned;
-      reply.header("Cache-Control", immutable ? "public, max-age=31536000, immutable" : "no-cache");
+      // Only stat when a range was actually asked for: the icon and texture
+      // routes are hot and pay nothing for a feature they never use.
+      if (request.headers.range) {
+        const { size } = await fs.stat(file);
+        const range = parseByteRange(request.headers.range, size);
+        if (range === false) {
+          return reply.code(416).header("Content-Range", `bytes */${size}`).send();
+        }
+        if (range) {
+          reply.header("Cache-Control", cacheControl);
+          reply.header("Content-Range", `bytes ${range.start}-${range.end}/${size}`);
+          reply.header("Content-Length", range.end - range.start + 1);
+          return reply.code(206).type(type).send(createReadStream(file, { start: range.start, end: range.end }));
+        }
+      }
+      const buf = await fs.readFile(file);
+      reply.header("Cache-Control", cacheControl);
       return reply.type(type).send(buf);
     } catch {
       return reply.status(404).send({ error: "not extracted" });
@@ -350,6 +431,10 @@ serveAssetDir("/images", IMAGES_DIR);
 // brief blank. Same contract as the others: our own extractor is the only
 // writer, and a genuine miss stays a 404.
 serveAssetDir("/models", MODELS_DIR);
+// Music kit audio. Registered here for the same cross-node reason as the rest —
+// nginx's /music/ block ends in `try_files $uri @backend` — and it is the one
+// mount whose clients seek, which is why serveAssetDir learned byte ranges.
+serveAssetDir("/music", MUSIC_DIR);
 
 // Serve renders directly too — nginx falls back here when its mount copy
 // misses (e.g. frontend/backend pods on different nodes).
@@ -375,6 +460,492 @@ for (const route of ["/api/renders/:key", "/renders/:key"]) {
   }
   });
 }
+
+// ---- Share cards (what a pasted link unfurls to) ----------------------------
+//
+// A shared craft or loadout link shows a picture in Discord, and that picture is
+// a render the OWNER'S BROWSER already baked — never one made on demand.
+//
+// That constraint is the design. This pod has no GL context and no headless
+// browser, so rendering here is not on the table; and even if it were, a crawler
+// must never be able to start a 40-second composite by following a link, because
+// a chat client fanning five unfurl fetches at a skin nobody has rendered is the
+// cheapest denial of service in the building. So these routes only ever SERVE
+// what is already on the mount: the card bake the client uploads through POST
+// /api/render/:id, or failing that the flat econ icon that ships with every
+// finish. A skin nobody has opened in 3D unfurls with its Steam icon and the
+// right words — a card, not a stall.
+//
+// The INCOMPLETE sentinel is inherited rather than re-checked: a white
+// mid-extraction snapshot is refused by the client before it is ever uploaded
+// (snapshotModelNow in src/viewer3d.ts), so everything in RENDERS_DIR has
+// already passed that gate. Nothing here writes to that directory, so nothing
+// here can weaken it.
+//
+// The public URL of a card is /api/share/image with the link's own state in the
+// query, and it stays that URL whatever it resolves to. That is deliberate: the
+// first person to paste a link may only get the flat icon, and when the owner's
+// client bakes the render later the SAME url starts answering with it, so the
+// unfurl improves on its own. The cache lifetime carries that (see below) —
+// there is nothing to invalidate, because there is nothing keyed on the answer.
+
+/**
+ * The one item a loadout card shows, in preference order.
+ *
+ * A loadout is 20-odd slots and an unfurl is one picture, so something has to
+ * choose. The knife leads because it is the piece a CS2 loadout is judged by and
+ * the one people spend on; rifles next (the gun the sender is most likely
+ * showing off), then SMGs/heavies, then pistols. Gloves and the agent sit below
+ * the guns — they render as a pair of hands and a person, which read as a
+ * different kind of picture entirely — and the slots with no model at all
+ * (music kit, graffiti) come last so they are only ever a last resort.
+ *
+ * Within this order a slot whose render is already baked wins over one that is
+ * not, so a shared loadout shows a real render whenever the owner has ever
+ * looked at one of these items in 3D.
+ *
+ * This is a THIRD list of slot names (SLOT_RE and schema.sql's boot DELETE are
+ * the other two) and deliberately not enforced against them: those two must
+ * agree or a restart wipes people's equips, while a slot missing from this one
+ * merely ranks last in a beauty contest. Nothing here can lose a row.
+ */
+const SHARE_HERO_SLOTS = [
+  "knife", "r1", "r2", "r3", "r4", "r5",
+  "m1", "m2", "m3", "m4", "m5",
+  "sp", "p1", "p2", "p3", "p4",
+  "gloves", "agent", "zeus", "c4",
+  "collectible", "graffiti", "musickit",
+];
+
+/** An item a card can be written about: the catalog scalars, plus the owned row
+ *  behind them when there is one (a draft has none — nothing owns it yet). */
+type ShareFacts = ItemFacts & { instanceId: number | null };
+
+/** Where a card's picture comes from: a file on the mount, or the first-party
+ *  CDN for a box whose own extraction has not run yet. */
+interface ShareArt {
+  file?: string;
+  url?: string;
+  type: string;
+  /** True for the owner's real 3D bake, false for the flat econ icon. Decides
+   *  the cache lifetime and nothing else. */
+  baked: boolean;
+}
+
+/**
+ * The owner's baked card for one row, if it is already on the mount.
+ *
+ * Keyed through renderKeyForRow — the SAME server-side derivation the upload
+ * path uses, so this cannot be pointed at another user's slot by anything in the
+ * request. The key is never handed out: the file is served as bytes rather than
+ * redirected to /renders/<key>, because that filename spells `inst-<row id>` and
+ * a Location header would put the owner's row handle in a public response, which
+ * is exactly what withoutInstanceHandle exists to prevent one level down.
+ */
+async function bakedShareRender(facts: ShareFacts, version: number): Promise<string | null> {
+  if (facts.instanceId == null) return null;
+  const file = path.join(
+    RENDERS_DIR,
+    renderKeyForRow({ id: facts.instanceId, wear: facts.wear, seed: facts.seed, stattrak: facts.stattrak }, version),
+  );
+  return (await fs.stat(file).then((s) => s.isFile(), () => false)) ? file : null;
+}
+
+/** The econ icon's path on the mount, or null if the catalog's value is not the
+ *  shape this mount serves. Validated like serveAssetDir even though the string
+ *  comes from cs2-lib rather than the request — the ITEM ID does come from the
+ *  request, and one exported path with a `..` in it would be enough. */
+function econIconFile(image: string | null | undefined): string | null {
+  if (!image || !image.startsWith("/images/")) return null;
+  const rel = image.slice("/images/".length);
+  if (rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+\.webp$/.test(rel)) return null;
+  return path.join(IMAGES_DIR, rel);
+}
+
+/**
+ * The best picture we HAVE for an item — bake, then icon, then the CDN.
+ *
+ * Never the picture we could make: see the header. The icon fallback is what
+ * makes "never bake cold" a feature rather than a hole — every finish in the
+ * economy ships one, so a craft link for a skin nobody has rendered still
+ * unfurls with the artwork Steam itself shows.
+ *
+ * That icon goes out as WEBP, which every crawler worth the name reads
+ * (Discord, Slack and Twitter cards all do). Transcoding is not an option
+ * anyway: there is no image encoder in this pod, and the choice is a webp or no
+ * picture at all.
+ */
+async function shareArtFor(facts: ShareFacts | null, version: number): Promise<ShareArt | null> {
+  if (!facts) return null;
+  const baked = await bakedShareRender(facts, version);
+  if (baked) return { file: baked, type: "image/png", baked: true };
+  const image = getItem(facts.itemId)?.image ?? null;
+  const icon = econIconFile(image);
+  if (icon && (await fs.stat(icon).then((s) => s.isFile(), () => false))) {
+    return { file: icon, type: "image/webp", baked: false };
+  }
+  // A deployment whose own extraction has never run has no icons either, and a
+  // link that unfurls blank on a fresh install reads as the feature being
+  // broken. assetOrigin() is the same first-party mirror the client falls back
+  // to in that state, and it stops answering the moment a local extraction
+  // completes — see its own note on why that is not "silently using someone
+  // else's assets".
+  const origin = await assetOrigin();
+  return origin && image ? { url: `${origin}${image}`, type: "image/webp", baked: false } : null;
+}
+
+/**
+ * The equipped-only rule, and why the share routes need one.
+ *
+ * /api/loadout/:steamId is public by design — an equipped loadout is already
+ * public, because /api/equipped/v5 hands the same items to any game server that
+ * asks with no credential at all. What a player merely OWNS is not, and the
+ * README is explicit that an owned-item list would need a decision before it got
+ * a route. An image endpoint that answered for any instance id would be that
+ * route in pictures, reachable by counting.
+ *
+ * So a row answers only while it is equipped in the live loadout — precisely the
+ * set /api/loadout/:steamId already discloses. Anything else reads as unknown
+ * and unfurls as the plain app card, WITHOUT even the item's icon: the icon
+ * would name the skin, and "instance 41,207 is a Redline" is the disclosure this
+ * whole rule exists to withhold. That costs nothing real, because an item link
+ * is owner-only by design — the share menu says so in as many words, and the
+ * portable form of a craft is the /craft link, which needs no row at all.
+ */
+async function equippedShareFacts(instanceId: number): Promise<ShareFacts | null> {
+  const { rows } = await pool.query<{
+    id: string; item_id: number; wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+  }>(
+    `SELECT i.id, i.item_id, i.wear, i.seed, i.stattrak, i.nametag
+       FROM inventory.owned_items i
+      WHERE i.id = $1
+        AND EXISTS (SELECT 1 FROM inventory.loadout l WHERE l.item_instance_id = i.id)`,
+    [instanceId],
+  );
+  const row = rows[0];
+  return row
+    ? {
+        instanceId: Number(row.id),
+        itemId: Number(row.item_id),
+        wear: row.wear == null ? null : Number(row.wear),
+        seed: row.seed == null ? null : Number(row.seed),
+        stattrak: !!row.stattrak,
+        nametag: row.nametag,
+      }
+    : null;
+}
+
+/** The hero of a public loadout: highest-ranked slot with a bake, else the
+ *  highest-ranked slot at all. Reads the same rows /api/loadout/:steamId serves
+ *  and returns none of the handles — only the scalars a card is written from. */
+async function loadoutShareFacts(
+  steamId: string,
+  team: "CT" | "T" | null,
+  version: number,
+): Promise<ShareFacts | null> {
+  const { rows } = await pool.query<{
+    team: string; slot: string; id: string | null; item_id: number | null;
+    wear: number | null; seed: number | null; stattrak: boolean | null; nametag: string | null;
+  }>(
+    `SELECT l.team, l.slot, i.id,
+            COALESCE(i.item_id, l.item_id) AS item_id,
+            COALESCE(i.wear, l.wear) AS wear,
+            COALESCE(i.seed, l.seed) AS seed,
+            COALESCE(i.stattrak, l.stattrak) AS stattrak,
+            COALESCE(i.nametag, l.nametag) AS nametag
+       FROM inventory.loadout l
+       LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+      WHERE l.steam_id = $1`,
+    [steamId],
+  );
+  // An absent `team` means CT, not "either": App.vue's viewQuery omits the key
+  // when it matches DEFAULT_TEAM, so the commonest loadout link in existence
+  // carries no team at all and must not land on the T side by row order.
+  const wanted = team ?? "CT";
+  const ordered = rows
+    .filter((r) => r.item_id != null)
+    .map((r) => {
+      const slot = SHARE_HERO_SLOTS.indexOf(r.slot);
+      return { r, rank: (r.team === wanted ? 0 : 1000) + (slot < 0 ? 999 : slot) };
+    })
+    .sort((a, b) => a.rank - b.rank)
+    .map(({ r }) => ({
+      instanceId: r.id == null ? null : Number(r.id),
+      itemId: Number(r.item_id),
+      wear: r.wear == null ? null : Number(r.wear),
+      seed: r.seed == null ? null : Number(r.seed),
+      stattrak: !!r.stattrak,
+      nametag: r.nametag,
+    }));
+  for (const facts of ordered) {
+    if (await bakedShareRender(facts, version)) return facts;
+  }
+  return ordered[0] ?? null;
+}
+
+async function shareFactsFor(target: ShareTarget, version: number): Promise<ShareFacts | null> {
+  switch (target.kind) {
+    case "draft": {
+      // No row and no bake by definition — a draft is a link, not an item
+      // anybody owns yet. It resolves to the finish's icon, which is why the
+      // craft link that carries a full sticker layout still unfurls with the
+      // skin on it.
+      //
+      // The defaults matter as much as the values: encodeDraft OMITS anything
+      // sitting at its default, so an absent wear or seed is not "unknown", it
+      // is the editor's neutral pair — which is why decodeDraft restores
+      // DEFAULT_WEAR and seed 1 on the way back in. Without the same restoration
+      // here the commonest craft link in existence (a finish nobody has dragged
+      // a slider on) unfurls with no float, no pattern and no wear bracket. The
+      // floor is the finish's own minimum where it has one: 1,683 of the 2,106
+      // finishes are narrower than 0..1, and a card claiming a Factory New
+      // 0.0000 Blaze describes an item that cannot exist.
+      const skin = getItem(target.skinId);
+      return {
+        instanceId: null,
+        itemId: target.skinId,
+        wear: target.wear ?? skin?.wearMin ?? 0,
+        seed: target.seed ?? 1,
+        stattrak: target.stattrak,
+        nametag: target.nametag,
+      };
+    }
+    case "instance":
+      return equippedShareFacts(target.instanceId);
+    case "player":
+      return loadoutShareFacts(target.steamId, target.team, version);
+    default:
+      return null;
+  }
+}
+
+/** Title and blurb for a target, once its facts are known. */
+function shareText(target: ShareTarget, facts: ShareFacts | null): { title: string; description: string } {
+  const name = facts ? itemTitle(facts) : null;
+  const specs = facts ? itemDescription(facts) : "";
+  if (target.kind === "player") {
+    // Nothing here knows the player's NAME — identity lives in the panel, and
+    // this endpoint is unauthenticated. The panel's own unfurl middleware does
+    // know it, which is why /api/share/meta hands back the parts separately: it
+    // can put the person in the title and keep the item in the line below.
+    return {
+      title: name ?? "CS2 loadout",
+      description: truncate(["Equipped CS2 loadout", specs].filter(Boolean).join(" · ")),
+    };
+  }
+  if (name) {
+    return { title: name, description: truncate(specs || "CS2 skin on 5Stack") };
+  }
+  return {
+    title: "5Stack Inventory",
+    description: "Craft, equip and inspect CS2 skins — rendered with the game's own shaders.",
+  };
+}
+
+/**
+ * The canonical query for a card's IMAGE — the state, and nothing else.
+ *
+ * Rebuilt from the parsed target rather than forwarded from the request so the
+ * image URL is stable and cacheable: two links to the same craft that differ
+ * only in which screen they were copied from (`?from=`, `?sort=`, a stale `?d=2`)
+ * must not fan out into two cache entries of the identical picture. The keys
+ * dropped here are the ones the picture cannot depend on — the renderer never
+ * sees them.
+ */
+function shareImageQuery(target: ShareTarget): URLSearchParams {
+  const params = new URLSearchParams();
+  switch (target.kind) {
+    case "draft":
+      params.set("path", `/craft/${target.skinId}`);
+      if (target.wear != null) params.set("wear", String(target.wear));
+      if (target.seed != null) params.set("seed", String(target.seed));
+      if (target.stattrak) params.set("st", "1");
+      if (target.nametag) params.set("name", target.nametag);
+      break;
+    case "instance":
+      params.set("path", `/items/${target.instanceId}`);
+      break;
+    case "player":
+      params.set("path", "/");
+      params.set("player", target.steamId);
+      if (target.team) params.set("team", target.team);
+      break;
+    default:
+      params.set("path", "/");
+  }
+  return params;
+}
+
+/**
+ * The link's own query as it arrived, minus the `path` key these routes add.
+ *
+ * Used only for the HUMAN destination, and it has to be the whole thing: the
+ * placement of five stickers and a charm lives in `s0..s4`/`charm`, so a
+ * redirect that kept only the canonical keys would hand the recipient the same
+ * gun with the stickers slid back to their defaults — a link that looks like it
+ * worked. Bounded because it is reflected into a crawler-facing page: escaping
+ * makes it safe, a cap makes it small.
+ */
+function forwardedShareQuery(query: Record<string, string>): URLSearchParams {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(query)) {
+    if (k === "path" || params.size >= 32) continue;
+    if (v) params.set(k, v.slice(0, 256));
+  }
+  return params;
+}
+
+/** First value wins, so a repeated `?player=` cannot smuggle an array into a
+ *  parser that expects a string. Mirrors the client router's flatten(). */
+function flatQuery(raw: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries((raw ?? {}) as Record<string, unknown>)) {
+    const first = Array.isArray(v) ? v[0] : v;
+    if (typeof first === "string") out[k] = first;
+  }
+  return out;
+}
+
+/**
+ * Where a human who clicks a share link should land: the plugin's page in the
+ * PANEL, which is a different origin from this one and one the backend cannot
+ * derive. The panel is only ever reached in-cluster here (FIVESTACK_AUTH_URL),
+ * and the plugin's public domain is a sibling of the panel's rather than a
+ * suffix of it, so there is nothing to infer it from — it has to be configured,
+ * as FIVESTACK_PANEL_URL. Null when it is not, so callers can fall back to a URL
+ * they can prove; the card still unfurls either way, because the tags need no
+ * panel at all.
+ *
+ * Deliberately not learned from traffic the way resolveInvsimUrl learns this
+ * pod's own URL. The only header that would carry it is `Origin`, which any page
+ * on the internet can set on a credentialed request — remembering one would turn
+ * a share link into an open redirect to wherever the last attacker pointed it.
+ *
+ * The base is `/apps/<slug>` with the slug from 5stack-plugin.json, which is the
+ * contract the host implements (see the routing section of the README).
+ */
+function panelShareUrl(pluginPath: string, query: URLSearchParams): string | null {
+  const panel = (process.env.FIVESTACK_PANEL_URL ?? "").replace(/\/+$/, "");
+  if (!panel) return null;
+  const search = query.toString();
+  return `${panel}/apps/inventory${pluginPath === "/" ? "" : pluginPath}${search ? `?${search}` : ""}`;
+}
+
+/** The plugin-relative path a target came from — the human link's other half. */
+function sharePluginPath(target: ShareTarget): string {
+  switch (target.kind) {
+    case "draft":
+      return `/craft/${target.skinId}`;
+    case "instance":
+      return `/items/${target.instanceId}`;
+    default:
+      return "/";
+  }
+}
+
+/** PNG dimensions without reading the file: 24 bytes off the front. Only the
+ *  bakes are PNGs, so an icon simply has no dimensions to declare. */
+async function pngSizeOf(file: string): Promise<{ width: number; height: number } | null> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(file, "r");
+    const head = Buffer.alloc(24);
+    const { bytesRead } = await handle.read(head, 0, 24, 0);
+    return pngPixelSize(head.subarray(0, bytesRead));
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/** Everything the three routes below need, derived once — so the picture, the
+ *  words and the tags cannot disagree about what a link is. */
+async function resolveShare(query: Record<string, string>) {
+  const target = parseShareTarget(query.path ?? "/", query);
+  const version = await renderVersion();
+  const facts = await shareFactsFor(target, version);
+  const art = await shareArtFor(facts, version);
+  return { target, art, ...shareText(target, facts) };
+}
+
+// The card image. Public and unauthenticated because a crawler has no session —
+// that is the whole point of an unfurl — and because everything it can answer
+// with is either already public (an equipped loadout) or catalog artwork.
+app.get("/api/share/image", async (request, reply) => {
+  const { art } = await resolveShare(flatQuery(request.query));
+  if (!art) return reply.status(404).send({ error: "no share image" });
+  // A bake is final for its key, so it caches for a day. The icon fallback is
+  // NOT final — it is standing in for a render that may land minutes later, and
+  // an unfurl cached for a day would keep showing the flat icon long after the
+  // real thing existed. Ten minutes is enough to absorb the burst of fetches one
+  // paste produces and short enough that the next paste gets the render.
+  reply.header("Cache-Control", art.baked ? "public, max-age=86400" : "public, max-age=600");
+  if (art.url) return reply.redirect(art.url, 302);
+  try {
+    return reply.type(art.type).send(await fs.readFile(art.file as string));
+  } catch {
+    return reply.status(404).send({ error: "no share image" });
+  }
+});
+
+// The same answer as JSON, for a host that renders its own tags. The panel's
+// link shims (web/server/middleware/*-unfurl.ts) sniff the crawler UA and
+// answer at the pasted URL itself; when one lands for /apps/inventory/* this is
+// the call it makes — one request, no database access, no idea what a render key
+// is. Title and description arrive separately from the image for the same
+// reason: the panel knows the player's name and this endpoint does not.
+app.get("/api/share/meta", async (request, reply) => {
+  const query = flatQuery(request.query);
+  const { target, art, title, description } = await resolveShare(query);
+  const origin = requestOrigin(request);
+  const size = art?.file && art.type === "image/png" ? await pngSizeOf(art.file) : null;
+  reply.header("Cache-Control", "public, max-age=300");
+  return {
+    kind: target.kind,
+    title,
+    description,
+    image: art ? `${origin}/api/share/image?${shareImageQuery(target)}` : null,
+    imageWidth: size?.width ?? null,
+    imageHeight: size?.height ?? null,
+    /** False means the picture is the flat econ icon — a host that would rather
+     *  show nothing than a 2D icon can act on it. */
+    baked: art?.baked ?? false,
+    canonical: panelShareUrl(sharePluginPath(target), forwardedShareQuery(query)),
+  };
+});
+
+// A complete unfurl document, served from this plugin's own domain. Point a link
+// here and it unfurls today with no host changes at all; the tags are the same
+// set the panel's own shims emit, so this doubles as the reference the middleware
+// above would render.
+app.get("/api/share/unfurl", async (request, reply) => {
+  const query = flatQuery(request.query);
+  const { target, art, title, description } = await resolveShare(query);
+  const origin = requestOrigin(request);
+  const size = art?.file && art.type === "image/png" ? await pngSizeOf(art.file) : null;
+  const canonical = panelShareUrl(sharePluginPath(target), forwardedShareQuery(query));
+  // og:url is the address of the THING, so it is the panel's page when we know
+  // it and the URL actually fetched when we do not — never a guess. The human
+  // link degrades further, to this plugin's own front door: a page that unfurls
+  // beautifully and then dead-ends is worse than no page.
+  const humanUrl = canonical ?? `${origin}/`;
+  // Short, not immutable: the picture behind this page can improve on its own
+  // (icon today, the owner's render tomorrow), and a chat client that cached the
+  // document for a day would never ask again.
+  reply.header("Cache-Control", "public, max-age=300");
+  return reply.type("text/html; charset=utf-8").send(
+    renderUnfurl({
+      title,
+      description,
+      pageUrl: canonical ?? `${origin}${request.url}`,
+      humanUrl,
+      image: art ? `${origin}/api/share/image?${shareImageQuery(target)}` : null,
+      imageWidth: size?.width ?? null,
+      imageHeight: size?.height ?? null,
+    }),
+  );
+});
 
 // ---- Composite store routes ---------------------------------------------------
 // Filename builder. MUST agree with compositeKey() in src/compositeStore.ts.
@@ -1035,11 +1606,35 @@ app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", asy
   return {
     bounds,
     slots,
+    // The anchor counts, per body. NOT a sticker cap — an item carries five on
+    // every weapon (STICKER_LIMITS.maxStickers) and shares an anchor when the
+    // stack outnumbers them; see slotCount's note. Published because the client
+    // otherwise recounts the slots itself, and because a markup regression is
+    // legible as a zero here and invisible in a rendered position.
+    anchorCount: slotCount(slots),
+    anchorCountLegacy: slotCount(slots, "body_legacy"),
     charmQuads,
     charmBounds: charmBounds(charmQuads),
     charmBoundsLegacy: charmBounds(charmQuads, "body_legacy"),
   };
 });
+
+/** What a loadout slot can be crafted from. Its own function because TWO routes
+ *  ask now — the catalog itself and the stock-price map beside it — and a slot
+ *  the two disagree about is a picker full of items with no prices. */
+function catalogForSlot(slot: string) {
+  if (slot === "knife") return { base: null, skins: getKnives() };
+  if (slot === "gloves") return { base: null, skins: getGloves() };
+  if (slot === "agent") return { base: null, skins: getAgents() };
+  if (slot === "musickit") return { base: null, skins: getMusicKits() };
+  if (slot === "collectible") return { base: null, skins: getCollectibles() };
+  // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
+  // graffiti is the one catalog whose splits aren't in any item field.
+  if (slot === "graffiti") return { base: null, ...getGraffiti() };
+  if (slot === "zeus") return getWeaponSkins("taser");
+  if (slot === "c4") return getWeaponSkins("c4");
+  return getWeaponSkins(slot);
+}
 
 app.get<{ Querystring: { slot?: string } }>(
   "/api/catalog/skins",
@@ -1048,35 +1643,22 @@ app.get<{ Querystring: { slot?: string } }>(
     if (!slot) {
       return reply.status(400).send({ error: "slot required" });
     }
-    if (slot === "knife") {
-      return { base: null, skins: getKnives() };
-    }
-    if (slot === "gloves") {
-      return { base: null, skins: getGloves() };
-    }
-    if (slot === "agent") {
-      return { base: null, skins: getAgents() };
-    }
-    if (slot === "musickit") {
-      return { base: null, skins: getMusicKits() };
-    }
-    if (slot === "collectible") {
-      return { base: null, skins: getCollectibles() };
-    }
-    if (slot === "graffiti") {
-      // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
-      // graffiti is the one catalog whose splits aren't in any item field.
-      return { base: null, ...getGraffiti() };
-    }
-    if (slot === "zeus") {
-      return getWeaponSkins("taser");
-    }
-    if (slot === "c4") {
-      return getWeaponSkins("c4");
-    }
-    return getWeaponSkins(slot);
+    return catalogForSlot(slot);
   },
 );
+
+// The collections index — every skin set in the game, with the ids of what is in
+// it. Small enough to hand over whole (94 rows, ~1.6k ids) and deliberately so:
+// the client intersects those ids with the inventory it already has to answer
+// "you own 4 of 17", which is a set operation, not an endpoint.
+app.get("/api/catalog/collections", async () => getCollections());
+
+// One collection's finishes. A key nothing answers to is a stale link, not a
+// client error — 404 rather than 400, and the armory shows its empty state.
+app.get<{ Querystring: { key?: string } }>("/api/catalog/collection", async (request, reply) => {
+  const page = getCollection(request.query.key ?? "");
+  return page ?? reply.status(404).send({ error: "unknown collection" });
+});
 
 // Attachment pickers: one page of matches, the match total so the grid can scroll
 // on into a 10k-item catalog instead of stopping at an arbitrary cap, and the
@@ -1276,6 +1858,19 @@ interface ItemRow {
    *  it in the same breath as the offsets. */
   charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
   patches?: unknown[] | null;
+  /**
+   * When this instance entered the inventory.
+   *
+   * A string by the time anything here reads it: node-postgres hands back a Date
+   * and it becomes an ISO string on the way out through JSON, so the client sorts
+   * lexicographically — which is the same order numerically for ISO-8601.
+   *
+   * Note the id would ALSO work as a proxy: it is an identity column, so higher
+   * means inserted later. This carries the real field anyway, because sorting a
+   * user-visible "recently added" on a surrogate key is only correct until
+   * someone backfills a row, and because the date is worth showing.
+   */
+  created_at?: string | null;
 }
 
 // Reject bad wear on the RAW array — normSpecs() clamps, so it has to be
@@ -1444,6 +2039,11 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     // re-bake treadmill every time a kill lands.
     stattrak_count: row.stattrak ? row.stattrak_count ?? 0 : 0,
     nametag: row.nametag,
+    // Drives the "Recently added" sort. Emitted for every instance rather than
+    // only when that sort is active: the client sorts in memory over the list it
+    // already holds, so a field the row omits is a mode that silently does
+    // nothing.
+    created_at: row.created_at ?? null,
     slot: slotForItem(row.item_id),
     item,
     equipped: equippedOn.filter((e) => e.slot === slotForItem(row.item_id)),
@@ -1457,7 +2057,7 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
@@ -1487,6 +2087,11 @@ app.get("/api/inventory", async (request, reply) => {
   for (const row of items) {
     for (const inst of referencedInstances(row)) attachedTo.set(inst, String(row.id));
   }
+  // NO prices here, deliberately. They are a second request (see
+  // /api/inventory/prices): an inventory is what someone came for and it must
+  // paint the moment it is ready, while pricing is an enhancement that can
+  // arrive a beat later — and being separate means it can also be re-fetched on
+  // its own after a sync, a craft, or the switch being turned on.
   return resolved.map((row) => ({
     ...enrichAttachments(row),
     slot: slotForItem(row.item_id),
@@ -1958,6 +2563,65 @@ app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, rep
   return { ok: true };
 });
 
+/**
+ * The wishlist: catalog items the caller wants but does not own.
+ *
+ * Enriched through getItem on the way out for the same reason the inventory is —
+ * the client should not need a second lookup to draw a tile. An id cs2-lib has
+ * retired resolves to null and is dropped rather than rendering a blank card.
+ */
+app.get("/api/wishlist", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{ item_id: number; created_at: string }>(
+    `SELECT item_id, created_at FROM inventory.wishlist WHERE steam_id = $1
+      ORDER BY created_at DESC, item_id`,
+    [identity.steamId],
+  );
+  return rows
+    .map((r) => ({ item_id: r.item_id, created_at: r.created_at, item: getItem(r.item_id) }))
+    .filter((r) => r.item != null);
+});
+
+/**
+ * Add or remove one catalog item.
+ *
+ * `isOwnable` is the gate, not `getItem` — a wishlist of things that can never
+ * enter an inventory (a case, a key, a tool) is a list of rows nothing will ever
+ * clear. Same predicate the Steam import uses, so the two agree on what "an item
+ * you could have" means.
+ */
+app.post<{ Body: { item_id?: number; want?: boolean } }>(
+  "/api/wishlist",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const itemId = Number(request.body?.item_id);
+    if (!Number.isInteger(itemId) || itemId <= 0 || !isOwnable(itemId)) {
+      return reply.status(400).send({ error: "That item can't be wishlisted." });
+    }
+    if (request.body?.want === false) {
+      await pool.query(`DELETE FROM inventory.wishlist WHERE steam_id = $1 AND item_id = $2`, [
+        identity.steamId,
+        itemId,
+      ]);
+      return { want: false };
+    }
+    // ON CONFLICT DO NOTHING, so starring twice is not an error and does not
+    // move the created_at that orders the list.
+    await pool.query(
+      `INSERT INTO inventory.wishlist (steam_id, item_id) VALUES ($1, $2)
+       ON CONFLICT (steam_id, item_id) DO NOTHING`,
+      [identity.steamId, itemId],
+    );
+    return { want: true };
+  },
+);
+
 // ---- Loadout (per-user; slots reference owned instances) ----
 
 app.get("/api/loadout", async (request, reply) => {
@@ -1992,6 +2656,8 @@ app.get("/api/loadout", async (request, reply) => {
      WHERE l.steam_id = $1`,
     [identity.steamId],
   );
+  // Prices ride on /api/inventory/prices, not here — same reasoning as the
+  // inventory: the loadout is the screen, money is an overlay on it.
   return rows
     .filter((row) => row.item_id != null)
     .map((row) => ({ ...row, item: getItem(row.item_id as number) }));
@@ -2002,6 +2668,9 @@ app.get("/api/loadout", async (request, reply) => {
 // shotguns + LMGs), r1-r5 = rifles (incl. snipers), plus knife/gloves/agent.
 // KEEP IN STEP WITH the slot whitelist in schema.sql — that DELETE runs on every
 // boot, so a slot this accepts and that list omits is wiped on the next restart.
+// Over there it is one `legal_slot` CTE cleaning BOTH slot-bearing tables
+// (inventory.loadout and the presets' parked rows), so adding a slot here is
+// still exactly one list to edit there.
 const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti|collectible)$/;
 const START_PISTOLS = new Set(["glock", "usp_silencer", "hkp2000"]);
 function slotCategories(slot: string): string[] | null {
@@ -2206,18 +2875,10 @@ app.post<{
   if (ma && ma === getItem(rb.resolvedItemId)?.model) {
     return reply.status(400).send({ error: "Both sides of that swap are the same weapon." });
   }
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  await inTransaction(async (client) => {
     await client.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, ra));
     await client.query(UPSERT_LOADOUT, upsertParams(identity.steamId, team, rb));
-    await client.query("COMMIT");
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  } finally {
-    client.release();
-  }
+  });
   return { ok: true };
 });
 
@@ -2240,38 +2901,505 @@ app.delete<{ Querystring: { team?: string; slot?: string } }>(
   },
 );
 
+// ---- Loadout presets (named builds you switch between) ----------------------
+//
+// The preset you are wearing has no rows of its own: its slots ARE
+// inventory.loadout, which is why nothing above this comment had to change to
+// support presets. Every other preset parks its slots in
+// inventory.loadout_preset_slots, and activate swaps the two sets over inside a
+// transaction. See the long note in schema.sql for why the alternative — a
+// preset_id folded into inventory.loadout's key — was not taken: it would have
+// put a "which preset is active" lookup into /api/equipped/v5, the one read
+// every game server makes for every player on every connect.
+//
+// These routes live under /api/loadout/… alongside `/api/loadout/:steamId`.
+// find-my-way matches a static segment before a parametric one, so "presets"
+// never reaches the steam-id route — the same arrangement /api/inventory/:id
+// already has with /api/inventory/import-steam.
+
+// Six, because the desktop deck lays cards three across and six fills two
+// rows exactly — the "new" card sits in the sixth cell until you use it. It
+// was five (CS2's own count) when the switcher was a pill strip; that strip is
+// gone and the cap now answers to the surface that shows the builds. Keep in
+// step with PRESET_LIMIT in src/App.vue.
+const PRESET_LIMIT = 6;
+const PRESET_NAME_MAX = 24;
+
+/**
+ * Anything that can run a query — the pool itself, or one pooled client inside
+ * a transaction. The helpers below take it so the same code can mint a preset
+ * standalone or as part of a caller's transaction, where a write that escaped
+ * to the pool would be a row that survives the rollback.
+ */
+type Queryable = typeof pool | PoolClient;
+
+/** Collapse whitespace, cap the length, fall back when nothing is left. */
+function cleanPresetName(raw: unknown, fallback: string): string {
+  const name = typeof raw === "string" ? raw.replace(/\s+/g, " ").trim() : "";
+  return name ? name.slice(0, PRESET_NAME_MAX) : fallback;
+}
+
+/**
+ * The id of the preset whose slots are currently in inventory.loadout, minting
+ * it if this player has never had one.
+ *
+ * Every player needs exactly one from the moment they equip anything, and the
+ * boot-time backfill in schema.sql can only cover the players who had a loadout
+ * when it ran. This is the other half: a player who signs in for the first time
+ * after that gets theirs here, on whichever preset route they touch first.
+ *
+ * `q` takes a pooled client so the mint can join a caller's transaction — an
+ * activate that mints the source preset outside its own transaction would be a
+ * row that survives a rollback.
+ */
+async function ensureActivePreset(
+  steamId: string,
+  q: Queryable = pool,
+): Promise<string> {
+  const read = async () => {
+    const { rows } = await q.query<{ id: string }>(
+      `SELECT id FROM inventory.loadout_presets WHERE steam_id = $1 AND active`,
+      [steamId],
+    );
+    return rows.length ? String(rows[0].id) : null;
+  };
+  const existing = await read();
+  if (existing) return existing;
+  // The conflict target names the partial index's predicate, so this is the
+  // unique "one active per player" index and not a full-table one. DO NOTHING
+  // rather than an error because two first-ever page loads in two tabs is a
+  // real race, and losing it is not a failure — it means somebody else already
+  // made the row we were about to.
+  const { rows } = await q.query<{ id: string }>(
+    `INSERT INTO inventory.loadout_presets (steam_id, name, active)
+     VALUES ($1, 'Loadout 1', true)
+     ON CONFLICT (steam_id) WHERE active DO NOTHING
+     RETURNING id`,
+    [steamId],
+  );
+  if (rows.length) return String(rows[0].id);
+  // Losing the race means somebody else committed the row, so the re-read finds
+  // it. Throw rather than cast a null away: every caller feeds this id straight
+  // into `WHERE preset_id = $1`, where a null matches nothing and silently
+  // parks nothing and loads nothing — a loadout deleted and not replaced, with
+  // no error anywhere to say so.
+  const minted = await read();
+  if (!minted) throw new Error(`No active preset for ${steamId} after minting one.`);
+  return minted;
+}
+
+/** A preset row the caller owns, or null. Every write route starts here. */
+async function ownedPreset(
+  steamId: string,
+  id: string,
+  q: Queryable = pool,
+): Promise<{ id: string; name: string; active: boolean } | null> {
+  if (!/^\d+$/.test(id)) return null;
+  const { rows } = await q.query<{ id: string; name: string; active: boolean }>(
+    `SELECT id, name, active FROM inventory.loadout_presets WHERE id = $1 AND steam_id = $2`,
+    [id, steamId],
+  );
+  return rows.length ? { ...rows[0], id: String(rows[0].id) } : null;
+}
+
+/**
+ * Make `presetId` the live one. MUST be called inside a transaction.
+ *
+ * Between parking the current rows and loading the new ones the player has NO
+ * loadout at all, and a game server polling /api/equipped/v5 in that window
+ * would build them a vanilla rack and never re-evaluate it (the plugin skins
+ * weapons in a GiveNamedItem detour at creation — nothing revisits a weapon that
+ * already exists). Inside a transaction that window is invisible to every other
+ * reader; outside one it is a real, if narrow, way to spawn someone skinless.
+ *
+ * Returns false when the preset was already active, so callers can skip the
+ * "switched" notification without a second query.
+ */
+async function activatePreset(
+  client: PoolClient,
+  steamId: string,
+  presetId: string,
+): Promise<boolean> {
+  await ensureActivePreset(steamId, client);
+  // Serialises two activations for the same player, and the ORDER here is the
+  // whole point: the lock has to come first and the "which one is live" read
+  // second. Reading first and then locking the row that read named is no
+  // serialisation at all — the loser blocks, wakes holding the id of a preset
+  // that is no longer active, and parks the winner's freshly swapped-in build
+  // under it while deleting what the winner parked. Two clicks on the SAME
+  // preset were the worst of it: the loser emptied inventory.loadout, loaded it
+  // back from rows the winner had already deleted, and committed a player with
+  // no loadout at all — the final `SET active = true` being a no-op on an
+  // already-active row meant the unique index never objected.
+  //
+  // Every preset the player owns, in id order: `FOR UPDATE` on a predicate that
+  // an activation itself changes (`WHERE active`) re-checks the predicate after
+  // it unblocks and returns nothing, so the lock is taken on something stable.
+  // The consistent order is what keeps two players' worth of rows deadlock-free.
+  const { rows: locked } = await client.query<{ id: string; active: boolean }>(
+    `SELECT id, active FROM inventory.loadout_presets WHERE steam_id = $1 ORDER BY id FOR UPDATE`,
+    [steamId],
+  );
+  const fromRow = locked.find((r) => r.active);
+  if (!fromRow) throw new Error(`No active preset for ${steamId} while activating ${presetId}.`);
+  const fromId = String(fromRow.id);
+  if (fromId === presetId) return false;
+
+  // Park what is live now under the preset that owns it. The DELETE first
+  // because a preset that was active carries no parked rows, but one that was
+  // half-parked by an interrupted earlier attempt might.
+  await client.query(`DELETE FROM inventory.loadout_preset_slots WHERE preset_id = $1`, [fromId]);
+  await client.query(
+    `INSERT INTO inventory.loadout_preset_slots
+       (preset_id, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at)
+     SELECT $1, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at
+       FROM inventory.loadout WHERE steam_id = $2`,
+    [fromId, steamId],
+  );
+  // Clear the old flag BEFORE setting the new one: loadout_presets_active_idx
+  // is a unique partial index, and the other order trips it every single time.
+  await client.query(
+    `UPDATE inventory.loadout_presets SET active = false, updated_at = now() WHERE id = $1`,
+    [fromId],
+  );
+
+  await client.query(`DELETE FROM inventory.loadout WHERE steam_id = $1`, [steamId]);
+  await client.query(
+    `INSERT INTO inventory.loadout
+       (steam_id, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at)
+     SELECT $1, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at
+       FROM inventory.loadout_preset_slots WHERE preset_id = $2`,
+    [steamId, presetId],
+  );
+  // The rows live in exactly ONE of the two tables, never both. A copy left
+  // behind here would be a second source of truth that every subsequent equip
+  // silently diverges from, and switching away and back would hand the player
+  // their loadout as it was at this moment instead of as they left it.
+  await client.query(`DELETE FROM inventory.loadout_preset_slots WHERE preset_id = $1`, [presetId]);
+  await client.query(
+    `UPDATE inventory.loadout_presets SET active = true, updated_at = now() WHERE id = $1`,
+    [presetId],
+  );
+  return true;
+}
+
+/** Run `fn` in a transaction. */
+async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const out = await fn(client);
+    await client.query("COMMIT");
+    return out;
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// The filled-slot count is per preset and comes from two different places for
+// the same reason the whole feature does: the active one's slots are the live
+// loadout, everyone else's are parked.
+const PRESET_LIST_SQL = `
+  SELECT p.id, p.name, p.active,
+         (CASE WHEN p.active
+               THEN (SELECT count(*) FROM inventory.loadout l WHERE l.steam_id = p.steam_id)
+               ELSE (SELECT count(*) FROM inventory.loadout_preset_slots s WHERE s.preset_id = p.id)
+          END)::int AS slots
+    FROM inventory.loadout_presets p
+   WHERE p.steam_id = $1
+   ORDER BY p.created_at, p.id`;
+
+// Deliberately nothing more per preset (no art, no per-side counts): the deck
+// reads each parked build's ROWS through /api/loadout/:steamId?preset= and
+// derives those itself, the same way it does for the one on screen.
+type PresetRow = { id: string; name: string; active: boolean; slots: number };
+const listPresets = async (steamId: string, q: Queryable = pool) =>
+  (await q.query<PresetRow>(PRESET_LIST_SQL, [steamId])).rows.map((r) => ({
+    ...r,
+    id: String(r.id),
+  }));
+
+app.get("/api/loadout/presets", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  // A read that writes, deliberately: this is where a player who has never
+  // equipped anything gets their first preset, so the switcher has something to
+  // show and "duplicate this one" has a source. It is idempotent and costs one
+  // indexed lookup on the path that already hit it.
+  await ensureActivePreset(identity.steamId);
+  return listPresets(identity.steamId);
+});
+
+// Create a preset. `copy` seeds it from the loadout you are wearing right now —
+// that is the "duplicate" action; without it the preset starts empty.
+//
+// NOT modelled on /api/loadout/copy-from, which mints a fresh owned_items row
+// per slot. That is right for cloning a STRANGER's loadout (their instances are
+// not yours to point at) and wrong here: crafting is the gate, presets are only
+// arrangements of what you already own. Minting would double your inventory
+// every time you duplicated a build, and each copy would then wear its own
+// stickers and its own StatTrak count.
+app.post<{ Body: { name?: string; copy?: boolean } }>(
+  "/api/loadout/presets",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const copy = request.body?.copy === true;
+    const created = await inTransaction(async (client) => {
+      await ensureActivePreset(identity.steamId, client);
+      const { rows: count } = await client.query<{ n: string }>(
+        `SELECT count(*) AS n FROM inventory.loadout_presets WHERE steam_id = $1`,
+        [identity.steamId],
+      );
+      if (Number(count[0].n) >= PRESET_LIMIT) {
+        return null;
+      }
+      const name = cleanPresetName(request.body?.name, `Loadout ${Number(count[0].n) + 1}`);
+      const { rows } = await client.query<{ id: string }>(
+        `INSERT INTO inventory.loadout_presets (steam_id, name, active)
+         VALUES ($1, $2, false) RETURNING id`,
+        [identity.steamId, name],
+      );
+      const id = String(rows[0].id);
+      if (copy) {
+        await client.query(
+          `INSERT INTO inventory.loadout_preset_slots
+             (preset_id, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, updated_at)
+           SELECT $1, team, slot, item_id, item_instance_id, wear, seed, stattrak, nametag, now()
+             FROM inventory.loadout WHERE steam_id = $2`,
+          [id, identity.steamId],
+        );
+      }
+      return id;
+    });
+    if (created == null) {
+      return reply
+        .status(400)
+        .send({ error: `You can keep ${PRESET_LIMIT} loadouts — delete one to make room.` });
+    }
+    const presets = await listPresets(identity.steamId);
+    return presets.find((p) => p.id === created) ?? presets[presets.length - 1];
+  },
+);
+
+app.patch<{ Params: { id: string }; Body: { name?: string } }>(
+  "/api/loadout/presets/:id",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const preset = await ownedPreset(identity.steamId, request.params.id);
+    if (!preset) {
+      return reply.status(404).send({ error: "No such loadout." });
+    }
+    const name = cleanPresetName(request.body?.name, preset.name);
+    await pool.query(
+      `UPDATE inventory.loadout_presets SET name = $1, updated_at = now() WHERE id = $2`,
+      [name, preset.id],
+    );
+    return { id: preset.id, name, active: preset.active };
+  },
+);
+
+// Wear a different build. One transaction, because the swap is a window in
+// which the player has no loadout — see activatePreset.
+app.post<{ Params: { id: string } }>(
+  "/api/loadout/presets/:id/activate",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const preset = await ownedPreset(identity.steamId, request.params.id);
+    if (!preset) {
+      return reply.status(404).send({ error: "No such loadout." });
+    }
+    await inTransaction((client) => activatePreset(client, identity.steamId, preset.id));
+    return { ok: true, active: preset.id };
+  },
+);
+
+// Delete a preset. Deleting the one you are WEARING is allowed and moves you to
+// the oldest of the rest — the buttons in the header act on the preset on
+// screen, and refusing the only one you can see is a worse rule to explain than
+// "you always end up wearing something". The last preset is not deletable for
+// that same reason: there would be nothing left to move to, and inventory.
+// loadout would have no name.
+app.delete<{ Params: { id: string } }>(
+  "/api/loadout/presets/:id",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const preset = await ownedPreset(identity.steamId, request.params.id);
+    if (!preset) {
+      return reply.status(404).send({ error: "No such loadout." });
+    }
+    const outcome = await inTransaction(async (client) => {
+      const { rows: rest } = await client.query<{ id: string }>(
+        `SELECT id FROM inventory.loadout_presets
+          WHERE steam_id = $1 AND id <> $2 ORDER BY created_at, id`,
+        [identity.steamId, preset.id],
+      );
+      if (!rest.length) {
+        return null;
+      }
+      let active = preset.active ? String(rest[0].id) : await ensureActivePreset(identity.steamId, client);
+      if (preset.active) {
+        // Reuses the ordinary switch rather than a bespoke "delete and adopt"
+        // path. It parks the doomed preset's live rows on its way out, which
+        // the DELETE below then cascades away — a wasted write, and worth it
+        // for there being exactly one piece of code that moves the live rows.
+        await activatePreset(client, identity.steamId, active);
+      }
+      // Cascades its parked slots. Scoped to the owner as well as the id so a
+      // guessed id can never reach somebody else's build.
+      await client.query(`DELETE FROM inventory.loadout_presets WHERE id = $1 AND steam_id = $2`, [
+        preset.id,
+        identity.steamId,
+      ]);
+      return active;
+    });
+    if (outcome == null) {
+      return reply.status(400).send({ error: "That's your only loadout — rename it instead." });
+    }
+    return { ok: true, active: outcome };
+  },
+);
+
 // ---- Public loadout view + copy (player profiles / sharing) -----------------
 
-// Read-only view of any player's loadout (enriched like /api/loadout, but
-// without inventory instance ids). Public: loadouts are cosmetic + shareable.
-app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId", async (request, reply) => {
+/**
+ * Take the owner's row handle off one enriched attachment.
+ *
+ * Same reasoning as the null instance id below, one level deeper: `inst` names a
+ * row in the OWNER's inventory, and the only thing anyone does with one is act
+ * on it. Nothing a viewer renders needs it — the placement, the scratch wear and
+ * the charm's pattern are all inline by the time enrichAttachments is done — so
+ * it goes out null rather than being a handle a stranger holds. Missing this is
+ * the quiet way a "read-only" endpoint stops being read-only.
+ */
+function withoutInstanceHandle<T extends { inst?: string | null } | null>(a: T): T {
+  return a ? { ...a, inst: null } : a;
+}
+
+// Read-only view of any player's loadout (enriched like /api/inventory, but
+// without inventory instance ids). Unauthenticated on purpose: an equipped
+// loadout is already public — /api/equipped/v5 hands the same items to any game
+// server that asks, with no credential — and this is the shareable, human-facing
+// form of it. What is NOT public is anything a player merely owns; see the
+// README for why an owned-item list needs a decision before it gets a route.
+// Every preset a player has, for a VISITOR. Same rows and same shape the owner
+// sees — id, name, active, filled-slot count — because none of that is private:
+// a preset is an arrangement of items, and this endpoint has always disclosed
+// the active one anyway.
+//
+// It deliberately does NOT call ensureActivePreset the way the owner's list
+// does. That is a read that writes, and a stranger opening a profile must not
+// mint rows in someone else's account. A player who has never equipped anything
+// simply lists empty.
+app.get<{ Params: { steamId: string } }>("/api/loadout/:steamId/presets", async (request, reply) => {
   const steamId = request.params.steamId;
   if (!/^\d{17}$/.test(steamId)) {
     return reply.status(400).send({ error: "invalid steam id" });
   }
+  return listPresets(steamId);
+});
+
+app.get<{ Params: { steamId: string }; Querystring: { preset?: string } }>(
+  "/api/loadout/:steamId",
+  async (request, reply) => {
+  const steamId = request.params.steamId;
+  if (!/^\d{17}$/.test(steamId)) {
+    return reply.status(400).send({ error: "invalid steam id" });
+  }
+
+  // Which build to read. Absent — and for the ACTIVE preset — that is the live
+  // loadout; a parked preset is its own table. The two carry identical columns
+  // (loadout_preset_slots is inventory.loadout minus steam_id), which is what
+  // lets one SELECT serve both by swapping the FROM rather than duplicating it.
+  //
+  // Ownership is checked, never assumed: `preset` is a bare id from the caller,
+  // so without this a visitor could walk ids and read builds out of accounts
+  // they never asked about. A preset that is not this player's 404s rather than
+  // falling back to the live loadout — quietly answering with a different build
+  // than the one requested is how someone ends up certain they are looking at
+  // something they are not.
+  let parkedId: string | null = null;
+  if (request.query.preset) {
+    if (!/^\d+$/.test(request.query.preset)) {
+      return reply.status(400).send({ error: "invalid preset" });
+    }
+    const { rows: owned } = await pool.query<{ id: string; active: boolean }>(
+      `SELECT id, active FROM inventory.loadout_presets WHERE id = $1 AND steam_id = $2`,
+      [request.query.preset, steamId],
+    );
+    if (!owned.length) {
+      return reply.status(404).send({ error: "no such preset" });
+    }
+    if (!owned[0].active) parkedId = String(owned[0].id);
+  }
   const { rows } = await pool.query<{
     team: string; slot: string; item_id: number | null; skinned: boolean;
-    wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+    wear: number | null; seed: number | null; stattrak: boolean; stattrak_count: number;
+    nametag: string | null; stickers: unknown[] | null; patches: unknown[] | null;
+    charm_id: number | null; charm_offset: ItemRow["charm_offset"];
   }>(
     `SELECT l.team, l.slot,
        COALESCE(i.item_id, l.item_id) AS item_id,
        (l.item_instance_id IS NOT NULL) AS skinned,
        COALESCE(i.wear, l.wear) AS wear, COALESCE(i.seed, l.seed) AS seed,
-       COALESCE(i.stattrak, l.stattrak) AS stattrak, COALESCE(i.nametag, l.nametag) AS nametag
-     FROM inventory.loadout l
+       COALESCE(i.stattrak, l.stattrak) AS stattrak,
+       -- Same as /api/loadout: only owned instances carry a count.
+       COALESCE(i.stattrak_count, 0) AS stattrak_count,
+       COALESCE(i.nametag, l.nametag) AS nametag,
+       -- Attachments are i.* with no COALESCE: inventory.loadout has no columns
+       -- for them, so a free default weapon simply has none. Selecting these at
+       -- all is the fix for a viewer seeing a bare gun where the owner had five
+       -- stickers and a charm — the part of a loadout people actually spend
+       -- their time on, and the part this endpoint used to drop on the floor
+       -- while copy-from happily cloned it.
+       i.stickers, i.patches, i.charm_id, i.charm_offset
+     FROM ${parkedId ? "inventory.loadout_preset_slots" : "inventory.loadout"} l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
-     WHERE l.steam_id = $1`,
-    [steamId],
+     WHERE ${parkedId ? "l.preset_id" : "l.steam_id"} = $1`,
+    [parkedId ?? steamId],
   );
+  // Dereference the attachment links against the OWNER's rows — this is their
+  // loadout, so their instances are the ones a linked spec points at. Same read
+  // at the same place as every other consumer; see resolveAttachments for why
+  // that lives at read time rather than in each caller.
+  const resolved = await withAttachments(steamId, rows.filter((row) => row.item_id != null));
   // The instance id stays null — it is someone else's row handle and a viewer
   // has no business acting on it. `skinned` carries the one bit the client
   // actually needed from it: crafted skin vs. free default weapon. Without it a
   // viewer saw every cell as unskinned, so names read "Default" and the focus
   // view fell back to the base model even though the art was right.
-  return rows
-    .filter((row) => row.item_id != null)
-    .map((row) => ({ ...row, item_instance_id: null, item: getItem(row.item_id as number) }));
-});
+  return resolved.map((row) => {
+    // charm_offset is dropped rather than sanitised: enrichAttachments has
+    // already folded its x/y/z/seed into `charm`, so all that would survive the
+    // trip is the `inst` we are deliberately withholding.
+    const { charm_offset, ...enriched } = enrichAttachments(row);
+    return {
+      ...enriched,
+      item_instance_id: null,
+      stickers: enriched.stickers.map(withoutInstanceHandle),
+      patches: enriched.patches.map(withoutInstanceHandle),
+      charm: withoutInstanceHandle(enriched.charm),
+      item: getItem(row.item_id as number),
+    };
+  });
+  },
+);
 
 // Clone another player's loadout: copies each equipped skin into the caller's
 // inventory (origin 'copied') and equips it in the same slot.
@@ -2292,27 +3420,71 @@ app.post<{ Params: { steamId: string } }>(
     const { rows } = await pool.query<{
       team: string; slot: string; base_item_id: number | null; item_id: number | null;
       wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
-      stickers: (number | null)[] | null; patches: (number | null)[] | null; charm_id: number | null;
+      stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
+      charm_offset: AttachBody["charm_offset"];
     }>(
       `SELECT l.team, l.slot, l.item_id AS base_item_id, i.item_id, i.wear, i.seed,
-              i.stattrak, i.nametag, i.stickers, i.patches, i.charm_id
+              i.stattrak, i.nametag, i.stickers, i.patches, i.charm_id, i.charm_offset
        FROM inventory.loadout l
        LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
        WHERE l.steam_id = $1`,
       [source],
     );
+    // Resolve the source's attachment links BEFORE copying anything.
+    //
+    // The specs in a weapon's jsonb are a CACHE of each attachment's wear/seed,
+    // and the authoritative copy lives on the attachment's own owned_items row —
+    // which is why resolveAttachments exists and why its doc calls itself "one
+    // resolve at read time instead of four consumers each remembering to check".
+    // Editing an applied charm's pattern writes the new seed to that row and
+    // deliberately does NOT rewrite every weapon referencing it, so the blob can
+    // be arbitrarily out of date.
+    //
+    // Copying read the blob. linkAttachments then minted the new owner's charm
+    // with `charmOffset.seed` and their stickers with `s.w` — the stale values —
+    // so a copied loadout could come out a different COLOUR from the one on
+    // screen, and copied stickers could carry the wrong scratch. This route was
+    // the fifth consumer, and the one that didn't check.
+    //
+    // Scoped to `source`, not the caller: the instances belong to them, and
+    // instFactsFor is steam_id-scoped precisely so a spec can't name a stranger's
+    // row. Nothing new is exposed — the public loadout endpoint already shows
+    // these items' wear and seed, and the copy clones them regardless.
+    const resolved = await withAttachments(source, rows);
     let copied = 0;
-    for (const row of rows) {
+    for (const row of resolved) {
       if (row.item_id != null) {
+        // Through linkAttachments, exactly like a craft — NOT straight into the
+        // column. The specs being copied carry the SOURCE user's `inst` ids, and
+        // an inst only means anything to its owner (instFactsFor is scoped by
+        // steam_id). Written verbatim they resolved to nothing here, so every
+        // copied sticker quietly fell back to its inline `w` and was not a thing
+        // the new owner actually owned. linkAttachments already refuses an inst
+        // that is not the caller's and mints a fresh one instead, which is
+        // exactly what a copy wants.
+        //
+        // charm_offset rides along for the first time here too — it was never
+        // selected, so a copied loadout silently lost its charm PLACEMENT.
+        const linked = await linkAttachments(
+          identity.steamId,
+          {
+            stickers: row.stickers,
+            patches: row.patches,
+            charm_id: row.charm_id,
+            charm_offset: row.charm_offset,
+          },
+          null,
+        );
         const { rows: inserted } = await pool.query<{ id: string }>(
           `INSERT INTO inventory.owned_items
-             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, origin)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,'copied') RETURNING id`,
+             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, charm_offset, origin)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10::jsonb,'copied') RETURNING id`,
           [
             identity.steamId, row.item_id, row.wear, row.seed, row.stattrak, row.nametag,
-            row.stickers?.some((x) => x != null) ? JSON.stringify(row.stickers) : null,
-            row.patches?.some((x) => x != null) ? JSON.stringify(row.patches) : null,
+            normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null,
+            normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
             row.charm_id,
+            linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
           ],
         );
         await pool.query(
@@ -2660,6 +3832,1070 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
       (unresolved.length ? ` | UNRESOLVED attachments: ${[...new Set(unresolved)].join("; ")}` : ""),
   );
   return { imported, updated, removed, skipped, partial: !complete };
+});
+
+// ---- Market prices (opt-in) -------------------------------------------------
+// A Steam market price feed, mirrored hourly into inventory.prices and held in
+// memory for lookups. The mapping rules live in prices.ts, on their own, so
+// tools/price-coverage.ts can prove them without a Postgres; this half is the
+// job, the cache and the endpoints.
+//
+// OPT-IN and off by default, exactly like the shared asset CDN and for the same
+// reason: the fetch leaves the operator's network. There is no 5stack price CDN
+// — every source here is one the operator picked, and the default (Skinport)
+// needs no URL at all. The JSON-feed source falls back to the public
+// cs2-prices-tracker project, which the panel names rather than dressing up as
+// ours. Whichever host is in play, only the SERVER talks to it; a browser never
+// does.
+
+const PRICE_SYNC_INTERVAL_MS = 60 * 60_000;
+
+interface PriceConfig {
+  enabled: boolean;
+  source: PriceSource;
+  base: string;
+  custom: boolean;
+  /** Which number this source is asked for first. */
+  window: PriceWindow;
+}
+
+/** Read on nearly every priced request, and it is three short values in a
+ *  key/value table — memoised briefly so a page full of tiles doesn't ask the
+ *  database what the settings are once per tile. Short enough that flipping the
+ *  switch in the admin panel is visible immediately. */
+let priceConfigMemo: { at: number; value: PriceConfig } | null = null;
+const PRICE_CONFIG_TTL_MS = 5_000;
+
+async function priceSettings(): Promise<PriceConfig> {
+  if (priceConfigMemo && Date.now() - priceConfigMemo.at < PRICE_CONFIG_TTL_MS) {
+    return priceConfigMemo.value;
+  }
+  const { rows } = await pool.query<{ key: string; value: string }>(
+    `SELECT key, value FROM inventory.settings WHERE key IN ('prices', 'price_source', 'price_feed')`,
+  );
+  const settings = new Map(rows.map((r) => [r.key, r.value]));
+  const stored = settings.get("price_source") as PriceSource | undefined;
+  const source = stored && PRICE_SOURCES.includes(stored) ? stored : DEFAULT_PRICE_SOURCE;
+  const custom = (settings.get("price_feed") ?? "").trim();
+  const value: PriceConfig = {
+    enabled: settings.get("prices") === "1",
+    source,
+    base: custom || PRICE_FEED_BASE,
+    custom: custom !== "",
+    window: DEFAULT_WINDOW[source],
+  };
+  priceConfigMemo = { at: Date.now(), value };
+  return value;
+}
+const invalidatePriceConfig = () => (priceConfigMemo = null);
+
+interface PriceMetaRow {
+  source_url: string | null;
+  /** Which source produced the rows currently in the table — not necessarily the
+   *  one configured now, which is the whole point of storing it. */
+  source_name: string | null;
+  source_date: Date | null;
+  synced_at: Date | null;
+  attempted_at: Date | null;
+  failed_at: Date | null;
+  failure: string | null;
+  rows: number;
+  unmatched: number;
+  unmatched_sample: string | null;
+}
+async function priceMeta(): Promise<PriceMetaRow | null> {
+  const { rows } = await pool.query<PriceMetaRow>(
+    `SELECT source_url, source_name, source_date, synced_at, attempted_at, failed_at, failure, rows, unmatched, unmatched_sample
+     FROM inventory.price_meta WHERE id = 1`,
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * item_id -> the id its price is filed under, as a table.
+ *
+ * The JS twin of this is priceGroupId(), and it cannot be used here: the lookup
+ * is a JOIN in Postgres, so the name-collapse has to be something the join can
+ * reach. Rebuilt on boot rather than migrated — it is derived from cs2-lib, so a
+ * catalog bump changes it, and ~400 rows are cheaper to rewrite wholesale than
+ * to reconcile.
+ */
+async function syncPriceAliases(): Promise<number> {
+  const aliases = catalogSummary()
+    .map((item) => [item.id, priceGroupId(item.id)] as const)
+    .filter(([id, groupId]) => groupId !== id);
+  await inTransaction(async (client) => {
+    await client.query(`DELETE FROM inventory.price_aliases`);
+    for (let i = 0; i < aliases.length; i += 1_000) {
+      const chunk = aliases.slice(i, i + 1_000);
+      const values: number[] = [];
+      const tuples = chunk
+        .map(([id, groupId], n) => {
+          values.push(id, groupId);
+          return `($${n * 2 + 1},$${n * 2 + 2})`;
+        })
+        .join(",");
+      await client.query(`INSERT INTO inventory.price_aliases (item_id, price_item_id) VALUES ${tuples}`, values);
+    }
+  });
+  return aliases.length;
+}
+
+interface PriceTarget {
+  itemId: number;
+  wear: number | null;
+  stattrak: boolean;
+}
+
+/**
+ * Prices for a batch of items, in one query.
+ *
+ * Deliberately NOT a resident copy of the mirror. ~27k listings would sit in
+ * every worker's heap, and — the part that actually breaks — each replica would
+ * hold its own: the pod that runs a sync would serve fresh prices while its
+ * neighbours served whatever they last loaded, with nothing on screen to say
+ * which one you got. The table is the single copy; this reads it.
+ *
+ * One statement per REQUEST, not per item. The caller hands over every item it
+ * is about to render (a 200-item inventory, a 15-slot loadout, one craft with
+ * its stickers) and gets a map back — the join does the id-collapse via
+ * price_aliases and the float bucketing via wearTierSql, both of which used to
+ * be the reason this could not be SQL.
+ *
+ * Duplicates collapse before the query: an inventory with forty of the same
+ * sticker asks about it once.
+ */
+/** The identity of a target as the QUERY sees it.
+ *
+ *  `$n::real` is float4, so Postgres rounds the double we bind to single
+ *  precision and prints it back as the shortest decimal that parses to that
+ *  same float4. Math.fround is exactly that rounding, so asked and returned
+ *  land on the identical number — an exact Map key, with no tolerance to tune
+ *  and no linear scan over every target for every row.
+ *
+ *  It has to be the BOUND value on both sides. Re-deriving priceTargetKey from
+ *  the returned wear would be wrong, not merely slow, because float4 rounding
+ *  can cross a bracket boundary: a 0.06999999999999999 float is stored as
+ *  0.07000000029802322, so the caller keys it as Factory New while the row would
+ *  key as Minimal Wear, the get() misses, and a tile renders "no listing" for an
+ *  item the query actually priced. */
+const boundTargetKey = (itemId: number, wear: number | null, stattrak: boolean) =>
+  `${itemId}:${stattrak ? 1 : 0}:${wear == null ? "-" : Math.fround(wear)}`;
+
+/** Targets per statement. Each costs three bind parameters and Postgres stops
+ *  at 65535 of them, so a large enough set of distinct items turned the whole
+ *  price overlay into a `bind message supplies N parameters` 500 rather than
+ *  degrading. Chunked here rather than capped at the call sites: this is the
+ *  one place every price surface goes through, and a cap would silently drop
+ *  prices a second statement would simply answer. */
+const PRICE_LOOKUP_CHUNK = 2_000;
+
+async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promise<Map<string, PricePoint>> {
+  const unique = new Map<string, PriceTarget>();
+  for (const target of targets) {
+    unique.set(priceTargetKey(target.itemId, target.wear, target.stattrak), target);
+  }
+  const found = new Map<string, PricePoint>();
+  if (unique.size === 0) return found;
+  // Keyed off what was ASKED, never off what came back — see boundTargetKey.
+  // One entry per unique target, because priceTargetKey has already collapsed
+  // the float into its bracket: two copies of a skin in the same bracket are
+  // one question, asked once and answered once.
+  const byBound = new Map<string, [string, PriceTarget]>();
+  for (const entry of unique) {
+    byBound.set(boundTargetKey(entry[1].itemId, entry[1].wear, entry[1].stattrak), entry);
+  }
+  const asked = [...unique.values()];
+  for (let i = 0; i < asked.length; i += PRICE_LOOKUP_CHUNK) {
+    const chunk = asked.slice(i, i + PRICE_LOOKUP_CHUNK);
+    const values: unknown[] = [];
+    const tuples = chunk
+      .map((target, n) => {
+        values.push(target.itemId, target.wear, target.stattrak);
+        const b = n * 3;
+        return `($${b + 1}::int, $${b + 2}::real, $${b + 3}::boolean)`;
+      })
+      .join(",");
+    const { rows } = await pool.query<{
+      item_id: number;
+      wear: number | null;
+      stattrak_asked: boolean;
+      market_hash_name: string;
+      wear_tier: number;
+      stattrak: boolean;
+      last_24h: number | null;
+      last_7d: number | null;
+      last_30d: number | null;
+      last_90d: number | null;
+      suggested: number | null;
+      median: number | null;
+      lowest: number | null;
+    }>(
+      `SELECT v.item_id, v.wear, v.stattrak AS stattrak_asked,
+              p.market_hash_name, p.wear_tier, p.stattrak, p.last_24h, p.last_7d, p.last_30d,
+              p.last_90d, p.suggested, p.median, p.lowest
+         FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak)
+         LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
+         -- Two candidate rows, and the ORDER BY is the whole point: the item's OWN
+         -- id first, the name-collapsed one only as a fallback. A source that
+         -- prices Doppler phases separately (Skinport does; Steam does not) writes
+         -- a row per phase, and this is what lets a Ruby read its own $2.4k rather
+         -- than the shared "Doppler" price. When the source doesn't distinguish,
+         -- there is no exact row and the alias answers, exactly as before.
+         JOIN LATERAL (
+           SELECT pr.market_hash_name, pr.wear_tier, pr.stattrak, pr.last_24h, pr.last_7d,
+                  pr.last_30d, pr.last_90d, pr.suggested, pr.median, pr.lowest
+             FROM inventory.prices pr
+            WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
+              -- The item's own bracket, OR a listing that carries no bracket at
+              -- all (-1). That second case is not an edge: VANILLA knives are sold
+              -- as "★ Karambit", with no wear in the name, while the knife itself
+              -- very much has a float. Asking only for the float's bracket missed
+              -- every one of them — 22 melee items, and the most valuable things
+              -- most inventories hold.
+              -- Nothing here mints souvenirs. The column exists so a Souvenir AWP's
+              -- price is never filed on the plain one; this side just never asks.
+              AND pr.souvenir = false
+            -- Preference, not filter. Markets do not carry every variant: StatTrak
+            -- exists for a fraction of finishes and trades thinly, and the ends of
+            -- the wear range are often unlisted — so a Battle-Scarred StatTrak
+            -- weapon could match nothing at all and showed no price no matter what
+            -- its owner changed. Now the closest listing answers, in this order:
+            --   the item's own row (a phase-priced source wrote one)
+            --   its StatTrak variant matching the ask
+            --   its exact wear bracket
+            --   a listing with no bracket at all (vanilla knives)
+            --   failing all that, the nearest bracket by distance
+            -- What actually matched rides back to the caller, which labels it.
+            ORDER BY (pr.item_id = v.item_id) DESC,
+                     (pr.stattrak = v.stattrak) DESC,
+                     (pr.wear_tier = ${wearTierSql("v.wear")}) DESC,
+                     (pr.wear_tier = -1) DESC,
+                     abs(pr.wear_tier - ${wearTierSql("v.wear")}) ASC
+            LIMIT 1
+         ) p ON true`,
+      values,
+    );
+
+    for (const row of rows) {
+      // The window fallback stays in prices.ts — one implementation, already
+      // covered by tools/price-coverage.ts. Writing it a second time as SQL
+      // COALESCE would be two places to get "which window is this" wrong.
+      const point = pickPrice(
+        {
+          last24h: row.last_24h,
+          last7d: row.last_7d,
+          last30d: row.last_30d,
+          last90d: row.last_90d,
+          suggested: row.suggested,
+          median: row.median,
+          lowest: row.lowest,
+          marketHashName: row.market_hash_name,
+        },
+        window,
+      );
+      if (!point) continue;
+      // Say so when the listing is not the one asked for. Compared here, where both
+      // halves are in hand: the client knows what it asked but not what the table
+      // held, and a substitution the UI cannot see is a substitution it will
+      // present as exact.
+      // The target this row answers, looked up by the value that was BOUND
+      // rather than re-derived from the float that came back.
+      const target = byBound.get(boundTargetKey(row.item_id, row.wear, row.stattrak_asked));
+      if (!target) continue;
+      const askedTier = wearTierIndex(wearTierOf(target[1].wear));
+      if (row.wear_tier !== askedTier || row.stattrak !== row.stattrak_asked) {
+        point.approx = { wearTier: row.wear_tier, stattrak: row.stattrak };
+      }
+      found.set(target[0], point);
+    }
+  }
+  return found;
+}
+
+const itemNameOf = (id: number) => getItem(id)?.name ?? null;
+
+/** How many listings the mirror holds. Read off the meta row rather than
+ *  COUNT(*): it is written by the sync that produced them, and every price
+ *  surface asks this to decide whether to draw money at all. */
+async function priceListingCount(): Promise<number> {
+  const { rows } = await pool.query<{ rows: number }>(`SELECT rows FROM inventory.price_meta WHERE id = 1`);
+  return rows[0]?.rows ?? 0;
+}
+
+/** An itemized quote for a stored row or a craft-form body — both carry
+ *  attachments as the same jsonb specs, so both go through normSpecs. One query
+ *  for the weapon and everything on it. */
+async function quoteFor(
+  row: { item_id: number; wear?: number | null; stattrak?: boolean | null; stickers?: unknown[] | null; patches?: unknown[] | null; charm_id?: number | null },
+  window: PriceWindow,
+): Promise<Quote> {
+  const ids = (arr: unknown) => normSpecs(arr).map((spec) => (spec ? { id: spec.id } : null));
+  const spec = {
+    itemId: row.item_id,
+    wear: row.wear ?? null,
+    stattrak: row.stattrak === true,
+    stickers: ids(row.stickers),
+    patches: ids(row.patches),
+    charmId: row.charm_id ?? null,
+  };
+  // Attachments price at their bare name: no float, no StatTrak.
+  const targets: PriceTarget[] = [{ itemId: spec.itemId, wear: spec.wear, stattrak: spec.stattrak }];
+  for (const attachment of [...(spec.stickers ?? []), ...(spec.patches ?? [])]) {
+    if (attachment) targets.push({ itemId: attachment.id, wear: null, stattrak: false });
+  }
+  if (spec.charmId != null) targets.push({ itemId: spec.charmId, wear: null, stattrak: false });
+  const prices = await lookupPrices(targets, window);
+  return quoteItem(
+    spec,
+    (id, wear, stattrak) => prices.get(priceTargetKey(id, wear, stattrak)) ?? null,
+    itemNameOf,
+  );
+}
+
+const PRICE_INSERT_BATCH = 1_000;
+
+/**
+ * Pull the feed and replace the mirror.
+ *
+ * DELETE + INSERT inside ONE transaction, not an upsert: the feed is a full
+ * snapshot, so a merge would keep rows for listings that have since gone away,
+ * and prices that stopped being published would sit there looking current
+ * forever. The transaction is what makes the wholesale delete safe — a fetch
+ * that 404s, or a body that turns out to be an HTML error page, rolls back and
+ * leaves yesterday's prices exactly where they were. A failed sync must never
+ * cost an operator their price data.
+ */
+async function syncPrices(opts: { force?: boolean } = {}): Promise<
+  { skipped: "disabled" } | { rows: number; unmatched: number; collisions: number } | { error: string }
+> {
+  const { enabled, source, base } = await priceSettings();
+  if (!enabled && !opts.force) return { skipped: "disabled" };
+  const provider = PRICE_PROVIDERS[source];
+  const url = providerUrl(source, base);
+  const startedAt = performance.now();
+  await pool.query(
+    `INSERT INTO inventory.price_meta (id, source_url, source_name, attempted_at) VALUES (1, $1, $2, now())
+     ON CONFLICT (id) DO UPDATE SET source_url = EXCLUDED.source_url, source_name = EXCLUDED.source_name, attempted_at = now()`,
+    [url, source],
+  );
+  try {
+    const response = await fetch(url, {
+      // Per-provider: Skinport refuses a client that can't take Brotli (406).
+      headers: { Accept: "application/json", ...provider.headers },
+      signal: AbortSignal.timeout(120_000),
+    });
+    if (!response.ok) throw new Error(`Price source returned HTTP ${response.status}.`);
+    // The feed itself carries no date. Last-Modified is the mirror's own answer
+    // to "how old is this", and a missing header degrades to now() rather than
+    // failing the sync — a stale-looking date is a smaller problem than no
+    // prices at all.
+    const lastModified = response.headers.get("last-modified");
+    const sourceDate = lastModified ? new Date(lastModified) : new Date();
+    const { prices, unmatched, collisions } = provider.map(await response.json());
+    if (prices.length === 0) throw new Error("Price feed mapped to zero rows.");
+    await inTransaction(async (client) => {
+      await client.query(`DELETE FROM inventory.prices`);
+      for (let i = 0; i < prices.length; i += PRICE_INSERT_BATCH) {
+        const chunk = prices.slice(i, i + PRICE_INSERT_BATCH);
+        const values: unknown[] = [];
+        const tuples = chunk
+          .map((p, n) => {
+            values.push(
+              p.itemId, p.wearTier, p.stattrak, p.souvenir, p.marketHashName,
+              p.last24h, p.last7d, p.last30d, p.last90d,
+              p.suggested, p.median, p.lowest, p.listings, source,
+            );
+            const b = n * 14;
+            return `(${Array.from({ length: 14 }, (_, k) => `$${b + k + 1}`).join(",")})`;
+          })
+          .join(",");
+        await client.query(
+          `INSERT INTO inventory.prices
+             (item_id, wear_tier, stattrak, souvenir, market_hash_name,
+              last_24h, last_7d, last_30d, last_90d,
+              suggested, median, lowest, listings, source)
+           VALUES ${tuples}`,
+          values,
+        );
+      }
+      await client.query(
+        `UPDATE inventory.price_meta
+            SET source_date = $1, synced_at = now(), failed_at = NULL, failure = NULL,
+                rows = $2, unmatched = $3, unmatched_sample = $4
+          WHERE id = 1`,
+        [sourceDate, prices.length, unmatched.length, [...new Set(unmatched)].slice(0, 20).join("\n") || null],
+      );
+    });
+    app.log.info(
+      `[prices] ${source} ${url}: ${prices.length} listings, ${unmatched.length} unmatched, ${collisions.length} collisions ` +
+        `in ${Math.round(performance.now() - startedAt)}ms`,
+    );
+    return { rows: prices.length, unmatched: unmatched.length, collisions: collisions.length };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error.";
+    // Guarded, because the failure being handled is very often a DATABASE
+    // failure — a reset connection, an exhausted pool — and then this write
+    // throws too. Unguarded it escaped the handler entirely: the route 500'd
+    // bare, nothing was ever written to price_meta, and the panel said "never
+    // ran" for a sync that ran and failed. Those are the three states this row
+    // exists to keep apart.
+    try {
+      await pool.query(
+        `UPDATE inventory.price_meta SET failed_at = now(), failure = $1 WHERE id = 1`,
+        [message.slice(0, 1_000)],
+      );
+    } catch (metaError) {
+      app.log.error(`[prices] could not record the failure: ${(metaError as Error).message}`);
+    }
+    // Explicit, because the alternative is a price column that silently stops
+    // updating: the table still has yesterday's rows, so nothing on screen looks
+    // broken until someone notices every number is a week old.
+    app.log.warn(`[prices] ${source} ${url}: FAILED — ${message}`);
+    return { error: message };
+  }
+}
+
+let priceSyncRunning = false;
+function schedulePriceSync() {
+  const run = async () => {
+    if (priceSyncRunning) return;
+    priceSyncRunning = true;
+    try {
+      await syncPrices();
+    } catch (error) {
+      app.log.warn(`[prices] sync job threw — ${(error as Error).message}`);
+    } finally {
+      priceSyncRunning = false;
+    }
+  };
+  void run();
+  setInterval(() => void run(), PRICE_SYNC_INTERVAL_MS);
+}
+
+/** What the UI needs to decide whether to show money at all. Any signed-in user:
+ *  it is one row of operator state, and the alternative is every price surface
+ *  guessing from whether numbers came back. */
+app.get("/api/prices", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const { enabled, source, window } = await priceSettings();
+  const meta = await priceMeta();
+  const listings = meta?.rows ?? 0;
+  // Rows produced by a DIFFERENT source than the one configured are dead weight:
+  // a feed fills last_24h..last_90d, a market fills suggested/median/lowest, and
+  // the configured source's window chain only ever looks at its own columns. So
+  // a mirror full of feed rows under a market source resolves to nothing at all,
+  // for every item, silently. Reported as not-ready rather than ready-but-blank,
+  // because "no prices anywhere" with the switch on is the single most confusing
+  // state this feature has. `null` counts as a mismatch — it means the rows
+  // predate source tracking, which is exactly the case that needs a re-sync.
+  const stale = listings > 0 && meta?.source_name !== source;
+  return {
+    enabled,
+    source,
+    stale,
+    /** Enabled AND actually holding data. The gate every price surface reads —
+     *  an enabled feed that has never synced must not draw empty price slots. */
+    ready: enabled && listings > 0 && !stale,
+    window,
+    listings,
+    sourceDate: meta?.source_date?.toISOString() ?? null,
+    syncedAt: meta?.synced_at?.toISOString() ?? null,
+  };
+});
+
+/**
+ * What a craft would cost, itemized.
+ *
+ * Takes a craft-form body rather than an owned id on purpose: the estimate has
+ * to update while someone is still choosing the float and the stickers, before
+ * anything is saved. Same body shape the craft endpoint accepts, so the form can
+ * post exactly what it is holding.
+ */
+app.post<{ Body: Partial<ItemRow> }>("/api/prices/quote", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const body = request.body ?? {};
+  const itemId = body.item_id;
+  // Validated like the craft endpoint, not merely type-checked. This body is
+  // user-supplied and expands into one SQL statement with three bind parameters
+  // per attachment, so an unbounded sticker array is a cheap way to blow past
+  // Postgres's 65535-parameter ceiling and 500 the pool.
+  if (typeof itemId !== "number" || !getItem(itemId)) {
+    return reply.status(400).send({ error: "Unknown item." });
+  }
+  const cap = <T,>(arr: T[] | null | undefined, max: number) => (Array.isArray(arr) ? arr.slice(0, max) : arr);
+  const { window } = await priceSettings();
+  return await quoteFor(
+    {
+      ...body,
+      item_id: itemId,
+      stickers: cap(body.stickers, STICKER_LIMITS.maxStickers),
+      patches: cap(body.patches, STICKER_LIMITS.maxPatches),
+    },
+    window,
+  );
+});
+
+/**
+ * Every price this account's screens need, in one request, separate from the
+ * screens themselves.
+ *
+ * Split from /api/inventory and /api/loadout on purpose. An inventory is what
+ * someone came for and should paint the instant it is ready; a dollar figure is
+ * an overlay on it. Being its own request also means it can be re-fetched alone
+ * — after a craft, after a Steam sync, or the moment a player flips the switch
+ * on — without re-loading anything else.
+ *
+ * Two shapes, because two questions:
+ *   `items` — each owned row's OWN price. Summing this counts every thing once;
+ *             an applied sticker is a row here as well as a line on its weapon.
+ *   `slots` — what each equipped slot is WORTH: skin plus everything on it. Safe
+ *             to sum across a team, since an attachment lives on one weapon and
+ *             that weapon occupies one slot.
+ */
+app.get("/api/inventory/prices", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const { enabled, window } = await priceSettings();
+  if (!enabled) return { ready: false, window, items: {}, slots: {} };
+  const [{ rows: owned }, { rows: equipped }] = await Promise.all([
+    pool.query<{ id: string; item_id: number; wear: number | null; stattrak: boolean }>(
+      `SELECT id, item_id, wear, stattrak FROM inventory.owned_items WHERE steam_id = $1`,
+      [identity.steamId],
+    ),
+    // The live loadout AND every parked preset, in one read — `preset_id` is
+    // NULL for the live rows. The parked ones exist so the preset deck can put
+    // a figure on each card; they are priced by exactly the same arithmetic as
+    // the live slots below, so a build's value cannot change by being parked.
+    // Scoped through loadout_presets so a preset's rows only ever price for
+    // the account that owns it.
+    pool.query<{
+      preset_id: string | null;
+      team: string; slot: string; item_id: number | null; wear: number | null; stattrak: boolean;
+      stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
+    }>(
+      `SELECT NULL::text AS preset_id, l.team, l.slot,
+              COALESCE(i.item_id, l.item_id)   AS item_id,
+              COALESCE(i.wear, l.wear)         AS wear,
+              COALESCE(i.stattrak, l.stattrak) AS stattrak,
+              i.stickers, i.patches, i.charm_id
+         FROM inventory.loadout l
+         LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+        WHERE l.steam_id = $1
+       UNION ALL
+       SELECT s.preset_id::text, s.team, s.slot,
+              COALESCE(i.item_id, s.item_id)   AS item_id,
+              COALESCE(i.wear, s.wear)         AS wear,
+              COALESCE(i.stattrak, s.stattrak) AS stattrak,
+              i.stickers, i.patches, i.charm_id
+         FROM inventory.loadout_preset_slots s
+         JOIN inventory.loadout_presets p ON p.id = s.preset_id AND p.steam_id = $1
+         LEFT JOIN inventory.owned_items i ON i.id = s.item_instance_id`,
+      [identity.steamId],
+    ),
+  ]);
+  // ONE lookup for both halves — the equipped weapons are owned rows too, so
+  // asking twice would ask the same questions twice.
+  const targets: PriceTarget[] = owned.map((row) => ({
+    itemId: row.item_id,
+    wear: row.wear,
+    stattrak: row.stattrak,
+  }));
+  for (const row of equipped) {
+    if (row.item_id == null) continue;
+    targets.push({ itemId: row.item_id, wear: row.wear, stattrak: row.stattrak });
+    for (const spec of [...normSpecs(row.stickers), ...normSpecs(row.patches)]) {
+      if (spec) targets.push({ itemId: spec.id, wear: null, stattrak: false });
+    }
+    if (row.charm_id != null) targets.push({ itemId: row.charm_id, wear: null, stattrak: false });
+  }
+  const prices = await lookupPrices(targets, window);
+  const items: Record<string, PricePoint> = {};
+  for (const row of owned) {
+    const price = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak));
+    if (price) items[String(row.id)] = price;
+  }
+  const bare = (id: number) => prices.get(priceTargetKey(id, null, false))?.value ?? 0;
+  const slots: Record<string, number> = {};
+  // Parked presets, keyed by preset id, each in the same TEAM:slot shape as
+  // `slots` — so the client sums a card with the very code that sums the header.
+  const presets: Record<string, Record<string, number>> = {};
+  for (const row of equipped) {
+    if (row.item_id == null) continue;
+    const base = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak))?.value ?? 0;
+    const attachments =
+      normSpecs(row.stickers).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
+      normSpecs(row.patches).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
+      (row.charm_id != null ? bare(row.charm_id) : 0);
+    const total = base + attachments;
+    if (total <= 0) continue;
+    const into = row.preset_id == null ? slots : (presets[row.preset_id] ??= {});
+    into[`${row.team}:${row.slot}`] = Math.round(total * 100) / 100;
+  }
+  return {
+    ready: Object.keys(items).length > 0 || Object.keys(slots).length > 0,
+    window,
+    items,
+    slots,
+    presets,
+  };
+});
+
+/**
+ * What each finish in a slot would cost to buy BRAND NEW — the craft browser's
+ * price column, and what a sort-by-value there orders on.
+ *
+ * "Brand new" is Factory New when Factory New exists, and the next bracket up
+ * when it does not. Plenty of finishes have a float floor above 0.07 and are
+ * never sold Factory New at all (a Howl caps at 0.08); a strict FN lookup would
+ * price those at nothing and drop them out of the sort entirely, which is a
+ * worse answer than "the freshest one anybody sells". The bracket that answered
+ * rides back with the figure so the UI can say which it was.
+ *
+ * Non-StatTrak and non-Souvenir on purpose: this is the cost of the FINISH, the
+ * floor you would pay to own it at all. StatTrak is a variant you opt into, and
+ * pricing every row as its StatTrak copy would make the cheap end of the list
+ * meaningless.
+ */
+app.get<{ Querystring: { slot?: string } }>("/api/prices/stock", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) return reply.status(401).send({ error: "unauthorized" });
+  const slot = request.query.slot;
+  if (!slot) return reply.status(400).send({ error: "slot required" });
+  const { enabled, window } = await priceSettings();
+  const empty = { ready: false, window, prices: {} as Record<string, unknown> };
+  if (!enabled) return empty;
+  // The same catalog the picker is showing, so a price map and a grid can never
+  // be about different sets of items.
+  const ids = (catalogForSlot(slot).skins ?? []).map((skin) => skin.id);
+  if (ids.length === 0) return empty;
+  const values: number[] = [];
+  const tuples = ids
+    .map((id, i) => {
+      values.push(id);
+      return `($${i + 1}::int)`;
+    })
+    .join(",");
+  const { rows } = await pool.query<{
+    item_id: number;
+    wear_tier: number;
+    market_hash_name: string;
+    last_24h: number | null;
+    last_7d: number | null;
+    last_30d: number | null;
+    last_90d: number | null;
+    suggested: number | null;
+    median: number | null;
+    lowest: number | null;
+  }>(
+    `SELECT v.item_id, p.wear_tier, p.market_hash_name,
+            p.last_24h, p.last_7d, p.last_30d, p.last_90d,
+            p.suggested, p.median, p.lowest
+       FROM (VALUES ${tuples}) AS v(item_id)
+       LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
+       JOIN LATERAL (
+         SELECT pr.wear_tier, pr.market_hash_name, pr.last_24h, pr.last_7d, pr.last_30d,
+                pr.last_90d, pr.suggested, pr.median, pr.lowest
+           FROM inventory.prices pr
+          WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
+            AND pr.stattrak = false
+            AND pr.souvenir = false
+          -- The item's OWN row first (a source that prices Doppler phases wrote
+          -- one), then the freshest bracket that exists: wear_tier ascends
+          -- -1 (no bracket at all) → 0 Factory New → 1 Minimal Wear → …
+          ORDER BY (pr.item_id = v.item_id) DESC, pr.wear_tier ASC
+          LIMIT 1
+       ) p ON true`,
+    values,
+  );
+  const prices: Record<string, { value: number; window: PriceWindow; marketHashName: string; wearTier: number }> = {};
+  for (const row of rows) {
+    const point = pickPrice(
+      {
+        last24h: row.last_24h,
+        last7d: row.last_7d,
+        last30d: row.last_30d,
+        last90d: row.last_90d,
+        suggested: row.suggested,
+        median: row.median,
+        lowest: row.lowest,
+        marketHashName: row.market_hash_name,
+      },
+      window,
+    );
+    if (point) prices[String(row.item_id)] = { ...point, wearTier: row.wear_tier };
+  }
+  return { ready: Object.keys(prices).length > 0, window, prices };
+});
+
+// ---- Sale history for one listing -------------------------------------------
+// The spread behind the single figure. See inventory.price_history for why.
+
+/**
+ * One week.
+ *
+ * A sale spread moves on the scale of days, and the source allows a handful of
+ * calls per five minutes — the budget is the scarce thing here, not freshness.
+ * A tighter TTL spends it re-fetching numbers that have not moved, and the cost
+ * of being a few days stale on a range is nil next to the cost of having no
+ * range at all because the last twenty requests were refused.
+ */
+const HISTORY_TTL_MS = 7 * 24 * 60 * 60_000;
+/** A floor between OUTBOUND fetches, whatever is being asked for. Clicking
+ *  through twenty knives must not become twenty requests in twenty seconds. */
+const HISTORY_MIN_GAP_MS = 3_000;
+let lastHistoryFetch = 0;
+/**
+ * Refused, so stop asking.
+ *
+ * The per-request floor is not enough on its own: once the source starts
+ * answering 429 the polite thing — and the only thing that gets the budget
+ * back — is to go quiet for a while rather than keep knocking every three
+ * seconds. Process-local because it is a property of THIS pod's recent
+ * behaviour; the shared TTL below is what keeps replicas off each other's toes.
+ */
+let historyCooldownUntil = 0;
+const HISTORY_COOLDOWN_MS = 5 * 60_000;
+/** Marks "we asked about this name and it has no sale history" — see the note at
+ *  the write below. Not a real window; it never renders. */
+const HISTORY_NONE = "none";
+
+const HISTORY_WINDOWS = ["last_24_hours", "last_7_days", "last_30_days", "last_90_days"] as const;
+type HistoryWindow = (typeof HISTORY_WINDOWS)[number];
+interface HistoryRow {
+  window: HistoryWindow;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  median: number | null;
+  volume: number;
+}
+
+/** Skinport's sales history, which is public, phase-aware and returns one row
+ *  per version. Only this provider publishes it; with any other source selected
+ *  the detail endpoint simply has nothing to add. */
+function skinportHistoryUrl(marketHashName: string) {
+  return `https://api.skinport.com/v1/sales/history?app_id=730&currency=USD&market_hash_name=${encodeURIComponent(marketHashName)}`;
+}
+
+async function fetchSaleHistory(marketHashName: string): Promise<Map<string, HistoryRow[]>> {
+  const response = await fetch(skinportHistoryUrl(marketHashName), {
+    headers: { "Accept-Encoding": "br, gzip", Accept: "application/json" },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (response.status === 429) {
+    historyCooldownUntil = Date.now() + HISTORY_COOLDOWN_MS;
+    throw new Error("Sale history is rate-limited; backing off.");
+  }
+  if (!response.ok) throw new Error(`Sale history returned HTTP ${response.status}.`);
+  const payload = await response.json();
+  if (!Array.isArray(payload)) throw new Error("Sale history is not an array.");
+  const byVersion = new Map<string, HistoryRow[]>();
+  for (const raw of payload) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    if (entry.market_hash_name !== marketHashName) continue;
+    const version = typeof entry.version === "string" ? entry.version : "";
+    const rows: HistoryRow[] = [];
+    for (const window of HISTORY_WINDOWS) {
+      const w = (entry[window] ?? {}) as Record<string, unknown>;
+      const volume = typeof w.volume === "number" ? w.volume : 0;
+      // A window nobody sold in is not a data point. Storing four nulls per
+      // window would only teach the cache that this item trades at nothing.
+      if (volume <= 0) continue;
+      rows.push({
+        window,
+        min: positiveOrNull(w.min),
+        max: positiveOrNull(w.max),
+        avg: positiveOrNull(w.avg),
+        median: positiveOrNull(w.median),
+        volume,
+      });
+    }
+    if (rows.length) byVersion.set(version, rows);
+  }
+  return byVersion;
+}
+
+const positiveOrNull = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+
+/**
+ * What copies of this exact listing recently sold for.
+ *
+ * Answers a question the flat bracket price cannot: a Factory New Karambit
+ * Doppler is everything from a 0.0001 Phase 4 to a 0.069 one, and the MIN and
+ * MAX of recent sales bound how much that actually matters. The caller pairs it
+ * with where the item's own float sits inside its bracket — this endpoint
+ * deliberately does not, because a spread is a fact and the adjustment is an
+ * inference, and mixing them produces a number that looks measured.
+ */
+app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>(
+  "/api/prices/detail",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) return reply.status(401).send({ error: "unauthorized" });
+    const itemId = Number(request.query.item_id);
+    if (!Number.isFinite(itemId)) return reply.status(400).send({ error: "item_id is required." });
+    const { enabled, source, window } = await priceSettings();
+    const wear = request.query.wear != null && request.query.wear !== "" ? Number(request.query.wear) : null;
+    const stattrak = request.query.stattrak === "1";
+    const none = { available: false, window, marketHashName: null, version: null, history: [] as HistoryRow[] };
+    // Only one provider publishes a sale history, and the market name to ask it
+    // about comes out of our own mirror — which is keyed by exactly the four
+    // facts a listing is: item, bracket, StatTrak, Souvenir.
+    if (!enabled || source !== "skinport") return none;
+    const prices = await lookupPrices([{ itemId, wear, stattrak }], window);
+    const point = prices.get(priceTargetKey(itemId, wear, stattrak));
+    if (!point) return none;
+    const marketHashName = point.marketHashName;
+    // The phase, when the item has one: the source reports a row per version and
+    // a Black Pearl is not a Phase 1.
+    const version = getItem(itemId)?.altName ?? "";
+
+    const { rows: cached } = await pool.query<{
+      // `period` is a HistoryWindow OR the HISTORY_NONE sentinel, so it is typed
+      // as it is stored: a string, narrowed when the usable rows are picked.
+      version: string; period: string; min: number | null; max: number | null;
+      avg: number | null; median: number | null; volume: number; fetched_at: Date;
+    }>(
+      `SELECT version, period, min, max, avg, median, volume, fetched_at
+         FROM inventory.price_history WHERE market_hash_name = $1`,
+      [marketHashName],
+    );
+    const fresh =
+      cached.length > 0 && Date.now() - Math.max(...cached.map((r) => r.fetched_at.getTime())) < HISTORY_TTL_MS;
+
+    if (!fresh && Date.now() > historyCooldownUntil && Date.now() - lastHistoryFetch > HISTORY_MIN_GAP_MS) {
+      lastHistoryFetch = Date.now();
+      try {
+        const byVersion = await fetchSaleHistory(marketHashName);
+        const values: unknown[] = [];
+        const tuples: string[] = [];
+        for (const [ver, rows] of byVersion) {
+          for (const row of rows) {
+            const b = values.length;
+            values.push(marketHashName, ver, row.window, row.min, row.max, row.avg, row.median, row.volume);
+            tuples.push(`(${Array.from({ length: 8 }, (_, k) => `$${b + k + 1}`).join(",")}, now())`);
+          }
+        }
+        // NOTHING is a result too. Without a row saying "asked, and this name
+        // has no sale history", every view of that item re-asked — and the items
+        // with no history are exactly the thin ones people click through while
+        // browsing, so the empty answers were spending the whole budget. This is
+        // also why the INSERT below needs no guard of its own: there is always a
+        // row to write by the time it runs.
+        if (!tuples.length) {
+          values.push(marketHashName, version, HISTORY_NONE, null, null, null, null, 0);
+          tuples.push(`(${Array.from({ length: 8 }, (_, k) => `$${k + 1}`).join(",")}, now())`);
+        }
+        await pool.query(
+          `INSERT INTO inventory.price_history
+             (market_hash_name, version, period, min, max, avg, median, volume, fetched_at)
+           VALUES ${tuples.join(",")}
+           ON CONFLICT (market_hash_name, version, period) DO UPDATE SET
+             min = EXCLUDED.min, max = EXCLUDED.max, avg = EXCLUDED.avg,
+             median = EXCLUDED.median, volume = EXCLUDED.volume, fetched_at = now()`,
+          values,
+        );
+        const rows = byVersion.get(version) ?? byVersion.get("") ?? [];
+        return { available: rows.length > 0, window, marketHashName, version: version || null, history: rows };
+      } catch (error) {
+        // A history that won't load is not an error worth failing the request
+        // over — the caller still has a price to show.
+        app.log.warn(`[prices] sale history for ${marketHashName}: ${(error as Error).message}`);
+      }
+    }
+    // Serve what is stored, stale or not: a spread from this morning beats none.
+    const usable = cached.filter((r) => r.period !== HISTORY_NONE);
+    const mine = usable.filter((r) => r.version === version);
+    const rows = (mine.length ? mine : usable.filter((r) => r.version === "")).map((r) => ({
+      window: r.period as HistoryWindow,
+      min: r.min,
+      max: r.max,
+      avg: r.avg,
+      median: r.median,
+      volume: r.volume,
+    }));
+    return { available: rows.length > 0, window, marketHashName, version: version || null, history: rows };
+  },
+);
+
+// ---- Admin: the price feed ---------------------------------------------------
+// Same shape as the asset-CDN panel: read the switch, flip the switch, and see
+// enough of the last attempt to tell "never ran" from "ran and failed" from "ran
+// fine, that item just doesn't trade".
+/** What the sale-history cache holds. One cheap aggregate; the admin panel is
+ *  the only caller. */
+async function historyCacheStats() {
+  const { rows } = await pool.query<{ listings: string; withdata: string; oldest: Date | null }>(
+    `SELECT count(DISTINCT market_hash_name)                                 AS listings,
+            count(DISTINCT market_hash_name) FILTER (WHERE period <> 'none') AS withdata,
+            min(fetched_at)                                                  AS oldest
+       FROM inventory.price_history`,
+  );
+  const row = rows[0];
+  return {
+    listings: Number(row?.listings ?? 0),
+    /** The rest were asked about and genuinely have no recent sales — cached as
+     *  such so they are not asked about again for a week. */
+    withData: Number(row?.withdata ?? 0),
+    oldest: row?.oldest?.toISOString() ?? null,
+    staleAfterDays: HISTORY_TTL_MS / (24 * 60 * 60_000),
+  };
+}
+
+app.get("/api/admin/prices", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const { enabled, source, base, custom, window } = await priceSettings();
+  const meta = await priceMeta();
+  return {
+    enabled,
+    source,
+    sources: PRICE_SOURCES,
+    base,
+    /** The operator typed this URL in; false means it is our default. */
+    custom,
+    url: providerUrl(source, base),
+    providers: PRICE_SOURCES.map((id) => ({
+      id,
+      label: PRICE_PROVIDERS[id].label,
+      blurb: PRICE_PROVIDERS[id].blurb,
+      /** Null means "the operator supplies the URL" — only the JSON feed does. */
+      url: PRICE_PROVIDERS[id].url,
+      window: PRICE_PROVIDERS[id].window,
+    })),
+    defaultBase: PRICE_FEED_BASE,
+    /** Where the default mirror is built FROM. Shown so an operator who would
+     *  rather not depend on the 5stack host knows what to point at instead. */
+    window,
+    windows: PRICE_WINDOWS,
+    listings: meta?.rows ?? 0,
+    /** The mirror holds another source's rows — see the note in /api/prices. */
+    stale: (meta?.rows ?? 0) > 0 && meta?.source_name !== source,
+    /** The sale-history cache: how many listings have been looked up, and when
+     *  the oldest of them was. Shown because the rate budget it protects is the
+     *  reason it exists, and a cache nobody can see is a cache nobody trusts. */
+    history: await historyCacheStats(),
+    syncing: priceSyncRunning,
+    intervalMinutes: PRICE_SYNC_INTERVAL_MS / 60_000,
+    sourceDate: meta?.source_date?.toISOString() ?? null,
+    syncedAt: meta?.synced_at?.toISOString() ?? null,
+    syncedSource: meta?.source_name ?? null,
+    attemptedAt: meta?.attempted_at?.toISOString() ?? null,
+    failedAt: meta?.failed_at?.toISOString() ?? null,
+    failure: meta?.failure ?? null,
+    unmatched: meta?.unmatched ?? 0,
+    unmatchedSample: meta?.unmatched_sample?.split("\n").filter(Boolean) ?? [],
+  };
+});
+
+app.put<{ Body: { enabled?: boolean; base?: string | null; source?: string } }>("/api/admin/prices", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const body = request.body ?? {};
+  if (body.source !== undefined) {
+    if (!PRICE_SOURCES.includes(body.source as PriceSource)) {
+      return reply.status(400).send({ error: `Unknown price source. Pick one of: ${PRICE_SOURCES.join(", ")}.` });
+    }
+    // Switching source makes every stored row the wrong shape — a Skinport
+    // reference price and a feed's 7-day average live in different columns, and
+    // the old rows would simply never resolve. Cheaper and far less confusing to
+    // drop them and re-sync than to leave a table that silently prices nothing.
+    //
+    // One transaction, because dropping the mirror and recording which source we
+    // are now on are two halves of one switch. Split, a failure between them (or
+    // a pod restart) left the table emptied while the setting still named the
+    // OLD source: every price surface reports ready:false and nothing refills it
+    // on the source the operator actually chose.
+    await inTransaction(async (client) => {
+      const { rows: current } = await client.query<{ value: string }>(
+        `SELECT value FROM inventory.settings WHERE key = 'price_source' FOR UPDATE`,
+      );
+      if ((current[0]?.value ?? DEFAULT_PRICE_SOURCE) !== body.source) {
+        await client.query(`DELETE FROM inventory.prices`);
+        await client.query(`UPDATE inventory.price_meta SET rows = 0, unmatched = 0, unmatched_sample = NULL, synced_at = NULL, source_date = NULL WHERE id = 1`);
+      }
+      await client.query(
+        `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('price_source', $1, now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [body.source],
+      );
+    });
+  }
+  if (body.base !== undefined) {
+    const base = (body.base ?? "").trim();
+    // An http(s) URL or nothing. Anything else would be stored, retried hourly
+    // and reported as a fetch failure once an hour forever.
+    if (base !== "") {
+      let parsed: URL;
+      try {
+        parsed = new URL(base);
+      } catch {
+        return reply.status(400).send({ error: "That isn't a valid URL." });
+      }
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+        return reply.status(400).send({ error: "The feed URL must be http or https." });
+      }
+    }
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('price_feed', $1, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [base],
+    );
+  }
+  if (body.enabled !== undefined) {
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('prices', $1, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [body.enabled === true ? "1" : "0"],
+    );
+  }
+  invalidatePriceConfig();
+  const settings = await priceSettings();
+  // Turning it on with nothing mirrored yet would otherwise leave the panel
+  // saying "enabled" over an empty table until the top of the hour.
+  if (settings.enabled && (await priceListingCount()) === 0 && !priceSyncRunning) {
+    priceSyncRunning = true;
+    void syncPrices()
+      .catch(() => {})
+      .finally(() => {
+        priceSyncRunning = false;
+      });
+  }
+  return { enabled: settings.enabled, source: settings.source, base: settings.base, custom: settings.custom };
+});
+
+/** Force a refresh now, ignoring both the hourly clock and the opt-in — an
+ *  operator asking for a sync IS the opt-in, and it is how you test a URL
+ *  before flipping the switch. */
+app.post("/api/admin/prices/sync", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  if (priceSyncRunning) return reply.status(409).send({ error: "A price sync is already running." });
+  priceSyncRunning = true;
+  try {
+    const result = await syncPrices({ force: true });
+    if ("error" in result) return reply.status(502).send(result);
+    return result;
+  } finally {
+    priceSyncRunning = false;
+  }
+});
+
+/** Drop the mirror. The opt-in switch stops the refresh; this is for an operator
+ *  who wants the data gone as well — the rows are a third party's numbers about
+ *  a market, and "off" should be able to mean empty. */
+app.delete("/api/admin/prices", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  await pool.query(`DELETE FROM inventory.prices`);
+  await pool.query(
+    `UPDATE inventory.price_meta SET rows = 0, unmatched = 0, unmatched_sample = NULL, source_date = NULL, synced_at = NULL WHERE id = 1`,
+  );
+  return { listings: 0 };
 });
 
 // ---- Shared asset CDN (opt-in) ---------------------------------------------
@@ -3049,7 +5285,7 @@ function cachedDirStats() {
   if (dirStatsMemo && Date.now() - dirStatsMemo.at < DIR_STATS_TTL_MS) return dirStatsMemo.value;
   const modelsDir = path.join(path.dirname(RENDERS_DIR), "models");
   const value = (async () => {
-    const [renders, paints, images, models, composites] = await Promise.all([
+    const [renders, paints, images, models, composites, music] = await Promise.all([
       dirStats(RENDERS_DIR),
       dirStats(PAINTS_DIR, classifyPaintFile),
       dirStats(IMAGES_DIR),
@@ -3059,6 +5295,10 @@ function cachedDirStats() {
       // use rather than from an extraction, so an operator watching disk should
       // be able to see it.
       dirStats(COMPOSITES_DIR),
+      // ~3.5MB per music kit, ~350MB in total — the largest single thing this
+      // mount grew in one version, and the question an operator asks of this
+      // panel is "what is eating the disk". Unlisted, it is 350MB of nothing.
+      dirStats(MUSIC_DIR),
     ]);
     // Totals stay exactly where they were so an older panel keeps working; the
     // breakdown rides alongside as `parts`. A panel that doesn't know about it
@@ -3070,6 +5310,7 @@ function cachedDirStats() {
       images: strip(images),
       models: strip(models),
       composites: strip(composites),
+      music: strip(music),
       parts: { ...models.buckets, ...paints.buckets },
     };
   })();
@@ -3971,13 +6212,17 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
         wear: row.wear ?? 0,
       });
     } else if (row.slot === "musickit") {
-      out.musicKit = { musicId: item.index as number | undefined, stattrak, uid };
+      // hashed(), like every other entry. These three were the only ones built
+      // without it, which left them with NO change-detection signal at all:
+      // InventoryItem.Equals compares the hash and nothing else, so an absent
+      // hash means swapping your music kit could not be applied by !ws.
+      out.musicKit = hashed({ musicId: item.index as number | undefined, stattrak, uid });
     } else if (row.slot === "collectible") {
       // Pins and medals carry nothing but their defindex — no paint, no wear,
       // no uid to increment. The plugin hangs it off the player as-is.
-      out.collectible = { def: item.def as number | undefined };
+      out.collectible = hashed({ def: item.def as number | undefined });
     } else if (row.slot === "graffiti") {
-      out.graffiti = {
+      out.graffiti = hashed({
         def: item.index as number | undefined,
         // `?? 0`, NOT the raw field. 438 of the 2,205 graffiti carry no tint at
         // all, and the plugin's SprayGraffiti() returns early when Tint is null —
@@ -3985,7 +6230,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
         // did nothing for one graffiti in five.
         tint: (item.tint as number | undefined) ?? 0,
         uid,
-      };
+      });
     } else {
       // Weapon positions incl. zeus/c4 — keyed by weapon def index.
       if (item.def == null) continue;
@@ -4065,6 +6310,13 @@ async function start() {
   // listen() on 63 file reads.
   void warmPatchSlots(getAgents().map((a) => a.model).filter((m): m is string => !!m));
   void autoExtractIfStale();
+  // Prices: warm the index off the mirror already in Postgres, then keep it
+  // fresh on the hour. Both fire-and-forget — pricing is an enhancement, and a
+  // slow or unreachable feed must never hold up listen() or a single request.
+  void syncPriceAliases()
+    .then((n) => app.log.info(`[prices] ${n} catalog ids aliased onto their price group`))
+    .catch((error) => app.log.warn(`[prices] alias rebuild failed — ${(error as Error).message}`));
+  schedulePriceSync();
   // Freshness marker: node --watch in this container is event-based and quietly
   // misses synced edits, so "my change did nothing" is usually "the process is
   // still on old code".

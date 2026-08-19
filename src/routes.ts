@@ -9,6 +9,11 @@
 // The reason any of this exists: "the P90 renders white" is unreproducible
 // without the exact item, wear and seed, and a screenshot doesn't carry them.
 // A pasteable URL does.
+//
+// The two slot counts come from api.ts (a leaf module — no cycle) rather than
+// being written down again here, because a link that packs more slots than an
+// item can hold loses them silently on the way back in.
+import { MAX_STICKERS, MAX_PATCHES } from "./api";
 
 // ---- route table ------------------------------------------------------------
 
@@ -41,6 +46,10 @@ export function parsePath(path: string): Route {
   if (path.startsWith("/admin")) {
     return { name: "admin", section: path.replace(/^\/admin\/?/, "") };
   }
+
+  // Ids stay STRINGS here for the same reason the item route does: the API
+  // serves them as strings, and coercing to Number made every `inst.id === id`
+  // lookup fail silently.
 
   // Bare /craft is the browser; /craft/<id> is a draft of one particular finish.
   // Checked before the draft pattern so the two can share the segment.
@@ -117,6 +126,9 @@ export const STICKY_QUERY_KEYS = ["team", "slot", "q", "origin", "sort", "cat", 
 
 // State belonging to one screen only. Navigating away drops these — otherwise a
 // half-finished draft's wear would ride along onto the admin page.
+// `s5` is kept deliberately although nothing writes or reads a sixth sticker any
+// more: an old link that still carries one gets scrubbed on navigation instead of
+// trailing a key no screen owns.
 const DRAFT_KEYS = [
   "wear", "seed", "st", "name", "charm",
   "s0", "s1", "s2", "s3", "s4", "s5",
@@ -261,8 +273,12 @@ export function decodeDraft(
     seed: seed === null ? 1 : Math.min(100000, Math.max(0, Math.round(seed))),
     stattrak: q.st === "1",
     nametag: q.name ?? "",
-    stickers: [0, 1, 2, 3, 4, 5].map((i) => attach(q[`s${i}`])),
-    patches: [0, 1, 2, 3, 4].map((i) => {
+    // Exactly as many slots as an item carries. This used to read six (`s0..s5`),
+    // one more than anything downstream can hold — the craft form sliced the
+    // sixth off and the backend would have rejected it, so an `s5` in a link was
+    // read and then dropped without a word.
+    stickers: Array.from({ length: MAX_STICKERS }, (_, i) => attach(q[`s${i}`])),
+    patches: Array.from({ length: MAX_PATCHES }, (_, i) => {
       const n = Number(q[`p${i}`]);
       return Number.isInteger(n) && n > 0 ? n : null;
     }),

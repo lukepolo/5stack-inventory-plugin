@@ -17,6 +17,7 @@
  * sets it. A shared debug URL from before this file keeps working.
  */
 import { ref } from "vue";
+import { DEFAULT_ENVIRONMENT, VIEWER_ENVIRONMENTS } from "./viewerEnvironments";
 
 export interface DevFlag {
   /** The `?name=1` param and the localStorage suffix. */
@@ -33,6 +34,13 @@ export interface DevFlag {
    * Most of these are read once at module load or at mount, so flipping them
    * mid-session changes nothing until the model is rebuilt. Saying so in the HUD
    * is the difference between "this toggle is broken" and "reopen the item".
+   *
+   * ABSENT MEANS "NEEDS A REMOUNT" — the HUD asks `remount !== false`, so a flag
+   * that says nothing gets the reload prompt. That is the safe way round: the
+   * only cost of an unnecessary prompt is a reload, while a flag wrongly marked
+   * live is a control that silently does nothing and no longer admits it. So
+   * `remount: false` is a claim about the viewer, and only three of these make
+   * it — see the live setters in viewer3d.ts.
    */
   remount?: boolean;
   /** Grouping in the panel. */
@@ -49,6 +57,24 @@ export interface DevFlag {
 }
 
 export const FLAGS: DevFlag[] = [
+  {
+    name: "charmquads",
+    label: "Authored charm surfaces",
+    hint: "Use the model's own KeychainMarkup quads: they seat the UNPLACED charm's default spot and bound where a drag may go. A dragged charm goes wherever you point on the body inside that box. Off drops both, which is where default charms used to float.",
+    dflt: true,
+    remount: true,
+    group: "3D viewer",
+    audience: "developer",
+  },
+  {
+    name: "charmmap",
+    label: "Show the charm quads",
+    hint: "Paint the game's authored charm surfaces on the weapon (debug). They no longer restrict a drag — placement is free inside their bounding box — but they seat the unplaced default, and this shows whether they sit on the rendered mesh.",
+    dflt: false,
+    remount: true,
+    group: "3D viewer",
+    audience: "developer",
+  },
   {
     name: "patchboxes",
     label: "Patch footprints",
@@ -78,7 +104,24 @@ export const FLAGS: DevFlag[] = [
     label: "Bloom",
     hint: "A soft glow on the brightest parts of a skin. Applies to the 3D viewer; item cards are always rendered without it.",
     dflt: true,
-    remount: true,
+    // Live: the viewer builds and frees the composer on the switch. Stated as
+    // `false` rather than left out, because ABSENT MEANS "needs a remount" — the
+    // HUD reads `remount !== false` — and the three sliders under this one were
+    // always live, so a group where the dials moved and the switch above them
+    // asked you to reopen the item was the whole complaint.
+    remount: false,
+    group: "3D viewer",
+    audience: "user",
+  },
+  {
+    name: "inspectanim",
+    label: "Motion",
+    hint: "Play the weapon's own inspect animation in the 3D viewer instead of turning it on a turntable. Item cards are always rendered from the still pose.",
+    dflt: true,
+    // Live: the clip drives the camera and the light rig, never the mesh, so the
+    // viewer makes and unmakes a mixer instead of being rebuilt. Explicit for the
+    // same reason as bloom above — absent reads as "needs a remount".
+    remount: false,
     group: "3D viewer",
     audience: "user",
   },
@@ -190,6 +233,79 @@ export function setFlag(name: string, on: boolean): void {
   flagsVersion.value++;
 }
 
+/**
+ * A setting that PICKS ONE OF SEVERAL, for values that are neither a switch nor
+ * a dial.
+ *
+ * The third kind, and the reason it needs its own shape rather than being
+ * squeezed into the other two: a flag answers "which code path", a number
+ * answers "how much", and this answers "which one" — an enum with labels and its
+ * own per-option hint. Encoding four lighting rigs as three booleans would make
+ * two of the eight combinations meaningless and the picker unrepresentable.
+ *
+ * Shares the same `viewer3d.<name>` localStorage convention, so `?name=studio`
+ * in a debug URL works exactly like it does for the other two.
+ */
+export interface DevChoice {
+  name: string;
+  label: string;
+  hint: string;
+  dflt: string;
+  options: { value: string; label: string; hint?: string }[];
+  group: DevFlag["group"];
+  /** See DevFlag.remount — and note the picker only prints the note, so leaving
+   *  it out here reads as "live" rather than as "needs a remount". State it. */
+  remount?: boolean;
+  audience?: "user" | "developer";
+}
+
+export const CHOICES: DevChoice[] = [
+  {
+    name: "env",
+    label: "Lighting",
+    hint: "Which rig the viewer lights an item under. Item CARDS are always baked under Studio, whatever this says — a card is cached against its render key, so a preset baked into one could never be told apart from a bug.",
+    dflt: DEFAULT_ENVIRONMENT,
+    options: VIEWER_ENVIRONMENTS.map((e) => ({ value: e.key, label: e.label, hint: e.hint })),
+    // Live: a preset is five intensities and an env rotation, and the viewer
+    // re-assigns them on the lights it already has. It was remount-gated only
+    // because the rig was read once at mount, which made picking a preset update
+    // this hint and leave the render pixel for pixel identical.
+    remount: false,
+    group: "3D viewer",
+    audience: "user",
+  },
+];
+
+/** Bumped on every choice write, so the HUD re-renders and the viewer re-reads. */
+export const choicesVersion = ref(0);
+
+export function choiceValue(name: string): string {
+  const spec = CHOICES.find((c) => c.name === name);
+  const dflt = spec?.dflt ?? "";
+  try {
+    const stored = localStorage.getItem(key(name));
+    // Validated against the declared options, not just returned: a value from a
+    // build that offered a preset this one dropped has to fall back rather than
+    // reach the renderer as an unknown key.
+    if (stored && spec?.options.some((o) => o.value === stored)) return stored;
+    return dflt;
+  } catch {
+    return dflt;
+  }
+}
+
+export function setChoice(name: string, v: string): void {
+  try {
+    localStorage.setItem(key(name), v);
+  } catch {
+    /* private mode — the value just does not stick */
+  }
+  choicesVersion.value++;
+}
+
+export const userChoices = (): DevChoice[] => CHOICES.filter((c) => c.audience === "user");
+export const devChoices = (): DevChoice[] => CHOICES.filter((c) => c.audience !== "user");
+
 /** Back to defaults, and forget every stored answer. */
 export function resetFlags(): void {
   for (const n of NUMBERS) {
@@ -208,6 +324,14 @@ export function resetFlags(): void {
     }
   }
   flagsVersion.value++;
+  for (const c of CHOICES) {
+    try {
+      localStorage.removeItem(key(c.name));
+    } catch {
+      /* ignore */
+    }
+  }
+  choicesVersion.value++;
 }
 
 /** Bumped on every numeric write, so a slider re-renders and the viewer re-reads. */

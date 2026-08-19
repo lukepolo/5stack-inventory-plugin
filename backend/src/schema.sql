@@ -43,19 +43,6 @@ CREATE TABLE IF NOT EXISTS inventory.loadout (
 );
 CREATE INDEX IF NOT EXISTS loadout_steam_id_idx ON inventory.loadout (steam_id);
 
--- CS2-style positional slots: sp (starting pistol), p1-p4 (other pistols),
--- m1-m5 (mid-tier), r1-r5 (rifles), knife, gloves, agent. Drop rows from the
--- legacy one-slot-per-weapon scheme.
---
--- KEEP THIS IN STEP WITH SLOT_RE IN main.ts. This file is re-applied on every
--- boot, so a slot the API accepts but this list forgets is not a stale-data
--- cleanup — it is a wipe on the next restart, and it looks like the equip
--- silently failing hours later. 'graffiti' was exactly that: equippable since
--- the graffiti sheet shipped, absent here, deleted on every backend restart.
-DELETE FROM inventory.loadout WHERE slot NOT IN
-  ('sp','p1','p2','p3','p4','m1','m2','m3','m4','m5','r1','r2','r3','r4','r5',
-   'knife','gloves','agent','zeus','c4','musickit','graffiti','collectible');
-
 -- Migration: point the loadout at an owned instance instead of an inline item.
 ALTER TABLE inventory.loadout ADD COLUMN IF NOT EXISTS item_instance_id bigint;
 ALTER TABLE inventory.loadout ALTER COLUMN item_id DROP NOT NULL;
@@ -68,6 +55,120 @@ DO $$ BEGIN
       FOREIGN KEY (item_instance_id) REFERENCES inventory.owned_items (id) ON DELETE CASCADE;
   END IF;
 END $$;
+
+-- ---- Loadout presets --------------------------------------------------------
+--
+-- Named builds you switch between, the way CS2 ships five loadout slots. The
+-- shape here is deliberately lopsided: the preset you are WEARING has no rows
+-- of its own at all — its slots are `inventory.loadout`, unchanged, exactly the
+-- rows every query in main.ts already reads. Only the presets you are not
+-- wearing park their slots in `loadout_preset_slots`, and activating one swaps
+-- the two sets over inside a transaction.
+--
+-- The obvious alternative — fold a preset_id into inventory.loadout's primary
+-- key — was rejected for one reason: `GET /api/equipped/v5/:steamId` is the
+-- hottest read in the system. Every CS2 game server hits it, unauthenticated,
+-- for every player on every connect, and it is one index scan on (steam_id).
+-- A preset_id in that key would make it carry a "which preset is active"
+-- lookup forever, on every connect, to serve a feature the game server does not
+-- know exists — and it would put a preset filter into five other loadout
+-- queries besides, each of them a place to forget one and serve a player
+-- somebody else's build. Keeping the live loadout a table of exactly the live
+-- rows means none of those queries learned that presets exist.
+CREATE TABLE IF NOT EXISTS inventory.loadout_presets (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  steam_id bigint NOT NULL,
+  name text NOT NULL,
+  -- The pointer. Exactly one row per player carries it: the preset whose slots
+  -- are the ones sitting in inventory.loadout right now.
+  active boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS loadout_presets_steam_id_idx ON inventory.loadout_presets (steam_id);
+
+-- "At most one active preset per player", enforced by the database rather than
+-- by a code path that has to remember. Activation clears one flag and sets
+-- another; two tabs racing, or a crash between the two statements, would
+-- otherwise leave a player with two actives and nothing able to say which of
+-- them inventory.loadout actually holds — an ambiguity that costs you a build
+-- the next time you switch.
+CREATE UNIQUE INDEX IF NOT EXISTS loadout_presets_active_idx
+  ON inventory.loadout_presets (steam_id) WHERE active;
+
+-- The parked slots of every preset that is NOT active: the same columns as
+-- inventory.loadout, minus steam_id (the preset row owns that).
+--
+-- item_instance_id cascades on delete, matching the live loadout. That is a
+-- decision, not an inherited default: the loadout is craft-gated, so a slot IS
+-- a pointer at one specific owned instance, and once that instance is gone
+-- there is nothing legal left for the slot to hold. RESTRICT would instead make
+-- deleting a skin from your inventory fail because of a preset you are not
+-- looking at, naming a slot you would then have to go and empty by hand. The
+-- cost is that a delete now quietly empties that slot in every preset, not just
+-- the one on screen — same behaviour as today, just reaching further.
+CREATE TABLE IF NOT EXISTS inventory.loadout_preset_slots (
+  preset_id bigint NOT NULL REFERENCES inventory.loadout_presets (id) ON DELETE CASCADE,
+  team text NOT NULL,
+  slot text NOT NULL,
+  item_id integer,                 -- free vanilla weapon, same meaning as inventory.loadout.item_id
+  item_instance_id bigint REFERENCES inventory.owned_items (id) ON DELETE CASCADE,
+  wear real,
+  seed integer,
+  stattrak boolean NOT NULL DEFAULT false,
+  nametag text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (preset_id, team, slot)
+);
+
+-- Backfill: every player who already has a loadout gets a preset that IS it.
+--
+-- This moves ZERO rows. The live loadout stays in inventory.loadout untouched;
+-- all the new row does is give it a name and a handle. That is the property
+-- worth having in a migration re-applied on every boot — there is no step in it
+-- that can lose somebody's build, because there is no step in it that writes to
+-- inventory.loadout at all.
+--
+-- Guarded on "has no ACTIVE preset" rather than "has no presets": a player left
+-- with presets but no active one (a half-applied activation, say) has no live
+-- loadout the backend can name, and every write path is stuck until one exists.
+-- Self-healing beats stuck. main.ts mints the same row lazily for players who
+-- have never equipped anything, so this only has to cover the ones who have.
+INSERT INTO inventory.loadout_presets (steam_id, name, active)
+SELECT DISTINCT l.steam_id, 'Loadout 1', true
+  FROM inventory.loadout l
+ WHERE NOT EXISTS (
+   SELECT 1 FROM inventory.loadout_presets p WHERE p.steam_id = l.steam_id AND p.active
+ );
+
+-- CS2-style positional slots: sp (starting pistol), p1-p4 (other pistols),
+-- m1-m5 (mid-tier), r1-r5 (rifles), knife, gloves, agent. Drop rows from the
+-- legacy one-slot-per-weapon scheme.
+--
+-- KEEP THIS IN STEP WITH SLOT_RE IN main.ts. This file is re-applied on every
+-- boot, so a slot the API accepts but this list forgets is not a stale-data
+-- cleanup — it is a wipe on the next restart, and it looks like the equip
+-- silently failing hours later. 'graffiti' was exactly that: equippable since
+-- the graffiti sheet shipped, absent here, deleted on every backend restart.
+--
+-- Presets doubled the number of tables holding a `slot`, so the list is written
+-- ONCE into a CTE and both are cleaned from it — two literal copies would just
+-- have been the same trap again, one table deep. A data-modifying CTE always
+-- runs to completion whether or not the outer query reads it, which is what
+-- lets the first DELETE ride along inside a statement whose result is the
+-- second one. It has to sit here, below both CREATE TABLEs, for that reason.
+WITH legal_slot (slot) AS (
+  VALUES ('sp'),('p1'),('p2'),('p3'),('p4'),
+         ('m1'),('m2'),('m3'),('m4'),('m5'),
+         ('r1'),('r2'),('r3'),('r4'),('r5'),
+         ('knife'),('gloves'),('agent'),('zeus'),('c4'),
+         ('musickit'),('graffiti'),('collectible')
+), live AS (
+  DELETE FROM inventory.loadout
+   WHERE slot NOT IN (SELECT slot FROM legal_slot)
+)
+DELETE FROM inventory.loadout_preset_slots
+ WHERE slot NOT IN (SELECT slot FROM legal_slot);
 
 -- Attachments become owned instances.
 --
@@ -172,4 +273,162 @@ CREATE TABLE IF NOT EXISTS inventory.settings (
 CREATE TABLE IF NOT EXISTS inventory.steam_sync (
   steam_id bigint PRIMARY KEY,
   synced_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---- Market prices ---------------------------------------------------------
+-- A mirror of a Steam market price feed, resolved onto catalog ids. Rebuilt
+-- wholesale on each sync (the feed is a full snapshot, not a delta), which is
+-- why there is no updated_at per row — `price_meta.source_date` dates the whole
+-- table at once.
+--
+-- The primary key is the four facts a market listing is keyed by. `wear_tier`
+-- is an INDEX into the five Steam wear brackets with -1 for "this name carries
+-- no bracket" (agents, charms, music kits), rather than a nullable column: a
+-- NULL in a primary key would let the same floatless item in twice. Same reason
+-- `souvenir` is stored even though nothing here mints souvenirs yet — dropping
+-- the distinction would file a Souvenir AWP's price on the plain one, and those
+-- are different items with wildly different prices.
+CREATE TABLE IF NOT EXISTS inventory.prices (
+  item_id integer NOT NULL,
+  wear_tier smallint NOT NULL,
+  stattrak boolean NOT NULL,
+  souvenir boolean NOT NULL,
+  market_hash_name text NOT NULL,
+  -- Trailing sold-averages. Only a sale-history feed fills these in.
+  last_24h real,
+  last_7d real,
+  last_30d real,
+  last_90d real,
+  -- A live order book fills these instead: the market's own reference price,
+  -- the middle of what is listed, and the cheapest ask. Deliberately separate
+  -- columns rather than one `price`, because "sold for, on average, last week"
+  -- and "is on sale right now for" are different claims and a UI has to be able
+  -- to say which one it is showing.
+  suggested real,
+  median real,
+  lowest real,
+  -- How many are listed. Not a price — the thing that makes a four-figure ask
+  -- with one listing behind it readable as the outlier it is.
+  listings integer,
+  source text NOT NULL DEFAULT 'skinport',
+  PRIMARY KEY (item_id, wear_tier, stattrak, souvenir)
+);
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS suggested real;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS median real;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS lowest real;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS listings integer;
+ALTER TABLE inventory.prices ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'skinport';
+-- No secondary index: every lookup joins on the full primary key (item_id +
+-- bracket + stattrak + souvenir), which the PK's own index already serves. A
+-- spare index on item_id alone would only cost write time on the ~27k-row
+-- wholesale rewrite each sync does.
+DROP INDEX IF EXISTS inventory.prices_item_id_idx;
+
+-- item_id -> the id its price is filed under.
+--
+-- The mirror is keyed by market NAME, and 398 catalog items share a name with
+-- another (every Doppler and Gamma Doppler phase, most collectible variants), so
+-- a price row can only ever carry the first of them. An owned row points at the
+-- specific one — you own Phase 3, not "Doppler" — so something has to bridge the
+-- two, and it has to live where the JOIN can reach it. In JS that bridge is
+-- priceGroupId(); this is the same collapse, in a table.
+--
+-- Derived from cs2-lib, not authored: rebuilt on boot, because a catalog bump
+-- changes it. Only ids that actually differ get a row; the join COALESCEs.
+CREATE TABLE IF NOT EXISTS inventory.price_aliases (
+  item_id integer PRIMARY KEY,
+  price_item_id integer NOT NULL
+);
+
+-- One row. Every sync outcome, success or failure, so an operator looking at a
+-- blank price column can tell "never ran", "ran and the source 404'd" and "ran
+-- fine, that item just doesn't trade" apart — three states that look identical
+-- from the UI and have completely different fixes.
+CREATE TABLE IF NOT EXISTS inventory.price_meta (
+  id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  source_url text,
+  source_name text,
+  -- timestamptz, not date. It is written from a feed's Last-Modified (a full
+  -- instant) and read back with .toISOString(): a `date` column truncated the
+  -- time, node-postgres parsed the bare date at LOCAL midnight, and the
+  -- toISOString() then shifted it back across UTC — so in any America/* pod the
+  -- panel reported yesterday's date for a feed published today. That date is
+  -- exactly the signal an operator uses to judge whether a sync is stale.
+  source_date timestamptz,
+  synced_at timestamptz,
+  attempted_at timestamptz,
+  failed_at timestamptz,
+  failure text,
+  rows integer NOT NULL DEFAULT 0,
+  -- Names the catalog had no answer for. Small and boring while the mapping
+  -- works; a jump here is the whole early warning — see tools/price-coverage.ts.
+  unmatched integer NOT NULL DEFAULT 0,
+  unmatched_sample text
+);
+ALTER TABLE inventory.price_meta ADD COLUMN IF NOT EXISTS source_name text;
+-- Was `date` on instances created before the note above. Conditional because
+-- this file runs on EVERY boot and an unconditional ALTER TYPE takes an ACCESS
+-- EXCLUSIVE lock each time for a column that is already right. The cast itself
+-- is exact (midnight in the server's zone) and the next sync overwrites it.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'inventory' AND table_name = 'price_meta'
+       AND column_name = 'source_date' AND data_type = 'date'
+  ) THEN
+    ALTER TABLE inventory.price_meta ALTER COLUMN source_date TYPE timestamptz;
+  END IF;
+END $$;
+
+-- ---- Sale history, per market listing --------------------------------------
+-- What copies of ONE listing actually sold for, and the spread between them.
+--
+-- The price table answers "what is this worth" with a single figure for a whole
+-- wear bracket. That is the wrong shape for a knife: a Factory New Karambit
+-- Doppler covers everything from a 0.0001 Phase 4 to a 0.069 one, and those are
+-- different items to anyone buying. The MIN and MAX of recent sales bound that
+-- spread — not perfectly (stickers and patterns move price too, and no public
+-- feed exposes per-listing floats) but honestly, and it is the difference
+-- between "$1,400" and "$1,205 to $1,520 across ten sales".
+--
+-- Cached in Postgres rather than per process because the source rate-limits to a
+-- handful of calls per five minutes: every replica shares one row, and
+-- `fetched_at` is what stops a player clicking through twenty knives from
+-- spending the whole budget.
+CREATE TABLE IF NOT EXISTS inventory.price_history (
+  market_hash_name text NOT NULL,
+  -- Doppler phase / gem, or '' for the listings that have none. Part of the key
+  -- because the source reports a row per phase and they differ by thousands.
+  version text NOT NULL DEFAULT '',
+  -- NOT "window": that is a reserved word in Postgres (window functions), and an
+  -- unquoted column by that name is a syntax error that fails the whole schema
+  -- apply — which runs on every boot, so it took the backend down with it.
+  period text NOT NULL,
+  min real,
+  max real,
+  avg real,
+  median real,
+  volume integer NOT NULL DEFAULT 0,
+  fetched_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (market_hash_name, version, period)
+);
+CREATE INDEX IF NOT EXISTS price_history_fetched_idx ON inventory.price_history (fetched_at);
+
+-- ---- Wishlist --------------------------------------------------------------
+-- Catalog items the caller wants but does not own — "I want that Fade one day".
+--
+-- Its own table rather than a flag on the item, because a wanted item is not a
+-- row in owned_items and never will be until someone crafts it, so there is
+-- nothing to flag. Keyed by the cs2-lib item id, which is why it cannot be a
+-- nullable column on the inventory table.
+--
+-- No foreign key to anything: item_id addresses the economy, which lives in
+-- cs2-lib and not in this database. An id cs2-lib later retires simply stops
+-- resolving through getItem and the row reads as unknown, which is the same
+-- degradation every other stored item_id already has.
+CREATE TABLE IF NOT EXISTS inventory.wishlist (
+  steam_id bigint NOT NULL,
+  item_id integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (steam_id, item_id)
 );

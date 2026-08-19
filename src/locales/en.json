@@ -7,6 +7,8 @@
       "crafted": "Crafted — it's in your inventory.",
       "copy_created": "Editable copy created in your inventory.",
       "inspect_sent": "Sent to your game client — CS2 will open the inspect view.",
+      "loadout_copied": "Copied {summary} into your inventory and equipped them on your own loadout.",
+      "loadout_copy_empty": "Nothing to copy — that loadout is empty.",
       "synced": "Synced with Steam — {summary}.",
       "synced_partial": "Synced with Steam — {summary}. Inventory too large to read fully.",
       "synced_no_changes": "Synced with Steam — everything was already up to date.",
@@ -53,6 +55,7 @@
           "econ-icons": "Extracting item icons",
           "paint-chain": "Extracting paint chain",
           "sticker-art": "Extracting sticker art",
+          "music-audio": "Extracting music kit audio",
           "stamp": "Recording the build"
         },
         "time_left": "~{duration} left"
@@ -61,6 +64,137 @@
         "cleared": "Cleared {count} files.",
         "verdict_failed": "Verdict not saved: {error}"
       }
+    },
+    "armory": {
+      "search": "Search…",
+      "drill": "Browse finishes"
+    },
+    "music": {
+      "play": "Play preview",
+      "pause": "Pause preview",
+      "seek": "Seek preview",
+      "failed": "Preview unavailable"
+    },
+    "viewer": {
+      "hint_place": "Drag a sticker or the charm across the model to place it, and shift-drag a sticker to turn it.",
+      "hint_place_touch": "Drag a sticker or the charm across the model to place it, and twist two fingers on a sticker to turn it.",
+      "hint_dismiss": "Dismiss",
+      "controls": {
+        "pause_clip": "Pause the model's own inspect animation ({clip})",
+        "play_clip": "Play the model's own inspect animation ({clip})",
+        "spin": "Spin",
+        "spin_hint_touch": "Drag with one finger to rotate the model",
+        "spin_hint": "Drag to rotate the model",
+        "zoom": "Zoom",
+        "zoom_hint_touch": "Pinch to zoom",
+        "zoom_hint": "Scroll to zoom",
+        "pan": "Pan",
+        "pan_hint_touch": "Drag with two fingers to pan",
+        "pan_hint": "Right-drag to pan",
+        "move": "Move",
+        "move_hint": "Drag a sticker or charm to move it — zoom in for fine placement",
+        "turn": "Turn",
+        "turn_hint_touch": "Twist two fingers on a sticker to rotate it",
+        "turn_hint": "Shift-drag a sticker to rotate it",
+        "pause": "Pause",
+        "play": "Play",
+        "scrub": "Scrub the inspect animation"
+      }
+    },
+    "pattern": {
+      "pattern": "Pattern",
+      "type_exact": "Type an exact pattern",
+      "zoom_in": "Showing {span} patterns — click to zoom in",
+      "zoom_full": "Narrowest band — click for the full range",
+      "roll": "Random pattern between {lo} and {hi}",
+      "charm_aria": "Charm pattern",
+      "drag_browse": "Drag to browse",
+      "roll_range": "🎲 rolls in here",
+      "metric_measured": "{metric}: measured over this finish's composited artwork",
+      "measuring": "measuring…",
+      "diff_identical": "{pct}% different — all but identical",
+      "diff": "{pct}% different",
+      "blink": "Flip between the two on the model — the eye catches a change that blinks",
+      "blink_stop": "showing {which} — stop",
+      "blink_start": "Flip between them",
+      "weapon_aria": "Weapon pattern",
+      "measuring_pct": "Measuring… {pct}%",
+      "top": "Top",
+      "find": "Find",
+      "find_weighted": "Composite all {count} patterns once and rank them by {metric} — a few seconds, measured on the gun",
+      "find_hint": "Composite all {count} patterns once and rank them by {metric}. Open the 3D view first and it can weight the answer by what you actually see.",
+      "pin_stop": "Comparing against #{seed} — click to stop",
+      "pin_start": "Hold this pattern, then move to another to see how they differ",
+      "pin_off": "Stop comparing",
+      "pin_on": "Compare with another"
+    },
+    "status": {
+      "equipped_on": "Equipped on {team}",
+      "applied_to": "Applied to {name}",
+      "steam_synced": "Synced from your Steam inventory (read-only)"
+    },
+    "actions": {
+      "focus": "Focus",
+      "view3d": "View in 3D",
+      "inspect": "Inspect in game",
+      "duplicate": "Synced from Steam and read-only — craft your own copy of it",
+      "edit": "Edit item",
+      "remove": "Delete from inventory"
+    },
+    "devhud": {
+      "heading": "Viewer settings",
+      "changed": "{count} changed",
+      "reset": "Back to defaults",
+      "close": "Close (Esc)",
+      "remount": "Reopen the item to apply",
+      "advanced": "Advanced",
+      "advanced_note": "Rendering diagnostics. Several of these deliberately draw the model wrong so it can be measured — if something looks broken, reset.",
+      "reload_note": "Read at load — reload to apply.",
+      "reload": "Reload"
+    },
+    "filters": {
+      "all": "All",
+      "clear": "Clear",
+      "sort": "Sort",
+      "reset": "Reset",
+      "search": "Filter {count} …",
+      "search_clear": "Clear filter",
+      "no_match": "No match"
+    },
+    "sort": {
+      "reverse_hint": "{hint} — click to reverse",
+      "reverse": "Reverse sort order"
+    },
+    "share": {
+      "tooltip": "Copy a link to this",
+      "button": "Share",
+      "heading": "Copy link",
+      "copied": "Copied",
+      "clipboard_failed": "Couldn't reach the clipboard — copy from the address bar instead."
+    },
+    "deck": {
+      "open": "{count} colours — open"
+    },
+    "tile": {
+      "baking": "baking",
+      "queued": "queued",
+      "preparing": "preparing"
+    },
+    "badges": {
+      "stattrak_kills": "StatTrak™ — {kills} kills"
+    },
+    "specs": {
+      "nametag": "Name tag",
+      "applied": "Applied",
+      "pattern": "Pattern",
+      "wear": "Wear",
+      "scratched": "scratched",
+      "kills": "kills"
+    },
+    "price": {
+      "approx_note": "No exact listing — this is the {note} one.",
+      "estimate": "Rough estimate — {window} for {name}. Not a sale price.",
+      "none": "No {source} listing for this item{bracket}."
     }
   }
 }

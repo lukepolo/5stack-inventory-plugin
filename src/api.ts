@@ -17,6 +17,8 @@ function resolveApiBase(): string {
 const API_BASE = resolveApiBase();
 export const API_ORIGIN = API_BASE;
 
+import { WEAR_STOPS } from "./itemVisuals";
+
 export type Team = "CT" | "T";
 
 export interface CatalogWeapon {
@@ -80,17 +82,23 @@ export interface Skin {
   wearMax?: number | null;
   seedMin?: number | null;
   seedMax?: number | null;
-  // ---- sheet facets. Only graffiti carries these today; the sheet's filter bar
-  // is driven entirely by which of them appear on the list it loaded, so a
-  // catalog without them renders exactly as it did before.
+  // ---- sheet facets. The sheet's filter bar is driven entirely by which of
+  // them appear on the list it loaded, so a catalog without them renders exactly
+  // as it did before — which is what let `collection` spread from graffiti to
+  // every weapon, knife, glove and agent finish without touching the bar.
   /** Coarse "what IS this" split — the sheet's tab strip. */
   group?: string;
-  /** Capsule / box / tournament it came in. Absent when it came in none. */
+  /** The set it came in — a capsule for graffiti, a case, map or drop pool for a
+   *  finish. Absent when it came in none: M4A4 | Howl's collection was withdrawn
+   *  with the skin, and the classic knife pool is the special of eleven cases at
+   *  once, so no single one is true. */
   collection?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
   /** That variant's colourway ("Cash Green"). */
   tintName?: string;
+  /** MUSIC KITS only: the kit's menu theme, ready to play. See `CatalogItem`. */
+  audio?: string | null;
 }
 
 /** Facet metadata a catalog can ship next to its skins, for the values the
@@ -142,6 +150,18 @@ export interface CatalogItem {
   design?: number;
   /** That variant's colourway ("Cash Green"). */
   tintName?: string;
+  /** The set it came in — see `Skin.collection`. Present on an OWNED instance
+   *  too (the backend resolver fills it), which is what lets the inventory grid
+   *  and the loadout sheet sort by collection. */
+  collection?: string;
+  /**
+   * MUSIC KITS only: the kit's menu theme, as a fully resolved, playable URL.
+   *
+   * Null or absent means this instance has not extracted the audio (or the item
+   * is not a music kit), and every surface reads that as "draw no player" — the
+   * transport is never rendered against a track that cannot load.
+   */
+  audio?: string | null;
 }
 
 export interface LoadoutEntry {
@@ -162,6 +182,25 @@ export interface LoadoutEntry {
   stattrak_count: number;
   nametag: string | null;
   item: CatalogItem | null;
+  // NO price here. It rode on this type briefly and was never set: slot values
+  // come from /inventory/prices, keyed TEAM:slot, so the loadout paints before
+  // money arrives. A permanently-undefined field is worse than none — the next
+  // person to reach for `row.value` gets a silent zero.
+  /**
+   * Attachments, sent only by the PUBLIC player-loadout endpoint.
+   *
+   * Your own loadout doesn't carry them and doesn't need to: every skinned row
+   * there points at something in your inventory, and that item is where the
+   * screen reads stickers from. A visitor holds no inventory for the player
+   * they are looking at, so nothing could resolve — which is why viewing
+   * someone's loadout used to show a bare gun where they had five stickers and
+   * a charm. The row brings its own, enriched exactly like an owned item's,
+   * minus the `inst` handles: those name rows in the owner's inventory and
+   * never leave their account.
+   */
+  stickers?: PlacedItem[];
+  patches?: PlacedItem[];
+  charm?: PlacedCharm;
 }
 
 // An owned, crafted item instance in the user's inventory.
@@ -172,6 +211,10 @@ export interface LoadoutEntry {
 // It must survive the round trip — see the Attach type in App.vue.
 export type AttachSpec = { id: number; x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null } | null;
 export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; r?: number | null; w?: number | null; inst?: string | null }) | null;
+/** An attached charm: catalog item, its offset on the gun, and the pattern that
+ *  grades its material. Named rather than inlined because two shapes carry one
+ *  — an owned item and a public loadout row — and they must not drift. */
+export type PlacedCharm = (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
 
 export interface InventoryItem {
   id: number;
@@ -185,18 +228,43 @@ export interface InventoryItem {
   nametag: string | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
-  charm?: (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
+  charm?: PlacedCharm;
   slot: string | null;
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];
   origin?: "crafted" | "steam" | "copied";
+  /** This item's own market price. Summing this column across an inventory
+   *  counts every thing exactly once — an applied sticker is its own row here
+   *  as well as a line on the weapon it sits on. */
+  price?: PricePoint | null;
   /** The owned item this one is currently attached to, if it's a sticker,
    *  patch or charm sitting on a weapon. Null when it's loose in the
    *  inventory. Derived server-side from what the weapons actually reference.
    *  A string, like every other owned-item id on the wire — node-postgres
    *  renders bigints as strings, so `id` is `"1014"` and this must match it. */
   attached_to?: string | null;
+  /** When this instance was crafted, imported or copied — an ISO string (the
+   *  column is timestamptz; node-postgres yields a Date and JSON stringifies
+   *  it). Drives the "Recently added" sort. Optional because an older backend
+   *  does not send it, and a mode with nothing to sort on has to degrade rather
+   *  than reorder the grid at random. */
+  created_at?: string | null;
 }
+
+/**
+ * Anything that carries the facts a screen prints ABOUT one copy: an owned
+ * instance, or a public loadout row.
+ *
+ * Both shapes hold the same enriched `stickers`/`patches`/`charm`, the same
+ * StatTrak pair and the same wear/seed/nametag, and every renderer of those
+ * facts (ItemBadges, ItemSpecs, attachmentsOf, the 3D placements builder) reads
+ * only that overlap. It is named here rather than in each of them because the
+ * union is the reason a VISITOR sees anything at all: they hold no inventory for
+ * the player they are looking at, so nothing resolves to an InventoryItem and
+ * every one of those surfaces would otherwise render a gun with none of the work
+ * on it.
+ */
+export type AttachSource = InventoryItem | LoadoutEntry;
 
 // Item artwork lives on our own mount, served under /images by the plugin host
 // — the same origin as /api. The backend emits ROOT-RELATIVE paths because it
@@ -223,10 +291,16 @@ export const assetUrl = (path: string) => withAssetVersion(`${assetOrigin}${path
 /** Rewrite every "/images/..." string in a decoded response body in place.
  *  Item art appears under a dozen different keys (item, skin, stickers[],
  *  patches[], charm, agents, collections...), so a walk is materially safer
- *  than enumerating them and silently missing one the next time a shape grows. */
+ *  than enumerating them and silently missing one the next time a shape grows.
+ *
+ *  "/music/..." joins it for exactly the same reason: a music kit's preview
+ *  arrives on both the catalog listing and the owned item, and a bare path in a
+ *  federated remote resolves against the PANEL's host, not ours. Riding the
+ *  same walk also means the audio picks up the ?v= stamp, which is what lets it
+ *  be cached hard without pinning a browser to one CS2 build's track. */
 function resolveAssetPaths(node: unknown): unknown {
   if (typeof node === "string") {
-    return node.startsWith("/images/") ? assetUrl(node) : node;
+    return node.startsWith("/images/") || node.startsWith("/music/") ? assetUrl(node) : node;
   }
   if (Array.isArray(node)) {
     for (let i = 0; i < node.length; i++) node[i] = resolveAssetPaths(node[i]);
@@ -437,12 +511,46 @@ export async function uploadTestSnap(key: string, blob: Blob): Promise<{ ok: boo
   }
 }
 
+/**
+ * How many stickers an item can carry — the STACK depth, five on every weapon.
+ *
+ * NOT the same number as how many anchors the weapon's model declares (4, 5 or
+ * 6; see `StickerGeometry.anchorCount`). The two are independent: the stack can
+ * outnumber the anchors, and then stickers SHARE one. cs2-lib says so outright
+ * ("a model with fewer schemas than stickers shares anchors") and its validator
+ * enforces the two separately — five stickers on an AK-47 is legal, a fifth
+ * ANCHOR on it is not.
+ *
+ * Deriving the well count from the anchors instead is what hid the fifth sticker
+ * on the sixteen weapons with four: AK-47, AWP, Glock, M4A1, Galil, M249, UMP,
+ * PP-Bizon, MAG-7, Negev, Tec-9, MP9, SCAR-20, SG 553, SSG 08, Dual Berettas.
+ *
+ * Mirrors `STICKER_LIMITS.maxStickers` (cs2-lib's `CS2_MAX_STICKERS`), which the
+ * backend enforces in `checkAttachments`. Duplicated rather than fetched because
+ * the frontend never imports cs2-lib and the craft form needs the array length
+ * before any request resolves.
+ */
+export const MAX_STICKERS = 5;
+
+/**
+ * How many patches an agent can carry — `CS2_MAX_PATCHES`, five.
+ *
+ * Equal to MAX_STICKERS today and still its own constant: they are unrelated
+ * numbers that happen to match, and this file exists to stop that kind of
+ * coincidence from being written down once and read as one rule.
+ *
+ * The equivalent of the anchor count here is `patchSlots` on /api/catalog (3-5,
+ * from the agent's own materials) — and unlike sticker anchors that one IS a cap,
+ * because the compositor has nowhere to stamp a patch the model never placed.
+ */
+export const MAX_PATCHES = 5;
+
 // Per-weapon sticker geometry (cached — schema data only moves on a CS2 model
 // change). `slots` carries the game's own per-slot UV anchors; `bounds` is the
 // looser envelope cs2-lib derives from them.
 export type StickerBounds = { x: [number, number]; y: [number, number] };
 export interface StickerSlot {
-  /** The game's slot index — this is what the protobuf `slot` field wants. */
+  /** The game's anchor index. NOT a cap on stickers — see MAX_STICKERS. */
   index: number;
   /** "body_hd" | "body_legacy" — must match the body the finish renders on. */
   mesh: string;
@@ -452,18 +560,64 @@ export interface StickerSlot {
   scale: number;
   rotation: number;
   special?: string;
+  /** Authored placement area as flat 2D triangle soup, same space as `offset`.
+   *  Absent on mounts extracted before v12. */
+  region?: number[];
+}
+/**
+ * One authored surface a charm may hang from — the game's own `KeychainMarkup`,
+ * out of the same model DATA block the sticker anchors come from.
+ *
+ * This is to a charm what `StickerSlot` is to a sticker: the model saying where
+ * the game puts one, rather than us inferring it. And the inference is what it
+ * replaces — the `keychain` attachment is a clip point that sits 70mm off an
+ * AK-47, 44mm off a MAG-7, so a charm previewed at it hangs in the air.
+ * Measured against the rendered mesh, these quads sit 1-3mm off it on every
+ * weapon and both bodies, which is the whole reason to carry them.
+ */
+export interface CharmQuad {
+  /** "body_hd" | "body_legacy" — pick the one the finish actually renders on. */
+  mesh: string;
+  /** The bone that MOVES this surface. `weapon_offset` is the static body;
+   *  slide/bolt/silencer/pump quads ride a part that animates in game. Ours
+   *  never animates, and all of them measure flush in the pose we render, so
+   *  they are all usable here — on a pistol most of the surface IS the slide. */
+  bone: string;
+  /** 4 corners x XYZ, flat, in GLB space (no base, no cal, no pose). Ordered as
+   *  two edges rather than a ring: (0,1) is one end, (2,3) the other. */
+  corners: number[];
 }
 export interface StickerGeometry {
   bounds: StickerBounds | null;
   slots: StickerSlot[];
+  /** Charm placement surfaces, empty on a knife (no charms) and on a mount
+   *  extracted before v23 — read as "we have no authored answer", not as "this
+   *  weapon takes no charm". */
+  charmQuads: CharmQuad[];
+  /** Anchors the HD body declares. 0 when the mount has no markup for the model
+   *  — read that as "unknown", not as "this weapon takes no stickers". */
+  anchorCount: number;
+  /** Anchors the LEGACY body declares. Differs from `anchorCount` on 14 of the
+   *  35 stickerable weapons (AWP 4/5, M4A1 4/7, Deagle 5/4 …), so a legacy paint
+   *  must not be placed against the HD count. */
+  anchorCountLegacy: number;
 }
 const stickerGeomCache = new Map<string, Promise<StickerGeometry>>();
 export function fetchStickerGeometry(model: string): Promise<StickerGeometry> {
   let cached = stickerGeomCache.get(model);
   if (!cached) {
     cached = request<StickerGeometry>(`/catalog/sticker-bounds/${encodeURIComponent(model)}`)
-      .then((r) => ({ bounds: r.bounds ?? null, slots: r.slots ?? [] }))
-      .catch(() => ({ bounds: null, slots: [] }));
+      .then((r) => ({
+        bounds: r.bounds ?? null,
+        slots: r.slots ?? [],
+        charmQuads: Array.isArray(r.charmQuads) ? r.charmQuads : [],
+        // Counted server-side from the same slots, so a client that only wants
+        // the number does not re-derive it — and a mount whose markup regressed
+        // shows up as a zero here rather than as a mispositioned sticker.
+        anchorCount: r.anchorCount ?? 0,
+        anchorCountLegacy: r.anchorCountLegacy ?? 0,
+      }))
+      .catch(() => ({ bounds: null, slots: [], charmQuads: [], anchorCount: 0, anchorCountLegacy: 0 }));
     stickerGeomCache.set(model, cached);
   }
   return cached;
@@ -481,6 +635,45 @@ export const fetchSkins = (slot: string) =>
     skins: r.skins ?? [],
     groups: Array.isArray(r.groups) ? r.groups : [],
     tints: Array.isArray(r.tints) ? r.tints : [],
+  }));
+
+// ---- Collections ------------------------------------------------------------
+//
+// The case, map or drop pool a finish came out of. The index is small enough to
+// hold whole, and it carries the member ids on purpose: "you own 4 of 17" is
+// then an intersection with the inventory already in memory, so the badge on a
+// tile and the page behind it can never disagree.
+
+/** How you get a collection — the tab strip on the collections index, and what
+ *  decides whether its skins can be StatTrak (case) or Souvenir (souvenir). */
+export type CollectionSource = "case" | "souvenir" | "drop";
+
+export interface Collection {
+  /** cs2-lib's own key ("set_bravo_i") — the handle, not the display name. */
+  key: string;
+  name: string;
+  /** The set's best finish — its art and its rarity colour, so a collection
+   *  tile lights the same way an item tile does. */
+  image: string | null;
+  rarity: string | null;
+  source: CollectionSource;
+  itemIds: number[];
+}
+
+// Normalised here for the same reason every other catalog fetch is: frontend and
+// backend ship as SEPARATE images, so a bundle that knows about collections runs
+// against a backend that doesn't for as long as it takes both to roll. An empty
+// list is what "this backend has no collections" has to look like — the armory
+// hides the section rather than showing one that opens onto nothing.
+export const fetchCollections = () =>
+  request<Collection[]>("/catalog/collections")
+    .then((r) => (Array.isArray(r) ? r : []))
+    .catch(() => [] as Collection[]);
+
+export const fetchCollection = (key: string) =>
+  request<Collection & { skins: Skin[] }>(`/catalog/collection?key=${encodeURIComponent(key)}`).then((r) => ({
+    ...r,
+    skins: r.skins ?? [],
   }));
 
 export const fetchLoadout = () => request<LoadoutEntry[]>("/loadout");
@@ -612,9 +805,35 @@ export const updateInstance = (
     body: JSON.stringify(body),
   });
 
+/** One wishlisted CATALOG item — something wanted but not owned, so it has no
+ *  instance id and nothing to attach a flag to. See setWishlist. */
+export interface WishlistEntry {
+  item_id: number;
+  created_at: string;
+  item: CatalogItem | null;
+}
+export const fetchWishlist = () => request<WishlistEntry[]>("/wishlist");
+export const setWishlist = (item_id: number, want: boolean) =>
+  request<{ want: boolean }>("/wishlist", {
+    method: "POST",
+    body: JSON.stringify({ item_id, want }),
+  });
+
 // Public read-only loadout for any player + clone it into your own.
-export const fetchPlayerLoadout = (steamId: string) =>
-  request<LoadoutEntry[]>(`/loadout/${steamId}`);
+//
+// `preset` picks WHICH of their named builds to read; omitted, that is the one
+// they are wearing. The id is validated server-side against the same steam id,
+// so a preset belonging to anyone else 404s rather than quietly returning the
+// live loadout under the name you asked for.
+export const fetchPlayerLoadout = (steamId: string, preset?: string | null) =>
+  request<LoadoutEntry[]>(
+    `/loadout/${steamId}${preset ? `?preset=${encodeURIComponent(preset)}` : ""}`,
+  );
+
+/** Someone else's named builds. Same shape as your own; nothing here is private
+ *  beyond what the equipped loadout already discloses. */
+export const fetchPlayerPresets = (steamId: string) =>
+  request<LoadoutPreset[]>(`/loadout/${steamId}/presets`);
 export const copyLoadoutFrom = (steamId: string) =>
   request<{ copied: number }>(`/loadout/copy-from/${steamId}`, { method: "POST", body: "{}" });
 
@@ -661,6 +880,9 @@ export type CacheStats = {
   images?: DirStat; // absent on older backends
   models?: DirStat;
   composites?: DirStat; // shared paint composites; absent on older backends
+  /** Music kit previews. ~3.5MB a kit, so it is the one directory an operator
+   *  can be surprised by; absent on a mount extracted before v28. */
+  music?: DirStat;
   /** Per-kind breakdown of `models` and `paints`. Absent on older backends. */
   parts?: Partial<Record<CachePart, DirStat>>;
 };
@@ -702,6 +924,314 @@ export const setAssetCdn = (enabled: boolean) =>
 // backend: those come from the CS2 install and only an extraction restores them.
 export const clearCache = (scope: "renders" | "composites" = "renders") =>
   request<{ cleared: Record<string, number> }>(`/admin/cache?scope=${scope}`, { method: "DELETE" });
+
+// ---- Market prices ----------------------------------------------------------
+// A mirrored Steam price feed. Off by default and operator-configurable (see the
+// Prices tab in the admin console) for the same reason as the asset CDN: the
+// fetch leaves their network, so the switch and the URL are both theirs. The
+// browser never touches the feed — everything here comes from our API.
+export type PriceWindow =
+  | "suggested"
+  | "median"
+  | "lowest"
+  | "last_24h"
+  | "last_7d"
+  | "last_30d"
+  | "last_90d";
+/** Every source an instance can pull for itself. There is no 5stack price CDN —
+ *  see the note in backend/src/prices.ts for why Steam's own market isn't one
+ *  of these. */
+export type PriceSource = "skinport" | "csfloat" | "waxpeer" | "bitskins" | "feed";
+
+/** One switchable source, as the server describes it. Rendered straight into the
+ *  settings list rather than duplicated here — the backend owns which providers
+ *  exist and what each is good for, so adding one is a backend change only. */
+export interface PriceProviderInfo {
+  id: PriceSource;
+  label: string;
+  blurb: string;
+  /** Null means the operator supplies the URL (the JSON feed). */
+  url: string | null;
+  window: PriceWindow;
+}
+
+/** A price never travels as a bare number: which trailing window it came from
+ *  is part of the claim. ~38% of listings have no 24h datapoint, so a displayed
+ *  price is often a 7- or 30-day average and has to be able to say so. */
+export interface PricePoint {
+  value: number;
+  window: PriceWindow;
+  marketHashName: string;
+  /**
+   * The listing found was NOT the one asked for.
+   *
+   * Markets don't carry every variant: StatTrak exists for a fraction of
+   * finishes and trades thinly, and the ends of the wear range are often
+   * unlisted — a Battle-Scarred StatTrak weapon can genuinely have nothing of
+   * its own for sale. Rather than showing no price at all, the closest listing
+   * answers and says so here.
+   *
+   * Anything rendering a price MUST make this visible. "$40" and "$40, for the
+   * non-StatTrak Field-Tested one" are different claims, and the second is only
+   * useful while it stays honest about being a stand-in.
+   */
+  approx?: { wearTier: number; stattrak: boolean };
+}
+
+/** The five Steam wear brackets by their stored index; -1 is "this item has no
+ *  bracket" (charms, agents, music kits, vanilla knives). */
+export const WEAR_TIER_NAME = [
+  "Factory New",
+  "Minimal Wear",
+  "Field-Tested",
+  "Well-Worn",
+  "Battle-Scarred",
+] as const;
+
+/** Which bracket a float falls in.
+ *
+ *  Imports the boundaries rather than restating them. They had been written out
+ *  four separate times — catalog.ts (which feeds the SQL), itemVisuals (which
+ *  draws the ramp), here, and the test harness — and the failure mode of drift
+ *  is the one catalog.ts warns about in capitals: a tile captioned
+ *  "Field-Tested" beside a Well-Worn price. itemVisuals imports only a TYPE from
+ *  this module, so there is no cycle. */
+const wearTierIndexOf = (wear: number) => {
+  const i = WEAR_STOPS.findIndex((stop) => wear < stop.max);
+  return i === -1 ? WEAR_STOPS.length - 1 : i;
+};
+
+/** What was substituted, in words — for the caption beside an approximate
+ *  figure. Empty when the listing was the one asked for. */
+export function approxNote(price: PricePoint, wear: number | null, stattrak: boolean): string {
+  if (!price.approx) return "";
+  const parts: string[] = [];
+  if (price.approx.stattrak !== stattrak) parts.push(price.approx.stattrak ? "StatTrak™" : "non-StatTrak");
+  const asked = wear == null ? -1 : wearTierIndexOf(wear);
+  if (price.approx.wearTier !== asked) {
+    parts.push(
+      price.approx.wearTier === -1 ? "no wear bracket" : WEAR_TIER_NAME[price.approx.wearTier] ?? "another wear",
+    );
+  }
+  return parts.join(", ");
+}
+
+export interface PriceStatus {
+  enabled: boolean;
+  source: PriceSource;
+  /** The mirror holds rows a DIFFERENT source produced, so nothing resolves —
+   *  a feed fills the trailing averages, a market fills the live-ask columns,
+   *  and each source only reads its own. Needs a re-sync, not a bug report. */
+  stale?: boolean;
+  /** Enabled AND holding data. The gate every price surface reads — an enabled
+   *  feed that has never synced must not draw empty price slots. */
+  ready: boolean;
+  window: PriceWindow;
+  listings: number;
+  sourceDate: string | null;
+  syncedAt: string | null;
+}
+export const fetchPriceStatus = () => request<PriceStatus>("/prices");
+
+/**
+ * Every price the screens need, in one request, deliberately separate from the
+ * screens' own data.
+ *
+ * The inventory and the loadout must paint the moment they're ready — money is
+ * an overlay on them, not a precondition. Being its own request also means it
+ * can be re-fetched alone: after a craft, after a Steam sync, or the instant a
+ * player flips the switch on.
+ *
+ * `items` is keyed by owned-item id (a string, like every owned id on the wire).
+ * `slots` is keyed `TEAM:slot` and is the whole slot — skin plus everything
+ * applied to it.
+ *
+ * There is deliberately NO server-side "what is my inventory worth" endpoint.
+ * Every owned row carries its own price here, so the totals — including the
+ * real-versus-crafted split on the origin tabs — are summed from rows the client
+ * already holds. A second implementation of one number is how two numbers drift.
+ */
+export interface InventoryPrices {
+  ready: boolean;
+  window: PriceWindow;
+  items: Record<string, PricePoint>;
+  slots: Record<string, number>;
+  /**
+   * Every PARKED preset's slots, keyed by preset id, each in the same TEAM:slot
+   * shape as `slots` — the preset deck's per-card figure. The active preset is
+   * not in here: its slots ARE `slots`. Optional because a backend that predates
+   * the deck leaves it off, and a card with no figure is the right degrade.
+   */
+  presets?: Record<string, Record<string, number>>;
+}
+export const fetchInventoryPrices = () => request<InventoryPrices>("/inventory/prices");
+
+/**
+ * What each finish in a slot costs BRAND NEW — the craft browser's price column.
+ *
+ * Factory New where it exists, the next bracket up where it doesn't: plenty of
+ * finishes have a float floor above 0.07 and are never sold Factory New, and
+ * pricing those at nothing would drop them out of a sort-by-value entirely.
+ * `wearTier` says which bracket answered, so the tooltip can be honest about it.
+ */
+export interface StockPrices {
+  ready: boolean;
+  window: PriceWindow;
+  prices: Record<string, PricePoint & { wearTier: number }>;
+}
+export const fetchStockPrices = (slot: string) =>
+  request<StockPrices>(`/prices/stock?slot=${encodeURIComponent(slot)}`);
+
+/**
+ * What copies of one exact listing recently sold for.
+ *
+ * The spread behind the single figure. A flat bracket price says a Factory New
+ * Karambit Doppler is worth $1,426; this says ten of them sold between $1,205
+ * and $1,520 — which is the part a knife owner actually wants, because their
+ * float and pattern decide where in that range theirs sits.
+ *
+ * Only Skinport publishes one (CSFloat and Waxpeer both require an account), so
+ * `available` is false on every other source. Phase-aware: `version` is the
+ * Doppler phase the rows belong to.
+ */
+export type HistoryWindow = "last_24_hours" | "last_7_days" | "last_30_days" | "last_90_days";
+export interface SaleWindow {
+  window: HistoryWindow;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  median: number | null;
+  volume: number;
+}
+export interface PriceDetail {
+  available: boolean;
+  window: PriceWindow;
+  marketHashName: string | null;
+  version: string | null;
+  history: SaleWindow[];
+}
+export const fetchPriceDetail = (itemId: number, wear: number | null, stattrak: boolean) =>
+  request<PriceDetail>(
+    `/prices/detail?item_id=${itemId}&wear=${wear ?? ""}&stattrak=${stattrak ? 1 : 0}`,
+  );
+
+/** The window a spread is worth showing from. Widest first would bury a fresh,
+ *  liquid market under three months of noise; narrowest first would show a
+ *  single sale as the whole story. Two sales is the floor for a RANGE to mean
+ *  anything at all. */
+export const bestSaleWindow = (history: SaleWindow[]): SaleWindow | null =>
+  history.find((h) => h.volume >= 2) ?? history.find((h) => h.volume >= 1) ?? null;
+
+export const HISTORY_WINDOW_LABEL: Record<HistoryWindow, string> = {
+  last_24_hours: "24h",
+  last_7_days: "7d",
+  last_30_days: "30d",
+  last_90_days: "90d",
+};
+
+export interface QuoteLine {
+  kind: "base" | "sticker" | "patch" | "charm";
+  itemId: number;
+  name: string | null;
+  price: PricePoint | null;
+}
+export interface Quote {
+  base: QuoteLine;
+  attachments: QuoteLine[];
+  baseTotal: number;
+  attachmentTotal: number;
+  total: number;
+  unpriced: number;
+  lines: number;
+}
+/** What a craft would cost to buy, itemized. Takes the craft form's own body so
+ *  the estimate can update before anything is saved. */
+export const quoteCraft = (body: {
+  item_id: number;
+  wear?: number | null;
+  stattrak?: boolean | null;
+  stickers?: unknown[] | null;
+  patches?: unknown[] | null;
+  charm_id?: number | null;
+}) => request<Quote>("/prices/quote", { method: "POST", body: JSON.stringify(body) });
+
+export interface PriceAdminStatus extends PriceStatus {
+  sources: PriceSource[];
+  providers: PriceProviderInfo[];
+  /** Which source produced the rows in the table right now — not necessarily
+   *  the configured one, if it was just changed. */
+  syncedSource: PriceSource | null;
+  base: string;
+  /** The operator typed this URL in; false means it is our default. */
+  custom: boolean;
+  url: string;
+  defaultBase: string;
+  windows: PriceWindow[];
+  syncing: boolean;
+  intervalMinutes: number;
+  attemptedAt: string | null;
+  failedAt: string | null;
+  failure: string | null;
+  unmatched: number;
+  unmatchedSample: string[];
+  /** The sale-history cache — the thing standing between browsing knives and a
+   *  rate limit. `listings` were looked up; `withData` had sales to report, and
+   *  the rest are cached as "nothing here" so they aren't asked about again. */
+  history?: { listings: number; withData: number; oldest: string | null; staleAfterDays: number };
+}
+export const fetchPriceAdmin = () => request<PriceAdminStatus>("/admin/prices");
+export const savePriceAdmin = (body: { enabled?: boolean; base?: string; source?: PriceSource }) =>
+  request<{ enabled: boolean; source: PriceSource; base: string; custom: boolean }>("/admin/prices", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+export const syncPricesNow = () =>
+  request<{ rows: number; unmatched: number; collisions: number }>("/admin/prices/sync", { method: "POST" });
+export const clearPrices = () => request<{ listings: number }>("/admin/prices", { method: "DELETE" });
+
+/** Money, short. Sub-$10 keeps cents (a $4.55 charm rounds to a meaningless $5);
+ *  above that they are noise on a number that moves by dollars a day, and four
+ *  digits of Dragon Lore do not fit in a tile corner. */
+export function formatPrice(value: number): string {
+  if (!Number.isFinite(value)) return "—";
+  if (value >= 10_000) return `$${Math.round(value / 1000)}k`;
+  if (value >= 10) return `$${Math.round(value).toLocaleString()}`;
+  return `$${value.toFixed(2)}`;
+}
+
+/** The honest caption for whichever number came back. Every price surface shows
+ *  this somewhere: a market's reference price, the middle of what's listed and a
+ *  90-day sold average are three different claims, and a bare "$41" implies a
+ *  precision none of them has. Always presented as a ROUGH ESTIMATE — none of
+ *  these is what an item would actually sell for. */
+/** The symbol and the digits, separately.
+ *
+ *  Money sits among instrument readouts here — floats, seeds, StatTrak counts —
+ *  and a full-weight "$" competes with the number it belongs to. Splitting them
+ *  lets the glyph sit back at partial opacity while the figure keeps primacy,
+ *  which is what makes a price read as a value rather than as one more code. */
+export const priceParts = (value: number) => {
+  const text = formatPrice(value);
+  return { symbol: text.slice(0, 1), digits: text.slice(1) };
+};
+
+export const PRICE_WINDOW_LABEL: Record<PriceWindow, string> = {
+  suggested: "market estimate",
+  median: "median listing",
+  lowest: "cheapest listing",
+  last_24h: "24-hour average",
+  last_7d: "7-day average",
+  last_30d: "30-day average",
+  last_90d: "90-day average",
+};
+
+export const PRICE_SOURCE_LABEL: Record<PriceSource, string> = {
+  skinport: "Skinport",
+  csfloat: "CSFloat",
+  waxpeer: "Waxpeer",
+  bitskins: "BitSkins",
+  feed: "JSON price feed",
+};
 
 // Admin: model extraction (pulls weapon GLBs + composite inputs from the
 // node's CS2 install straight onto the models mount). Runs as a child process
@@ -862,3 +1392,60 @@ export const unequip = (team: Team, slot: string) =>
     `/loadout?team=${team}&slot=${encodeURIComponent(slot)}`,
     { method: "DELETE" },
   );
+
+// ---- Loadout presets --------------------------------------------------------
+// Named builds. Only ONE of them is "the loadout" at a time — the rest are
+// parked server-side — so every mutation below changes what `fetchLoadout`
+// returns, and callers refresh rather than patch their copy.
+
+export interface LoadoutPreset {
+  /** A bigint on the wire, i.e. a STRING, same as every owned-item id here.
+   *  Compare with `String(...)` and never with `===` against a literal number. */
+  id: string;
+  name: string;
+  /** The one whose slots are the live loadout. Exactly one is ever true. */
+  active: boolean;
+  /** Filled slots across both teams — what the compact switcher shows under the name. */
+  slots: number;
+}
+
+/** One thumb in a preset deck card's hand — derived client-side from a build's
+ *  rows (see App's presetPreview); the server sends nothing for it. */
+export interface PresetPreviewItem {
+  team: Team;
+  slot: string;
+  /** A crafted skin, as opposed to the free default weapon chosen for the slot. */
+  skinned: boolean;
+  image: string | null;
+  rarity: string | null;
+  name: string;
+}
+
+export const fetchPresets = () => request<LoadoutPreset[]>("/loadout/presets");
+
+/** `copy: true` seeds the new preset from the loadout you are wearing now.
+ *  It does NOT duplicate the owned items — both presets point at the same
+ *  crafted instances, because crafting is the gate and a preset is only an
+ *  arrangement of what you already own. */
+export const createPreset = (body: { name?: string; copy?: boolean } = {}) =>
+  request<LoadoutPreset>("/loadout/presets", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const renamePreset = (id: string, name: string) =>
+  request<{ id: string; name: string; active: boolean }>(`/loadout/presets/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+
+/** Deleting the preset you are wearing moves you to another one, so the
+ *  response names whichever is active afterwards. */
+export const deletePreset = (id: string) =>
+  request<{ ok: true; active: string }>(`/loadout/presets/${id}`, { method: "DELETE" });
+
+export const activatePreset = (id: string) =>
+  request<{ ok: true; active: string }>(`/loadout/presets/${id}/activate`, {
+    method: "POST",
+    body: "{}",
+  });

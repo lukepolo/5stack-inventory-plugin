@@ -18,6 +18,9 @@ export const Z = {
   stage: 998,
   /** The craft modal — deliberately one above `stage`, since it is opened FROM it. */
   modal: 999,
+  /** The preset deck — a header popover. One UNDER `menu`, because each of
+   *  its cards raises the context menu and that has to land on top of it. */
+  deck: 998,
   /** Context menus, and the compact bottom sheets they become. */
   menu: 999,
   /** The undo-delete toast. */

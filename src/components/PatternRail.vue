@@ -19,7 +19,7 @@
 // is what the shader grades, but the viewer lights that afterwards — so expect
 // the rail to read flatter than the charm. It is a map for finding the band; the
 // 3D charm beside it is the truth.
-import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { API_ORIGIN } from "../api";
 import {
   charmAdjustSrgb,
@@ -57,13 +57,30 @@ const props = withDefaults(
      * the pattern silently does not take. Held as a skeleton instead.
      */
     loading?: boolean;
+    /**
+     * Show the pattern, don't offer to change it — the item's read-only spec.
+     *
+     * The swatch is the whole reason this mode exists rather than a line of
+     * text in the caller. "Pattern #1" is a true statement about a charm and a
+     * useless one: the number is a coordinate into a colour space, and the one
+     * thing anybody wants from it is the colour. Everything that edits (the
+     * rail, the die, the band control, click-to-edit) is dropped; the swatch and
+     * the number stay.
+     *
+     * It also does NOT hide itself on an inert charm, which is the one place
+     * this mode disagrees with the editing one. There the rail is a control
+     * that could not do anything and the row goes with it; here the number is
+     * still a real tradeable attribute of the item being described, so it is
+     * still worth stating — just without a colour beside it.
+     */
+    readonly?: boolean;
     min?: number;
     max?: number;
     /** Chunk width. 1000 over a 100000 space is 100 bands, which is as many
      *  ticks as a rail this size can show without becoming a hatch pattern. */
     chunk?: number;
   }>(),
-  { modelValue: null, image: null, albedo: null, loading: false, min: 1, max: 100000, chunk: 1000 },
+  { modelValue: null, image: null, albedo: null, loading: false, readonly: false, min: 1, max: 100000, chunk: 1000 },
 );
 
 const emit = defineEmits<{
@@ -83,6 +100,8 @@ const emit = defineEmits<{
  *  to. The one question worth asking when a band comes out the wrong colour:
  *  matching the wrong entry and matching none look identical on screen. */
 const PATTERN_LOG = typeof location !== "undefined" && /[?&]patternlog=1/.test(location.search);
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 const RAIL_H = 40;
 /** Downsample width/height of the albedo sample. 16x16 is 256 pixels — enough
@@ -630,11 +649,29 @@ watch(
        `rounded-md bg-secondary/40 p-2.5` row, so carrying the same card here
        drew a box inside an identical box. A control should not assume it is a
        card; the surface it sits on is the caller's decision. -->
-  <div v-if="shown !== 'inert'">
+  <div v-if="readonly || shown !== 'inert'">
+    <!-- READ-ONLY: the colour, the caption, the number. Nothing to grab.
+         The swatch is skipped rather than drawn empty when the colour cannot be
+         computed — an inert charm, or one whose albedo never arrived — because a
+         blank square beside a number reads as a colour that failed to load. -->
+    <div v-if="readonly" class="flex items-center gap-2">
+      <span
+        v-if="shown === 'loading'"
+        class="animate-skeleton h-5 w-5 flex-none rounded-sm bg-muted-foreground/20"
+      ></span>
+      <span
+        v-else-if="swatch"
+        class="h-5 w-5 flex-none rounded-sm ring-1 ring-inset ring-white/15"
+        :style="{ background: swatch, boxShadow: `0 0 10px -2px ${swatch}` }"
+      ></span>
+      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
+      <span class="font-mono text-f13 tabular-nums">#{{ seed.toLocaleString() }}</span>
+    </div>
+
     <!-- Holds the row's height while the econ lookup lands. Collapsing to
          nothing and springing back is the jump the charm slot above already
          avoids, and this control is taller than that one. -->
-    <div v-if="shown === 'loading'">
+    <div v-else-if="shown === 'loading'">
       <div class="mb-2 flex items-center gap-2">
         <span class="animate-skeleton h-5 w-5 flex-none rounded-sm bg-muted-foreground/20"></span>
         <span class="animate-skeleton h-2 w-24 rounded-full bg-muted-foreground/20" :style="{ '--i': 1 }"></span>
@@ -663,7 +700,7 @@ watch(
             transition: 'background 220ms linear, box-shadow 220ms linear',
           }"
         ></span>
-        <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+        <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
 
         <!-- Click-to-edit. The field is gone from the row because a coordinate
              is only worth typing once you know where you are going — but a
@@ -683,7 +720,7 @@ watch(
         <button
           v-else
           class="rounded px-1 font-mono text-f13 tabular-nums text-foreground/90 transition-colors hover:bg-white/5 hover:text-[color:var(--acc)]"
-          title="Type an exact pattern"
+          :title="tr('inventory.pattern.type_exact', 'Type an exact pattern')"
           @click="beginEdit"
         >#{{ seed.toLocaleString() }}</button>
 
@@ -707,15 +744,15 @@ watch(
             "
             :title="
               zoomLevel < ZOOM_STEPS.length
-                ? `Showing ${spanLabel} patterns — click to zoom in`
-                : 'Narrowest band — click for the full range'
+                ? tr('inventory.pattern.zoom_in', 'Showing {span} patterns — click to zoom in', { span: spanLabel })
+                : tr('inventory.pattern.zoom_full', 'Narrowest band — click for the full range')
             "
             @click="cycleZoom"
           >{{ spanLabel }}</button>
           <span class="w-px flex-none self-stretch" :class="zoom ? 'bg-[color:var(--acc)]/40' : 'bg-input'"></span>
           <button
             class="px-1.5 py-0.5 text-f11 leading-none transition-colors hover:bg-white/5"
-            :title="`Random pattern between ${lo.toLocaleString()} and ${hi.toLocaleString()}`"
+            :title="tr('inventory.pattern.roll', 'Random pattern between {lo} and {hi}', { lo: lo.toLocaleString(), hi: hi.toLocaleString() })"
             @click="roll"
           >🎲</button>
         </div>
@@ -731,7 +768,7 @@ watch(
         :aria-valuemin="lo"
         :aria-valuemax="hi"
         :aria-valuenow="seed"
-        aria-label="Charm pattern"
+        :aria-label="tr('inventory.pattern.charm_aria', 'Charm pattern')"
         @pointerdown="onDown"
         @pointermove="onMove"
         @pointerup="onUp"
@@ -748,7 +785,7 @@ watch(
           v-if="shown === 'unavailable'"
           class="absolute inset-0 grid place-items-center bg-secondary/70 text-f8 uppercase tracking-cs1 text-muted-foreground/70"
         >
-          Drag to browse
+          {{ tr('inventory.pattern.drag_browse', 'Drag to browse') }}
         </div>
 
         <!-- Ticks. Major rules carry a number; minors are hairlines. -->
@@ -807,7 +844,7 @@ watch(
            of what the old Lock button was trying to mean. -->
       <div class="mt-1 flex items-baseline font-mono text-f8 tabular-nums text-muted-foreground/60">
         <span>{{ lo.toLocaleString() }}</span>
-        <span v-if="zoom" class="mx-auto uppercase tracking-cs1 text-[color:var(--acc)]/80">🎲 rolls in here</span>
+        <span v-if="zoom" class="mx-auto uppercase tracking-cs1 text-[color:var(--acc)]/80">{{ tr('inventory.pattern.roll_range', '🎲 rolls in here') }}</span>
         <span class="ml-auto">{{ hi.toLocaleString() }}</span>
       </div>
     </div>

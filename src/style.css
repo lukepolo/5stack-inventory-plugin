@@ -89,6 +89,42 @@
     box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
     cursor: ew-resize;
   }
+
+  /* Inspect-clip scrub, in the viewer's control legend.
+     Not `pattern-range` even though the shape is the same: that track's decile
+     hairlines say "you are at index N of a range", which is the honest reading
+     of a pattern and the wrong one for a clip — a clip has a start and an end
+     and the only interesting quantity is how far through you are. So the track
+     FILLS, and it is sized to sit inside a 26px legend cell rather than to span
+     a settings panel. */
+  [data-cs2-inventory] .clip-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 76px;
+    height: 4px;
+    border-radius: 9999px;
+    outline: none;
+    background: rgba(255, 255, 255, 0.16);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  }
+  [data-cs2-inventory] .clip-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    height: 12px;
+    width: 5px;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.7);
+    cursor: ew-resize;
+  }
+  [data-cs2-inventory] .clip-range::-moz-range-thumb {
+    height: 12px;
+    width: 5px;
+    border: none;
+    border-radius: 2px;
+    background: #fff;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.7);
+    cursor: ew-resize;
+  }
 }
 
 
@@ -283,6 +319,37 @@
   --tac-ct-foreground: 0 0% 10%;
   --tac-ct-cta-from: color-mix(in hsl, hsl(var(--tac-ct)), white 15%);
   --tac-ct-cta-to: color-mix(in hsl, hsl(var(--tac-ct)), black 12%);
+
+  /* MONEY. Estimated values: the price on a card, a slot's worth, a loadout
+     total, the editor's live cost.
+
+     WHITE, not a hue, and that is the point. Every colour in this panel already
+     carries a meaning — amber is "you can press this" (see the action-button
+     block below), --acc/--tac-ct is "this is your CT side" and moves when you
+     flip teams, the rarity palette is the item's grade, the wear ramp is a
+     float. A value is none of those, and a fourth hue competing with them made
+     the figure look like a status rather than a number.
+
+     It also gets out of the way of its own emphasis: the digits sit at full
+     white — the brightest thing in the readout, which is right, since they are
+     what you came to read — while the "$" drops to 55% and the "est" suffix
+     further still. That hierarchy inside the figure does the work a colour was
+     doing, and it survives on both team sides and over any rarity glow.
+
+     (It was briefly a cyan against an undefined `--tac-cyan`, which rendered as
+     no background on the spine and inherited white on the digits; then a green
+     at 156°, chosen to clear --tac-ct at 198°. White needs neither dodge.)
+
+     HSL channels, not a hex, to match the shape of every other token here —
+     `hsl(var(--tac-value) / 0.55)` has to work for the tints. */
+  --tac-value: 0 0% 100%;
+
+  /* STATTRAK. The counter's gold, and the one colour here that is not ours to
+     pick — it is CS2's own, so it stays where the game put it and only moves
+     into a token so the places that had it as a raw #f2c14e agree. Not
+     --tac-amber: the panel's brand amber means "you can press this", and a
+     StatTrak badge is a fact about the item, not a control. */
+  --tac-stattrak: 45 86% 62%;
 }
 
 /* ---- action buttons --------------------------------------------------------
@@ -441,6 +508,24 @@
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
+/* A music kit's transport, drawn ON its cover art rather than on a plate over it.
+   A kit IS its artwork — the thing you are choosing between — so the control has
+   to stop being a box. What replaces the box is a shadow: .art-mark keeps a bare
+   glyph and a bare readout legible over a light sleeve and a dark one alike,
+   which is the only job the plate was really doing.
+
+   drop-shadow, not text-shadow: the same class has to carry an <svg> glyph and a
+   line of text, and text-shadow does nothing to the former. */
+[data-cs2-inventory] .art-mark {
+  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.85)) drop-shadow(0 0 3px rgb(0 0 0 / 0.55));
+}
+
+/* An equaliser lived here, animating in place of the pause glyph while a kit
+   played. Removed rather than parked: it put a readout where the control was, so
+   pausing meant hunting for a button that had turned into a picture. Playing
+   state is carried by the transport's accent colour and by the progress groove
+   along the sleeve's bottom edge. */
 @keyframes cs2FadeOut {
   from { opacity: 1; }
   to { opacity: 0; }

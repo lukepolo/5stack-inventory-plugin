@@ -6,7 +6,7 @@
 // a craft editor, and which one you want depends on what you're about to say
 // about it. Each row shows the path it will copy, so you can see what you're
 // sharing before you paste it somewhere.
-import { ref, onBeforeUnmount } from "vue";
+import { inject, ref, onBeforeUnmount } from "vue";
 import { Share2, Check, Link2 } from "lucide-vue-next";
 import type { ShareLink } from "../routes";
 import Tooltip from "./Tooltip.vue";
@@ -27,6 +27,8 @@ const props = defineProps<{
    */
   btnClass?: string;
 }>();
+
+const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
 
 const open = ref(false);
 // This popover puts a full-screen click-catcher at z-1000, so it can swallow
@@ -59,7 +61,7 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
 
 <template>
   <div class="relative">
-    <Tooltip text="Copy a link to this">
+    <Tooltip :text="tr('inventory.share.tooltip', 'Copy a link to this')">
       <button
         :class="[
           'tac-action',
@@ -73,7 +75,7 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
         @click.stop="open = !open"
       >
         <Share2 class="h-3.5 w-3.5" />
-        <span v-if="!props.icon">{{ props.label ?? "Share" }}</span>
+        <span v-if="!props.icon">{{ props.label ?? tr('inventory.share.button', 'Share') }}</span>
       </button>
     </Tooltip>
 
@@ -92,7 +94,7 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
         @click.stop
       >
         <div class="border-b border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">
-          Copy link
+          {{ tr('inventory.share.heading', 'Copy link') }}
         </div>
         <button
           v-for="l in props.links"
@@ -109,12 +111,12 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
             :class="copied === l.key ? 'text-[hsl(var(--success,142_70%_55%))]' : 'text-muted-foreground'"
           />
           <span class="min-w-0 flex-1">
-            <span class="block text-f13">{{ copied === l.key ? "Copied" : l.label }}</span>
+            <span class="block text-f13">{{ copied === l.key ? tr('inventory.share.copied', 'Copied') : l.label }}</span>
             <span v-if="l.hint" class="block text-f10 text-muted-foreground">{{ l.hint }}</span>
           </span>
         </button>
         <div v-if="failed" class="border-t border-border px-3 py-1.5 text-f10 text-[#ff7a6a]">
-          Couldn't reach the clipboard — copy from the address bar instead.
+          {{ tr('inventory.share.clipboard_failed', "Couldn't reach the clipboard — copy from the address bar instead.") }}
         </div>
         <div v-else-if="props.note" class="border-t border-border px-3 py-1.5 text-f10 leading-relaxed text-muted-foreground">
           {{ props.note }}

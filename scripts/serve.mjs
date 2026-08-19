@@ -7,6 +7,9 @@ import { readFile, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+// Shared with the backend rather than reimplemented here — one behaviour in
+// both environments is the whole point of this file having ranges at all.
+import { parseByteRange } from "../backend/src/byteRange.mjs";
 
 const root = fileURLToPath(new URL("../dist", import.meta.url));
 // Extracted CS2 models live on a hostPath mount (see k8s/deployment.yaml);
@@ -23,6 +26,10 @@ const imagesDir = process.env.IMAGES_DIR ?? "/cs2-models/images";
 // hot-swap reasoning as the icons above: without this route, dev clients never
 // see a cache hit and every 3D open pays the full ~38MB of composite inputs.
 const compositesDir = process.env.COMPOSITES_DIR ?? "/cs2-models/composites";
+// Music kit menu themes (extract-models.sh step 5b). ~3.5MB each, ~350MB in
+// total, and the only asset here anyone STREAMS rather than downloads — see the
+// Range handling below, which exists for this directory and benefits the rest.
+const musicDir = process.env.MUSIC_DIR ?? "/cs2-models/music";
 // Production nginx falls back to the backend when a mount-backed path misses
 // (`try_files $uri @backend`), for the case where the frontend and backend pods
 // land on different nodes and only one of them can see the file. Mirror that
@@ -42,6 +49,12 @@ const MIME = {
   ".glb": "model/gltf-binary",
   ".webp": "image/webp",
   ".map": "application/json",
+  // Music kit audio. Both, because the extractor probes the container rather
+  // than assuming it — Source2Viewer picks the format from the codec inside the
+  // .vsnd_c, so a PCM-stored kit lands as .wav and would otherwise be served as
+  // application/octet-stream, which no browser will play.
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
 };
 const HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -80,7 +93,12 @@ function cacheControlFor(base, pathname, query) {
   // meant the biggest files in the whole pipeline (an AK's 4096-square textures
   // plus the 38MB .inputs.hd bundle) were re-downloaded on every single page
   // load in dev. Same rule, same fix.
-  if (base === paintsDir || base === modelsDir) return query.get("v") ? IMMUTABLE : "no-cache";
+  // MUSIC is the same shape again: `valve_cs2_01.mp3` is a name the extractor
+  // reuses on every run while a CS2 update can change the bytes behind it, so it
+  // is only immutable once the client has stamped the extraction version on it.
+  if (base === paintsDir || base === modelsDir || base === musicDir) {
+    return query.get("v") ? IMMUTABLE : "no-cache";
+  }
   return HEADERS["Cache-Control"];
 }
 
@@ -108,6 +126,9 @@ createServer(async (req, res) => {
     } else if (pathname.startsWith("/composites/")) {
       base = compositesDir;
       pathname = pathname.slice("/composites".length);
+    } else if (pathname.startsWith("/music/")) {
+      base = musicDir;
+      pathname = pathname.slice("/music".length);
     }
     const file = normalize(join(base, pathname));
     if (!file.startsWith(base + sep) && file !== join(root, "index.html")) {
@@ -127,16 +148,27 @@ createServer(async (req, res) => {
         base === rendersDir ||
         base === testsDir ||
         base === imagesDir ||
-        base === modelsDir
+        base === modelsDir ||
+        base === musicDir
       ) {
         try {
-          const upstream = await fetch(backendOrigin + req.url);
+          // The client's Range rides along, and the upstream's answer is passed
+          // back verbatim (206 + Content-Range, or 200). Without forwarding it,
+          // a cross-node music miss would hand the player a 3.5MB 200 for a seek
+          // it asked 64KB of — and, worse, an <audio> that saw one unranged
+          // response stops offering to seek at all.
+          const upstream = await fetch(backendOrigin + req.url, {
+            headers: req.headers.range ? { range: req.headers.range } : undefined,
+          });
           if (upstream.ok) {
             const body = Buffer.from(await upstream.arrayBuffer());
-            res.writeHead(200, {
+            const range = upstream.headers.get("content-range");
+            res.writeHead(upstream.status === 206 ? 206 : 200, {
               ...HEADERS,
               "Cache-Control": cacheControlFor(base, pathname, parsed.searchParams),
               "Content-Type": upstream.headers.get("content-type") ?? MIME[extname(file)] ?? "application/octet-stream",
+              "Accept-Ranges": "bytes",
+              ...(range ? { "Content-Range": range } : {}),
             });
             res.end(body);
             return;
@@ -168,12 +200,36 @@ createServer(async (req, res) => {
     // single-threaded server that stalled hard enough for the edge to return
     // 503s. Production nginx streams via sendfile; this makes dev behave the
     // same instead of falling over as soon as it fronts a CDN host.
-    res.writeHead(200, {
+    const common = {
       ...HEADERS,
       "Cache-Control": cacheControlFor(base, pathname, parsed.searchParams),
       "Content-Type": MIME[extname(file)] ?? "application/octet-stream",
-      "Content-Length": info.size,
-    });
+      // Advertised on EVERY file, not just audio: it is the browser's only
+      // signal that seeking is possible, and it has to be on the first (unranged)
+      // response — by the time a range is asked for it is too late.
+      "Accept-Ranges": "bytes",
+    };
+    const range = parseByteRange(req.headers.range, info.size);
+    if (range === false) {
+      res.writeHead(416, { ...common, "Content-Range": `bytes */${info.size}` });
+      res.end();
+      return;
+    }
+    if (range) {
+      const length = range.end - range.start + 1;
+      res.writeHead(206, {
+        ...common,
+        "Content-Range": `bytes ${range.start}-${range.end}/${info.size}`,
+        "Content-Length": length,
+      });
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      createReadStream(file, { start: range.start, end: range.end }).on("error", () => res.destroy()).pipe(res);
+      return;
+    }
+    res.writeHead(200, { ...common, "Content-Length": info.size });
     if (req.method === "HEAD") {
       res.end();
       return;

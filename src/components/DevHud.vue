@@ -20,15 +20,18 @@
  * visible, not something you rediscover an hour later wondering why every agent
  * is covered in coloured rectangles.
  */
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, inject, onMounted, onUnmounted, ref } from "vue";
 import { X, RotateCcw, ChevronRight } from "lucide-vue-next";
 import {
   activeFlags, devFlags, devNumbers, flagValue, flagsVersion, numberValue, numbersVersion,
   resetFlags, setFlag, setNumber, userFlags, userNumbers, type DevFlag, type DevNumber,
+  choiceValue, choicesVersion, setChoice, userChoices, type DevChoice,
 } from "../devFlags";
 
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
+
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 // Everything reads through the version refs: localStorage has no reactivity of
 // its own, and polling it would be worse than a counter.
@@ -45,6 +48,16 @@ const shown = (list: DevNumber[]) => {
   void flagsVersion.value;
   return list.filter((n) => !n.requires || flagValue(n.requires));
 };
+const pickValue = (c: DevChoice) => {
+  void choicesVersion.value;
+  return choiceValue(c.name);
+};
+/** The hint under a picker is the SELECTED option's, not the setting's — the
+ *  setting's label already says what it is; what you want to know is what the
+ *  thing you just chose does. */
+const pickHint = (c: DevChoice) =>
+  c.options.find((o) => o.value === pickValue(c))?.hint ?? c.hint;
+const userPicks = computed(() => userChoices());
 const userSwitches = computed(() => userFlags());
 const userKnobs = computed(() => shown(userNumbers()));
 /** Advanced, grouped, so Patches and Diagnostics stay apart. */
@@ -107,19 +120,19 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
     class="w-[320px] rounded-lg border border-border bg-background/95 shadow-xl backdrop-blur"
   >
     <div class="flex items-center gap-2 border-b border-border px-3 py-2">
-      <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">Viewer settings</span>
+      <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">{{ tr('inventory.devhud.heading', 'Viewer settings') }}</span>
       <span
         v-if="activeCount"
         class="rounded bg-[color:var(--acc)]/15 px-1.5 py-0.5 font-mono text-f9 text-[color:var(--acc)]"
-      >{{ activeCount }} changed</span>
+      >{{ tr('inventory.devhud.changed', '{count} changed', { count: activeCount }) }}</span>
       <button
         class="ml-auto rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
-        title="Back to defaults"
+        :title="tr('inventory.devhud.reset', 'Back to defaults')"
         @click="reset()"
       ><RotateCcw class="h-3.5 w-3.5" /></button>
       <button
         class="rounded p-1 text-muted-foreground transition-colors hover:text-foreground"
-        title="Close (Esc)"
+        :title="tr('inventory.devhud.close', 'Close (Esc)')"
         @click="emit('close')"
       ><X class="h-3.5 w-3.5" /></button>
     </div>
@@ -127,6 +140,32 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
     <div class="max-h-[60vh] overflow-y-auto p-2">
       <!-- USER SETTINGS. No group heading: this IS the panel as far as most
            people are concerned, and a heading over a single section is chrome. -->
+
+      <!-- Pickers first: a lighting rig frames every switch under it, so choosing
+           one is the outer decision. Segmented rather than a <select> — there are
+           four options and the panel is already 240px of buttons, so a native
+           dropdown would be the only OS-chrome control in it. -->
+      <div v-for="c in userPicks" :key="c.name" class="rounded px-1.5 py-1.5">
+        <span class="block text-f11 text-foreground">{{ c.label }}</span>
+        <div class="mt-1.5 flex flex-wrap gap-1">
+          <button
+            v-for="o in c.options"
+            :key="o.value"
+            type="button"
+            class="rounded border px-2 py-1 text-f10 transition-colors"
+            :class="pickValue(c) === o.value
+              ? 'border-[#f2c14e] text-[#f2c14e]'
+              : 'border-border/60 text-muted-foreground hover:text-foreground'"
+            :aria-pressed="pickValue(c) === o.value"
+            @click="setChoice(c.name, o.value)"
+          >{{ o.label }}</button>
+        </div>
+        <span class="mt-1 block text-f10 leading-snug text-muted-foreground/70">{{ pickHint(c) }}</span>
+        <!-- Same note the flags carry: read when the rig is built, so an open
+             viewer keeps the old one until it is rebuilt. -->
+        <span v-if="c.remount" class="mt-0.5 block text-f9 text-muted-foreground/50">{{ tr('inventory.devhud.remount', 'Reopen the item to apply') }}</span>
+      </div>
+
       <button
         v-for="f in userSwitches"
         :key="f.name"
@@ -174,12 +213,16 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
         @click="advancedOpen = !advancedOpen"
       >
         <ChevronRight class="h-3 w-3 transition-transform" :class="advancedOpen && 'rotate-90'" />
-        Advanced
+        {{ tr('inventory.devhud.advanced', 'Advanced') }}
       </button>
       <div v-if="advancedOpen">
         <p class="px-1.5 pb-1 text-f9 leading-snug text-muted-foreground/80">
-          Rendering diagnostics. Several of these deliberately draw the model wrong
-          so it can be measured — if something looks broken, reset.
+          {{
+            tr(
+              'inventory.devhud.advanced_note',
+              'Rendering diagnostics. Several of these deliberately draw the model wrong so it can be measured — if something looks broken, reset.'
+            )
+          }}
         </p>
         <div v-for="[name, flags, knobs] in advanced" :key="name" class="mb-2 last:mb-0">
           <div class="px-1 pb-1 text-f9 uppercase tracking-cs1 text-muted-foreground/70">{{ name }}</div>
@@ -224,11 +267,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
     </div>
 
     <div v-if="dirty" class="flex items-center gap-2 border-t border-border px-3 py-2">
-      <span class="flex-1 text-f9 text-muted-foreground">Read at load — reload to apply.</span>
+      <span class="flex-1 text-f9 text-muted-foreground">{{ tr('inventory.devhud.reload_note', 'Read at load — reload to apply.') }}</span>
       <button
         class="rounded border border-[color:var(--acc)]/45 bg-[color:var(--acc)]/12 px-2 py-1 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
         @click="reload()"
-      >Reload</button>
+      >{{ tr('inventory.devhud.reload', 'Reload') }}</button>
     </div>
   </div>
 </template>

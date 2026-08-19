@@ -10,7 +10,7 @@
 // Rendered as <span>s, not <button>s, on purpose — every host puts this INSIDE
 // a <button> (tile, slot), and a nested button is invalid HTML that browsers
 // silently reparent, which drops the click handlers.
-import { computed } from "vue";
+import { computed, inject } from "vue";
 import { Box, Copy, Crosshair, ExternalLink, Pencil, Trash2 } from "lucide-vue-next";
 import type { InventoryItem } from "../api";
 import { canInspect, isCustomizable, isReadOnly } from "../itemVisuals";
@@ -43,6 +43,8 @@ const emit = defineEmits<{ (e: "focus" | "view3d" | "inspect" | "edit" | "duplic
 
 // Steam-synced items are read-only server-side, so they get Duplicate where
 // crafted items get Edit — never both.
+const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
+
 const readOnly = computed(() => !!props.inst && isReadOnly(props.inst));
 // Hidden, not disabled, for types we have no models for.
 //
@@ -74,29 +76,39 @@ const ICON = computed(() => (props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
 <template>
   <!-- Hidden on touch outright: 20px targets are unusable there, and tap /
        long-press both open the action menu, which has every one of these. -->
+  <!-- The cluster carries its own surface. What sits behind it differs per cell
+       — artwork, a truncated name, a price, a status chip — so there is no one
+       thing to fade and no contrast that can be assumed. A translucent plate is
+       the only fix that holds for all of them, and it costs less room than
+       plating each button.
+
+       backdrop-blur, not more opacity: at 80% the plate still shows enough of
+       what is under it to read as sitting ON the cell rather than punched out of
+       it, and blurring the backdrop kills the detail that was competing with the
+       glyphs without darkening the cell further. -->
   <span
     v-if="!isCoarse && (inst || focus)"
-    class="absolute z-[3] flex opacity-0 transition-opacity group-hover:opacity-100"
-    :class="compact ? 'right-1 top-1 gap-0.5' : 'right-1.5 top-1.5 gap-1'"
+    class="absolute z-[3] flex rounded-md border border-border/50 bg-background/80 opacity-0 backdrop-blur-[2px] transition-opacity duration-100 group-hover:opacity-100"
+    :class="compact ? 'right-1 top-1 gap-0.5 p-0.5' : 'right-1.5 top-1.5 gap-1 p-1'"
   >
-    <span v-if="focus" :class="BTN" title="Focus" @click.stop="emit('focus')"><Crosshair :class="ICON" /></span>
-    <span v-if="can3d" :class="BTN" title="View in 3D" @click.stop="emit('view3d')"><Box :class="ICON" /></span>
+    <span v-if="focus" :class="BTN" :title="tr('inventory.actions.focus', 'Focus')" @click.stop="emit('focus')"><Crosshair :class="ICON" /></span>
+    <span v-if="can3d" :class="BTN" :title="tr('inventory.actions.view3d', 'View in 3D')" @click.stop="emit('view3d')"><Box :class="ICON" /></span>
     <!-- steam:// can't launch CS2 from a phone — hide the dead-end on touch. -->
-    <span v-if="canInspectItem" :class="BTN" title="Inspect in game" @click.stop="emit('inspect')"><ExternalLink :class="ICON" /></span>
+    <span v-if="canInspectItem" :class="BTN" :title="tr('inventory.actions.inspect', 'Inspect in game')" @click.stop="emit('inspect')"><ExternalLink :class="ICON" /></span>
     <span
       v-if="readOnly"
       :class="BTN"
-      title="Synced from Steam and read-only — craft your own copy of it"
+      :title="tr('inventory.actions.duplicate', 'Synced from Steam and read-only — craft your own copy of it')"
       @click.stop="emit('duplicate')"
     ><Copy :class="ICON" /></span>
-    <span v-else-if="canEditItem" :class="BTN" title="Edit item" @click.stop="emit('edit')"><Pencil :class="ICON" /></span>
+    <span v-else-if="canEditItem" :class="BTN" :title="tr('inventory.actions.edit', 'Edit item')" @click.stop="emit('edit')"><Pencil :class="ICON" /></span>
     <!-- Guarded like the rest: with no instance there is nothing to delete, and
          a default weapon offering a bin was the one action that used to escape
          the null check. -->
     <span
       v-if="inst"
       :class="[BTN, 'hover:!border-[#e04a3a] hover:!text-[#ff7a6a]']"
-      title="Delete from inventory"
+      :title="tr('inventory.actions.remove', 'Delete from inventory')"
       @click.stop="emit('remove')"
     ><Trash2 :class="ICON" /></span>
   </span>

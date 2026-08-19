@@ -20,7 +20,7 @@
 // picker shows rarity alone), while the bar itself always renders — Sort is
 // always meaningful, and a bar that can vanish could strand an active filter
 // with no visible control to switch it off.
-import { computed, nextTick, watch } from "vue";
+import { computed, inject, nextTick, watch } from "vue";
 import { X } from "lucide-vue-next";
 import FilterDropdown from "./FilterDropdown.vue";
 import SortDirection from "./SortDirection.vue";
@@ -72,6 +72,8 @@ const emit = defineEmits<{
   (e: "clear"): void;
 }>();
 
+const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
+
 const pill = makePill();
 // Re-measure when the strip's CONTENT changes, not just its size: the counts
 // re-render on every keystroke and a tab can appear or vanish with them.
@@ -101,7 +103,7 @@ function fmtCount(n?: number) {
  * reads back as "Collection · All collection".
  */
 function axisOptions(a: FacetAxis): FacetOption[] {
-  return [{ value: "", label: "All" }, ...a.options];
+  return [{ value: "", label: tr("inventory.filters.all", "All") }, ...a.options];
 }
 </script>
 
@@ -167,7 +169,7 @@ function axisOptions(a: FacetAxis): FacetOption[] {
       class="flex h-8 items-center gap-1.5 rounded-md px-2 text-f10 uppercase tracking-cs1 text-muted-foreground transition-colors hover:text-foreground"
       @click="emit('clear')"
     >
-      <X class="h-3 w-3" /> Clear
+      <X class="h-3 w-3" /> {{ tr('inventory.filters.clear', 'Clear') }}
     </button>
 
     <!-- Sort sits apart from the narrowing controls: it changes the ORDER of
@@ -177,7 +179,7 @@ function axisOptions(a: FacetAxis): FacetOption[] {
         class="ml-auto"
         :model-value="sort ?? ''"
         :options="sorts"
-        prefix="Sort"
+        :prefix="tr('inventory.filters.sort', 'Sort')"
         @update:model-value="emit('update:sort', $event)"
       />
       <SortDirection

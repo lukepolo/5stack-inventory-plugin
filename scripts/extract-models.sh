@@ -92,6 +92,29 @@ set -euo pipefail
 # ramp lookup coordinate. v10-v12 mounts render Glock | AXIA's slide as chrome
 # instead of dark steel, and anything with an SFX/material mask over-shiny.
 # Verified: cwebp -exact round-trips RGBA byte-identical, IM differs.
+# v28 (2026-08-18): MUSIC KIT AUDIO (new step 5b -> <mount>/music). The one item
+# type with no preview of any kind: a kit IS its sound, and you picked one by
+# reading its name. `music_definitions` in items_game.txt names the sound folder
+# per kit and Source2Viewer decodes `sounds/music/<name>/mainmenu.vsnd_c` STRAIGHT
+# TO MP3 — no ffmpeg, no transcode step — so the only reason this did not exist
+# was that nobody had read the mapping.
+#
+# The mapping is keyed by cs2-lib's `variantIndex`, NOT `definitionIndex`.
+# definitionIndex is 1314 for every kit — it means "is a music kit", not which
+# one — so keying on it resolves all 100 kits to one folder and every kit plays
+# the same song. That is the whole trap in this step.
+#
+# ~3.5MB x 101 kits, roughly 350MB on the mount, served with byte ranges so a
+# browser fetches only the seconds it plays (nginx does this natively;
+# scripts/serve.mjs and serveAssetDir had to learn it). Deliberately NOT trimmed:
+# a shorter clip is the thing that would have needed ffmpeg, and full fidelity
+# costs nothing once the transport is honest about ranges.
+#
+# This bump is not free — EXTRACT_VERSION is also the card-bake and composite
+# generation key, so every cached render is re-baked by it. It rides one anyway
+# because the version IS the "your mount is behind, re-run" signal: without a
+# bump a v27 mount looks current forever and no operator would ever run the step,
+# so the audio would never appear on any deployment that is already up to date.
 # v27 (2026-08-05): `liquid.metalMap` — csgo_simple_liquid's METALNESS, which is
 # g_tColorA's ALPHA. The shader declares no metalness texture (which is why this
 # was twice written off as "this shader has no metalness"), but the decompile
@@ -228,7 +251,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=27
+EXTRACT_VERSION=28
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -327,7 +350,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art stamp)
+STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art music-audio stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -405,6 +428,7 @@ step() { # step "Name" — closes the previous step and opens this one
 #   ONLY_STEPS=charm-models   ~1s    every charm's params (charm-shading.json)
 #   ONLY_STEPS=charm-anchors  ~5s    where charms hang
 #   ONLY_STEPS=sticker-markup ~1s    sticker slots
+#   ONLY_STEPS=music-audio    ~1-2m  the 101 music kit previews (~350MB)
 #
 # Only reach for the paint chain when a NEW TEXTURE has to be extracted; params
 # alone never need it. Two things make scoped runs safe, and both had to be
@@ -415,9 +439,10 @@ step() { # step "Name" — closes the previous step and opens this one
 #   · a scoped run does NOT stamp extract-version.json, so the mount stays
 #     honestly stale and a full run still happens later.
 #
-# The seven model steps are individually selectable. econ-icons, paint-chain and
-# sticker-art are one interleaved flow with no seam between them, so naming any
-# of the three runs all three.
+# The seven model steps are individually selectable, and so is music-audio (it
+# reads the econ schema and the archive and nothing else). econ-icons,
+# paint-chain and sticker-art are one interleaved flow with no seam between them,
+# so naming any of the three runs all three.
 #
 # A skipped step reuses whatever the last run left in $WORK and $DEST. That is
 # the point, and it is also the hazard: skip decompile-models after changing the
@@ -695,12 +720,14 @@ for k in "${!MAP[@]}"; do MODEL_KEY_JSON+="\"$k\":\"${MAP[$k]}\","; done
 MODEL_KEY_JSON="${MODEL_KEY_JSON%,}}"
 export MODEL_KEY_JSON
 
-# ---- The econ schema, out here because THREE steps read it -------------------
+# ---- The econ schema, out here because FOUR steps read it --------------------
 # rename-models needs the glove table below, charm-models needs
-# keychain_definitions, and step 3f needs sticker_kits. One small file and about
-# a second to pull, so it is extracted once up front rather than by whichever
-# step happens to run first — which is also what makes it survive a skip (see
-# the note on ONLY_STEPS).
+# keychain_definitions, step 3f needs sticker_kits, and music-audio needs
+# music_definitions (which is the only place a kit's sound FOLDER is named — so
+# a scoped ONLY_STEPS=music-audio run works without a decompile). One small file
+# and about a second to pull, so it is extracted once up front rather than by
+# whichever step happens to run first — which is also what makes it survive a
+# skip (see the note on ONLY_STEPS).
 echo ""
 echo "--- Reading the econ schema…"
 rm -rf "$WORK/raw_items"
@@ -4318,9 +4345,18 @@ PYEOF
   # ---- swap staging into place ------------------------------------------------
   # `set -e` means we only reach here if the step above succeeded, so the live
   # copy is only ever replaced by a COMPLETE one. Two renames within the same
-  # filesystem, so each is atomic: a request either resolves against the old
-  # directory or the new one, never a half-built mix. Readers already holding an
-  # open fd finish against the inode they opened.
+  # filesystem, so each is atomic and no request ever sees a half-built mix.
+  # Readers already holding an open fd finish against the inode they opened.
+  #
+  # NOT one atomic swap, though, and the comment here used to claim it was: for
+  # the instant between the two renames the live path does not exist at all, and
+  # a request landing in it 404s. rename(2) cannot replace a non-empty directory,
+  # so closing that window for real means making the live path a SYMLINK and
+  # flipping it — a change to the on-disk layout of the mount, which the panel
+  # repo's manifests own rather than this one. What made the window matter was
+  # the asset routes handing those 404s a year-long immutable Cache-Control (see
+  # serveAssetDir); they no longer do, so a request unlucky enough to land in it
+  # retries and succeeds instead of caching the miss forever.
   echo "--- Swapping paints into place…"
   rm -rf "$PAINT_LIVE.old"
   mv "$PAINT_LIVE" "$PAINT_LIVE.old"
@@ -4332,6 +4368,216 @@ PYEOF
   # sticker-art is closed by the python above (it alone knows that phase's
   # duration); paint-chain stays with the shell so the run stamp still records a
   # time for it. Clearing STEP_NAME here instead dropped BOTH from the stamp.
+fi
+
+fi
+
+# ---- 5b. Music kit audio -----------------------------------------------------
+if step_if "music-audio"; then
+# A music kit IS its sound, and until this step there was no preview of any kind
+# — you picked one by reading the artist's name. This decodes each kit's menu
+# theme out of this instance's own CS2 install, exactly like every other asset
+# here: licensed music, mirrored locally, never fetched from anyone else.
+#
+# THE MAPPING IS `variantIndex`, NOT `definitionIndex`. items_game.txt's
+# `music_definitions` is keyed by cs2-lib's variantIndex and its `name` is the
+# sound folder ("1" -> valve_cs2_01, "3" -> danielsadowski_01, "4" -> noisia_01,
+# checked against the catalogue). definitionIndex is 1314 for EVERY kit — it says
+# "this is a music kit", not which one — so keying on it collapses all 100 kits
+# onto one folder and every kit plays the same song.
+#
+# `mainmenu` of the 13-22 files a kit ships (bombplanted, deathcam,
+# roundmvpanthem, startround...) because it is the menu theme, i.e. the part
+# people recognise; all 101 folders on this build have one.
+#
+# No transcode: Source2Viewer writes .vsnd_c straight out as .mp3. The output
+# extension is still PROBED rather than assumed — the CLI picks the container
+# from the codec inside the .vsnd_c, so a kit stored as PCM lands as .wav, and
+# assuming .mp3 would drop it silently rather than serve it.
+echo ""
+echo "--- Extracting music kit audio…"
+if [[ -n "$OUT_DIR" ]]; then MUSIC_LIVE="$OUT_DIR/music"; else MUSIC_LIVE="$WORK/music"; fi
+# Staged like the paints, and for a sharper reason: an mp3 is written
+# PROGRESSIVELY, and the browser range-requests it. A viewer who hits a file
+# mid-write gets a truncated body, and a truncated decode is what an <audio>
+# element caches — so it stays broken for that session even after the file is
+# whole. The live directory is only ever replaced by a complete one.
+MUSIC_DEST="$MUSIC_LIVE.next"
+rm -rf "$MUSIC_DEST"
+mkdir -p "$MUSIC_DEST" "$MUSIC_LIVE"
+
+CLI="$CLI" VPK="$VPK" ITEMS_GAME="$ITEMS_GAME" MUSIC_DEST="$MUSIC_DEST" \
+RAW_MUSIC="$WORK/raw_music" python3 - <<'PYEOF'
+import glob, json, os, re, shutil, subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+cli, vpk = os.environ["CLI"], os.environ["VPK"]
+src, dest, raw = os.environ.get("ITEMS_GAME", ""), os.environ["MUSIC_DEST"], os.environ["RAW_MUSIC"]
+
+CORES = int(os.environ.get("CORES") or 0) or (os.cpu_count() or 4)
+
+
+def pool_size(cap=8):
+    """Same knob the panel writes and every other step reads, re-read here so
+    raising it mid-run speeds this step up too."""
+    try:
+        with open(os.environ["JOBS_FILE"]) as fh:
+            n = int(fh.read().strip())
+    except Exception:
+        n = int(os.environ.get("EXTRACT_JOBS") or 1)
+    return max(1, min(cap, CORES, max(4, n)))
+
+
+def progress(step, done, total, state="running"):
+    """Unit counts for the panel — a file, not stdout, so it survives a backend
+    restart mid-run. See the shell's `prog` helper for the whole story."""
+    pf = os.environ.get("PROGRESS_FILE")
+    if not pf:
+        return
+    try:
+        try:
+            with open(pf) as fh:
+                doc = json.load(fh)
+        except Exception:
+            doc = {"steps": []}
+        for s in doc.get("steps", []):
+            if s["name"] == step:
+                s["state"], s["done"], s["total"] = state, done, total
+                break
+        doc["at"] = __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(pf, "w") as fh:
+            json.dump(doc, fh)
+    except Exception:
+        pass
+
+
+# ---- the mapping ------------------------------------------------------------
+# Same depth walker the sticker_kits block uses: the table arrives as
+#   "music_definitions" { "1" { "name" "valve_cs2_01" ... } ... }
+# and, like keychain_definitions, may arrive in more than one block — so entries
+# are merged rather than the first block winning.
+KV = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"\s*$')
+INDEX = re.compile(r'^"(\d+)"$')
+# The folder name becomes a filename on a public route, so it is validated here
+# rather than trusted: items_game.txt is game data, but this is the one value in
+# this step that crosses into a path.
+FOLDER = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+kits = {}
+if src and os.path.exists(src):
+    lines = open(src, encoding="utf8", errors="replace").read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != '"music_definitions"':
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != "{":
+            j += 1
+        depth, j = 1, j + 1
+        cur, entry = None, None
+        while j < len(lines) and depth > 0:
+            stripped = lines[j].strip()
+            if stripped == "{":
+                depth += 1
+            elif stripped == "}":
+                depth -= 1
+                if depth == 1 and cur is not None:
+                    name = (entry or {}).get("name")
+                    if name and FOLDER.match(name):
+                        kits[cur] = name
+                    cur, entry = None, None
+            elif depth == 1:
+                m = INDEX.match(stripped)
+                if m:
+                    cur, entry = m.group(1), {}
+            elif depth == 2 and entry is not None:
+                m = KV.match(lines[j])
+                if m:
+                    entry[m.group(1)] = m.group(2)
+            j += 1
+        i = j
+
+if not kits:
+    print("!!! No music_definitions recovered — every music kit stays previewless. "
+          "Check that scripts/items/items_game.txt extracted.")
+
+# Deduplicated: the manifest is index -> file, but two indices naming the same
+# folder must not decode the same 3.5MB twice.
+folders = sorted(set(kits.values()))
+progress("music-audio", 0, len(folders))
+
+# ---- decode -----------------------------------------------------------------
+# `-f` takes a COMMA-SEPARATED LIST of exact archive paths and honours them only
+# while `-e` is omitted — one process extracts exactly the files asked for. That
+# is the difference between ~100 process launches and a handful, and it is why
+# nothing here unpacks a folder (a kit folder holds 13-22 files and we want one).
+shutil.rmtree(raw, ignore_errors=True)
+os.makedirs(raw, exist_ok=True)
+wanted = [f"sounds/music/{name}/mainmenu.vsnd_c" for name in folders]
+workers = pool_size()
+stride = max(1, (len(wanted) + workers - 1) // workers)
+slices = [wanted[i:i + stride] for i in range(0, len(wanted), stride)]
+
+
+def grab(paths):
+    subprocess.run([cli, "-i", vpk, "-o", raw, "-d", "-f", ",".join(paths)], capture_output=True)
+
+
+if slices:
+    with ThreadPoolExecutor(max_workers=len(slices)) as pool:
+        list(pool.map(grab, slices))
+
+# ---- collect ----------------------------------------------------------------
+# Probed by glob for the reason in the step comment: the container is chosen by
+# the codec, not by us.
+written, missing = {}, []
+for name in folders:
+    stem = os.path.join(raw, "sounds", "music", name, "mainmenu")
+    hit = next(iter(sorted(glob.glob(glob.escape(stem) + ".*"))), None)
+    if hit is None:
+        missing.append(name)
+        continue
+    out = name + os.path.splitext(hit)[1].lower()
+    shutil.move(hit, os.path.join(dest, out))
+    written[name] = out
+    progress("music-audio", len(written), len(folders))
+shutil.rmtree(raw, ignore_errors=True)
+
+# The manifest lives WITH the audio rather than in models/, so the atomic swap
+# below moves both together — a manifest that promised a file the swap had not
+# published yet would advertise a preview that 404s. Keyed by variantIndex,
+# which is the number the backend has in hand for a kit.
+index = {idx: written[name] for idx, name in kits.items() if name in written}
+with open(os.path.join(dest, "music-kits.json"), "w") as fh:
+    json.dump(index, fh, indent=1, sort_keys=True)
+
+print(f"--- Music kits: {len(written)}/{len(folders)} themes -> {dest} ({len(index)} kits mapped)")
+if missing:
+    print(f"!!! {len(missing)} kits have no mainmenu track in this build, e.g. {missing[:4]}")
+PYEOF
+
+# ---- swap staging into place -------------------------------------------------
+# Guarded on the staging directory having something in it, which the paint swap
+# does not need: paints run under `set -e` behind a step that fails loudly, while
+# this one degrades quietly — no items_game.txt means zero kits resolved and the
+# python above still exits 0. Swapping then would DELETE a good previous run's
+# audio and replace it with an empty directory. Leaving the old copy live is the
+# honest failure: the previews keep working and the warning above says why.
+staged=$(find "$MUSIC_DEST" -type f -name '*.mp3' -o -type f -name '*.wav' | wc -l | tr -d "[:space:]")
+if (( staged > 0 )); then
+  # Two renames within one filesystem, so each is atomic — no request ever sees a
+  # half-written file. See the paint swap above for the window BETWEEN them, why
+  # it cannot be closed without turning the live path into a symlink, and why it
+  # stopped being permanent once 404s lost their immutable Cache-Control.
+  rm -rf "$MUSIC_LIVE.old"
+  mv "$MUSIC_LIVE" "$MUSIC_LIVE.old"
+  mv "$MUSIC_DEST" "$MUSIC_LIVE"
+  rm -rf "$MUSIC_LIVE.old"
+  echo "--- Music live: $staged themes ($(du -sh "$MUSIC_LIVE" | cut -f1))"
+else
+  rm -rf "$MUSIC_DEST"
+  echo "!! No music decoded — keeping the previously extracted audio (if any) rather than emptying it."
 fi
 
 fi

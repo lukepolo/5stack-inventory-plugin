@@ -9,7 +9,7 @@
 // `kind` picks the icon pair (see sortIcons.ts) and `hint` is the mode's own words
 // for the CURRENT direction — "ascending" means nothing to someone looking for a
 // clean float, "Lowest float first" is the thing they're actually after.
-import { computed } from "vue";
+import { computed, inject } from "vue";
 import { SORT_DIR_ICON, type SortDir, type SortKind } from "../sortIcons";
 
 const props = withDefaults(defineProps<{ modelValue: SortDir; kind?: SortKind; hint?: string }>(), {
@@ -17,14 +17,15 @@ const props = withDefaults(defineProps<{ modelValue: SortDir; kind?: SortKind; h
 });
 const emit = defineEmits<{ (e: "update:modelValue", v: SortDir): void }>();
 
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 const icon = computed(() => SORT_DIR_ICON[props.kind][props.modelValue]);
 </script>
 
 <template>
   <button
     class="tac-action flex h-8 w-8 flex-none items-center justify-center rounded-md border border-border bg-background text-muted-foreground"
-    :title="hint ? `${hint} — click to reverse` : 'Reverse sort order'"
-    :aria-label="hint ?? 'Reverse sort order'"
+    :title="hint ? tr('inventory.sort.reverse_hint', '{hint} — click to reverse', { hint }) : tr('inventory.sort.reverse', 'Reverse sort order')"
+    :aria-label="hint ?? tr('inventory.sort.reverse', 'Reverse sort order')"
     @click="emit('update:modelValue', props.modelValue === 'desc' ? 'asc' : 'desc')"
   >
     <component :is="icon" class="h-3.5 w-3.5" />
