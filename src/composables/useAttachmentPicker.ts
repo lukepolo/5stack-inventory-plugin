@@ -254,10 +254,22 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
     if (pickerLoading.value || pickerLoadingMore.value || pickerDone.value) return;
     void pickerFetch(pickerResults.value.length);
   }
-  watch(pickerQuery, () => {
-    clearTimeout(pickerTimer);
-    pickerTimer = setTimeout(pickerSearch, SEARCH_DEBOUNCE_MS);
-  });
+  // `flush: "sync"` so the timer is armed on the same tick the query changes,
+  // which is what lets openPicker below disarm it. With the default (pre) flush
+  // this ran in a microtask AFTER openPicker's own clearTimeout, re-arming a
+  // search for the empty query it had just assigned: reopening a picker that had
+  // been typed into fired the immediate search, then a second page-0 search
+  // ~250ms later that discarded any page the user had scrolled to and sent the
+  // grid back to the top. The body only touches a timer, so running it per
+  // keystroke rather than per tick costs nothing.
+  watch(
+    pickerQuery,
+    () => {
+      clearTimeout(pickerTimer);
+      pickerTimer = setTimeout(pickerSearch, SEARCH_DEBOUNCE_MS);
+    },
+    { flush: "sync" },
+  );
   // A debounced search that outlives the component fires into a torn-down setup
   // and writes to refs nothing reads. App used to clear this alongside its own
   // timers; it travels with the timer now.
@@ -396,6 +408,10 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
     pickerGroups.value = [];
     pickerCollections.value = [];
     pickerRarities.value = [];
+    // Clearing pickerQuery above armed the debounce watcher (see its flush note).
+    // Drop that timer: this function does its own immediate search, and the
+    // debounced one would land on top of it a quarter-second later.
+    clearTimeout(pickerTimer);
     void pickerSearch();
   }
 

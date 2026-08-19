@@ -60,12 +60,6 @@ export const needsOwnedItem = (mode: SortMode): boolean =>
   mode === "wear" || mode === "recent";
 
 /**
- * Catalog lists have no float, so offering "Wear" over one is a control that
- * does nothing. Surfaces that show catalog entries filter the list through this.
- */
-export const SORTS_WITHOUT_WEAR = SORTS.filter(([mode]) => mode !== "wear" && mode !== "value");
-
-/**
  * Rarity, not insertion order: an inventory reads better with the covert reds at
  * the top than with whatever you happened to craft last.
  */

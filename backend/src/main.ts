@@ -9,6 +9,8 @@ import Fastify, { LogController } from "fastify";
 // runtime export to import.
 import type { PoolClient } from "pg";
 import { pool } from "./db.ts";
+// Shared with scripts/serve.mjs — see the module header for why it is .mjs.
+import { parseByteRange } from "./byteRange.mjs";
 import { getIdentity } from "./identity.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
 import {
@@ -347,29 +349,6 @@ const ASSET_TYPES: Record<string, string> = {
   ".wav": "audio/wav",
 };
 
-/**
- * One `bytes=` range against a known size, or null when none was asked for and
- * false when the one asked for cannot be met.
- *
- * The distinction matters: an unsatisfiable range is a 416, and answering it
- * with the whole file instead hands a media element bytes from an offset it did
- * not ask about, which it decodes as noise.
- */
-function parseByteRange(header: string | undefined, size: number): { start: number; end: number } | null | false {
-  const m = /^bytes=(\d*)-(\d*)$/.exec((header ?? "").trim());
-  if (!m) return null;
-  const [, rawStart, rawEnd] = m;
-  // `bytes=-500` means the LAST 500 bytes. Media elements use the suffix form
-  // to read a trailing index, so reading it as "0 to 500" serves the header
-  // where the tail was asked for.
-  let start = rawStart === "" ? size - Number(rawEnd) : Number(rawStart);
-  let end = rawStart === "" ? size - 1 : rawEnd === "" ? size - 1 : Number(rawEnd);
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
-  start = Math.max(0, start);
-  end = Math.min(size - 1, end);
-  if (size === 0 || start > end || start >= size) return false;
-  return { start, end };
-}
 // Static asset mounts, populated ONLY by our own extractor from the instance's
 // own CS2 install (scripts/extract-models.sh). A miss is a 404 and stays a
 // 404: there is no upstream to fall back to by design, so an unpopulated or
@@ -407,10 +386,17 @@ function serveAssetDir(routePrefix: string, dir: string) {
     // So both are only immutable once the client has stamped the extraction
     // version on them (see withAssetVersion). Unversioned requests still
     // revalidate, which keeps old clients and hand-typed URLs correct.
+    // Set on the SUCCESS paths only, never up here. A miss on this route is a
+    // 404, and the extractor's atomic directory swap makes misses real: for the
+    // instant between its two renames the live directory does not exist, and a
+    // pod whose mount is a run behind answers 404 for longer than that. A 404
+    // that goes out `immutable` is a 404 the browser and Cloudflare keep for a
+    // year against a URL whose content now exists, so the skin stays white long
+    // after the mount is correct — the exact trap /images had to be fixed for
+    // once already. Errors carry no Cache-Control and revalidate every time.
     const versioned = (request.query as { v?: string } | undefined)?.v != null;
     const selfVersioning = type !== "application/json" && !type.startsWith("audio/");
     const cacheControl = selfVersioning || versioned ? "public, max-age=31536000, immutable" : "no-cache";
-    reply.header("Cache-Control", cacheControl);
     try {
       // Only stat when a range was actually asked for: the icon and texture
       // routes are hot and pay nothing for a feature they never use.
@@ -421,12 +407,14 @@ function serveAssetDir(routePrefix: string, dir: string) {
           return reply.code(416).header("Content-Range", `bytes */${size}`).send();
         }
         if (range) {
+          reply.header("Cache-Control", cacheControl);
           reply.header("Content-Range", `bytes ${range.start}-${range.end}/${size}`);
           reply.header("Content-Length", range.end - range.start + 1);
           return reply.code(206).type(type).send(createReadStream(file, { start: range.start, end: range.end }));
         }
       }
       const buf = await fs.readFile(file);
+      reply.header("Cache-Control", cacheControl);
       return reply.type(type).send(buf);
     } catch {
       return reply.status(404).send({ error: "not extracted" });
@@ -2556,8 +2544,6 @@ app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request
   return { inspect: link, stattrak: row.stattrak };
 });
 
-// Where this gun has actually been: the ledger behind the StatTrak counter.
-//
 app.delete<{ Params: { id: string } }>("/api/inventory/:id", async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
@@ -2990,7 +2976,14 @@ async function ensureActivePreset(
     [steamId],
   );
   if (rows.length) return String(rows[0].id);
-  return (await read()) as string;
+  // Losing the race means somebody else committed the row, so the re-read finds
+  // it. Throw rather than cast a null away: every caller feeds this id straight
+  // into `WHERE preset_id = $1`, where a null matches nothing and silently
+  // parks nothing and loads nothing — a loadout deleted and not replaced, with
+  // no error anywhere to say so.
+  const minted = await read();
+  if (!minted) throw new Error(`No active preset for ${steamId} after minting one.`);
+  return minted;
 }
 
 /** A preset row the caller owns, or null. Every write route starts here. */
@@ -3025,12 +3018,29 @@ async function activatePreset(
   steamId: string,
   presetId: string,
 ): Promise<boolean> {
-  const fromId = await ensureActivePreset(steamId, client);
-  // Serialises two activations for the same player. Without it both could read
-  // the same "current" preset and both park the live rows under it — the second
-  // parking whatever the first had already swapped in, so one build ends up
-  // stored under two names and the other is gone.
-  await client.query(`SELECT 1 FROM inventory.loadout_presets WHERE id = $1 FOR UPDATE`, [fromId]);
+  await ensureActivePreset(steamId, client);
+  // Serialises two activations for the same player, and the ORDER here is the
+  // whole point: the lock has to come first and the "which one is live" read
+  // second. Reading first and then locking the row that read named is no
+  // serialisation at all — the loser blocks, wakes holding the id of a preset
+  // that is no longer active, and parks the winner's freshly swapped-in build
+  // under it while deleting what the winner parked. Two clicks on the SAME
+  // preset were the worst of it: the loser emptied inventory.loadout, loaded it
+  // back from rows the winner had already deleted, and committed a player with
+  // no loadout at all — the final `SET active = true` being a no-op on an
+  // already-active row meant the unique index never objected.
+  //
+  // Every preset the player owns, in id order: `FOR UPDATE` on a predicate that
+  // an activation itself changes (`WHERE active`) re-checks the predicate after
+  // it unblocks and returns nothing, so the lock is taken on something stable.
+  // The consistent order is what keeps two players' worth of rows deadlock-free.
+  const { rows: locked } = await client.query<{ id: string; active: boolean }>(
+    `SELECT id, active FROM inventory.loadout_presets WHERE steam_id = $1 ORDER BY id FOR UPDATE`,
+    [steamId],
+  );
+  const fromRow = locked.find((r) => r.active);
+  if (!fromRow) throw new Error(`No active preset for ${steamId} while activating ${presetId}.`);
+  const fromId = String(fromRow.id);
   if (fromId === presetId) return false;
 
   // Park what is live now under the preset that owns it. The DELETE first
@@ -3909,9 +3919,7 @@ async function syncPriceAliases(): Promise<number> {
   const aliases = catalogSummary()
     .map((item) => [item.id, priceGroupId(item.id)] as const)
     .filter(([id, groupId]) => groupId !== id);
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  await inTransaction(async (client) => {
     await client.query(`DELETE FROM inventory.price_aliases`);
     for (let i = 0; i < aliases.length; i += 1_000) {
       const chunk = aliases.slice(i, i + 1_000);
@@ -3924,13 +3932,7 @@ async function syncPriceAliases(): Promise<number> {
         .join(",");
       await client.query(`INSERT INTO inventory.price_aliases (item_id, price_item_id) VALUES ${tuples}`, values);
     }
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
+  });
   return aliases.length;
 }
 
@@ -3958,10 +3960,30 @@ interface PriceTarget {
  * Duplicates collapse before the query: an inventory with forty of the same
  * sticker asks about it once.
  */
-/** float4 round-trip tolerance: a JS double bound as ::real comes back rounded,
- *  so identity has to be "the same number to within float4 precision". */
-const nearlyEqual = (a: number | null, b: number | null) =>
-  a === b || (a != null && b != null && Math.abs(a - b) < 1e-6);
+/** The identity of a target as the QUERY sees it.
+ *
+ *  `$n::real` is float4, so Postgres rounds the double we bind to single
+ *  precision and prints it back as the shortest decimal that parses to that
+ *  same float4. Math.fround is exactly that rounding, so asked and returned
+ *  land on the identical number — an exact Map key, with no tolerance to tune
+ *  and no linear scan over every target for every row.
+ *
+ *  It has to be the BOUND value on both sides. Re-deriving priceTargetKey from
+ *  the returned wear would be wrong, not merely slow, because float4 rounding
+ *  can cross a bracket boundary: a 0.06999999999999999 float is stored as
+ *  0.07000000029802322, so the caller keys it as Factory New while the row would
+ *  key as Minimal Wear, the get() misses, and a tile renders "no listing" for an
+ *  item the query actually priced. */
+const boundTargetKey = (itemId: number, wear: number | null, stattrak: boolean) =>
+  `${itemId}:${stattrak ? 1 : 0}:${wear == null ? "-" : Math.fround(wear)}`;
+
+/** Targets per statement. Each costs three bind parameters and Postgres stops
+ *  at 65535 of them, so a large enough set of distinct items turned the whole
+ *  price overlay into a `bind message supplies N parameters` 500 rather than
+ *  degrading. Chunked here rather than capped at the call sites: this is the
+ *  one place every price surface goes through, and a cap would silently drop
+ *  prices a second statement would simply answer. */
+const PRICE_LOOKUP_CHUNK = 2_000;
 
 async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promise<Map<string, PricePoint>> {
   const unique = new Map<string, PriceTarget>();
@@ -3970,112 +3992,118 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
   }
   const found = new Map<string, PricePoint>();
   if (unique.size === 0) return found;
-  const values: unknown[] = [];
-  const tuples = [...unique.values()]
-    .map((target, i) => {
-      values.push(target.itemId, target.wear, target.stattrak);
-      const b = i * 3;
-      return `($${b + 1}::int, $${b + 2}::real, $${b + 3}::boolean)`;
-    })
-    .join(",");
-  const { rows } = await pool.query<{
-    item_id: number;
-    wear: number | null;
-    stattrak_asked: boolean;
-    market_hash_name: string;
-    wear_tier: number;
-    stattrak: boolean;
-    last_24h: number | null;
-    last_7d: number | null;
-    last_30d: number | null;
-    last_90d: number | null;
-    suggested: number | null;
-    median: number | null;
-    lowest: number | null;
-  }>(
-    `SELECT v.item_id, v.wear, v.stattrak AS stattrak_asked,
-            p.market_hash_name, p.wear_tier, p.stattrak, p.last_24h, p.last_7d, p.last_30d,
-            p.last_90d, p.suggested, p.median, p.lowest
-       FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak)
-       LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
-       -- Two candidate rows, and the ORDER BY is the whole point: the item's OWN
-       -- id first, the name-collapsed one only as a fallback. A source that
-       -- prices Doppler phases separately (Skinport does; Steam does not) writes
-       -- a row per phase, and this is what lets a Ruby read its own $2.4k rather
-       -- than the shared "Doppler" price. When the source doesn't distinguish,
-       -- there is no exact row and the alias answers, exactly as before.
-       JOIN LATERAL (
-         SELECT pr.market_hash_name, pr.wear_tier, pr.stattrak, pr.last_24h, pr.last_7d,
-                pr.last_30d, pr.last_90d, pr.suggested, pr.median, pr.lowest
-           FROM inventory.prices pr
-          WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
-            -- The item's own bracket, OR a listing that carries no bracket at
-            -- all (-1). That second case is not an edge: VANILLA knives are sold
-            -- as "★ Karambit", with no wear in the name, while the knife itself
-            -- very much has a float. Asking only for the float's bracket missed
-            -- every one of them — 22 melee items, and the most valuable things
-            -- most inventories hold.
-            -- Nothing here mints souvenirs. The column exists so a Souvenir AWP's
-            -- price is never filed on the plain one; this side just never asks.
-            AND pr.souvenir = false
-          -- Preference, not filter. Markets do not carry every variant: StatTrak
-          -- exists for a fraction of finishes and trades thinly, and the ends of
-          -- the wear range are often unlisted — so a Battle-Scarred StatTrak
-          -- weapon could match nothing at all and showed no price no matter what
-          -- its owner changed. Now the closest listing answers, in this order:
-          --   the item's own row (a phase-priced source wrote one)
-          --   its StatTrak variant matching the ask
-          --   its exact wear bracket
-          --   a listing with no bracket at all (vanilla knives)
-          --   failing all that, the nearest bracket by distance
-          -- What actually matched rides back to the caller, which labels it.
-          ORDER BY (pr.item_id = v.item_id) DESC,
-                   (pr.stattrak = v.stattrak) DESC,
-                   (pr.wear_tier = ${wearTierSql("v.wear")}) DESC,
-                   (pr.wear_tier = -1) DESC,
-                   abs(pr.wear_tier - ${wearTierSql("v.wear")}) ASC
-          LIMIT 1
-       ) p ON true`,
-    values,
-  );
-  // Keyed off what was ASKED, never off what came back. Targets bind as $n::real
-  // (float4), so a wear of 0.14999999 returns as 0.15000000596 — the caller keys
-  // it as Minimal Wear and the row would key as Field-Tested, the get() misses,
-  // and a tile renders "no listing" for an item the query actually priced.
-  const asked = [...unique.entries()];
-  for (const row of rows) {
-    // The window fallback stays in prices.ts — one implementation, already
-    // covered by tools/price-coverage.ts. Writing it a second time as SQL
-    // COALESCE would be two places to get "which window is this" wrong.
-    const point = pickPrice(
-      {
-        last24h: row.last_24h,
-        last7d: row.last_7d,
-        last30d: row.last_30d,
-        last90d: row.last_90d,
-        suggested: row.suggested,
-        median: row.median,
-        lowest: row.lowest,
-        marketHashName: row.market_hash_name,
-      },
-      window,
+  // Keyed off what was ASKED, never off what came back — see boundTargetKey.
+  // One entry per unique target, because priceTargetKey has already collapsed
+  // the float into its bracket: two copies of a skin in the same bracket are
+  // one question, asked once and answered once.
+  const byBound = new Map<string, [string, PriceTarget]>();
+  for (const entry of unique) {
+    byBound.set(boundTargetKey(entry[1].itemId, entry[1].wear, entry[1].stattrak), entry);
+  }
+  const asked = [...unique.values()];
+  for (let i = 0; i < asked.length; i += PRICE_LOOKUP_CHUNK) {
+    const chunk = asked.slice(i, i + PRICE_LOOKUP_CHUNK);
+    const values: unknown[] = [];
+    const tuples = chunk
+      .map((target, n) => {
+        values.push(target.itemId, target.wear, target.stattrak);
+        const b = n * 3;
+        return `($${b + 1}::int, $${b + 2}::real, $${b + 3}::boolean)`;
+      })
+      .join(",");
+    const { rows } = await pool.query<{
+      item_id: number;
+      wear: number | null;
+      stattrak_asked: boolean;
+      market_hash_name: string;
+      wear_tier: number;
+      stattrak: boolean;
+      last_24h: number | null;
+      last_7d: number | null;
+      last_30d: number | null;
+      last_90d: number | null;
+      suggested: number | null;
+      median: number | null;
+      lowest: number | null;
+    }>(
+      `SELECT v.item_id, v.wear, v.stattrak AS stattrak_asked,
+              p.market_hash_name, p.wear_tier, p.stattrak, p.last_24h, p.last_7d, p.last_30d,
+              p.last_90d, p.suggested, p.median, p.lowest
+         FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak)
+         LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
+         -- Two candidate rows, and the ORDER BY is the whole point: the item's OWN
+         -- id first, the name-collapsed one only as a fallback. A source that
+         -- prices Doppler phases separately (Skinport does; Steam does not) writes
+         -- a row per phase, and this is what lets a Ruby read its own $2.4k rather
+         -- than the shared "Doppler" price. When the source doesn't distinguish,
+         -- there is no exact row and the alias answers, exactly as before.
+         JOIN LATERAL (
+           SELECT pr.market_hash_name, pr.wear_tier, pr.stattrak, pr.last_24h, pr.last_7d,
+                  pr.last_30d, pr.last_90d, pr.suggested, pr.median, pr.lowest
+             FROM inventory.prices pr
+            WHERE pr.item_id IN (v.item_id, COALESCE(a.price_item_id, v.item_id))
+              -- The item's own bracket, OR a listing that carries no bracket at
+              -- all (-1). That second case is not an edge: VANILLA knives are sold
+              -- as "★ Karambit", with no wear in the name, while the knife itself
+              -- very much has a float. Asking only for the float's bracket missed
+              -- every one of them — 22 melee items, and the most valuable things
+              -- most inventories hold.
+              -- Nothing here mints souvenirs. The column exists so a Souvenir AWP's
+              -- price is never filed on the plain one; this side just never asks.
+              AND pr.souvenir = false
+            -- Preference, not filter. Markets do not carry every variant: StatTrak
+            -- exists for a fraction of finishes and trades thinly, and the ends of
+            -- the wear range are often unlisted — so a Battle-Scarred StatTrak
+            -- weapon could match nothing at all and showed no price no matter what
+            -- its owner changed. Now the closest listing answers, in this order:
+            --   the item's own row (a phase-priced source wrote one)
+            --   its StatTrak variant matching the ask
+            --   its exact wear bracket
+            --   a listing with no bracket at all (vanilla knives)
+            --   failing all that, the nearest bracket by distance
+            -- What actually matched rides back to the caller, which labels it.
+            ORDER BY (pr.item_id = v.item_id) DESC,
+                     (pr.stattrak = v.stattrak) DESC,
+                     (pr.wear_tier = ${wearTierSql("v.wear")}) DESC,
+                     (pr.wear_tier = -1) DESC,
+                     abs(pr.wear_tier - ${wearTierSql("v.wear")}) ASC
+            LIMIT 1
+         ) p ON true`,
+      values,
     );
-    if (!point) continue;
-    // Say so when the listing is not the one asked for. Compared here, where both
-    // halves are in hand: the client knows what it asked but not what the table
-    // held, and a substitution the UI cannot see is a substitution it will
-    // present as exact.
-    // The target this row answers, by identity rather than by re-deriving the
-    // key from a rounded float.
-    const target = asked.find(
-      ([, t]) => t.itemId === row.item_id && t.stattrak === row.stattrak_asked && nearlyEqual(t.wear, row.wear),
-    );
-    if (!target) continue;
-    const askedTier = wearTierIndex(wearTierOf(target[1].wear));
-    if (row.wear_tier !== askedTier || row.stattrak !== row.stattrak_asked) {
-      point.approx = { wearTier: row.wear_tier, stattrak: row.stattrak };
+
+    for (const row of rows) {
+      // The window fallback stays in prices.ts — one implementation, already
+      // covered by tools/price-coverage.ts. Writing it a second time as SQL
+      // COALESCE would be two places to get "which window is this" wrong.
+      const point = pickPrice(
+        {
+          last24h: row.last_24h,
+          last7d: row.last_7d,
+          last30d: row.last_30d,
+          last90d: row.last_90d,
+          suggested: row.suggested,
+          median: row.median,
+          lowest: row.lowest,
+          marketHashName: row.market_hash_name,
+        },
+        window,
+      );
+      if (!point) continue;
+      // Say so when the listing is not the one asked for. Compared here, where both
+      // halves are in hand: the client knows what it asked but not what the table
+      // held, and a substitution the UI cannot see is a substitution it will
+      // present as exact.
+      // The target this row answers, looked up by the value that was BOUND
+      // rather than re-derived from the float that came back.
+      const target = byBound.get(boundTargetKey(row.item_id, row.wear, row.stattrak_asked));
+      if (!target) continue;
+      const askedTier = wearTierIndex(wearTierOf(target[1].wear));
+      if (row.wear_tier !== askedTier || row.stattrak !== row.stattrak_asked) {
+        point.approx = { wearTier: row.wear_tier, stattrak: row.stattrak };
+      }
+      found.set(target[0], point);
     }
-    found.set(target[0], point);
   }
   return found;
 }
@@ -4161,9 +4189,7 @@ async function syncPrices(opts: { force?: boolean } = {}): Promise<
     const sourceDate = lastModified ? new Date(lastModified) : new Date();
     const { prices, unmatched, collisions } = provider.map(await response.json());
     if (prices.length === 0) throw new Error("Price feed mapped to zero rows.");
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
+    await inTransaction(async (client) => {
       await client.query(`DELETE FROM inventory.prices`);
       for (let i = 0; i < prices.length; i += PRICE_INSERT_BATCH) {
         const chunk = prices.slice(i, i + PRICE_INSERT_BATCH);
@@ -4195,13 +4221,7 @@ async function syncPrices(opts: { force?: boolean } = {}): Promise<
           WHERE id = 1`,
         [sourceDate, prices.length, unmatched.length, [...new Set(unmatched)].slice(0, 20).join("\n") || null],
       );
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
+    });
     app.log.info(
       `[prices] ${source} ${url}: ${prices.length} listings, ${unmatched.length} unmatched, ${collisions.length} collisions ` +
         `in ${Math.round(performance.now() - startedAt)}ms`,
@@ -4209,10 +4229,20 @@ async function syncPrices(opts: { force?: boolean } = {}): Promise<
     return { rows: prices.length, unmatched: unmatched.length, collisions: collisions.length };
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error.";
-    await pool.query(
-      `UPDATE inventory.price_meta SET failed_at = now(), failure = $1 WHERE id = 1`,
-      [message.slice(0, 1_000)],
-    );
+    // Guarded, because the failure being handled is very often a DATABASE
+    // failure — a reset connection, an exhausted pool — and then this write
+    // throws too. Unguarded it escaped the handler entirely: the route 500'd
+    // bare, nothing was ever written to price_meta, and the panel said "never
+    // ran" for a sync that ran and failed. Those are the three states this row
+    // exists to keep apart.
+    try {
+      await pool.query(
+        `UPDATE inventory.price_meta SET failed_at = now(), failure = $1 WHERE id = 1`,
+        [message.slice(0, 1_000)],
+      );
+    } catch (metaError) {
+      app.log.error(`[prices] could not record the failure: ${(metaError as Error).message}`);
+    }
     // Explicit, because the alternative is a price column that silently stops
     // updating: the table still has yesterday's rows, so nothing on screen looks
     // broken until someone notices every number is a week old.
@@ -4621,22 +4651,22 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
         // NOTHING is a result too. Without a row saying "asked, and this name
         // has no sale history", every view of that item re-asked — and the items
         // with no history are exactly the thin ones people click through while
-        // browsing, so the empty answers were spending the whole budget.
+        // browsing, so the empty answers were spending the whole budget. This is
+        // also why the INSERT below needs no guard of its own: there is always a
+        // row to write by the time it runs.
         if (!tuples.length) {
           values.push(marketHashName, version, HISTORY_NONE, null, null, null, null, 0);
           tuples.push(`(${Array.from({ length: 8 }, (_, k) => `$${k + 1}`).join(",")}, now())`);
         }
-        if (tuples.length) {
-          await pool.query(
-            `INSERT INTO inventory.price_history
-               (market_hash_name, version, period, min, max, avg, median, volume, fetched_at)
-             VALUES ${tuples.join(",")}
-             ON CONFLICT (market_hash_name, version, period) DO UPDATE SET
-               min = EXCLUDED.min, max = EXCLUDED.max, avg = EXCLUDED.avg,
-               median = EXCLUDED.median, volume = EXCLUDED.volume, fetched_at = now()`,
-            values,
-          );
-        }
+        await pool.query(
+          `INSERT INTO inventory.price_history
+             (market_hash_name, version, period, min, max, avg, median, volume, fetched_at)
+           VALUES ${tuples.join(",")}
+           ON CONFLICT (market_hash_name, version, period) DO UPDATE SET
+             min = EXCLUDED.min, max = EXCLUDED.max, avg = EXCLUDED.avg,
+             median = EXCLUDED.median, volume = EXCLUDED.volume, fetched_at = now()`,
+          values,
+        );
         const rows = byVersion.get(version) ?? byVersion.get("") ?? [];
         return { available: rows.length > 0, window, marketHashName, version: version || null, history: rows };
       } catch (error) {
@@ -4742,18 +4772,26 @@ app.put<{ Body: { enabled?: boolean; base?: string | null; source?: string } }>(
     // reference price and a feed's 7-day average live in different columns, and
     // the old rows would simply never resolve. Cheaper and far less confusing to
     // drop them and re-sync than to leave a table that silently prices nothing.
-    const { rows: current } = await pool.query<{ value: string }>(
-      `SELECT value FROM inventory.settings WHERE key = 'price_source'`,
-    );
-    if ((current[0]?.value ?? DEFAULT_PRICE_SOURCE) !== body.source) {
-      await pool.query(`DELETE FROM inventory.prices`);
-      await pool.query(`UPDATE inventory.price_meta SET rows = 0, unmatched = 0, unmatched_sample = NULL, synced_at = NULL, source_date = NULL WHERE id = 1`);
-    }
-    await pool.query(
-      `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('price_source', $1, now())
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [body.source],
-    );
+    //
+    // One transaction, because dropping the mirror and recording which source we
+    // are now on are two halves of one switch. Split, a failure between them (or
+    // a pod restart) left the table emptied while the setting still named the
+    // OLD source: every price surface reports ready:false and nothing refills it
+    // on the source the operator actually chose.
+    await inTransaction(async (client) => {
+      const { rows: current } = await client.query<{ value: string }>(
+        `SELECT value FROM inventory.settings WHERE key = 'price_source' FOR UPDATE`,
+      );
+      if ((current[0]?.value ?? DEFAULT_PRICE_SOURCE) !== body.source) {
+        await client.query(`DELETE FROM inventory.prices`);
+        await client.query(`UPDATE inventory.price_meta SET rows = 0, unmatched = 0, unmatched_sample = NULL, synced_at = NULL, source_date = NULL WHERE id = 1`);
+      }
+      await client.query(
+        `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('price_source', $1, now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [body.source],
+      );
+    });
   }
   if (body.base !== undefined) {
     const base = (body.base ?? "").trim();
@@ -6211,7 +6249,7 @@ app.post<{ Body: { apiKey?: string; targetUid?: number; userId?: string } }>(
     if (targetUid == null || !userId || !/^\d{17}$/.test(userId)) {
       return reply.status(400).send({ error: "targetUid and userId required" });
     }
-    const { rowCount } = await pool.query(
+    await pool.query(
       `UPDATE inventory.owned_items
        SET stattrak_count = stattrak_count + 1
        WHERE id = $1 AND steam_id = $2 AND stattrak`,

@@ -43,11 +43,23 @@ export const wearTier = (wear: number) => stopFor(wear).tier;
  * sales instead of a guess.
  */
 export function wearPositionInTier(wear: number): { tier: string; pct: number } {
-  const index = Math.max(0, WEAR_STOPS.findIndex((s) => wear < s.max));
-  const stop = WEAR_STOPS[index] ?? WEAR_STOPS[WEAR_STOPS.length - 1];
+  const found = WEAR_STOPS.findIndex((s) => wear < s.max);
+  // No bracket matched means the float is off the TOP of the scale, so it falls
+  // back to the last stop — the same direction stopFor above falls. The old
+  // `Math.max(0, …)` turned findIndex's -1 into index 0 and reported those as
+  // Factory New, the two helpers disagreeing about the same float. While the last stop's max
+  // is Infinity only a non-finite wear can get here, and that one also drove the
+  // percentage to NaN, which the craft panel printed as "top NaN% of Factory
+  // New"; the moment a real ceiling replaces Infinity it would be every
+  // Battle-Scarred item.
+  const index = found === -1 ? WEAR_STOPS.length - 1 : found;
+  const stop = WEAR_STOPS[index];
   const low = index === 0 ? 0 : WEAR_STOPS[index - 1].max;
   const high = Number.isFinite(stop.max) ? stop.max : 1;
-  return { tier: stop.tier, pct: Math.min(1, Math.max(0, (wear - low) / (high - low))) };
+  const pct = (wear - low) / (high - low);
+  // A float that is not a number sits at the WORST end of the worst bracket:
+  // whatever it is, it is not evidence of a good one.
+  return { tier: stop.tier, pct: Number.isFinite(pct) ? Math.min(1, Math.max(0, pct)) : 1 };
 }
 
 // Steam blue — the one colour that means "this came from your Steam inventory".

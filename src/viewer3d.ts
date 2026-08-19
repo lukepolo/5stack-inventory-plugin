@@ -2142,7 +2142,9 @@ export interface ViewerHandle {
   setInspectPlaying: (on: boolean) => void;
   /** Scrub, in seconds into the clip. */
   setInspectTime: (t: number) => void;
-  snapshot: () => Promise<Blob | null>;
+  /** `live` keeps the inspect turn that is on screen — see the implementation.
+   *  Bakes omit it and get the canonical pose. */
+  snapshot: (opts?: { live?: boolean }) => Promise<Blob | null>;
   /** True when the paint composited on fallbacks because a texture it names is
    *  not on the mount yet (an extraction is still running). What's on screen is
    *  not the real skin, so it must not be baked into a card. */
@@ -11090,21 +11092,33 @@ async function buildViewer(
     },
     paintIncomplete: () => paintWasIncomplete,
     // Render one fresh frame and hand back a PNG of exactly what's on screen.
-    async snapshot() {
+    async snapshot(opts?: { live?: boolean }) {
       if (disposed) return null;
-      // THE CANONICAL POSE, ALWAYS — the third of the three things that keep a
-      // card bake reproducible (a `still` viewer builds no mixer, and the motion
-      // never touches the model, only the rig). The rig is restored at the end
-      // of every frame, so a capture taken between frames is already canonical;
-      // this makes that true by construction rather than by ordering, because a
-      // baked card is keyed forever and nothing ever re-bakes it.
+      // THE CANONICAL POSE BY DEFAULT — the third of the three things that keep
+      // a card bake reproducible (a `still` viewer builds no mixer, and the
+      // motion never touches the model, only the rig). The rig is restored at
+      // the end of every frame, so a capture taken between frames is already
+      // canonical; this makes that true by construction rather than by
+      // ordering, because a baked card is keyed forever and nothing ever
+      // re-bakes it.
       clearInspect();
       controls.update();
+      // ...and the framed one when the USER is the one asking. The Save button
+      // (downloadStageImage) promises the angle on screen, and between frames
+      // the inspect turn is not applied — so a bake-shaped capture handed back a
+      // picture the user was not looking at. Re-applied here in the same order
+      // the render loop uses, so the charm swings from the same camera.
+      if (opts?.live) applyInspect();
       stepCharm();
       // Through the same blit the screen sees, so a snapshot is exactly the
       // frame a user would get — and reading from the 2D canvas sidesteps the
       // shared drawing buffer being cleared before toBlob can run.
       drawFrame();
+      // Before the await, never after: OrbitControls re-derives its orbit from
+      // camera.position at the top of every update(), so a camera left rotated
+      // across a frame boundary is one whose next update treats the clip's turn
+      // as the user's — it compounds and the model spins away.
+      if (opts?.live) clearInspect();
       return await new Promise<Blob | null>((resolve) => view.toBlob(resolve, "image/png"));
     },
     dispose() {

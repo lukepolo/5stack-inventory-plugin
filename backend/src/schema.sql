@@ -348,7 +348,13 @@ CREATE TABLE IF NOT EXISTS inventory.price_meta (
   id smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   source_url text,
   source_name text,
-  source_date date,
+  -- timestamptz, not date. It is written from a feed's Last-Modified (a full
+  -- instant) and read back with .toISOString(): a `date` column truncated the
+  -- time, node-postgres parsed the bare date at LOCAL midnight, and the
+  -- toISOString() then shifted it back across UTC — so in any America/* pod the
+  -- panel reported yesterday's date for a feed published today. That date is
+  -- exactly the signal an operator uses to judge whether a sync is stale.
+  source_date timestamptz,
   synced_at timestamptz,
   attempted_at timestamptz,
   failed_at timestamptz,
@@ -360,6 +366,19 @@ CREATE TABLE IF NOT EXISTS inventory.price_meta (
   unmatched_sample text
 );
 ALTER TABLE inventory.price_meta ADD COLUMN IF NOT EXISTS source_name text;
+-- Was `date` on instances created before the note above. Conditional because
+-- this file runs on EVERY boot and an unconditional ALTER TYPE takes an ACCESS
+-- EXCLUSIVE lock each time for a column that is already right. The cast itself
+-- is exact (midnight in the server's zone) and the next sync overwrites it.
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_schema = 'inventory' AND table_name = 'price_meta'
+       AND column_name = 'source_date' AND data_type = 'date'
+  ) THEN
+    ALTER TABLE inventory.price_meta ALTER COLUMN source_date TYPE timestamptz;
+  END IF;
+END $$;
 
 -- ---- Sale history, per market listing --------------------------------------
 -- What copies of ONE listing actually sold for, and the spread between them.

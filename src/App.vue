@@ -4966,9 +4966,13 @@ function quoteKeyOf(c: NonNullable<typeof craft.value>) {
   ].join("|");
 }
 
+let quoteToken = 0;
 function scheduleCraftQuote() {
   const c = craft.value;
   clearTimeout(quoteTimer);
+  // Supersedes any request already in flight as well as any timer not yet fired
+  // — see the token note below.
+  quoteToken++;
   if (!c || !pricesOn.value) {
     craftQuote.value = null;
     // The cleared timer's `finally` will never run, so this is the only place
@@ -4978,6 +4982,13 @@ function scheduleCraftQuote() {
     return;
   }
   craftQuoting.value = true;
+  // Which request owns the busy flag. Without it the flag was lowered by whichever
+  // quote settled FIRST: change a sticker just after a timer has fired and the
+  // older request's `finally` clears it while the newer one is still ~500ms away,
+  // so the panel shows the previous total at full opacity with nothing pending.
+  // The value itself keeps its own guard below — a late answer for a gun that is
+  // no longer on screen is worse than none.
+  const token = quoteToken;
   quoteTimer = setTimeout(async () => {
     const key = quoteKeyOf(c);
     try {
@@ -4993,9 +5004,9 @@ function scheduleCraftQuote() {
       // gun that no longer exists on screen is worse than none.
       if (craft.value && quoteKeyOf(craft.value) === key) craftQuote.value = quote;
     } catch {
-      craftQuote.value = null;
+      if (token === quoteToken) craftQuote.value = null;
     } finally {
-      craftQuoting.value = false;
+      if (token === quoteToken) craftQuoting.value = false;
     }
   }, 250);
 }
@@ -5625,7 +5636,10 @@ async function downloadStageImage(slot: ReturnType<typeof useViewerMount>, name:
   if (!handle) return;
   let blob: Blob | null = null;
   try {
-    blob = await handle.snapshot();
+    // `live`: the frame on screen, inspect turn and all. The bake queue is the
+    // other caller and deliberately does not pass it — a card is keyed forever
+    // and has to come out of a canonical pose.
+    blob = await handle.snapshot({ live: true });
   } catch (e) {
     notify((e as Error).message);
     return;
@@ -5644,7 +5658,14 @@ async function downloadStageImage(slot: ReturnType<typeof useViewerMount>, name:
   // file and break naive shell globs on the other side.
   const slug = name.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase();
   a.download = (slug || "item") + ".png";
+  // In the document, not detached. Chrome fires a download from an element that
+  // was never connected; Firefox does not, so the button simply did nothing
+  // there — and silently, since nothing above it can see a click that had no
+  // effect.
+  a.style.display = "none";
+  document.body.appendChild(a);
   a.click();
+  a.remove();
   // Revoked a tick later, not immediately: some browsers have not started
   // reading the blob when click() returns, and revoking first cancels the save.
   setTimeout(() => URL.revokeObjectURL(url), 10_000);

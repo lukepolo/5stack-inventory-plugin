@@ -80,7 +80,15 @@ export function stackByDesign<T>(
   for (const st of out) {
     const n = st.variants.length;
     if (n < 2) continue;
-    const at = (k: number) => st.variants[((((of(st.face)?.design ?? 0) + k) % n) + n) % n];
+    // Read BEFORE st.face is reassigned on the next line. The closure used to
+    // reach through st.face on every call, so the offset that chose the face and
+    // the offset that chose the two layers behind it were read off different
+    // faces. That is harmless only because byDesign groups on `design` and every
+    // variant in a stack answers the same number — a coincidence, not an
+    // invariant: any looser grouping key would have the layers disagree with the
+    // face and the colours reshuffle.
+    const design = of(st.face)?.design ?? 0;
+    const at = (k: number) => st.variants[(((design + k) % n) + n) % n];
     st.face = at(0);
     // Thirds apart, so the two behind never repeat the face or each other.
     st.behind = [at(Math.floor(n / 3)), at(Math.floor((2 * n) / 3))]

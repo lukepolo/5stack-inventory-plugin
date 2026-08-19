@@ -7,6 +7,9 @@ import { readFile, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+// Shared with the backend rather than reimplemented here — one behaviour in
+// both environments is the whole point of this file having ranges at all.
+import { parseByteRange } from "../backend/src/byteRange.mjs";
 
 const root = fileURLToPath(new URL("../dist", import.meta.url));
 // Extracted CS2 models live on a hostPath mount (see k8s/deployment.yaml);
@@ -97,36 +100,6 @@ function cacheControlFor(base, pathname, query) {
     return query.get("v") ? IMMUTABLE : "no-cache";
   }
   return HEADERS["Cache-Control"];
-}
-
-/**
- * Byte ranges, which one directory here genuinely needs.
- *
- * A music kit is ~3.5MB and nobody listens to all of it — without this the
- * browser downloads the whole track before the first note and cannot seek at
- * all, because seeking IS a range request and an element that never saw
- * `Accept-Ranges: bytes` treats the stream as unseekable. nginx does this for
- * free on static files; the hot-swap pods run this file and no nginx, so it has
- * to be here too or preview behaves differently in the two environments.
- *
- * Returns null for "no range asked for", false for "asked for one we cannot
- * satisfy" (which is a 416, not a 200 — answering the whole file to an
- * unsatisfiable range is how a player ends up decoding garbage).
- */
-function parseRange(header, size) {
-  const m = /^bytes=(\d*)-(\d*)$/.exec((header ?? "").trim());
-  if (!m) return null;
-  const [, rawStart, rawEnd] = m;
-  // `bytes=-500` is the LAST 500 bytes, not "from 0 to 500" — media elements
-  // use it to read a trailing index, and getting it backwards serves the header
-  // where the seek target was asked for.
-  let start = rawStart === "" ? size - Number(rawEnd) : Number(rawStart);
-  let end = rawStart === "" ? size - 1 : rawEnd === "" ? size - 1 : Number(rawEnd);
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
-  start = Math.max(0, start);
-  end = Math.min(size - 1, end);
-  if (size === 0 || start > end || start >= size) return false;
-  return { start, end };
 }
 
 createServer(async (req, res) => {
@@ -236,7 +209,7 @@ createServer(async (req, res) => {
       // response — by the time a range is asked for it is too late.
       "Accept-Ranges": "bytes",
     };
-    const range = parseRange(req.headers.range, info.size);
+    const range = parseByteRange(req.headers.range, info.size);
     if (range === false) {
       res.writeHead(416, { ...common, "Content-Range": `bytes */${info.size}` });
       res.end();

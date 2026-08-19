@@ -1224,7 +1224,9 @@ const WEAR_TIER_MAX: readonly (readonly [SteamWearTier, number])[] = STEAM_WEAR_
  *  price under a bare name with no bracket, which is exactly `null` here. */
 export function wearTierOf(wear: number | null | undefined): SteamWearTier | null {
   if (wear == null || !Number.isFinite(wear)) return null;
-  return (WEAR_TIER_MAX.find(([, max]) => wear < max) ?? WEAR_TIER_MAX[4])[0];
+  // The last entry's max is Infinity, so the find always matches — the `??` is
+  // there for the type checker, not for a gap in the bracket table.
+  return (WEAR_TIER_MAX.find(([, max]) => wear < max) ?? WEAR_TIER_MAX[WEAR_TIER_MAX.length - 1])[0];
 }
 
 /** Tier as a small int, so it can be a NOT NULL primary-key column. -1 is "this
@@ -1232,8 +1234,6 @@ export function wearTierOf(wear: number | null | undefined): SteamWearTier | nul
  *  inside a PK. */
 export const wearTierIndex = (tier: SteamWearTier | null) =>
   tier === null ? -1 : STEAM_WEAR_TIERS.indexOf(tier);
-export const wearTierFromIndex = (index: number): SteamWearTier | null =>
-  STEAM_WEAR_TIERS[index] ?? null;
 
 /**
  * The id of a specific VARIANT — "Skeleton Knife | Doppler" + "Ruby".

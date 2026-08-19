@@ -4345,9 +4345,18 @@ PYEOF
   # ---- swap staging into place ------------------------------------------------
   # `set -e` means we only reach here if the step above succeeded, so the live
   # copy is only ever replaced by a COMPLETE one. Two renames within the same
-  # filesystem, so each is atomic: a request either resolves against the old
-  # directory or the new one, never a half-built mix. Readers already holding an
-  # open fd finish against the inode they opened.
+  # filesystem, so each is atomic and no request ever sees a half-built mix.
+  # Readers already holding an open fd finish against the inode they opened.
+  #
+  # NOT one atomic swap, though, and the comment here used to claim it was: for
+  # the instant between the two renames the live path does not exist at all, and
+  # a request landing in it 404s. rename(2) cannot replace a non-empty directory,
+  # so closing that window for real means making the live path a SYMLINK and
+  # flipping it — a change to the on-disk layout of the mount, which the panel
+  # repo's manifests own rather than this one. What made the window matter was
+  # the asset routes handing those 404s a year-long immutable Cache-Control (see
+  # serveAssetDir); they no longer do, so a request unlucky enough to land in it
+  # retries and succeeds instead of caching the miss forever.
   echo "--- Swapping paints into place…"
   rm -rf "$PAINT_LIVE.old"
   mv "$PAINT_LIVE" "$PAINT_LIVE.old"
@@ -4557,8 +4566,10 @@ PYEOF
 # honest failure: the previews keep working and the warning above says why.
 staged=$(find "$MUSIC_DEST" -type f -name '*.mp3' -o -type f -name '*.wav' | wc -l | tr -d "[:space:]")
 if (( staged > 0 )); then
-  # Two renames within one filesystem, so each is atomic — a request resolves
-  # against the old directory or the new one, never a half-written file.
+  # Two renames within one filesystem, so each is atomic — no request ever sees a
+  # half-written file. See the paint swap above for the window BETWEEN them, why
+  # it cannot be closed without turning the live path into a symlink, and why it
+  # stopped being permanent once 404s lost their immutable Cache-Control.
   rm -rf "$MUSIC_LIVE.old"
   mv "$MUSIC_LIVE" "$MUSIC_LIVE.old"
   mv "$MUSIC_DEST" "$MUSIC_LIVE"
