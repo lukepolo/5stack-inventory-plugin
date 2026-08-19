@@ -2917,10 +2917,12 @@ app.delete<{ Querystring: { team?: string; slot?: string } }>(
 // never reaches the steam-id route — the same arrangement /api/inventory/:id
 // already has with /api/inventory/import-steam.
 
-// CS2 itself ships five loadout slots. Matching it is not deference: the
-// switcher is a pill strip in a header that already scrolls sideways on a
-// phone, and an unbounded list of them is a strip you cannot read.
-const PRESET_LIMIT = 5;
+// Six, because the desktop deck lays cards three across and six fills two
+// rows exactly — the "new" card sits in the sixth cell until you use it. It
+// was five (CS2's own count) when the switcher was a pill strip; that strip is
+// gone and the cap now answers to the surface that shows the builds. Keep in
+// step with PRESET_LIMIT in src/App.vue.
+const PRESET_LIMIT = 6;
 const PRESET_NAME_MAX = 24;
 
 /**
@@ -3110,6 +3112,9 @@ const PRESET_LIST_SQL = `
    WHERE p.steam_id = $1
    ORDER BY p.created_at, p.id`;
 
+// Deliberately nothing more per preset (no art, no per-side counts): the deck
+// reads each parked build's ROWS through /api/loadout/:steamId?preset= and
+// derives those itself, the same way it does for the one on screen.
 type PresetRow = { id: string; name: string; active: boolean; slots: number };
 const listPresets = async (steamId: string, q: Queryable = pool) =>
   (await q.query<PresetRow>(PRESET_LIST_SQL, [steamId])).rows.map((r) => ({
@@ -4360,18 +4365,34 @@ app.get("/api/inventory/prices", async (request, reply) => {
       `SELECT id, item_id, wear, stattrak FROM inventory.owned_items WHERE steam_id = $1`,
       [identity.steamId],
     ),
+    // The live loadout AND every parked preset, in one read — `preset_id` is
+    // NULL for the live rows. The parked ones exist so the preset deck can put
+    // a figure on each card; they are priced by exactly the same arithmetic as
+    // the live slots below, so a build's value cannot change by being parked.
+    // Scoped through loadout_presets so a preset's rows only ever price for
+    // the account that owns it.
     pool.query<{
+      preset_id: string | null;
       team: string; slot: string; item_id: number | null; wear: number | null; stattrak: boolean;
       stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
     }>(
-      `SELECT l.team, l.slot,
+      `SELECT NULL::text AS preset_id, l.team, l.slot,
               COALESCE(i.item_id, l.item_id)   AS item_id,
               COALESCE(i.wear, l.wear)         AS wear,
               COALESCE(i.stattrak, l.stattrak) AS stattrak,
               i.stickers, i.patches, i.charm_id
          FROM inventory.loadout l
          LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
-        WHERE l.steam_id = $1`,
+        WHERE l.steam_id = $1
+       UNION ALL
+       SELECT s.preset_id::text, s.team, s.slot,
+              COALESCE(i.item_id, s.item_id)   AS item_id,
+              COALESCE(i.wear, s.wear)         AS wear,
+              COALESCE(i.stattrak, s.stattrak) AS stattrak,
+              i.stickers, i.patches, i.charm_id
+         FROM inventory.loadout_preset_slots s
+         JOIN inventory.loadout_presets p ON p.id = s.preset_id AND p.steam_id = $1
+         LEFT JOIN inventory.owned_items i ON i.id = s.item_instance_id`,
       [identity.steamId],
     ),
   ]);
@@ -4398,6 +4419,9 @@ app.get("/api/inventory/prices", async (request, reply) => {
   }
   const bare = (id: number) => prices.get(priceTargetKey(id, null, false))?.value ?? 0;
   const slots: Record<string, number> = {};
+  // Parked presets, keyed by preset id, each in the same TEAM:slot shape as
+  // `slots` — so the client sums a card with the very code that sums the header.
+  const presets: Record<string, Record<string, number>> = {};
   for (const row of equipped) {
     if (row.item_id == null) continue;
     const base = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak))?.value ?? 0;
@@ -4406,9 +4430,17 @@ app.get("/api/inventory/prices", async (request, reply) => {
       normSpecs(row.patches).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
       (row.charm_id != null ? bare(row.charm_id) : 0);
     const total = base + attachments;
-    if (total > 0) slots[`${row.team}:${row.slot}`] = Math.round(total * 100) / 100;
+    if (total <= 0) continue;
+    const into = row.preset_id == null ? slots : (presets[row.preset_id] ??= {});
+    into[`${row.team}:${row.slot}`] = Math.round(total * 100) / 100;
   }
-  return { ready: Object.keys(items).length > 0 || Object.keys(slots).length > 0, window, items, slots };
+  return {
+    ready: Object.keys(items).length > 0 || Object.keys(slots).length > 0,
+    window,
+    items,
+    slots,
+    presets,
+  };
 });
 
 /**

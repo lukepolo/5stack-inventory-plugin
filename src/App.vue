@@ -6,7 +6,7 @@ import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
-  MoreHorizontal, Layers,
+  Layers,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -53,6 +53,7 @@ import {
   deletePreset,
   activatePreset,
   type LoadoutPreset,
+  type PresetPreviewItem,
   type Team,
   type CatalogWeapon,
   type DefaultsMap,
@@ -117,6 +118,7 @@ import PillTabs from "./components/PillTabs.vue";
 import DeckCard from "./components/DeckCard.vue";
 import DeckFan from "./components/DeckFan.vue";
 import ContextMenu, { MENU_ROW } from "./components/ContextMenu.vue";
+import PresetDeck from "./components/PresetDeck.vue";
 import FilterSheet from "./components/FilterSheet.vue";
 import { Z } from "./zLayers";
 import { SORT_DIR_ICON, type SortDir } from "./sortIcons";
@@ -127,7 +129,7 @@ import {
 import {
   DEFAULT_WEAR, POSITION_GROUPS, START_PISTOLS, isWeaponPos, isSpecial, isShared, isNo3d,
   type OriginFilter, ORIGIN_FILTERS, ORIGIN_VALUES, WEAPON_GROUPS, GEAR_TYPES,
-  matchesOrigin, catsForPos, DEFAULTS, RAIL, EXTRAS, ALL_SPECIALS,
+  matchesOrigin, catsForPos, DEFAULTS, RAIL, EXTRAS, ALL_SPECIALS, sortPreview,
 } from "./loadoutModel";
 import { useSortControl } from "./composables/useSortControl";
 import { SWIPE_ARM_PX } from "./composables/useSwipeDismiss";
@@ -493,14 +495,32 @@ function instanceById(id: unknown): InventoryItem | undefined {
 /** What's in this slot, in money — the skin plus every sticker, patch and charm
  *  on it (the server's per-slot `value`). Null when prices are off or the slot
  *  holds a free default, which is most of them and correctly worth nothing. */
-function valueForSlot(pos: string, forTeam: Team): number | null {
-  if (!pricesOn.value) return null;
+/** One slot's figure out of a TEAM:slot map — the live loadout's, or a parked
+ *  preset's. Same lookup for both so a build prices the same wherever it sits. */
+function slotValueIn(values: Record<string, number>, pos: string, forTeam: Team): number | null {
   // Shared slots (knife, gloves) can be stored under either side, same rule as
   // rowFor — otherwise a knife equipped from the T side prices as nothing on CT.
-  const value = isShared(pos)
-    ? slotValues.value[`CT:${pos}`] ?? slotValues.value[`T:${pos}`]
-    : slotValues.value[`${forTeam}:${pos}`];
+  const value = isShared(pos) ? values[`CT:${pos}`] ?? values[`T:${pos}`] : values[`${forTeam}:${pos}`];
   return value && value > 0 ? value : null;
+}
+function valueForSlot(pos: string, forTeam: Team): number | null {
+  if (!pricesOn.value) return null;
+  return slotValueIn(slotValues.value, pos, forTeam);
+}
+/** What one side of a build is worth — guns plus everything on them. */
+function sideValueIn(values: Record<string, number>, forTeam: Team): number {
+  let total = 0;
+  // Through slotValueIn, not the raw keys. A shared slot (knife, gloves, zeus,
+  // C4, music kit, graffiti, collectible) is stored under whichever side
+  // equipped it and the lookup falls back CT→T to find it — so summing the raw
+  // map credited it to one side only, and the header total came out lower than
+  // the cells drawn underneath it. Flipping sides then changed the total for a
+  // loadout that had not changed.
+  for (const group of POSITION_GROUPS) {
+    for (const pos of group.positions) total += slotValueIn(values, pos, forTeam) ?? 0;
+  }
+  for (const special of ALL_SPECIALS) total += slotValueIn(values, special.slot, forTeam) ?? 0;
+  return total;
 }
 /** The showing side's figure — what a cell draws. */
 const cellValue = (pos: string) => valueForSlot(pos, team.value);
@@ -1130,9 +1150,28 @@ const presets = ref<LoadoutPreset[]>([]);
 const presetBusy = ref(false);
 /** Cursor anchor for the preset menu — same contract as the slot/item menus. */
 const presetCtx = ref<{ x: number; y: number } | null>(null);
-/** The in-place rename draft; null when not renaming. */
+/**
+ * Which preset the menu acts on. Null = the one on screen, which is the only
+ * thing the compact menu can mean. On desktop the menu is raised from a CARD
+ * in the deck and names that card's build, so "Delete this loadout" has a
+ * "this" that is not necessarily the one you are wearing.
+ */
+const presetMenuFor = ref<string | null>(null);
+const presetMenuTarget = computed(
+  () => presets.value.find((p) => p.id === (presetMenuFor.value ?? activePreset.value?.id)) ?? null,
+);
+/** The in-place rename draft; null when not renaming. COMPACT only — the header
+ *  input that replaces the name button. Desktop renames inside the deck. */
 const presetDraft = ref<string | null>(null);
 const presetInputEl = ref<HTMLInputElement | null>(null);
+/**
+ * The loadout deck — the desktop switcher's open state. The header button's
+ * box, so the deck hangs off the control that opened it; null = closed.
+ */
+const presetDeck = ref<{ x: number; y: number; w: number } | null>(null);
+const presetBtnEl = ref<HTMLButtonElement | null>(null);
+/** The deck card mid-rename (its name is an input). */
+const presetRenaming = ref<string | null>(null);
 
 const activePreset = computed(() => presets.value.find((p) => p.active) ?? null);
 
@@ -1164,11 +1203,17 @@ const shownPresetId = computed(() =>
  * and leaves the list empty, and a switcher over an empty list is a control with
  * nothing behind it.
  *
- * A single preset still shows its pill. It names the build you are wearing and
- * it is what the menu button hangs off — which is also how anyone finds out
- * presets exist at all.
+ * For the OWNER a single preset still shows its pill. It names the build you
+ * are wearing and it is what the menu button hangs off — which is also how
+ * anyone finds out presets exist at all.
+ *
+ * For a VISITOR it takes two. Their strip is a switch and nothing else — no cog,
+ * nothing to manage — so with one build there is nothing to switch to and the
+ * pill would just restate that the page shows what the player wears.
  */
-const showPresets = computed(() => (canEdit.value || !!viewerId.value) && presets.value.length > 0);
+const showPresets = computed(() =>
+  canEdit.value ? presets.value.length > 0 : !!viewerId.value && presets.value.length > 1,
+);
 
 /**
  * DISPLAY ONLY — PRESET_LIMIT in backend/src/main.ts is the door, and it answers
@@ -1176,7 +1221,7 @@ const showPresets = computed(() => (canEdit.value || !!viewerId.value) && preset
  * action that would bounce. If the two ever drift, the worst case is a hidden
  * row that would have worked, or a row that returns that sentence.
  */
-const PRESET_LIMIT = 5;
+const PRESET_LIMIT = 6;
 const presetsFull = computed(() => presets.value.length >= PRESET_LIMIT);
 
 async function loadPresets() {
@@ -1191,7 +1236,48 @@ async function loadPresets() {
     : canEdit.value
       ? await fetchPresets().catch(() => [])
       : [];
+  void loadPresetRows();
 }
+
+/**
+ * The ROWS of every parked preset, by id — what the deck cards are drawn from.
+ *
+ * The build on screen is `loadout`; every other build is fetched here through
+ * the same public per-preset read a visitor uses, and its art, its per-side
+ * meters and its "nothing equipped" are derived from those rows exactly as the
+ * shown card's are from `loadout`. One derivation, so a card looks the same
+ * whether or not it is the one you are on — which is the whole point of a deck.
+ *
+ * A parked build cannot change while parked (only the live one is editable),
+ * so entries are fetched once and kept. The one that just became live is
+ * dropped on switch — its rows are `loadout` now — and whichever was live is
+ * fetched fresh, because the server has just parked its rows.
+ */
+const presetRows = ref<Record<string, LoadoutEntry[]>>({});
+async function loadPresetRows() {
+  const owner = viewerId.value ?? props.user?.steam_id;
+  if (!owner) return;
+  const parked = presets.value.filter((p) => p.id !== shownPresetId.value);
+  // Forget what is no longer parked (deleted, or now on screen).
+  const keep = new Set(parked.map((p) => p.id));
+  for (const id of Object.keys(presetRows.value)) if (!keep.has(id)) delete presetRows.value[id];
+  await Promise.all(
+    parked
+      .filter((p) => !(p.id in presetRows.value))
+      .map(async (p) => {
+        try {
+          const rows = await fetchPlayerLoadout(String(owner), p.id);
+          // Guard against a switch that landed while this was in flight.
+          if (p.id !== shownPresetId.value) presetRows.value[p.id] = rows;
+        } catch {
+          // A card with no rows draws blank; not worth a toast over someone's loadout.
+        }
+      }),
+  );
+}
+/** A preset's rows, wherever they live; null while unknown (fetch in flight). */
+const rowsOf = (p: LoadoutPreset): LoadoutEntry[] | null =>
+  p.id === shownPresetId.value ? loadout.value : presetRows.value[p.id] ?? null;
 
 async function switchPreset(id: string) {
   // A VISITOR is changing what they are LOOKING AT, not what the owner wears.
@@ -1207,6 +1293,9 @@ async function switchPreset(id: string) {
     try {
       loadout.value = await fetchPlayerLoadout(viewerId.value, id);
       viewerPreset.value = id;
+      // The build just left behind is parked again as far as the deck is
+      // concerned, and it has no cached rows (shown builds never do).
+      void loadPresetRows();
       queueLoadoutRenders();
     } catch (e) {
       fail(e);
@@ -1255,9 +1344,50 @@ async function newPreset(copy: boolean) {
   if (made) await switchPreset(made.id);
 }
 
+function togglePresetDeck() {
+  if (presetDeck.value) {
+    closePresetDeck();
+    return;
+  }
+  const box = presetBtnEl.value?.getBoundingClientRect();
+  if (!box) return;
+  presetDeck.value = { x: box.left, y: box.bottom, w: box.width };
+}
+function closePresetDeck() {
+  presetDeck.value = null;
+  presetRenaming.value = null;
+  presetMenuFor.value = null;
+}
+/** A deck card's ··· (or right-click): the context menu, aimed at THAT build. */
+function openPresetCardMenu(id: string, at: { x: number; y: number }) {
+  presetMenuFor.value = id;
+  presetCtx.value = at;
+}
+
+/** Two renames, one per surface. Compact edits in the header, where the name
+ *  button is; desktop edits in the deck card, where the name is. The menu row
+ *  that starts it doesn't know which — the open deck decides. */
 function startPresetRename() {
-  presetDraft.value = activePreset.value?.name ?? "";
+  const target = presetMenuTarget.value ?? activePreset.value;
+  if (!target) return;
+  if (presetDeck.value) {
+    presetRenaming.value = target.id;
+    return;
+  }
+  presetDraft.value = target.name;
   void nextTick(() => presetInputEl.value?.select());
+}
+
+async function commitDeckRename(id: string, name: string) {
+  presetRenaming.value = null;
+  const target = presets.value.find((p) => p.id === id);
+  if (!target || !name.trim() || name.trim() === target.name) return;
+  try {
+    await renamePreset(id, name);
+    await loadPresets();
+  } catch (e) {
+    fail(e);
+  }
 }
 
 async function commitPresetRename() {
@@ -1278,7 +1408,7 @@ async function commitPresetRename() {
 }
 
 function askDeletePreset() {
-  const target = activePreset.value;
+  const target = presetMenuTarget.value ?? activePreset.value;
   if (!target) return;
   confirmAsk.value = {
     title: `Delete "${target.name}"?`,
@@ -1287,7 +1417,8 @@ function askDeletePreset() {
     body:
       `That loadout and the ${target.slots} slot${target.slots === 1 ? "" : "s"} in it go away. ` +
       "The items themselves stay in your inventory — a preset only arranges what you already own. " +
-      "You'll be switched to another loadout.",
+      // Only true of the one you are wearing; a parked build just goes.
+      (target.active ? "You'll be switched to another loadout." : ""),
     confirmLabel: "Delete",
     onConfirm: () => void removePreset(target.id),
   };
@@ -5205,6 +5336,9 @@ const craftValueTip = computed(() => {
 
 /** Slot values, keyed TEAM:slot, straight off the server. */
 const slotValues = ref<Record<string, number>>({});
+/** The same, for every PARKED preset, keyed by preset id — the deck's per-card
+ *  figure. The active preset is not here; its slots are `slotValues`. */
+const presetSlotValues = ref<Record<string, Record<string, number>>>({});
 /** A fetch is in flight AND we have nothing yet — the only state worth showing a
  *  player. A refresh over prices already on screen is silent: numbers that
  *  flicker to "loading" every time something is crafted are worse than numbers
@@ -5225,9 +5359,11 @@ async function loadPrices() {
   if (!priceStatus.value?.enabled) return;
   pricesLoading.value = true;
   try {
-    const { items, slots, ready } = await fetchInventoryPrices();
+    const { items, slots, presets: parked, ready } = await fetchInventoryPrices();
     for (const inst of inventory.value) inst.price = items[String(inst.id)] ?? null;
     slotValues.value = slots;
+    // Absent on a backend that predates the deck: the cards simply carry no figure.
+    presetSlotValues.value = parked ?? {};
     pricesLoaded.value = ready;
   } catch {
     // Prices failing is not worth a toast on top of someone's inventory. The
@@ -5293,23 +5429,67 @@ const inventoryUnpriced = computed(() => inventory.value.filter((i) => !i.price)
 /** What the equipped loadout for a side would cost — guns plus everything on
  *  them. `value` is the server's per-slot figure and already includes stickers,
  *  patches and charms, which is why this sums that and not `price`. */
-const loadoutValue = computed(() => {
-  const totals: Record<string, number> = { CT: 0, T: 0 };
-  // Through cellValue, not the raw keys. A shared slot (knife, gloves, zeus, C4,
-  // music kit, graffiti, collectible) is stored under whichever side equipped it
-  // and cellValue falls back CT→T to find it — so summing the raw map credited it
-  // to one side only, and the header total came out lower than the cells drawn
-  // underneath it. Flipping sides then changed the total for a loadout that had
-  // not changed.
-  for (const team of ["CT", "T"] as Team[]) {
-    for (const group of POSITION_GROUPS) {
-      for (const pos of group.positions) totals[team] += valueForSlot(pos, team) ?? 0;
-    }
-    for (const special of ALL_SPECIALS) totals[team] += valueForSlot(special.slot, team) ?? 0;
-  }
-  return totals;
-});
+const loadoutValue = computed<Record<string, number>>(() =>
+  pricesOn.value
+    ? { CT: sideValueIn(slotValues.value, "CT"), T: sideValueIn(slotValues.value, "T") }
+    : { CT: 0, T: 0 },
+);
 const teamLoadoutValue = computed(() => loadoutValue.value[team.value] ?? 0);
+
+/**
+ * A preset deck card's figure: what one side of THIS build is worth, by the
+ * same arithmetic as the header chip above it. The active preset IS the live
+ * loadout, so it reads the header's own slot map — the card and the chip
+ * cannot disagree. Null where there is nothing honest to print: prices off, a backend
+ * without per-preset values, or a visitor (prices are the signed-in account's
+ * and say nothing about the builds on someone else's page).
+ */
+/**
+ * Filled weapon positions per side, for a deck card's meters — counted off the
+ * build's rows (see presetRows), so the shown card's number moves the instant a
+ * slot is equipped and a parked card's is the same count by the same rule.
+ * Null while the rows are still on their way: no meter, not an empty one.
+ */
+const GUN_POSITIONS = POSITION_GROUPS.flatMap((g) => g.positions);
+function presetGuns(p: LoadoutPreset): { CT: number; T: number } | null {
+  const rows = rowsOf(p);
+  if (!rows) return null;
+  const count = (t: Team) =>
+    GUN_POSITIONS.filter((pos) => rows.some((r) => r.team === t && r.slot === pos)).length;
+  return { CT: count("CT"), T: count("T") };
+}
+
+/**
+ * The hand a deck card fans out: five of the build's items for the showing side,
+ * off its rows (every LoadoutEntry carries its catalog item).
+ */
+function presetPreview(p: LoadoutPreset): PresetPreviewItem[] | null {
+  // Null is UNKNOWN — rows still in flight — and the card draws a blank strip.
+  // Only a known-empty list may say "nothing equipped"; "42 slots" beside that
+  // sentence is the kind of contradiction people screenshot.
+  const rows = rowsOf(p);
+  if (!rows) return null;
+  return sortPreview(
+    rows
+      .filter((r) => r.team === team.value)
+      .map((row) => ({
+        team: row.team,
+        slot: row.slot,
+        skinned: row.skinned,
+        image: row.item?.image ?? null,
+        rarity: row.item?.rarity ?? null,
+        name: row.item?.name ?? "",
+      })),
+  ).slice(0, 5);
+}
+
+function presetValue(p: LoadoutPreset, side: Team): number | null {
+  if (!pricesOn.value || viewerId.value) return null;
+  const values = p.active ? slotValues.value : presetSlotValues.value[p.id];
+  if (!values) return null;
+  const total = sideValueIn(values, side);
+  return total > 0 ? total : null;
+}
 
 /** "$41" / "$4.55" / "$18k" — see formatPrice. Blank rather than "$0" when
  *  nothing in the set could be priced, so an empty state reads as unknown. */
@@ -5782,7 +5962,14 @@ const focusInspect = viewerTransport(focusViewer);
 const teardownViewer = focusViewer.teardown;
 watch([focusModelKey, focusPaint], async ([key]) => {
   teardownViewer();
-  focus3dAvailable.value = key ? await hasModel(key) : false;
+  // Peek before awaiting — same as the craft modal. On a cache hit this whole
+  // branch stays synchronous, so `focus3d` is already true when the focus view
+  // first paints and the 2D art never appears. Awaiting here on every entry
+  // mounted the 2D art for one tick, then flipped to 3D, and the art's 100ms
+  // leave transition played out under the spinner — one frame of flat icon
+  // that the 3D model then "jumped" away from.
+  const known = key ? hasModelSync(key) : false;
+  focus3dAvailable.value = known ?? (await hasModel(key!));
   if (!focus3dAvailable.value) focus3d.value = false;
   else {
     // Model exists → land on the preferred stage (3D unless they picked 2D).
@@ -6169,6 +6356,12 @@ function onGlobalKey(e: KeyboardEvent) {
       e.stopPropagation();
     } else if (presetCtx.value) {
       presetCtx.value = null;
+      presetMenuFor.value = null;
+      e.stopPropagation();
+    } else if (presetDeck.value) {
+      // The deck's rename input stops Escape itself (it abandons the edit); this
+      // is the deck with no edit in flight, and Escape shuts it.
+      closePresetDeck();
       e.stopPropagation();
     } else if (presetDraft.value != null) {
       // Escape ABANDONS the rename — commitPresetRename is the blur/Enter path,
@@ -6755,48 +6948,28 @@ if (MDEBUG) {
           @keydown.enter.prevent="commitPresetRename"
           @blur="commitPresetRename"
         />
-        <!-- COMPACT: one control, not a strip plus a menu button.
-             Five presets is the cap, and five pills at ~60px each plus a 32px
-             cog is most of a phone's width spent saying which build you are on
-             — a question with one answer. So the name IS the button, and the
-             menu it opens lists the others to switch to above the actions that
-             manage them. That also retires the odd part of the desktop layout:
-             a strip you switch with, sitting next to a button that does
-             everything else to the same thing. -->
+        <!-- ONE control, both breakpoints: the name of the build you are on.
+             It used to be a strip of every preset plus a square ··· beside it
+             on desktop, and with one preset (most people) that read as two
+             unrelated buttons — "a LOADOUT 1 button, and a dots button" — for
+             one thing and its menu. Now the name IS the button. What it opens
+             differs by surface: compact gets the bottom sheet (switch list over
+             the actions), desktop gets the deck — every build as a card, with
+             the meter and the figure that tell builds apart, and the manage
+             menu hanging off each card. See PresetDeck.vue. -->
         <button
-          v-else-if="isCompact"
-          class="flex h-8 min-w-0 items-center gap-1.5 rounded-md border border-border px-2 text-f11 uppercase tracking-wider text-muted-foreground tac-action disabled:opacity-60"
+          v-else
+          ref="presetBtnEl"
+          class="tac-action flex min-w-0 items-center gap-1.5 border border-border uppercase tracking-wider text-muted-foreground disabled:opacity-60"
+          :class="[isCompact ? 'h-8 rounded-md px-2 text-f11' : 'h-9 rounded-lg px-3 text-f11 font-semibold', presetDeck && 'tac-on']"
           :disabled="presetBusy"
-          :title="`${activePresetName} — tap to switch or manage`"
-          @click="presetCtx = { x: $event.clientX, y: $event.clientY }"
+          :title="`${activePresetName} — ${isCompact ? 'tap' : 'click'} to switch or manage`"
+          @click="isCompact ? (presetCtx = { x: $event.clientX, y: $event.clientY }) : togglePresetDeck()"
         >
           <Loader2 v-if="presetBusy" class="h-3.5 w-3.5 flex-none animate-spin" />
           <Layers v-else class="h-3.5 w-3.5 flex-none" />
-          <span class="max-w-[7rem] truncate">{{ activePresetName }}</span>
-          <ChevronDown class="h-3 w-3 flex-none opacity-60" />
-        </button>
-        <PillTabs
-          v-else
-          :items="presets"
-          :item-key="(p) => p.id"
-          :item-title="(p) => `${p.name} — ${p.slots} slot${p.slots === 1 ? '' : 's'}`"
-          :active="shownPresetId"
-          :button-class="`relative z-[1] flex h-7 max-w-[9rem] items-center rounded-md text-f11 uppercase tracking-wider transition-colors px-3`"
-          @select="(id) => switchPreset(id)"
-        >
-          <template #default="{ item: p }">
-            <span class="truncate">{{ p.name }}</span>
-          </template>
-        </PillTabs>
-        <button
-          v-if="canEdit && !isCompact"
-          class="grid h-9 w-9 flex-none place-items-center rounded-md border border-border text-muted-foreground tac-action disabled:opacity-60"
-          :disabled="presetBusy"
-          title="Loadout presets"
-          @click="presetCtx = { x: $event.clientX, y: $event.clientY }"
-        >
-          <Loader2 v-if="presetBusy" class="h-3.5 w-3.5 animate-spin" />
-          <MoreHorizontal v-else class="h-3.5 w-3.5" />
+          <span class="max-w-[9rem] truncate">{{ activePresetName }}</span>
+          <ChevronDown class="h-3 w-3 flex-none opacity-60 transition-transform" :class="presetDeck && 'rotate-180'" />
         </button>
       </div>
       <button
@@ -6809,7 +6982,25 @@ if (MDEBUG) {
         <!-- Icon-only on compact: the label costs ~54px of a ~376px header,
              and the crosshair plus its active accent already carry the state. -->
         <Crosshair class="h-3.5 w-3.5" />
-        <span v-if="!isCompact">{{ view === 'focus' ? 'Focused' : 'Focus' }}</span>
+        <!-- "Focus" → "Focused": the suffix slides open rather than appearing.
+             It used to print one word or the other, so engaging focus grew the
+             button by two letters with no transition and shoved the value chip
+             beside it. The suffix sits in a one-column grid whose track goes
+             0fr → 1fr (a width:auto you CAN transition), on the same 150ms the
+             border and fill already take, and the button grows with it. The
+             inner span needs min-w-0 or the track can't shrink below the text. -->
+        <span v-if="!isCompact" class="flex">
+          <span>Focus</span>
+          <span
+            class="grid"
+            :style="{
+              gridTemplateColumns: view === 'focus' ? '1fr' : '0fr',
+              opacity: view === 'focus' ? 1 : 0,
+              transition: 'grid-template-columns 150ms cubic-bezier(0.4, 0, 0.2, 1), opacity 150ms cubic-bezier(0.4, 0, 0.2, 1)',
+            }"
+            :aria-hidden="view !== 'focus'"
+          ><span class="min-w-0 overflow-hidden">ed</span></span>
+        </span>
       </button>
       <!-- The headline figure for whatever screen you're on: the side's loadout
            on the loadout screens, the whole collection on the inventory. ONE
@@ -7290,13 +7481,8 @@ if (MDEBUG) {
               </div>
               <!-- Stage controls live in the header, on the same baseline as the
                    rarity chip. The 3D toggle used to float over the artwork
-                   anchored to nothing.
-                   The spec boxes hang UNDER them, which is where the editor puts
-                   the same panel — top right, in a column. Focus and the modal
-                   are the two screens you open to study one item, and laying its
-                   facts out differently in each is how people learn to distrust
-                   both. -->
-              <div class="flex flex-none flex-col items-end gap-2.5">
+                   anchored to nothing. The spec column is NOT in here — see the
+                   body row below. -->
               <div class="flex flex-none items-center gap-2.5">
                 <!-- Same sliding-pill animated tabs as every other tab group. -->
                 <PillTabs
@@ -7349,17 +7535,33 @@ if (MDEBUG) {
                   :btn-class="FOCUS_STAGE"
                 />
               </div>
-              <ItemSpecs
-                v-if="focusSpecs && !isCompact"
-                :inst="focusSpecs"
-                still
-                class="w-[210px] gap-1.5"
-              />
-              </div>
             </div>
 
-            <div class="relative z-[2] grid min-h-0 place-items-center">
-              <div v-show="focus3d" ref="viewer3dEl" class="h-full min-h-[240px] w-full"></div>
+            <!-- BODY: the stage beside the spec column, laid out the way the
+                 craft modal lays out the same two things — preview left, a
+                 300px column of the same boxes on the right. Focus and the modal
+                 are the two screens you open to study one item, and laying its
+                 facts out differently in each is how people learn to distrust
+                 both.
+                 The column used to hang off the header's control cluster as a
+                 right-aligned stack of shrink-wrapped boxes, which (a) looked
+                 nothing like the modal's stretched column and (b) sat in the
+                 `auto` header row of the card grid, so four boxes of specs made
+                 the header ~300px tall and the stage row that much shorter and
+                 lower — the model was centred in what was left, i.e. shoved
+                 down the card. In the body row the column is a sibling of the
+                 stage, so the stage keeps its full height, centres the model in
+                 the space BESIDE the column (as the modal does), and gets a
+                 squarer pane into the bargain. -->
+            <div class="relative z-[2] flex min-h-0 gap-5">
+            <!-- ONE grid cell for the 3D host and the 2D art. Both carry
+                 col-start-1 row-start-1 because they can coexist for a moment:
+                 a 2D→3D flip shows the host while the art's leave transition
+                 is still playing, and as two auto rows the host took the first
+                 and the leaving art was laid out UNDER it — a flat icon drawn
+                 a pane lower for 100ms, which read as the model jumping. -->
+            <div class="relative grid min-h-0 min-w-0 flex-1 place-items-center">
+              <div v-show="focus3d" ref="viewer3dEl" class="col-start-1 row-start-1 h-full min-h-[240px] w-full"></div>
               <div v-if="focus3d && focusViewer.busy.value" class="absolute inset-0 z-[3] grid place-items-center">
                 <div class="flex flex-col items-center gap-3 text-muted-foreground">
                   <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
@@ -7377,7 +7579,7 @@ if (MDEBUG) {
                 leave-active-class="transition duration-100 ease-in"
                 leave-to-class="opacity-0 scale-105"
               >
-                <div v-if="!focus3d" :key="selected" class="grid h-full w-full min-h-0 place-items-center">
+                <div v-if="!focus3d" :key="selected" class="col-start-1 row-start-1 grid h-full w-full min-h-0 place-items-center">
                   <ItemArt
                     :inst="isSpecial(selected) ? null : cellInstance(selected)"
                     :image="isSpecial(selected) ? focusRow?.item?.image : cellImage(selected)"
@@ -7430,6 +7632,19 @@ if (MDEBUG) {
                 @inspect-play="focusInspect.play"
                 @inspect-seek="focusInspect.seek"
               />
+            </div>
+            <!-- Same column, same boxes, same width as the modal's spec sheet
+                 (App.vue, the craft modal's options column): ItemSpecs renders
+                 a fragment of boxes, so the wrapper is what makes them a
+                 stretched column rather than a stack — a class on the component
+                 itself has no single root to land on and was being dropped.
+                 `still`: this column does not animate in, the view does. -->
+            <div
+              v-if="focusSpecs && !isCompact"
+              class="flex w-[300px] min-h-0 flex-none flex-col gap-2.5 overflow-y-auto"
+            >
+              <ItemSpecs :inst="focusSpecs" still />
+            </div>
             </div>
 
             <div class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5">
@@ -9440,8 +9655,8 @@ if (MDEBUG) {
          worse than the strip it replaced. Desktop keeps the strip, so listing
          the same builds here would be two ways to do one thing a centimetre
          apart. -->
-    <ContextMenu :at="presetCtx" @close="presetCtx = null">
-      <template #title>{{ activePresetName }}</template>
+    <ContextMenu :at="presetCtx" @close="presetCtx = null; presetMenuFor = null">
+      <template #title>{{ presetMenuTarget?.name ?? activePresetName }}</template>
       <template v-if="isCompact">
         <button
           v-for="p in presets"
@@ -9466,13 +9681,20 @@ if (MDEBUG) {
            rows that write. Without it a stranger gets Rename and Delete on an
            account that is not theirs, one tap from a header that only ever
            advertised itself as a view. -->
+      <!-- The row handlers read presetMenuTarget BEFORE clearing presetMenuFor —
+           the action is synchronous up to the point it captures its target, so
+           the order in each handler is load-bearing. -->
       <template v-if="canEdit">
-      <button :class="[MENU_ROW, isCompact && 'border-t border-border']" @click="presetCtx = null; startPresetRename()">
+      <button :class="[MENU_ROW, isCompact && 'border-t border-border']" @click="presetCtx = null; startPresetRename(); presetMenuFor = null">
         <Pencil class="h-3.5 w-3.5" /> Rename…
       </button>
+      <!-- Creation rows are COMPACT only. On desktop this menu is raised from a
+           deck card and is about that card; making a new build is the deck's
+           own footer and dashed card, where it is about the set. -->
       <!-- Duplicate leads over "new empty": rebuilding 15 craft-gated slots by
            hand is the whole reason this feature exists, so the row that starts
            you from what you're already wearing is the one people want. -->
+      <template v-if="isCompact">
       <button
         v-if="!presetsFull"
         :class="[MENU_ROW, 'border-t border-border']"
@@ -9488,18 +9710,44 @@ if (MDEBUG) {
       <div v-else class="border-t border-border px-3 py-2 text-f11 leading-relaxed text-muted-foreground">
         {{ PRESET_LIMIT }} loadouts is the limit — delete one to make room.
       </div>
+      </template>
       <!-- Hidden, not disabled, at one preset: there is no state in which it
            becomes available without first creating another, so a dead row here
            would only ever be furniture. -->
       <button
         v-if="presets.length > 1"
         :class="[MENU_ROW, 'border-t border-border text-muted-foreground hover:!text-[#ff7a6a]']"
-        @click="presetCtx = null; askDeletePreset()"
+        @click="presetCtx = null; askDeletePreset(); presetMenuFor = null"
       >
         <Trash2 class="h-3.5 w-3.5" /> Delete this loadout
       </button>
       </template>
     </ContextMenu>
+
+    <!-- The desktop switcher's open state; see PresetDeck.vue. Sits UNDER the
+         context menu (Z.deck < Z.menu) because its cards raise that menu. -->
+    <PresetDeck
+      v-if="!isCompact"
+      :at="presetDeck"
+      :presets="presets"
+      :shown-id="shownPresetId"
+      :team="team"
+      :can-edit="canEdit"
+      :busy="presetBusy"
+      :limit="PRESET_LIMIT"
+      :renaming="presetRenaming"
+      :value-for="presetValue"
+      :guns-for="presetGuns"
+      :preview-for="presetPreview"
+      :prices-on="pricesOn"
+      @close="closePresetDeck"
+      @switch="(id) => { closePresetDeck(); void switchPreset(id); }"
+      @menu="openPresetCardMenu"
+      @rename="commitDeckRename"
+      @rename-cancel="presetRenaming = null"
+      @duplicate="closePresetDeck(); void newPreset(true)"
+      @create="closePresetDeck(); void newPreset(false)"
+    />
   </div>
   </div>
   </div>

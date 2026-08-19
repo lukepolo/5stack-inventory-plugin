@@ -60,8 +60,17 @@ export const FLAGS: DevFlag[] = [
   {
     name: "charmquads",
     label: "Authored charm surfaces",
-    hint: "Seat a charm on the model's own KeychainMarkup quads. Off falls back to the nearest triangle anywhere on the weapon, which is where charms used to float.",
+    hint: "Use the model's own KeychainMarkup quads: they seat the UNPLACED charm's default spot and bound where a drag may go. A dragged charm goes wherever you point on the body inside that box. Off drops both, which is where default charms used to float.",
     dflt: true,
+    remount: true,
+    group: "3D viewer",
+    audience: "developer",
+  },
+  {
+    name: "charmmap",
+    label: "Show the charm quads",
+    hint: "Paint the game's authored charm surfaces on the weapon (debug). They no longer restrict a drag — placement is free inside their bounding box — but they seat the unplaced default, and this shows whether they sit on the rendered mesh.",
+    dflt: false,
     remount: true,
     group: "3D viewer",
     audience: "developer",

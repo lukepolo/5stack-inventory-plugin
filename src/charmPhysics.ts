@@ -1409,12 +1409,14 @@ export function stepCharmSim(
  * For still/offscreen viewers, which exist only to be photographed: they should
  * not be at the mercy of rAF timing for a pose that is fully determined.
  */
-export function settleCharmSim(sim: CharmSim, g: Float32Array, maxSteps = 600, contact?: ContactFn) {
-  for (let i = 0; i < maxSteps && !sim.asleep; i++) {
+export function settleCharmSim(sim: CharmSim, g: Float32Array, maxSteps = 600, contact?: ContactFn): number {
+  let i = 0;
+  for (; i < maxSteps && !sim.asleep; i++) {
     stepCharmSimOnce(sim, CHARM_STEP, g, contact);
     updateSleep(sim);
   }
   writeBones(sim);
+  return i;
 }
 
 /** Largest per-node movement over the last step, in inches. */

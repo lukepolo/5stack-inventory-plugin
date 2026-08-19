@@ -75,6 +75,9 @@ interface Probe {
   camPos: string[];
   /** Frustum half-height — see below; camPos alone no longer says how big. */
   halfH: string;
+  /** The frustum the camera actually got for this host's shape (= halfH up to the reference aspect). */
+  paneHalfH?: string;
+  paneAspect?: string;
   target: string[];
 }
 
@@ -236,7 +239,8 @@ async function one() {
   // large the item renders. Both are printed because a wrong camDir and a wrong
   // halfH look identical in a thumbnail.
   line(`camPos:    ${p.camPos.join(", ")}  (standoff only — parallel projection)`);
-  line(`halfH:     ${p.halfH}  (frustum half-height = apparent size)`);
+  line(`halfH:     ${p.halfH}  (tuned frustum half-height = apparent size)`);
+  if (p.paneHalfH) line(`paneHalfH: ${p.paneHalfH}  (what the camera got for a ${p.paneAspect}:1 host — see frameHalfH)`);
   line(`target:    ${p.target.join(", ")}  (orbit pivot)`);
   line(`flags:     flatOn=${p.flatOn} dual=${p.dual} weaponPaint=${p.weaponPaint} body=${p.bodyVariant}`);
   line(`props:     ${p.propStats}`);

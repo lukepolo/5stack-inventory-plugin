@@ -1056,6 +1056,13 @@ export interface InventoryPrices {
   window: PriceWindow;
   items: Record<string, PricePoint>;
   slots: Record<string, number>;
+  /**
+   * Every PARKED preset's slots, keyed by preset id, each in the same TEAM:slot
+   * shape as `slots` — the preset deck's per-card figure. The active preset is
+   * not in here: its slots ARE `slots`. Optional because a backend that predates
+   * the deck leaves it off, and a card with no figure is the right degrade.
+   */
+  presets?: Record<string, Record<string, number>>;
 }
 export const fetchInventoryPrices = () => request<InventoryPrices>("/inventory/prices");
 
@@ -1398,8 +1405,20 @@ export interface LoadoutPreset {
   name: string;
   /** The one whose slots are the live loadout. Exactly one is ever true. */
   active: boolean;
-  /** Filled slots across both teams — what the switcher shows under the name. */
+  /** Filled slots across both teams — what the compact switcher shows under the name. */
   slots: number;
+}
+
+/** One thumb in a preset deck card's hand — derived client-side from a build's
+ *  rows (see App's presetPreview); the server sends nothing for it. */
+export interface PresetPreviewItem {
+  team: Team;
+  slot: string;
+  /** A crafted skin, as opposed to the free default weapon chosen for the slot. */
+  skinned: boolean;
+  image: string | null;
+  rarity: string | null;
+  name: string;
 }
 
 export const fetchPresets = () => request<LoadoutPreset[]>("/loadout/presets");

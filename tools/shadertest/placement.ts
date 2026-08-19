@@ -213,6 +213,112 @@ async function charmSurfacesFor(model: string) {
  * (sizeL * 0.003) rather than as zero, because the seat deliberately holds the
  * pivot a hair off the shell — a charm sunk into the metal is its own bug.
  */
+/**
+ * ?drop=1 — sweep the whole screen through the REAL drag pipeline and paint
+ * where each pointer position would put the charm.
+ *
+ * Placement is free inside the game's bounds box, so the sweep asserts the
+ * three things that can still go wrong: the landing leaves the surface, the
+ * landing escapes the box, or a pointer ON the gun does not get the charm
+ * under it (outside the box clamp, `slideMm` should be ~0 — that number is
+ * the whole "it won't go where I point" feel, which is why it is printed).
+ */
+async function dropSweep(models: string[]) {
+  const host = document.createElement("div");
+  // Big host on purpose: the sweep photographs the weapon as the background of
+  // the scatter, and a 320px snapshot makes the red dots unreadable.
+  host.style.cssText = "width:960px;height:660px;position:fixed;left:-9999px;top:0";
+  document.body.appendChild(host);
+  const progress = document.createElement("div");
+  progress.className = "dim";
+  el.appendChild(progress);
+  for (const model of models) {
+    progress.textContent = `… ${model}`;
+    try {
+      const charmSurfaces = await charmSurfacesFor(model);
+      const handle = await Promise.race([
+        mountViewer(host, model, { paintMaterial: null, interactive: false, still: true, charmSurfaces } as any),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error("mount timed out after 20s")), 20000)),
+      ]);
+      const probe = handle.probePlacement();
+      // On-surface within the snap's own idempotence tolerance (sizeL * 0.005,
+      // floored at 4mm for pistols); in-box with a hair of slack for the snap
+      // pulling a clamped point back to the body.
+      const tolMm = Math.max(4, probe.sizeL * 1000 * 0.006);
+      const shot = await handle.snapshot();
+      const img = new Image();
+      if (shot) {
+        img.src = URL.createObjectURL(shot);
+        await img.decode();
+      }
+      const W = 128, H = 88;
+      const cv = document.createElement("canvas");
+      cv.width = img.width || 960;
+      cv.height = img.height || 660;
+      const ctx = cv.getContext("2d")!;
+      if (shot) ctx.drawImage(img, 0, 0, cv.width, cv.height);
+      let good = 0, bad = 0, outBox = 0, held = 0, rayFrames = 0;
+      let slideSum = 0, slideMax = 0;
+      const offenders: { x: number; y: number; surf: number; slide: number }[] = [];
+      for (let iy = 0; iy < H; iy++) {
+        for (let ix = 0; ix < W; ix++) {
+          const nx = ((ix + 0.5) / W) * 2 - 1;
+          const ny = -(((iy + 0.5) / H) * 2 - 1);
+          const r = probe.dropAt(nx, ny);
+          const px = ((nx + 1) / 2) * cv.width;
+          const py = ((1 - ny) / 2) * cv.height;
+          let color: string | null = null;
+          if (!r) {
+            held++;
+            color = "rgba(255,220,0,0.8)";
+          } else if ((r.surfMm != null && r.surfMm > tolMm) || (r.viaRay && r.slideMm > tolMm)) {
+            bad++;
+            offenders.push({ x: nx, y: ny, surf: r.surfMm ?? -1, slide: r.slideMm });
+            color = "rgba(255,40,40,0.95)";
+          } else {
+            if (r.inBox > tolMm) outBox++;
+            if (r.viaRay) {
+              rayFrames++;
+              slideSum += r.slideMm;
+              slideMax = Math.max(slideMax, r.slideMm);
+              good++;
+              color = "rgba(0,220,90,0.55)";
+            }
+          }
+          // Off-gun slide frames that land fine are the normal case — leave
+          // them unpainted so the picture is the WEAPON's droppable surface.
+          if (color) {
+            ctx.fillStyle = color;
+            ctx.fillRect(px - 2, py - 2, 4, 4);
+          }
+        }
+      }
+      const total = good + bad;
+      const out = document.createElement("img");
+      // A data URL, not an object URL — shoot.mjs pulls images back over CDP by
+      // reading src, and a blob: URL is a handle into a browser it is about to
+      // close.
+      out.src = cv.toDataURL("image/png");
+      out.style.cssText = "max-width:100%;display:block;margin:4px 0";
+      el.appendChild(out);
+      line(
+        `${model.padEnd(16)} on-gun frames=${total} underPointer=${good} BAD=${bad}` +
+          ` (${total ? ((bad / total) * 100).toFixed(1) : "0"}%)  held=${held} outsideGameBox=${outBox}` +
+          `  slide avg=${rayFrames ? (slideSum / rayFrames).toFixed(1) : "0"}mm max=${slideMax.toFixed(0)}mm`,
+        bad ? "fail" : "pass",
+      );
+      for (const o of offenders.slice(0, 8)) {
+        line(`${"".padEnd(16)} bad landing at ndc ${o.x.toFixed(2)},${o.y.toFixed(2)} — surf=${o.surf.toFixed(1)}mm slide=${o.slide.toFixed(1)}mm`, "warn");
+      }
+      if (offenders.length > 8) line(`${"".padEnd(16)} …and ${offenders.length - 8} more`, "warn");
+      handle.dispose();
+    } catch (e) {
+      line(`${model.padEnd(16)} ERROR ${(e as Error).message}`, "fail");
+    }
+  }
+  progress.remove();
+}
+
 async function quadSweep(models: string[]) {
   const host = document.createElement("div");
   host.style.cssText = "width:320px;height:220px;position:fixed;left:-9999px;top:0";
@@ -500,6 +606,17 @@ async function hookSweep(models: string[], charms: string[], live = false, cases
       !!qs.get("live"),
       !!qs.get("cases"),
     );
+    return;
+  }
+  if (qs.get("drop")) {
+    line("drop sweep — placement is FREE: does every frame land ON the surface, UNDER the pointer?");
+    line("dot = one pointer position, coloured by where resolveDragAnchor puts the charm:", "dim");
+    line("  green  = pointer on the gun, charm lands under it, on the surface", "dim");
+    line("  red    = landing off the surface, or a ray frame that slid away — the bug", "dim");
+    line("  yellow = frame refused/held", "dim");
+    line("  (outsideGameBox = landings beyond cs2-lib's clamp box: telemetry, not a failure)", "dim");
+    line("");
+    await dropSweep(one ? [one] : ["ak47", "usp_silencer", "glock", "m4a1_silencer", "awp"]);
     return;
   }
   if (qs.get("quads")) {

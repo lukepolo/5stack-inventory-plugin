@@ -755,6 +755,20 @@ const PERF = debugFlag("perf");
  * magnitudes, not this.
  */
 const FRAMING_TAN = Math.tan((35 * Math.PI) / 360);
+/**
+ * The pane shape the interactive framing was tuned in — the craft modal's stage,
+ * which runs ~1.0–1.3 wide across window sizes. Panes up to this aspect get the
+ * tuned height verbatim; wider ones (the focus stage) zoom in with the aspect so
+ * the weapon keeps the modal's share of the WIDTH. See frameHalfH in mountViewer.
+ */
+const FRAME_REF_ASPECT = 1.3;
+/**
+ * How much taller than the posed silhouette a wide pane's frustum must stay.
+ * The silhouette is the bare model — the charm hangs BELOW it on a strap and
+ * swings, the StatTrak module rides above the receiver — and the orbit needs
+ * somewhere to go, so the floor is the model's own height plus 40%.
+ */
+const FRAME_MIN_SLACK = 1.4;
 
 /**
  * Mount-phase stopwatch.
@@ -1764,6 +1778,58 @@ export const viewersIdle = () =>
       });
 
 const COARSE_POINTER = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
+
+/**
+ * A paint's own normal map, shared across mounts.
+ *
+ * These are the 4k maps custom paint jobs ship (paint-UV space), and they used
+ * to be loaded through a fresh TextureLoader on every mount — the browser's
+ * HTTP cache made the bytes free, but a NEW Texture object is a new GPU upload,
+ * and a 4096x4096 upload with mipmaps is ~190-250ms of main thread (measured
+ * with ?perf=1: the `tex` stage, one texture, every time the focus stage
+ * re-opened the same AK). Keeping the Texture lets three find it already
+ * resident: the second open of a weapon pays nothing for it.
+ *
+ * Plain LRU, no refcount: evicting a texture a live viewer still holds only
+ * costs that viewer a re-upload on its next frame (three re-inits a disposed
+ * texture on use), which is the behaviour before this cache existed, and the
+ * cap is small because each entry is ~85MB of VRAM with its mip chain — the
+ * focus stage, the craft modal and the craft preview are the most that are
+ * ever open at once.
+ */
+const PAINT_NORMAL_MAX = COARSE_POINTER ? 2 : 4;
+const paintNormals = new Map<string, Promise<import("three").Texture | null>>();
+function paintNormalTexture(
+  THREE: typeof import("three"),
+  renderer: import("three").WebGLRenderer,
+  url: string,
+): Promise<import("three").Texture | null> {
+  const hit = paintNormals.get(url);
+  if (hit) {
+    // Refresh LRU order.
+    paintNormals.delete(url);
+    paintNormals.set(url, hit);
+    return hit;
+  }
+  const p = new THREE.TextureLoader()
+    .loadAsync(url)
+    .then((t) => {
+      t.flipY = false;
+      t.channel = 0; // paint UV = the weapon material's own uv set
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+      return t;
+    })
+    .catch(() => null);
+  paintNormals.set(url, p);
+  while (paintNormals.size > PAINT_NORMAL_MAX) {
+    const oldest = paintNormals.keys().next().value as string;
+    const victim = paintNormals.get(oldest)!;
+    paintNormals.delete(oldest);
+    void victim.then((t) => t?.dispose());
+  }
+  return p;
+}
 /**
  * Resolution a composite runs at DURING a wear/pattern drag.
  *
@@ -2208,6 +2274,28 @@ export interface PlacementProbe {
      *  charmSurfaceCandidates. The winner is a measurement, not a claim. */
     candidates: Record<string, number> | null;
   } | null;
+  /**
+   * One frame of a charm drag, from a pointer position — the REAL pipeline
+   * (resolveDragAnchor), not a probe-side re-implementation of it. Null when
+   * that frame would be held (a hole on a mapless body, no geometry).
+   *
+   * Placement is free inside the game's bounds box, so the invariants are:
+   * the landing is ON the surface (`surfMm` ~ clearance), INSIDE the box
+   * (`inBox` ~ 0), and — for a pointer on the gun — UNDER the pointer
+   * (`slideMm` ~ 0 except where the box clamp legitimately moved it).
+   */
+  dropAt: (ndcX: number, ndcY: number) => {
+    raw: { x: number; y: number; z: number };
+    anchor: { x: number; y: number; z: number };
+    /** Pointer ON the weapon (ray hit) vs off it (silhouette slide). */
+    viaRay: boolean;
+    /** How far the landing sits from the pointer's own answer, mm. */
+    slideMm: number;
+    /** Landing to the weapon surface, mm. Null: a model with no triangles. */
+    surfMm: number | null;
+    /** Landing's distance OUTSIDE the game's bounds box, mm. 0 = inside. */
+    inBox: number;
+  } | null;
 }
 
 /**
@@ -2256,8 +2344,10 @@ export interface CharmSeatProbe {
   /** The weapon's own rendered bounds, to read those two against. */
   weaponBox: { min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null;
   /** Authored charm surfaces, and how many of their centres `enclosedSpot`
-   *  would have refused a drag onto. Anything above zero is the guard
-   *  overruling the game — see onCharmMap. */
+   *  would have refused a drag onto. It no longer can — the drag seats onto
+   *  those surfaces before the guess is consulted, and the guess only runs on a
+   *  body with no map — so this is the standing measure of how wrong the guess
+   *  would be if it ever got the vote back. */
   mapSpots: { total: number; enclosed: number } | null;
   /** The drawn bulk's centre in normalised device coords. */
   ndc: { x: number; y: number; z: number } | null;
@@ -3534,16 +3624,7 @@ async function buildViewer(
         // materials ship a real g_tNormal even with the switch off, so keying
         // off presence bump-maps surfaces CS2 shades flat. See PaintDef.
         const normalTex = paint.normal && paint.useNormalMap
-          ? await new THREE.TextureLoader()
-              .loadAsync(await paintTextureUrl(paint.normal))
-              .then((t) => {
-                t.flipY = false;
-                t.channel = 0; // paint UV = the weapon material's own uv set
-                t.wrapS = t.wrapT = THREE.RepeatWrapping;
-                t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
-                return t;
-              })
-              .catch(() => null)
+          ? await paintNormalTexture(THREE, renderer, await paintTextureUrl(paint.normal))
           : null;
         if (comp) {
           releaseComposite = comp.release;
@@ -3795,6 +3876,20 @@ async function buildViewer(
   const viewDir = camDir.clone().normalize();
   const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), viewDir).normalize();
   const upv = new THREE.Vector3().crossVectors(viewDir, right);
+  // The model's silhouette on the screen axes, from the posed box: how tall and
+  // how wide it is in the starting pose. "fit" frames on these outright; the
+  // interactive branch uses extentUp as the floor the wide-pane zoom below may
+  // not cross.
+  const paneAspect = () => (container.clientWidth || 640) / (container.clientHeight || 480);
+  let extentUp = 0;
+  let extentRight = 0;
+  for (const cx of [cboxFit.min.x, cboxFit.max.x])
+    for (const cy of [cboxFit.min.y, cboxFit.max.y])
+      for (const cz of [cboxFit.min.z, cboxFit.max.z]) {
+        const c = new THREE.Vector3(cx, cy, cz);
+        extentUp = Math.max(extentUp, Math.abs(c.dot(upv)));
+        extentRight = Math.max(extentRight, Math.abs(c.dot(right)));
+      }
   let halfH: number;
   if (opts?.frame === "fit") {
     // Exact fit, and now genuinely exact: a parallel frustum needs no distance
@@ -3803,16 +3898,7 @@ async function buildViewer(
     // strictly tighter than the perspective solve it replaces — the near corners
     // no longer demand room they only needed because they were near — so a card
     // comes out marginally larger, which is free pixels on the weapon.
-    const aspect = (container.clientWidth || 640) / (container.clientHeight || 480);
-    let extentUp = 0;
-    let extentRight = 0;
-    for (const cx of [cboxFit.min.x, cboxFit.max.x])
-      for (const cy of [cboxFit.min.y, cboxFit.max.y])
-        for (const cz of [cboxFit.min.z, cboxFit.max.z]) {
-          const c = new THREE.Vector3(cx, cy, cz);
-          extentUp = Math.max(extentUp, Math.abs(c.dot(upv)));
-          extentRight = Math.max(extentRight, Math.abs(c.dot(right)));
-        }
+    const aspect = paneAspect();
     // Guns want a tight crop; a knife tilted to 30 degrees needs slack or it
     // reads as zoomed-in against the frame. The dual-wield tent is flat-on but
     // NOT tilted, so it wants the tight one — the slack costs it a third of its
@@ -3825,13 +3911,53 @@ async function buildViewer(
     // converts to — every kind keeps the framing it was tuned to.
     halfH = radius * camDir.length() * (opts?.frame ?? 1) * FRAMING_TAN;
   }
+  /**
+   * THE FRAMING FOR A GIVEN PANE SHAPE.
+   *
+   * `halfH` above is a HEIGHT, and it was tuned in the craft modal, whose stage
+   * is close to square (about 1.0–1.3 wide for every window size it gets). In
+   * that shape the width is what the weapon runs out of first, and the generous
+   * vertical slack — the tuned frustum is a touch taller than the box's whole
+   * diagonal, so no orbit can ever crop — costs nothing because the gun fills
+   * the width anyway. Hold that same height in a pane three times wider than it
+   * is tall (the focus stage, at 948x306 on a laptop) and the gun is sized for a
+   * 306px-tall square: a sliver in the middle of an empty stage, which reads as
+   * "zoomed out" although the frustum is exactly the modal's.
+   *
+   * So the tuned height is the framing for panes up to FRAME_REF_ASPECT, and
+   * beyond that the frustum shrinks with the aspect — the visible WIDTH stays
+   * what the modal shows, so the gun keeps the modal's share of the pane instead
+   * of the modal's share of a height it does not have. Floored at the silhouette
+   * height plus room (FRAME_MIN_SLACK) so a wide pane can never crop the posed
+   * model or the charm it swings under it; for an agent, whose silhouette is
+   * nearly the whole height, that floor IS the tuned height, so it does not move.
+   * Under "fit" (cards, bakes) the aspect is already in the number — untouched.
+   *
+   * Called from resize(), so the pane CHANGING shape reframes too: the modal is
+   * unchanged at every window size it reaches, and a pane that narrows below
+   * the reference crops its sides rather than shrinking the weapon, as before.
+   */
+  const frameHalfH = (aspect: number) =>
+    opts?.frame === "fit"
+      ? halfH
+      : Math.max(halfH * Math.min(1, FRAME_REF_ASPECT / Math.max(aspect, 1e-3)), Math.min(halfH, extentUp * FRAME_MIN_SLACK));
   // The standoff is arbitrary under a parallel projection — it changes nothing
   // about what is drawn. It is picked far enough out that no orbit can push
   // geometry through the near plane, and so that `camera.position` still reads
   // as "where the viewer is" for the facing tests and the charm's camera-frame
   // gravity, both of which take a direction from it.
   const camStandoff = radius * 8;
-  const camera = new THREE.OrthographicCamera(-halfH, halfH, halfH, -halfH, radius / 100, camStandoff + radius * 100);
+  // Built for the pane's CURRENT shape, so no frame ever draws through the
+  // square placeholder frustum; resize() restates it from here on.
+  const halfH0 = frameHalfH(paneAspect());
+  const camera = new THREE.OrthographicCamera(
+    -halfH0 * paneAspect(),
+    halfH0 * paneAspect(),
+    halfH0,
+    -halfH0,
+    radius / 100,
+    camStandoff + radius * 100,
+  );
   camera.position.copy(viewDir).multiplyScalar(camStandoff);
   if (opts?.viewAngle) {
     // Deterministic orbit for measurement sweeps — see ViewerOpts.viewAngle.
@@ -3877,8 +4003,16 @@ async function buildViewer(
   //
   // Inverted deliberately: zoom is a ratio of the frustum, so the CLOSE distance
   // is the LARGEST zoom.
-  controls.minZoom = halfH / (radius * 4 * FRAMING_TAN);
-  controls.maxZoom = halfH / (radius * 0.22 * FRAMING_TAN);
+  //
+  // Stated against the frustum the camera actually has, and restated whenever
+  // resize() reframes it: `zoom` is relative, so the same two DISTANCES come out
+  // as different ratios in a wide pane. Re-applying keeps the absolute range —
+  // four radii out, a fifth of a radius in — the same on every pane shape.
+  const setZoomRange = (frustumHalfH: number) => {
+    controls.minZoom = frustumHalfH / (radius * 4 * FRAMING_TAN);
+    controls.maxZoom = frustumHalfH / (radius * 0.22 * FRAMING_TAN);
+  };
+  setZoomRange(halfH0);
   // Coarse pointers get a slower orbit — a thumb sweep is far larger than a
   // mouse gesture, so 1:1 rotate speed makes small adjustments overshoot.
   if (typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches) controls.rotateSpeed = 0.6;
@@ -4005,7 +4139,12 @@ async function buildViewer(
       // The frustum half-height, which under a parallel projection is the whole
       // of "how big is it on screen" — camPos alone no longer says, because the
       // standoff is a constant and carries no framing information at all.
+      // `halfH` is the tuned framing; `paneHalfH` is what the camera actually
+      // has after frameHalfH() met this pane's shape (equal up to the reference
+      // aspect, smaller in a wide pane).
       halfH: n3(halfH),
+      paneHalfH: n3(camera.top),
+      paneAspect: n3(paneAspect()),
     });
     (globalThis as { __item3d?: string }).__item3d = line;
     console.log(`[item3d] ${line}`);
@@ -5760,7 +5899,7 @@ async function buildViewer(
   // Perf HUD counters. The charm's cost is entirely (rays × collider triangles)
   // plus the occasional rebuild, so surface those directly rather than making
   // someone infer them from a millisecond figure.
-  const charmCost = { rays: 0, rebuilds: 0, sleptAt: 0, awokeAt: 0, steps: 0, tests: 0 };
+  const charmCost = { rays: 0, rebuilds: 0, sleptAt: 0, awokeAt: 0, steps: 0, tests: 0, settleMs: 0, settleSteps: 0 };
   let charmLastT = 0;
   const charmColliderMat = new THREE.MeshBasicMaterial(); // FrontSide, like the weapon's own
   let charmCollider: import("three").Mesh | null = null;
@@ -6614,8 +6753,16 @@ async function buildViewer(
    * Runs off weaponTriangleCache — the same world-space triangle soup the cloth
    * collider is baked from, built once — with the same centroid+radius rejection
    * charmColliderFor uses, so a full scan of an 18k-triangle weapon is a flat
-   * pass over two Float32Arrays. Called when a placement CHANGES, never per
-   * frame; the cloth keeps its bucketed grid for the per-frame work.
+   * pass over two Float32Arrays.
+   *
+   * IT IS PER FRAME NOW. This used to say "called when a placement changes,
+   * never per frame" and the drag made that false: seating the anchor live puts
+   * about four of these in every pointermove (the seat, its candidates' hangs,
+   * the final seat). At the 0.1-0.2ms measured here that is under a millisecond
+   * against a pointer raycast the same frame already pays 0.7-11.8ms for, which
+   * is the only reason the live seat is affordable — keep the seeding pass below
+   * if you touch this. The cloth still keeps its bucketed grid for its own
+   * per-frame work; this is not that.
    */
   const nearTri = new THREE.Triangle();
   const nearA = new THREE.Vector3();
@@ -6689,10 +6836,9 @@ async function buildViewer(
    * MEASURED before it was used, because the whole history of charm placement is
    * spaces that looked right: corner-to-mesh distance is a 1-3mm median on every
    * weapon sampled (ak47 1.2, m4a1 2.0, awp 2.5, mac10 2.9, mag7 2.3, p90 2.5,
-   * usp_silencer 1.6, glock 2.4, deagle 2.7), both bodies. So they need no base,
-   * no `cal` and no pose — only the swizzle and scale every GLB coordinate here
-   * takes, plus the recentre. That is the same conversion `charmAnchors.json`
-   * ships pre-applied, which is why the anchor is read raw a few lines up.
+   * usp_silencer 1.6, glock 2.4, deagle 2.7), both bodies — and 0.00mm once
+   * they go through the same bind->posed->object transform the vertices take
+   * (see put(): the pose per bone, then the object's world matrix).
    *
    * EVERY BONE, not just the static body. The moving-part quads (slide, bolt,
    * silencer, pump) travel with an animation in game — but nothing here
@@ -6708,21 +6854,24 @@ async function buildViewer(
     const all = opts?.charmSurfaces ?? [];
     if (!all.length || !debugFlag("charmquads", true)) return null;
     const mine = all.filter((q) => q.mesh === bodyVariant);
-    const body = mine.length ? mine : all;
-    // THE STATIC BODY ONLY. Every bone's quads sit flush on the mesh in the pose
-    // we render, which is why they were all used at first — but flush is not the
-    // question a placement asks. A magazine drops, a slide cycles, a pump racks:
-    // a charm clipped to one of those is clipped to a part that moves out from
-    // under it, and on an M4A1-S the magazine is exactly where a charm kept
-    // landing. The game's own data says which bone carries a quad, so this is a
-    // filter rather than a guess.
+    const use = mine.length ? mine : all;
+    // EVERY BONE, and this is a reversal that was measured both ways. The set
+    // was filtered to `weapon_offset` for a while, on the argument that a slide
+    // cycles and a magazine drops out from under a charm clipped to it — but
+    // that argument was OURS, not the game's, and the game disagrees on every
+    // count that can be checked: Valve authored placement quads ON the slide,
+    // magazine and silencer bones (a USP-S puts 11 of its 15 there, a Glock 4
+    // of 7), and cs2-lib's getKeychainPositionBounds — the placement clamp as
+    // the game's own item schema carries it — folds every bone's quads into its
+    // box. Community guides say charms go anywhere on a weapon. Three sources,
+    // one answer: the moving-part surfaces are legal.
     //
-    // Falls back to every bone when the model declares no `weapon_offset` at all
-    // — the Dual Berettas, whose halves are `weapon_r`/`weapon_l` and are as
-    // static as any body. Reported by ?quads=1 so a model losing its surfaces
-    // this way is visible rather than mysterious.
-    const staticQuads = body.filter((q) => q.bone === "weapon_offset");
-    const use = staticQuads.length ? staticQuads : body;
+    // The filter also had a cost that was easy to see once ?drop=1 drew it: on
+    // a USP-S the surviving static sliver covered ~1% of the gun, so the live
+    // seat moved the average drag frame 64mm from the pointer — "it will not
+    // let me put it where I am pointing". Nothing here animates, and the quads
+    // measure as flush in the rendered pose on every bone (?quads=1), so
+    // keeping them costs nothing.
     const xyz = new Float32Array(use.length * 18);
     const c = new THREE.Vector3();
     let n = 0;
@@ -6749,11 +6898,20 @@ async function buildViewer(
       // weapon_l explicitly.
       const pose = poseBones.byName.get(q.bone) ?? poseXform;
       c.set(q.corners[i * 3], q.corners[i * 3 + 1], q.corners[i * 3 + 2]);
-      if (pose) c.applyMatrix4(pose).sub(center);
+      // Then THE OBJECT'S world matrix, not a bare recentre. The two are the
+      // same translation on every one-body weapon, which is how a plain
+      // `.sub(center)` measured 0.00mm on 12/12 of them and still left the
+      // elite's map 33-96mm off the pistols: the dual-wield presentation
+      // rotates the OBJECT after the pose bake (a quarter turn for the card's
+      // tent, the upright correction for the side-by-side), and an object
+      // rotation is exactly the transform a recentre does not carry. The
+      // vertices go through matrixWorld to reach the screen, so the quads must
+      // too — measured back to 0.00mm on the elite by ?quads=1&model=elite.
+      if (pose) c.applyMatrix4(pose).applyMatrix4(object.matrixWorld);
       // No pose baked (nothing in this catalogue, but a model could): the
       // vertices are then in the bind frame, and the conversion is the swizzle
       // and scale charmAnchors.json ships pre-applied.
-      else c.set(c.y, c.z, c.x).multiplyScalar(SRC_TO_M).sub(center);
+      else c.set(c.y, c.z, c.x).multiplyScalar(SRC_TO_M).applyMatrix4(object.matrixWorld);
       xyz[n++] = c.x;
       xyz[n++] = c.y;
       xyz[n++] = c.z;
@@ -6863,6 +7021,25 @@ async function buildViewer(
   }
   const nearestOnCharmSurface = (p: import("three").Vector3) =>
     nearestCharmSurfacePoints(p, 1)[0] ?? null;
+
+  /**
+   * The game's placement CLAMP, as a box around every authored quad.
+   *
+   * This is the exact construction cs2-lib's `getKeychainPositionBounds` ships
+   * in the item schema — the quads' own AABB — which is the strongest reading
+   * of what the game actually enforces: an offset clamped into the box, then
+   * the charm clipped to whatever surface is there. The quads as SURFACES are
+   * only used for the unplaced default now (see attachToBody); a drag is free
+   * anywhere on the body inside this box.
+   */
+  const charmBoundsBox = (() => {
+    const xyz = charmSurfaceTris;
+    if (!xyz) return null;
+    const b = new THREE.Box3();
+    const v = new THREE.Vector3();
+    for (let i = 0; i + 2 < xyz.length; i += 3) b.expandByPoint(v.set(xyz[i], xyz[i + 1], xyz[i + 2]));
+    return b;
+  })();
 
   /**
    * Would a charm hung here have room to hang, or does it sink into the gun?
@@ -7098,6 +7275,55 @@ async function buildViewer(
   }
 
   /**
+   * The whole "where does this pointer put the charm" pipeline, in one place.
+   *
+   * pointerNdc and the raycaster must already be set from the camera. This is
+   * every step of a drag frame that DECIDES the anchor — the ray, the
+   * silhouette slide, the seat, the hole guard — and none of the steps that
+   * merely present it (smoothing, orientation, the hook seat, velocity).
+   *
+   * Extracted from onPointerMove so the placement rig can measure the real
+   * gesture instead of a re-implementation of it: every mismatch this file has
+   * ever chased lived in the gap between "what the code does" and "what the
+   * probe thought it does". `?drop=1` sweeps this exact function.
+   */
+  function resolveDragAnchor(): {
+    /** The pointer's own answer — ray hit, or the silhouette slide. */
+    raw: import("three").Vector3;
+    /** Where the charm actually goes. Differs from raw by the seat. */
+    anchor: import("three").Vector3;
+    /** Whether the pointer was ON the weapon (ray) or off it (slide). */
+    viaRay: boolean;
+  } | null {
+    const surf = surfaceAnchor(raycaster.intersectObjects(weaponMeshes, false)[0]);
+    // Off the weapon: slide along the silhouette rather than inventing a point.
+    const raw = surf ?? nearestOnBody();
+    if (!raw) return null;
+    // FREE PLACEMENT. The charm goes exactly where the pointer says, kept on
+    // the surface and nothing else. Two rules were tried here and both
+    // reverted, each by measurement:
+    //   - a quad SEAT moved the average USP-S drag frame 16mm off the pointer
+    //     (64mm before the bones were unfiltered), enforcing a restriction no
+    //     source could confirm the game has;
+    //   - a clamp into charmBoundsBox (cs2-lib's own reading of the game's
+    //     limit) fought the surface snap — a clamped point snaps back to the
+    //     nearest surface, which is outside the box again wherever the box
+    //     excludes real body (the AK's magazine, which players demonstrably
+    //     charm in game). ?drop=1 scored the fight: 77% of AK frames
+    //     "escaped", every one of them flush on the gun at the pointer.
+    // The box survives as TELEMETRY (dropAt reports inBox) so the day someone
+    // places a charm in game at an out-of-box offset and reads it back, the
+    // question of whether the game clamps has a measurement waiting.
+    const anchor = snapToSurface(raw, true);
+    // Pointing at a hole is not a placement — but only where there is no
+    // authored data at all (a knife, or a mount extracted before the markup
+    // existed): with a map the box is the game's own rule and the guess does
+    // not get a vote. See the notes at the call site in onPointerMove.
+    if (!charmSurfaceTris && enclosedSpot(raw)) return null;
+    return { raw, anchor, viaRay: !!surf };
+  }
+
+  /**
    * THE GUARANTEE: a charm hangs ON the weapon.
    *
    * Every path below resolves a point that SHOULD be on the body, and measured
@@ -7184,16 +7410,30 @@ async function buildViewer(
   }
 
   /**
-   * Does the game's own map say a charm may hang here?
+   * Snap a placement onto the body's surface — and nothing more.
    *
-   * The authored quads are the ONE source here that is not our inference, so
-   * where they have an answer it outranks every heuristic below. False when a
-   * model ships no map at all, which must read as "no authored answer" and not
-   * as "no".
+   * This is the resolver for every PLACED charm, dragged or stored, and it
+   * deliberately does not consult the authored quads: a placement is where the
+   * user (or the game) put it, and the game's constraint is the bounds box the
+   * drag already clamped through, not the quad patches. Relocating a stored
+   * point onto the nearest quad is exactly the "it jumps to another area" that
+   * two rounds of this were spent removing.
+   *
+   * `dragging` skips the buried-leave rule: a stored offset inside the shell is
+   * a legitimate authored state (the AWP's own anchor buries its ring 12.8mm,
+   * correctly), while a drag anchor is constructed 0.3mm off a camera-facing
+   * surface, so a buried reading there is always the single-nearest-face sign
+   * test misfiring on thin or grazing geometry — slide serrations, a
+   * silhouette edge past the muzzle. Honouring it let 205 near-gun frames on a
+   * USP-S keep landings glued to whatever the misread happened to be.
    */
-  function onCharmMap(p: import("three").Vector3) {
-    const near = nearestOnCharmSurface(p);
-    return !!near && near.dist <= sizeL * 0.004;
+  function snapToSurface(p: import("three").Vector3, dragging = false) {
+    const tol = sizeL * 0.005;
+    const near = nearestOnWeapon(p);
+    if (!near) return p;
+    if (!dragging && p.clone().sub(near.point).dot(near.normal) < 0) return p;
+    if (near.dist <= tol) return p;
+    return near.point.clone().addScaledVector(near.normal, CHARM_CLEARANCE);
   }
 
   function attachToBody(p: import("three").Vector3) {
@@ -7210,12 +7450,15 @@ async function buildViewer(
     // Tested before the tolerance now, because the authored branch below has its
     // own reason to move a point that the mesh branch does not.
     if (p.clone().sub(near.point).dot(near.normal) < 0) return p;
-    // THE AUTHORED SURFACE WINS. `nearestOnWeapon` answers "where is the closest
-    // triangle", which from a point out in the air is whatever the silhouette
-    // happens to present — the flank of a magazine, the outside of a trigger
-    // guard. The model's own KeychainMarkup answers the question actually being
-    // asked, "where does this weapon take a charm", so when it is available a
-    // pivot is seated on it and not merely on the nearest geometry.
+    // THE AUTHORED SURFACE WINS — for the one caller this resolver has left:
+    // the UNPLACED default. Its input is the model's `keychain` attachment,
+    // which sits up to 70mm out in the air (AK), and from out there
+    // `nearestOnWeapon` answers with whatever the silhouette happens to present
+    // — the flank of a magazine, the front of a handguard, which is the "charm
+    // dangling under the barrel" every screenshot showed. The KeychainMarkup
+    // quads answer where a DEFAULT charm belongs, so the default is seated on
+    // one. A placed charm never comes through here (see snapToSurface): where
+    // the user put it IS the answer.
     //
     // Landing on the quad is not the last step: the quads are flat and the shell
     // is not, so the quad point is up to a few mm off the real surface. Seating
@@ -7240,8 +7483,21 @@ async function buildViewer(
       // pistol. Falls back to the nearest when none of them is free — a charm
       // inside the shell is still better than one out in the air, which is the
       // same trade liftOutOfBody makes.
-      const auth = cands.find((c) => hangsFree(seatOn(c.point, near).point)) ?? cands[0];
-      const seat = seatOn(auth.point, near);
+      // Kept as ONE pass, not `find` then re-seat. Identical answer — first
+      // candidate that hangs free, else the nearest — but the winner's seat is
+      // the seat we just tested rather than a second search for it, and
+      // `seatOn` is a full nearest-point query over the weapon. That was fine
+      // when a placement resolved once; the drag now resolves one per frame.
+      let auth = cands[0];
+      let seat: { point: import("three").Vector3; normal: import("three").Vector3 } | null = null;
+      for (const c of cands) {
+        const s = seatOn(c.point, near);
+        if (!hangsFree(s.point)) continue;
+        auth = c;
+        seat = s;
+        break;
+      }
+      seat ??= seatOn(auth.point, near);
       const target = seat.point.clone().addScaledVector(seat.normal, CHARM_CLEARANCE);
       // IDEMPOTENT BY CONSTRUCTION, and it has to be: a drag re-resolves the
       // pivot on every pointermove, so a correction that keeps correcting is a
@@ -7266,7 +7522,12 @@ async function buildViewer(
   }
 
   function charmPivot(c: CharmPlacement) {
-    return attachToBody(resolveCharmPivot(c));
+    // The same placed/unplaced fork resolveCharmPivot itself branches on: a
+    // placement with any component is somewhere someone chose — keep it there,
+    // on the surface. Only the untouched default gets seated onto the authored
+    // quads.
+    const placed = c.x != null || c.y != null || c.z != null;
+    return placed ? snapToSurface(resolveCharmPivot(c)) : attachToBody(resolveCharmPivot(c));
   }
 
   /**
@@ -7366,13 +7627,55 @@ async function buildViewer(
   ring.renderOrder = 30;
   ring.visible = false;
   scene.add(ring);
-  function updateRing() {
+  /**
+   * `?charmmap=1` — paint the authored KeychainMarkup quads on the weapon.
+   *
+   * A DEBUG VIEW, not UI. The quads stopped being the placement rule (a drag is
+   * free anywhere on the body inside their bounding box — see
+   * resolveDragAnchor), so lighting them during a drag told the user a rule
+   * that no longer exists; the drag-time highlight is gone. The flag remains
+   * because the quads still do two jobs — seat the unplaced default, and
+   * supply the clamp box — and "are they on the mesh we render" is a question
+   * someone will need drawn again (it is how the elite's 33-96mm map offset
+   * was found).
+   */
+  const CHARM_MAP_ALWAYS = debugFlag("charmmap");
+  const charmMap = (() => {
+    const xyz = charmSurfaceTris;
+    if (!xyz || opts?.still || !CHARM_MAP_ALWAYS) return null;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(xyz), 3));
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0x5ad8ff,
+      transparent: true,
+      opacity: 0.2,
+      // The quads are two-sided authored surfaces and nothing guarantees which
+      // way one winds relative to the shell it covers.
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      // Measured flush ON the triangles they cover (0.00mm — ?quads=1), so
+      // without a bias every patch z-fights the weapon. Bias the DEPTH, not the
+      // geometry: moving the quads toward the camera in world space would lift
+      // the map off a curved shell.
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 29; // over the weapon, under the ring at 30
+    scene.add(mesh);
+    return { mesh, mat, geo };
+  })();
+
+    function updateRing() {
     if (!charm) {
       ring.visible = false;
       return;
     }
     ring.visible = charmDragging;
     if (!ring.visible) return;
+    // The pivot IS the placement now — surface under the pointer, clamped to
+    // the game's box — so the ring marks exactly where the charm clips.
     ring.position.copy(charm.pivot);
     ring.quaternion.copy(camera.quaternion); // face the viewer
     ringMat.opacity = 0.95;
@@ -7636,7 +7939,12 @@ async function buildViewer(
       // read as a glitch rather than as physics, and a still viewer (a card bake)
       // never runs enough frames to converge on its own.
       syncCharmSpace(sim);
-      settleCharmSim(sim, charmGravity(sim), 240, charmContact);
+      const tSettle = PERF ? performance.now() : 0;
+      const settled = settleCharmSim(sim, charmGravity(sim), 240, charmContact);
+      if (PERF) {
+        charmCost.settleMs = performance.now() - tSettle;
+        charmCost.settleSteps = settled;
+      }
     } else {
       // A tiny initial nudge so it arrives swinging.
       charm.prev.x += sizeL * 0.01;
@@ -8390,63 +8698,45 @@ async function buildViewer(
       // so where you see it is exactly where it stays when you drop it.
       const planeNormal = camera.getWorldDirection(new THREE.Vector3()).negate();
       const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, charm.pivot);
-      // Anchor ANYWHERE on the weapon: raycast the surface under the pointer
-      // (side, top, grip — wherever). Off the model, slide along the body via
-      // the camera plane instead.
-      // Camera-facing surfaces only, here and in every fallback below — see
-      // surfaceAnchor. Weapon materials are FrontSide so the direct cast is
-      // already one, but that is a property of the materials, not a guarantee
-      // this gesture should rest on.
-      const surf = surfaceAnchor(raycaster.intersectObjects(weaponMeshes, false)[0]);
-      let anchor = surf;
-      if (!anchor) {
-        // Pointer is off the weapon. Snap to the nearest point ON the body
-        // rather than inventing one.
-        //
-        // This branch used to hand charmPivot a NORMALISED fraction as `x`,
-        // from back when offsets were body fractions. With a real anchor,
-        // charmPivot reads `x` as an absolute offset in inches, so a fraction
-        // in [-1,1] resolved to a point near the model origin and the charm
-        // teleported off into space mid-drag.
-        // Flick velocity only — the anchor no longer comes from this point, so a
-        // frame where the plane cannot be hit is still a frame that can place.
+      // Anchor ANYWHERE on the weapon: raycast the surface under the pointer,
+      // slide along the silhouette off it, clamp into the game's bounds box —
+      // resolveDragAnchor is that whole pipeline, and the placement rig's
+      // ?drop=1 sweep measures it directly. Placement is otherwise FREE: the
+      // charm goes where you point, every frame, and that same frame is what
+      // the release stores, so a drop can never move it.
+      const r = resolveDragAnchor();
+      if (!r) {
+        // Nothing sensible under or near the pointer (a hole on a mapless
+        // body, or no geometry at all): hold the last valid anchor. Freezing
+        // for a frame is strictly better than jumping somewhere invalid, and it
+        // keeps an UNPLACED charm (x/y/z all null) on its default attachment
+        // instead of yanking it away on the first stray drag. The flick still
+        // tracks the pointer through the camera plane so a release over a hole
+        // keeps the hand's motion.
         const p = raycaster.ray.intersectPlane(plane, new THREE.Vector3());
         if (p) {
           dragVel.copy(p).sub(dragPrev.lengthSq() ? dragPrev : p);
           dragPrev.copy(p);
         }
-        anchor = nearestOnBody();
-        // Nothing sensible nearby: hold the last valid anchor. Freezing for a
-        // frame is strictly better than jumping somewhere invalid, and it also
-        // keeps an UNPLACED charm (x/y/z all null) on its default attachment
-        // instead of yanking it away on the first stray drag.
-        if (!anchor) return;
+        return;
       }
-      // Pointing at a hole is not a placement. Hold the last good anchor rather
-      // than dropping the charm inside the weapon — the cursor is over the
-      // magazine well or a gap, and there is nothing there to hang from. See
-      // enclosedSpot; this guards BOTH ways of choosing an anchor, and the
-      // direct pointer ray is the one that reaches the magwell.
-      // …UNLESS the game says a charm goes there. `enclosedSpot` is a guess made
-      // out of six rays: if enough of them hit geometry inside the charm's swing
-      // radius it calls the spot enclosed and the frame is dropped. That is a
-      // fair description of the magazine well, and a poor one of a divot, a
-      // rail, the gap beside a trigger guard — all places CS2 hangs charms and
-      // all places the guess refuses, which is what "it won't let me put it
-      // there, and I know it goes there" is. The authored map is not a guess, so
-      // where it has an answer the guess does not get a vote.
-      if (enclosedSpot(anchor) && !onCharmMap(anchor)) return;
-      // NOT constrained to the placement map, deliberately. The map covers 1-17%
-      // of a weapon's surface (measured by ?quads=1 — a USP-S is 1%, an AK 17%),
-      // so refusing every frame that lands outside it would refuse almost every
-      // frame, and a control that ignores most of the gesture reads as broken
-      // rather than as a rule. The drag follows the pointer across the whole
-      // body; the map is applied ONCE, when the placement is resolved on
-      // release. See attachToBody.
-      if (surf) {
-        dragVel.copy(anchor).sub(dragPrev.lengthSq() ? dragPrev : anchor);
-        dragPrev.copy(anchor);
+      if (r.viaRay) {
+        // From the POINTER's answer, not the seat's. The seat steps between
+        // patches, and a velocity measured across one of those steps is a flick
+        // the hand never made — it lands on release as a kick out of nowhere.
+        dragVel.copy(r.raw).sub(dragPrev.lengthSq() ? dragPrev : r.raw);
+        dragPrev.copy(r.raw);
+      } else {
+        // Off the weapon the anchor slides discontinuously along the
+        // silhouette, so the flick reads the pointer through the camera plane
+        // instead — same reasoning, different surface.
+        const p = raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+        if (p) {
+          dragVel.copy(p).sub(dragPrev.lengthSq() ? dragPrev : p);
+          dragPrev.copy(p);
+        }
       }
+      let anchor = r.anchor;
       // A simulated charm needs the OLD pivot to work out how far the anchor
       // moved, so moveCharmSimAnchor does the copy itself. Overwriting the pivot
       // here first leaves it a no-op: the pivot tracks the pointer (and the
@@ -9051,6 +9341,60 @@ async function buildViewer(
     const glass = outward > 0 ? glassBox.min.x : glassBox.max.x;
     const probe = 0.06;
     const dir = new THREE.Vector3(-outward, 0, 0).transformDirection(object.matrixWorld).normalize();
+    /**
+     * WHAT THE 65 RAYS BELOW ARE ALLOWED TO HIT.
+     *
+     * Every ray starts inside the plate's footprint and travels at most 2*probe
+     * inward, so the only geometry that can answer is the few hundred triangles
+     * under the plate — yet each intersectObjects() used to walk the WHOLE
+     * weapon (three has no BVH: ~26k triangles per cast, 65 casts, ~110ms of
+     * main thread on every mount of a StatTrak gun, warm cache or not). One
+     * pass over the geometry collects the triangles whose box touches the
+     * probe's box, in world space, and the rays cast against that instead.
+     * Falls back to the full cast for a mesh that is still skinned at render
+     * time (its attribute positions are the bind pose, not what is drawn).
+     */
+    const corner = new THREE.Vector3();
+    const probeBox = new THREE.Box3();
+    for (const sx of [-1, 1])
+      for (const sy of [glassBox.min.y, glassBox.max.y])
+        for (const sz of [glassBox.min.z, glassBox.max.z]) {
+          corner.set(mod.position.x + sx * probe, mod.position.y + sy, mod.position.z + sz);
+          probeBox.expandByPoint(object.localToWorld(corner));
+        }
+    probeBox.expandByScalar(probe * 0.25);
+    const nearby = (() => {
+      if (weaponMeshes.some((m) => (m as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh)) return null;
+      const out: number[] = [];
+      const a = new THREE.Vector3();
+      const b = new THREE.Vector3();
+      const c = new THREE.Vector3();
+      const tri = new THREE.Box3();
+      for (const m of weaponMeshes) {
+        const p = m.geometry.getAttribute("position");
+        const idx = m.geometry.getIndex();
+        if (!p) continue;
+        const n = idx ? idx.count : p.count;
+        for (let i = 0; i + 2 < n; i += 3) {
+          const ia = idx ? idx.getX(i) : i;
+          const ib = idx ? idx.getX(i + 1) : i + 1;
+          const ic = idx ? idx.getX(i + 2) : i + 2;
+          a.fromBufferAttribute(p, ia).applyMatrix4(m.matrixWorld);
+          b.fromBufferAttribute(p, ib).applyMatrix4(m.matrixWorld);
+          c.fromBufferAttribute(p, ic).applyMatrix4(m.matrixWorld);
+          tri.makeEmpty().expandByPoint(a).expandByPoint(b).expandByPoint(c);
+          if (tri.intersectsBox(probeBox)) out.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+        }
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(out, 3));
+      // World space already — an identity mesh, so the ray needs no transform.
+      const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial());
+      mesh.matrixWorld.identity();
+      mesh.matrixAutoUpdate = false;
+      return { mesh, dispose: () => { g.dispose(); (mesh.material as import("three").Material).dispose(); } };
+    })();
+    const targets = nearby ? [nearby.mesh] : weaponMeshes;
     let worst = Infinity;
     let at = "-";
     for (let i = 0; i <= 12; i++) {
@@ -9062,7 +9406,7 @@ async function buildViewer(
           dir,
         );
         raycaster.far = probe * 2;
-        const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+        const hit = raycaster.intersectObjects(targets, false)[0];
         if (!hit) continue; // nothing under this corner — the plate overhangs
         const surface = object.worldToLocal(hit.point.clone()).x - mod.position.x;
         const clear = outward > 0 ? glass - surface : surface - glass;
@@ -9072,6 +9416,7 @@ async function buildViewer(
         }
       }
     }
+    nearby?.dispose();
     // A plate hanging entirely off the geometry has nothing to clear.
     if (!Number.isFinite(worst)) return null;
     // Enough to beat depth precision at this scale without visibly lifting the
@@ -9551,12 +9896,14 @@ async function buildViewer(
   // has no such space. A silent no-op is the only sane answer.
   if (pres.attachments) {
     setStickers(opts?.stickers ?? []);
+    mt.mark("stickers");
     // NOT awaited — the charm's GLB, its cloth sidecar and its tint masks are
     // several fetches, and a weapon should appear without waiting on the thing
     // hanging off it. Kept as a PROMISE though: a caller that needs the charm
     // (the pattern rail, which grades its albedo) otherwise has no way to know
     // when it landed and paints an empty rail until the first drag pokes it.
     charmWork = setCharm(opts?.charm ?? null);
+    mt.mark("charm0");
   }
   // AWAITED, unlike the charm: snapshots fire on a fixed timer after mount, so
   // a module still loading when the shutter drops would bake a card with no
@@ -9564,6 +9911,7 @@ async function buildViewer(
   // one. The GLB is ~26KB and cached after the first item, so the cost is a
   // one-time fetch rather than a per-viewer stall.
   if (pres.attachments && opts?.stattrak) await mountStatTrak(opts.stattrak);
+  mt.mark("stattrak");
   // Awaited for the same reason as the module: a card baked before the plate
   // loads would be cached as though the weapon had no name on it.
   if (pres.attachments && opts?.nametag) await mountNameTag(opts.nametag.trim());
@@ -9662,7 +10010,11 @@ async function buildViewer(
         ? `  substeps/f ${(charmCost.steps / acc.frames).toFixed(2)}` +
           `  contacts/f ${(charmCost.tests / acc.frames).toFixed(1)}`
         : `  rays/f ${(charmCost.rays / acc.frames).toFixed(1)}`) +
-      `  rebuilds ${charmCost.rebuilds}\n` +
+      `  rebuilds ${charmCost.rebuilds}` +
+      // The synchronous settle burst at mount, which is main-thread time the
+      // open pays before the first frame — see setCharm.
+      (charmCost.settleSteps ? `  settle ${charmCost.settleSteps}st/${charmCost.settleMs.toFixed(0)}ms` : "") +
+      `\n` +
       // WHAT WAS ON OFFER AND WHAT WAS TAKEN. "It doesn't move" has two very
       // different causes — no clip matched the tree's list, or one matched and
       // measured as a static pose — and only the clip names separate them. This
@@ -10439,6 +10791,12 @@ async function buildViewer(
     updateRing();
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
+    // Split the first frame's cost in two: `wait` is everything from the last
+    // build stage to the draw call (the rAF wait, controls, the charm's first
+    // step), `first` is the draw itself — which is where the shader compile and
+    // the texture upload land, and the number that says whether the open-stall
+    // is GPU setup or something before it.
+    if (!firstFrameDone) mt.mark("wait");
     drawFrame();
     clearInspect();
     if (!firstFrameDone) {
@@ -10470,12 +10828,17 @@ async function buildViewer(
     view.height = Math.max(1, Math.round(cssH * dpr));
     // An orthographic frustum has no `aspect` field — its width IS the aspect,
     // so a resize restates left/right against the height the framing solved for.
-    // Height is what stays fixed: a pane that gets narrower should crop the
-    // sides, not shrink the weapon.
-    const halfW = halfH * (cssW / cssH);
+    // Up to the reference aspect the height stays fixed: a pane that gets
+    // narrower crops the sides, not the weapon. Wider than that, the height
+    // follows the width — see frameHalfH.
+    const paneH = frameHalfH(cssW / cssH);
+    const halfW = paneH * (cssW / cssH);
     camera.left = -halfW;
     camera.right = halfW;
+    camera.top = paneH;
+    camera.bottom = -paneH;
     camera.updateProjectionMatrix();
+    setZoomRange(paneH);
     // The pan's view offset is stated in the OLD viewport's pixels — re-apply it
     // against the new size, which also re-clamps it so a shrink cannot strand
     // the weapon off-frame. Forced, because the offset has to be restated for
@@ -10502,12 +10865,6 @@ async function buildViewer(
   const observer = new ResizeObserver(resize);
   observer.observe(container);
   resize();
-  // A still viewer exists only to be snapshot()'d, and snapshot() renders its
-  // own fresh frame — so drive the charm's verlet settle (which genuinely needs
-  // the frames) without paying for a full PBR draw each tick. During a bake
-  // sweep that's the difference between one GPU-bound scene and N of them.
-  if (opts?.still) settleLoop();
-  else renderLoop();
 
   // Only onscreen viewers hold back background bakes — a `still` viewer IS a
   // bake, and counting it would deadlock the queue against itself.
@@ -10526,7 +10883,7 @@ async function buildViewer(
     releaseViewer();
   };
 
-  return {
+  const handle: ViewerHandle = {
     setStatTrak: (spec) => void setStatTrak(spec),
     setNameTag: (text) => void setNameTag(text),
     setPatches: (images) => applyPatches(images),
@@ -11006,6 +11363,25 @@ async function buildViewer(
             })(),
           };
         },
+        dropAt(ndcX: number, ndcY: number) {
+          // Exactly the setup onPointerMove gives the shared machinery, and
+          // then the shared machinery itself — measuring anything else here
+          // would be measuring a claim.
+          pointerNdc.set(ndcX, ndcY);
+          raycaster.far = Infinity;
+          raycaster.setFromCamera(pointerNdc, camera);
+          const r = resolveDragAnchor();
+          if (!r) return null;
+          const n = nearestOnWeapon(r.anchor);
+          return {
+            raw: { x: r.raw.x, y: r.raw.y, z: r.raw.z },
+            anchor: { x: r.anchor.x, y: r.anchor.y, z: r.anchor.z },
+            viaRay: r.viaRay,
+            slideMm: r.raw.distanceTo(r.anchor) * 1000,
+            surfMm: n ? n.dist * 1000 : null,
+            inBox: charmBoundsBox ? charmBoundsBox.distanceToPoint(r.anchor) * 1000 : 0,
+          };
+        },
         /**
          * Corner-to-mesh distance for every authored charm quad on the body
          * being rendered — the check that has to pass before seating anything on
@@ -11163,6 +11539,11 @@ async function buildViewer(
       charmColliderMat.dispose();
       ring.geometry.dispose();
       ringMat.dispose();
+      if (charmMap) {
+        scene.remove(charmMap.mesh);
+        charmMap.geo.dispose();
+        charmMap.mat.dispose();
+      }
       controls.dispose();
       // Drops this viewer's REFERENCE to the composite; the pair itself stays in
       // the renderer-wide LRU. That is the point of sharing the renderer —
@@ -11187,4 +11568,90 @@ async function buildViewer(
       // the next mount of the same weapon. Both LRUs own their own lifetimes.
     },
   };
+
+  // A still viewer exists only to be snapshot()'d, and snapshot() renders its
+  // own fresh frame — so drive the charm's verlet settle (which genuinely needs
+  // the frames) without paying for a full PBR draw each tick. During a bake
+  // sweep that's the difference between one GPU-bound scene and N of them.
+  if (opts?.still) settleLoop();
+  else {
+    // THE FIRST FRAME'S SETUP, DONE BEFORE THE FIRST FRAME.
+    //
+    // The first draw of a mount used to be the single longest stall of an open:
+    // ~200-300ms on a warm cache (perf HUD `first`), on the main thread, so the
+    // view transition that brought the stage in froze mid-flight and the model
+    // then popped into place. Split with the HUD's `compile`/`tex`/`first`
+    // marks, almost none of it was shader work — programs survive across mounts
+    // (the painted materials are never disposed, so three keeps their programs)
+    // and compile() comes back in ~2ms — it was TEXTURE UPLOADS, one 4k normal
+    // map per mount; see paintNormalTexture for that fix. What is left here is
+    // the principle: issue the program compiles first (with
+    // KHR_parallel_shader_compile the driver links them in the background while
+    // the uploads below run), upload every texture the scene references, and
+    // only then start drawing, so the first frame finds everything resident.
+    //
+    // compileAsync was tried and rejected: it polls COMPLETION_STATUS_KHR, and
+    // on this driver the background link it waits for took ~850ms against the
+    // ~2ms the forced (sync) path costs — the model appeared half a second
+    // later than it needed to.
+    //
+    // Not for a still viewer: a bake is offscreen, nobody sees its stall, and
+    // snapshot() renders its own frame anyway.
+    try {
+      renderer.compile(scene, camera);
+    } catch {
+      // The first frame will compile as it always did.
+    }
+    mt.mark("compile");
+    // Upload every texture the scene references now, while the spinner is
+    // still up, rather than inside the first draw. Measured separately so the
+    // HUD can say whether an open-stall is programs (`compile`) or bytes (`tex`),
+    // and ?perf=1 names each texture that cost more than 2ms.
+    {
+      type Tex = import("three").Texture;
+      const seen = new Set<Tex>();
+      const isTex = (v: unknown): v is Tex => !!v && !!(v as Tex).isTexture;
+      scene.traverse((o) => {
+        const mats = (o as import("three").Mesh).material;
+        for (const m of Array.isArray(mats) ? mats : mats ? [mats] : []) {
+          const rec = m as unknown as Record<string, unknown>;
+          for (const k of Object.keys(rec)) if (isTex(rec[k])) seen.add(rec[k] as Tex);
+          const u = (m as import("three").ShaderMaterial).uniforms;
+          if (u) for (const k of Object.keys(u)) if (isTex(u[k]?.value)) seen.add(u[k].value as Tex);
+        }
+      });
+      const texLog: string[] = [];
+      // TIME-BUDGETED: a cold mount uploads ~60MB of decoded pixels (the
+      // composite pair, a 4k normal map, the sticker sheets), and doing that in
+      // one loop is a ~370ms main-thread stall — the freeze just moves from the
+      // first draw to here. Yield to the frame scheduler whenever a slice runs
+      // over budget, so the busy spinner keeps animating and input stays live;
+      // each texture is still a synchronous upload (initTexture is), but the
+      // stall is now many ~16ms slices instead of one long one.
+      let sliceStart = performance.now();
+      for (const t of seen) {
+        if (performance.now() - sliceStart > 12) {
+          await new Promise((r) => requestAnimationFrame(() => r(null)));
+          sliceStart = performance.now();
+        }
+        const t0 = PERF ? performance.now() : 0;
+        try { renderer.initTexture(t); } catch { /* a render-target texture or an unloaded one: the draw handles it */ }
+        if (PERF) {
+          const ms = performance.now() - t0;
+          const img = t.image as { width?: number; height?: number } | undefined;
+          if (ms > 2) texLog.push(`${t.name || t.constructor.name}#${t.id} ${img?.width ?? "?"}x${img?.height ?? "?"} rt=${!!(t as { isRenderTargetTexture?: boolean }).isRenderTargetTexture} ${ms.toFixed(0)}ms`);
+        }
+      }
+      if (PERF && texLog.length) console.log(`[viewer3d perf] texture uploads at mount:\n  ${texLog.join("\n  ")}`);
+    }
+    mt.mark("tex");
+    // The caller may have moved on while the driver worked — a 2D/3D flip, a
+    // slot change. The viewer is fully built by now, so it has to go through
+    // the same door every live one does, or its listeners, canvas and the
+    // liveViewers count all outlive it.
+    if (signal.aborted && !disposed) handle.dispose();
+    throwIfAborted(signal);
+    renderLoop();
+  }
+  return handle;
 }
