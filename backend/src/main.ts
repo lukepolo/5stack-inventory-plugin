@@ -12,6 +12,18 @@ import { pool } from "./db.ts";
 // Shared with scripts/serve.mjs — see the module header for why it is .mjs.
 import { parseByteRange } from "./byteRange.mjs";
 import { getIdentity } from "./identity.ts";
+import {
+  GAME_PLUGIN_SLUG,
+  deleteTypeCfg,
+  gamePluginState,
+  installGamePlugin,
+  panelCapabilities,
+  readPluginCfg,
+  readTypeCfgs,
+  writePluginCfg,
+  writeTypeCfg,
+  type GamePluginState,
+} from "./panel.ts";
 import { buildInspectLink, type InspectSticker } from "./inspect.ts";
 import {
   getStickerMarkup,
@@ -5008,16 +5020,25 @@ async function getServerApiKey(): Promise<string | null> {
   return rows[0]?.value ?? process.env.INVSIM_API_KEY ?? null;
 }
 
-// ---- Game type config sync -------------------------------------------------
-// Writes the invsim block to the TOP of the panel's match_type_cfgs rows
-// (Lan/Competitive/Wingman/Duel) so game servers pick the key up without any
-// manual config editing. Runs on startup, on admin key fetch, and on key
-// generation. A cfg row REPLACES the default file on the game server, so a
-// missing row is seeded from the stock config (same source the panel's
-// get-default-config endpoint uses) before prepending.
-// Lan is deliberately excluded — that cfg is hand-maintained, leave it alone.
-const CFG_TYPES = ["Competitive", "Wingman", "Duel"];
+// ---- Game config -----------------------------------------------------------
+// The cvars a game server needs to talk to this plugin. Where they go depends
+// on what the panel offers, best first:
+//
+//   plugin  the inventory-simulator entry's own config, exec'd only on servers
+//           that load it. Needs the operator to have installed it.
+//   global  the panel's Global config, exec'd on every match. For a plugin
+//           installed by hand, outside the directory.
+//   types   the individual Competitive/Wingman/Duel configs. What this used to
+//           do unconditionally, kept only for a panel too old to have either
+//           of the above.
+//
+// Nothing here runs on its own. An admin picks a target and presses a button;
+// rewriting an operator's server configs because a page was opened is what
+// this replaced.
+const LEGACY_CFG_TYPES = ["Lan", "Competitive", "Wingman", "Duel"];
 const CFG_MARKER = "5stack inventory plugin (auto-added)";
+
+type CfgTarget = "plugin" | "global" | "types";
 
 function invsimBlock(url: string, key: string): string {
   return [
@@ -5071,50 +5092,146 @@ async function resolveInvsimUrl(request?: { headers: Record<string, unknown>; pr
   return rows[0]?.value ?? null;
 }
 
-async function syncGameConfigs(url: string, key: string): Promise<{ updated: string[]; failed: string[] }> {
-  const updated: string[] = [];
-  const failed: string[] = [];
-  for (const type of CFG_TYPES) {
-    try {
-      const { rows } = await pool.query<{ cfg: string }>(
-        `SELECT cfg FROM public.match_type_cfgs WHERE type = $1`,
-        [type],
-      );
-      let cfg = rows[0]?.cfg;
-      if (cfg == null) {
-        app.log.info(`[invsim-cfg] ${type}: no row — seeding from default config`);
-        const def = await fetchDefaultCfg(type);
-        if (def == null) {
-          failed.push(type);
-          continue;
-        }
-        cfg = def;
+const BLOCK_CVARS = new Set([
+  "invsim_url",
+  "invsim_apikey",
+  "invsim_ws_enabled",
+  "invsim_ws_immediately",
+  "invsim_require_inventory",
+  "invsim_spraychanger_enabled",
+]);
+
+// Only the block this plugin wrote: the marker line, and the cvars that block
+// contains. An invsim_ line the operator added themselves is theirs to keep.
+function stripInvsim(cfg: string): string {
+  return cfg
+    .split("\n")
+    .filter((line) => {
+      if (line.includes(CFG_MARKER)) {
+        return false;
       }
-      // Strip any invsim lines already present (old bottom-placed block, stale
-      // key) so the fresh block always sits at the very top.
-      const cleaned = cfg
-        .split("\n")
-        .filter((line) => !/^\s*invsim_/.test(line) && !line.includes(CFG_MARKER))
-        .join("\n")
-        .replace(/^\s+/, "")
-        .replace(/\s+$/, "");
-      const next = invsimBlock(url, key) + "\n" + cleaned + "\n";
-      if (next === rows[0]?.cfg) {
-        continue;
-      }
-      await pool.query(
-        `INSERT INTO public.match_type_cfgs (type, cfg) VALUES ($1, $2)
-         ON CONFLICT (type) DO UPDATE SET cfg = EXCLUDED.cfg`,
-        [type, next],
-      );
-      app.log.info(`[invsim-cfg] ${type}: invsim block written at top (${next.length} chars)`);
-      updated.push(type);
-    } catch (error) {
-      app.log.error({ err: error }, `[invsim-cfg] ${type}: sync FAILED`);
-      failed.push(type);
-    }
+
+      const cvar = line.trim().split(/\s+/)[0];
+      return !BLOCK_CVARS.has(cvar);
+    })
+    .join("\n")
+    .trim();
+}
+
+// Spliced in at the top rather than written over the whole file: Global and the
+// type configs are shared with the operator, and the plugin config may well
+// have cvars they added themselves.
+function withInvsimBlock(
+  existing: string | null,
+  url: string,
+  key: string,
+): string {
+  const cleaned = stripInvsim(existing ?? "");
+  const block = invsimBlock(url, key);
+
+  return cleaned ? `${block}\n${cleaned}\n` : block;
+}
+
+// Where the cvars should go on this panel, given what it supports and what the
+// operator has actually installed.
+function resolveCfgTarget(
+  capabilities: { pluginConfig: boolean; globalConfig: boolean },
+  plugin: GamePluginState,
+): CfgTarget {
+  if (capabilities.pluginConfig && plugin.installed) {
+    return "plugin";
   }
-  return { updated, failed };
+
+  if (capabilities.globalConfig) {
+    return "global";
+  }
+
+  return "types";
+}
+
+async function writeInvsimConfig(
+  cookie: string,
+  target: CfgTarget,
+  url: string,
+  key: string,
+): Promise<void> {
+  if (target === "plugin") {
+    const existing = await readPluginCfg(cookie);
+    await writePluginCfg(cookie, withInvsimBlock(existing, url, key));
+    return;
+  }
+
+  if (target === "global") {
+    const existing = await readTypeCfgs(cookie, ["Global"]);
+    await writeTypeCfg(
+      cookie,
+      "Global",
+      withInvsimBlock(existing.Global ?? null, url, key),
+    );
+    return;
+  }
+
+  const existing = await readTypeCfgs(cookie, LEGACY_CFG_TYPES);
+
+  for (const type of LEGACY_CFG_TYPES) {
+    let base: string | null = existing[type] ?? null;
+
+    // A cfg row REPLACES the shipped file on the game server, so a row that
+    // does not exist yet has to be seeded from the stock config before
+    // anything is prepended to it.
+    if (base == null) {
+      base = await fetchDefaultCfg(type);
+
+      if (base == null) {
+        throw new Error(`unable to read the stock ${type} config`);
+      }
+    }
+
+    await writeTypeCfg(cookie, type, withInvsimBlock(base, url, key));
+  }
+}
+
+// The block this plugin used to prepend to every type config, taken back out
+// once it lives somewhere better. A row left holding nothing but the stock
+// config is deleted outright rather than left pinned: it only exists because
+// the old sync seeded it, and a pinned copy silently stops tracking the
+// defaults it was copied from.
+async function migrateLegacyTypeCfgs(
+  cookie: string,
+): Promise<{ moved: Array<string>; pinned: Array<string> }> {
+  const existing = await readTypeCfgs(cookie, LEGACY_CFG_TYPES);
+  const moved: Array<string> = [];
+  const pinned: Array<string> = [];
+
+  for (const type of LEGACY_CFG_TYPES) {
+    const cfg = existing[type];
+
+    if (cfg == null || !cfg.includes(CFG_MARKER)) {
+      continue;
+    }
+
+    const stripped = stripInvsim(cfg);
+    const stock = await fetchDefaultCfg(type);
+
+    if (!stripped || (stock != null && stripped === stock.trim())) {
+      await deleteTypeCfg(cookie, type);
+      moved.push(type);
+      continue;
+    }
+
+    await writeTypeCfg(cookie, type, `${stripped}\n`);
+
+    // The stock fetch failing leaves a copy of the shipped config pinned in the
+    // database. That is not "moved", and saying so hides the pin.
+    if (stock == null) {
+      pinned.push(type);
+      continue;
+    }
+
+    moved.push(type);
+  }
+
+  return { moved, pinned };
 }
 
 // ---- Cached-asset admin: sizes + clearing.
@@ -6013,40 +6130,147 @@ app.get("/api/admin/extract-models/log", async (request, reply) => {
 });
 
 app.get("/api/admin/server-api-key", async (request, reply) => {
-  const identity = await getIdentity(request);
-  if (!identity) {
-    return reply.status(401).send({ error: "unauthorized" });
-  }
-  if (identity.role !== "administrator") {
-    return reply.status(403).send({ error: "Only administrators can manage the server API key." });
-  }
-  const key = await getServerApiKey();
-  let cfg: { updated: string[]; failed: string[] } | null = null;
-  if (key) {
-    const url = await resolveInvsimUrl(request);
-    if (url) cfg = await syncGameConfigs(url, key);
-  }
-  return { key, cfg };
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  // Read-only. Opening the page used to rewrite three of the operator's server
+  // configs as a side effect; now nothing is written until they say so.
+  return { key: await getServerApiKey() };
 });
 
 app.post("/api/admin/server-api-key", async (request, reply) => {
-  const identity = await getIdentity(request);
-  if (!identity) {
-    return reply.status(401).send({ error: "unauthorized" });
-  }
-  if (identity.role !== "administrator") {
-    return reply.status(403).send({ error: "Only administrators can manage the server API key." });
-  }
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
   const key = `inv_${randomBytes(24).toString("hex")}`;
   await pool.query(
     `INSERT INTO inventory.settings (key, value, updated_at) VALUES ('server_api_key', $1, now())
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
     [key],
   );
-  let cfg: { updated: string[]; failed: string[] } | null = null;
+  return { key };
+});
+
+// What the panel can do with these cvars, what it has already been told, and
+// whether the old per-type block is still lying around.
+app.get("/api/admin/game-config", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+
+  const cookie = request.headers.cookie ?? "";
+  const key = await getServerApiKey();
   const url = await resolveInvsimUrl(request);
-  if (url) cfg = await syncGameConfigs(url, key);
-  return { key, cfg };
+
+  let plugin: GamePluginState = {
+    inCatalog: false,
+    installed: false,
+    installState: null,
+    runtimes: [],
+    requiresGuidelinesDisabled: false,
+    guidelinesDisabled: false,
+  };
+  let capabilities = { pluginConfig: false, globalConfig: false };
+  let legacy: Array<string> = [];
+
+  try {
+    capabilities = await panelCapabilities(cookie);
+    plugin = await gamePluginState(cookie);
+
+    const existing = await readTypeCfgs(cookie, LEGACY_CFG_TYPES);
+    legacy = LEGACY_CFG_TYPES.filter((type) =>
+      existing[type]?.includes(CFG_MARKER),
+    );
+  } catch (error) {
+    app.log.error({ err: error }, "[invsim-cfg] unable to read panel state");
+  }
+
+  const target = key && url ? resolveCfgTarget(capabilities, plugin) : null;
+
+  // Whether the resolved target already carries our block. Without this the UI
+  // cannot know a rotated key still needs pushing.
+  let configured = false;
+  if (target) {
+    try {
+      const current =
+        target === "plugin"
+          ? await readPluginCfg(cookie)
+          : target === "global"
+            ? (await readTypeCfgs(cookie, ["Global"])).Global
+            : (await readTypeCfgs(cookie, LEGACY_CFG_TYPES)).Competitive;
+      configured = Boolean(current?.includes(CFG_MARKER));
+    } catch (error) {
+      app.log.error({ err: error }, "[invsim-cfg] unable to read current cfg");
+    }
+  }
+
+  return {
+    key,
+    url,
+    slug: GAME_PLUGIN_SLUG,
+    capabilities,
+    plugin,
+    legacy,
+    configured,
+    // Nothing to migrate to on a panel with neither home, so the UI must not
+    // offer to "move" the block out of the only place it can live.
+    canMigrate: target !== "types",
+    cvars: key && url ? invsimBlock(url, key) : null,
+    target,
+  };
+});
+
+// The one place anything is written. `install` is the operator saying yes to
+// putting the CS2 plugin on their servers; without it this only configures
+// whatever they already run.
+app.post("/api/admin/game-config", async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+
+  const cookie = request.headers.cookie ?? "";
+  const body = (request.body ?? {}) as {
+    install?: boolean;
+    target?: CfgTarget;
+  };
+
+  if (body.target && !["plugin", "global", "types"].includes(body.target)) {
+    return reply.status(400).send({ error: `unknown target: ${body.target}` });
+  }
+
+  const key = await getServerApiKey();
+  const url = await resolveInvsimUrl(request);
+
+  if (!key) {
+    return reply.status(400).send({ error: "Generate a server API key first." });
+  }
+
+  if (!url) {
+    return reply
+      .status(400)
+      .send({ error: "Unable to work out this plugin's public URL." });
+  }
+
+  try {
+    if (body.install) {
+      await installGamePlugin(cookie);
+    }
+
+    const plugin = await gamePluginState(cookie);
+    const target =
+      body.target ??
+      resolveCfgTarget(await panelCapabilities(cookie), plugin);
+
+    await writeInvsimConfig(cookie, target, url, key);
+
+    // Only once the cvars have a new home -- writeInvsimConfig throws if the
+    // write did not land, so the old block stays where it is and still works.
+    const migration =
+      target === "types"
+        ? { moved: [], pinned: [] }
+        : await migrateLegacyTypeCfgs(cookie);
+
+    return { target, ...migration, plugin: await gamePluginState(cookie) };
+  } catch (error) {
+    app.log.error({ err: error }, "[invsim-cfg] configure failed");
+    return reply.status(502).send({ error: (error as Error).message });
+  }
 });
 
 // ---- Game-server API (ianlucas/cs2-css-inventory-simulator compatible) ------
@@ -6341,17 +6565,9 @@ async function start() {
   } catch {
     /* bundled/compiled — no source to stat */
   }
-  // Push the invsim block into the game type configs on boot so a deploy alone
-  // fixes them — no admin visit required. Needs a key and a known public URL
-  // (INVSIM_URL env, or remembered from a previous admin request).
-  try {
-    const key = await getServerApiKey();
-    const url = await resolveInvsimUrl();
-    if (key && url) await syncGameConfigs(url, key);
-    else app.log.info(`[invsim-cfg] startup sync skipped (key: ${!!key}, url: ${url ?? "unknown"})`);
-  } catch (error) {
-    app.log.error({ err: error }, "[invsim-cfg] startup sync failed");
-  }
+  // No startup config sync. Writing to an operator's server configs is now
+  // something an administrator asks for from the Game Server tab, and there is
+  // no session to make the request as here anyway.
 }
 
 start().catch((error) => {
