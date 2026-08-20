@@ -20,7 +20,7 @@ import {
   deleteInstance,
   fetchInspectLink,
   fetchDraftInspectLink,
-  fetchServerApiKey,
+  fetchGameConfig,
   fetchExtractStatus,
   type ExtractStatus,
   fetchPlayerLoadout,
@@ -69,7 +69,7 @@ import {
   MAX_PATCHES,
   uploadRender,
   renderUrlFor,
-  type CfgSyncResult,
+  type GameConfigState,
 } from "./api";
 import { usePluginRouter, type HostRouting } from "./pluginRouter";
 import {
@@ -4081,12 +4081,26 @@ async function copyToOtherTeam(pos: string) {
 // own fetching and polling, which mount/unmount now scope for free. App keeps
 // only the two things that outlive that route: the gear badge, and the loadout
 // render bookkeeping a cache clear invalidates.
-const cfgMissing = ref<string[] | null>(null); // failed config types; null = no sync report yet
-function onCfgSync(cfg: CfgSyncResult | null) {
-  if (cfg) cfgMissing.value = cfg.failed;
+// Badge state: true when the invsim cvars are not configured anywhere, or the
+// block this plugin used to write is still sitting in the match type configs.
+const cfgWarning = ref<string | null>(null);
+function onGameConfig(state: GameConfigState | null) {
+  if (!state) return;
+  if (!state.key) {
+    cfgWarning.value = "No server API key generated yet";
+    return;
+  }
+  if (state.legacy.length && state.canMigrate) {
+    cfgWarning.value = `Old invsim block still in ${state.legacy.join(", ")} — configure to move it`;
+    return;
+  }
+
+  cfgWarning.value = state.configured
+    ? null
+    : "Game servers are not configured for the inventory yet";
 }
 // The models mount needs the extraction run: either never run, or run by an
-// older pipeline than this build's script. Same badge as cfgMissing — this is
+// older pipeline than this build's script. Same badge as cfgWarning — this is
 // the only place either surfaces outside /admin, and an admin who never opens
 // the models tab would otherwise ship stale (or no) 3D forever.
 type ExtractWarn = "missing" | "stale" | null;
@@ -4096,7 +4110,7 @@ const extractWarnFrom = (s: ExtractStatus): ExtractWarn =>
 // Both badge reasons in one line, so the tooltip says which one (or both) it is.
 const gearWarnings = computed(() => {
   const out: string[] = [];
-  if (cfgMissing.value?.length) out.push(`Game-server setup needed (${cfgMissing.value.join(", ")})`);
+  if (cfgWarning.value) out.push(cfgWarning.value);
   if (extractWarn.value === "missing") out.push("Model extraction has never been run");
   else if (extractWarn.value === "stale") out.push("Model extraction is out of date — re-run it");
   return out;
@@ -6451,12 +6465,12 @@ const { staleBuild, reloadPage } = useBuildCheck();
 onMounted(() => {
   window.addEventListener("keydown", onGlobalKey);
   load();
-  // Admin app load hits the key endpoint, which makes the backend sync the
-  // invsim block into the game type configs (and reports the result) — that
-  // report is what lights the gear badge before /admin is ever opened.
+  // Admin app load asks the panel where the invsim cvars stand — that answer is
+  // what lights the gear badge before /admin is ever opened. Read-only: this
+  // used to write three of the operator's server configs as a side effect.
   if (props.user?.role === "administrator") {
-    fetchServerApiKey()
-      .then((res) => onCfgSync(res.cfg))
+    fetchGameConfig()
+      .then((state) => onGameConfig(state))
       .catch(() => { /* backend unavailable — the console will surface it */ });
     // Same idea for the models mount: ask once at load so the badge is right
     // before /admin is opened. Older backends omit `stale` — falsy, no badge.
@@ -8431,7 +8445,7 @@ if (MDEBUG) {
       :section="adminSection"
       @notify="notify"
       @navigate="(section: string) => go(section ? `/admin/${section}` : '/admin')"
-      @cfg-sync="onCfgSync"
+      @game-config="onGameConfig"
       @extract-stale="(warn: 'missing' | 'stale' | null) => (extractWarn = warn)"
       @cache-cleared="onCacheCleared"
       @back="go('/')"

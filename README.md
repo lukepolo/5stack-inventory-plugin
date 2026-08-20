@@ -234,16 +234,17 @@ applies to either:
 | Metamod / SourceMod (ss2) | [`ianlucas/cs2-ss2-inventory-simulator`][invsim]    |
 | CounterStrikeSharp | [`ianlucas/cs2-css-inventory-simulator`][invsim-css]        |
 
-Install: grab the latest release zip from that repo, unpack it into the
-server's plugin directory (`addons/` — `sourcemod/`+`metamod/` for the ss2
-build, `counterstrikesharp/plugins/` for the CSS build), and restart. Config
-comes from the convars below, not from a plugin config file. 5stack's own
-server images already ship the plugin; you only need this for servers you
-build yourself.
+Install it from your panel's **Plugin Directory** (`/plugins/inventory-simulator`)
+and every node downloads the release, checks it against the registry's digest,
+and unpacks it for you. The Game Server tab in this plugin's admin console
+offers to do that in one press. Failing that, grab the latest release zip from
+the repo above, unpack it into the server's plugin directory (`addons/` —
+`sourcemod/`+`metamod/` for the ss2 build, `counterstrikesharp/plugins/` for the
+CSS build), and restart. Config comes from the convars below, not from a plugin
+config file. 5stack's own server images already ship the plugin; you only need
+this for servers you build yourself.
 
-Settings → generate the server API key writes this block to the top of the
-panel's match config rows automatically, so servers pick it up with no manual
-editing:
+**Settings → Game Server → Configure** writes this block for you, in one place:
 
 ```
 invsim_url "https://inventory.5stack.gg"
@@ -254,8 +255,18 @@ invsim_require_inventory 1
 invsim_spraychanger_enabled 1
 ```
 
-The Lan cfg row is intentionally left untouched by the sync — edit it by hand if
-you want the block there.
+Where it lands depends on the panel, best first:
+
+| Target | When | Applies to |
+| --- | --- | --- |
+| The CS2 plugin's own config | it is installed from the plugin directory | servers that load the plugin |
+| The panel's **Global** config | the plugin is installed by hand | every match |
+| Competitive / Wingman / Duel | a panel with no Global config | those match types |
+
+Nothing is written until an administrator presses the button. Earlier versions
+prepended the block to the Competitive, Wingman and Duel rows on every admin
+page load; configuring now takes that copy back out, leaving the cvars in one
+place instead of three.
 
 | Method | Path                             | Auth               |
 | ------ | -------------------------------- | ------------------ |

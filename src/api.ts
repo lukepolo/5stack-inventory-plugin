@@ -1326,14 +1326,58 @@ export const setExtractJobs = (jobs: number) =>
   });
 
 // Admin: panel-generated server API key (game servers use it as invsim_apikey).
-export interface CfgSyncResult {
-  updated: string[];
-  failed: string[];
-}
 export const fetchServerApiKey = () =>
-  request<{ key: string | null; cfg: CfgSyncResult | null }>("/admin/server-api-key");
+  request<{ key: string | null }>("/admin/server-api-key");
 export const generateServerApiKey = () =>
-  request<{ key: string; cfg: CfgSyncResult | null }>("/admin/server-api-key", { method: "POST", body: "{}" });
+  request<{ key: string }>("/admin/server-api-key", { method: "POST", body: "{}" });
+
+// Where the invsim cvars can live on this panel, and where they are now.
+//
+//   plugin  the CS2 plugin's own config in the panel's plugin directory
+//   global  the panel's Global config, for a hand-installed game plugin
+//   types   the individual match type configs, for a panel with neither
+export type CfgTarget = "plugin" | "global" | "types";
+
+export interface GameConfigState {
+  key: string | null;
+  url: string | null;
+  slug: string;
+  capabilities: { pluginConfig: boolean; globalConfig: boolean };
+  plugin: {
+    inCatalog: boolean;
+    installed: boolean;
+    installState: string | null;
+    runtimes: string[];
+    requiresGuidelinesDisabled: boolean;
+    guidelinesDisabled: boolean;
+  };
+  // Match type configs still carrying the block this plugin used to write.
+  legacy: string[];
+  // Whether the resolved target already carries our block -- the only way to
+  // know a rotated key still needs pushing once the legacy block is gone.
+  configured: boolean;
+  // False on a panel with neither a plugin config nor a Global config: the type
+  // configs are the only home, so there is nothing to migrate away to.
+  canMigrate: boolean;
+  cvars: string | null;
+  target: CfgTarget | null;
+}
+
+export interface GameConfigResult {
+  target: CfgTarget;
+  moved: string[];
+  // Rows that kept a copy of the shipped config because the stock fetch failed.
+  pinned: string[];
+  plugin: GameConfigState["plugin"];
+}
+
+export const fetchGameConfig = () =>
+  request<GameConfigState>("/admin/game-config");
+export const applyGameConfig = (body: { install?: boolean; target?: CfgTarget }) =>
+  request<GameConfigResult>("/admin/game-config", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
 
 // Inspect link for the craft currently in the editor, saved or not — so what
 // you inspect is the state on screen rather than the last write to the DB.

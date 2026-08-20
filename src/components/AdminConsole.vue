@@ -28,6 +28,8 @@ import {
   API_ORIGIN,
   fetchServerApiKey,
   generateServerApiKey,
+  fetchGameConfig,
+  applyGameConfig,
   fetchCacheStats,
   clearCache,
   fetchAssetCdn,
@@ -45,7 +47,8 @@ import {
   extractLogUrl,
   type AssetCdnStatus,
   type CacheStats,
-  type CfgSyncResult,
+  type GameConfigState,
+  type CfgTarget,
   type DirStat,
   type ExtractStatus,
   type PriceAdminStatus,
@@ -60,7 +63,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "notify", message: string, kind: "error" | "success"): void;
-  (e: "cfg-sync", cfg: CfgSyncResult | null): void;
+  (e: "game-config", state: GameConfigState | null): void;
   // Both scopes clearClearCache accepts. It said "renders" only, which made the
   // composites button a type error at its own call site.
   (e: "cache-cleared", scope: "renders" | "composites"): void;
@@ -108,20 +111,28 @@ async function copy(text: string, what: string) {
 // ---- game server: key + configs ---------------------------------------------
 const serverApiKey = ref<string | null>(null);
 const keyBusy = ref(false);
-const cfgMissing = ref<string[] | null>(null);
-function applyCfgSync(cfg: CfgSyncResult | null) {
-  emit("cfg-sync", cfg);
-  if (!cfg) return;
-  cfgMissing.value = cfg.failed;
-  if (cfg.updated.length) {
-    emit("notify", `invsim commands updated in: ${cfg.updated.join(", ")}.`, "success");
+const gameConfig = ref<GameConfigState | null>(null);
+const cfgBusy = ref(false);
+// Set once a configure run finishes, so the migration is reported rather than
+// happening silently behind the operator.
+const cfgMoved = ref<string[] | null>(null);
+const cfgPinned = ref<string[] | null>(null);
+const cfgDismissed = ref(false);
+
+async function loadGameConfig() {
+  try {
+    const state = await fetchGameConfig();
+    gameConfig.value = state;
+    emit("game-config", state);
+  } catch (e) {
+    fail(e);
   }
 }
 async function loadKey() {
   try {
     const res = await fetchServerApiKey();
     serverApiKey.value = res.key;
-    applyCfgSync(res.cfg);
+    await loadGameConfig();
   } catch (e) {
     fail(e);
   }
@@ -132,23 +143,87 @@ async function rotateKey() {
   try {
     const res = await generateServerApiKey();
     serverApiKey.value = res.key;
-    applyCfgSync(res.cfg);
     emit("notify", tr("inventory.admin.server.key_reissued", "New server key issued — the old key is now dead."), "success");
+    await loadGameConfig();
+    // A rotated key is only live once it reaches wherever the cvars already
+    // live; leaving it un-pushed is how servers end up authenticating with a
+    // key that no longer exists.
+    if (gameConfig.value?.target && configuredSomewhere.value) {
+      await configure({ target: gameConfig.value.target });
+    }
   } catch (e) {
     fail(e);
   } finally {
     keyBusy.value = false;
   }
 }
-const invsimSnippet = computed(() =>
-  [
-    `invsim_url "${API_ORIGIN}"`,
-    `invsim_apikey "${serverApiKey.value ?? "<generate a key first>"}"`,
-    "invsim_ws_enabled 1",
-    "invsim_ws_immediately 1",
-    "invsim_require_inventory 1",
-    "invsim_spraychanger_enabled 1",
-  ].join("\n"),
+
+// Somewhere is already carrying the block, so a key rotation has a home to go
+// to without asking again.
+const configuredSomewhere = computed(
+  () => gameConfig.value?.configured === true,
+);
+
+// The plugin is installed but cannot make its calls until the operator turns
+// Valve's server guidelines off for it, which is theirs to decide -- it risks
+// every GSLT on their Steam account -- so this points at the switch.
+const needsGuidelinesOff = computed(
+  () =>
+    gameConfig.value?.plugin.requiresGuidelinesDisabled === true &&
+    gameConfig.value?.plugin.guidelinesDisabled === false &&
+    gameConfig.value?.plugin.installed === true,
+);
+
+const canInstall = computed(
+  () =>
+    Boolean(gameConfig.value?.plugin.inCatalog) &&
+    !gameConfig.value?.plugin.installed &&
+    Boolean(gameConfig.value?.capabilities.pluginConfig),
+);
+
+const pluginDirectoryPath = computed(
+  () => `/plugins/${gameConfig.value?.slug ?? "inventory-simulator"}`,
+);
+
+async function configure(body: { install?: boolean; target?: CfgTarget }) {
+  if (cfgBusy.value) return;
+  cfgBusy.value = true;
+  cfgDismissed.value = false;
+  try {
+    const result = await applyGameConfig(body);
+    cfgMoved.value = result.moved;
+    cfgPinned.value = result.pinned;
+    await loadGameConfig();
+    emit(
+      "notify",
+      result.target === "plugin"
+        ? "Configured on the CS2 plugin — servers loading it pick the cvars up."
+        : result.target === "global"
+          ? "Written to your Global config — every match picks the cvars up."
+          : "Written to your Competitive, Wingman and Duel configs.",
+      "success",
+    );
+  } catch (e) {
+    fail(e);
+  } finally {
+    cfgBusy.value = false;
+  }
+}
+
+// The one source for these lines. The backend builds the same block from the
+// same values and returns it, so nothing here can drift from what is actually
+// written; the fallback only covers a backend too old to send it.
+const invsimSnippet = computed(
+  () =>
+    gameConfig.value?.cvars ??
+    [
+      `invsim_url "${gameConfig.value?.url ?? API_ORIGIN}"`,
+      `invsim_apikey "${serverApiKey.value ?? "<generate a key first>"}"`,
+      "invsim_ws_enabled 1",
+      "invsim_ws_immediately 1",
+      "invsim_require_inventory 1",
+      "invsim_spraychanger_enabled 1",
+    ].join("\n"),
 );
 
 // ---- extraction run time ----------------------------------------------------
@@ -827,6 +902,10 @@ const BTN =
   "inline-flex h-9 items-center justify-center gap-2 rounded-md border border-input px-3 text-sm text-muted-foreground transition-colors hover:border-[hsl(var(--tac-amber))] hover:text-foreground disabled:pointer-events-none disabled:opacity-50";
 const BTN_PRIMARY =
   "inline-flex h-9 items-center gap-2 rounded-md bg-[hsl(var(--tac-amber))] px-4 text-sm font-medium text-black shadow-sm transition-[filter] hover:brightness-110 disabled:pointer-events-none disabled:opacity-50";
+// Sits next to BTN_PRIMARY. Both are h-9, but a hairline border against a
+// solid amber fill reads as the smaller of the two, so these rows give the
+// secondary a face of its own.
+const BTN_FILLED = "border-transparent bg-secondary px-4 text-foreground";
 const BTN_DANGER =
   "inline-flex h-9 items-center gap-2 rounded-md border border-input px-3 text-sm text-muted-foreground transition-colors hover:border-destructive/60 hover:text-destructive disabled:pointer-events-none disabled:opacity-50";
 </script>
@@ -945,8 +1024,8 @@ const BTN_DANGER =
                     {{ serverApiKey ? "Generate new key" : "Generate key" }}
                   </button>
                   <p class="min-w-[16rem] flex-1 text-xs text-muted-foreground">
-                    Rotating invalidates the current key immediately. Game type configs are rewritten
-                    automatically; servers configured by hand need the new key pasted in.
+                    Rotating invalidates the current key immediately. Wherever these cvars are already
+                    configured is updated with it; servers configured by hand need the new key pasted in.
                   </p>
                 </div>
               </div>
@@ -960,8 +1039,7 @@ const BTN_DANGER =
                 <div class="min-w-0 flex-1 space-y-0.5">
                   <h3 class="text-sm font-semibold uppercase tracking-wider text-foreground">Game configs</h3>
                   <p class="text-sm text-muted-foreground">
-                    Kept at the very top of your Lan, Competitive, Wingman and Duel configs, so they run
-                    before anything else.
+                    The cvars a CS2 server needs to read loadouts from this plugin.
                   </p>
                 </div>
                 <div class="shrink-0 pl-4">
@@ -974,22 +1052,117 @@ const BTN_DANGER =
 
               <pre class="overflow-x-auto rounded-md border border-input bg-background px-3 py-2.5 font-mono text-xs text-muted-foreground">{{ invsimSnippet }}</pre>
 
+              <p v-if="!serverApiKey" class="text-sm text-muted-foreground">
+                Generate a key above before configuring anything — the block is not valid without one.
+              </p>
+
+              <!-- The CS2 plugin is the operator's call, not ours. Offer it,
+                   say what it does, and configure whatever they already run if
+                   they would rather not. -->
               <div
-                v-if="cfgMissing && cfgMissing.length"
+                v-else-if="canInstall"
+                class="space-y-3 rounded-md border border-input bg-background/60 px-3 py-3"
+              >
+                <div class="space-y-1">
+                  <p class="text-sm font-medium text-foreground">
+                    Install the CS2 Inventory Simulator on your servers?
+                  </p>
+                  <p class="text-xs text-muted-foreground">
+                    It is in your panel's plugin directory. Installing it from there gets you
+                    version tracking and digest-checked downloads on every node, and we can set
+                    these cvars on the plugin itself so they only apply where it loads.
+                  </p>
+                  <p class="text-xs text-[hsl(var(--tac-amber))]">
+                    This also sets the plugin to load on ranked, tournament and custom matches,
+                    so skins follow players everywhere. Narrow that later on the plugin's page.
+                  </p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <button :class="BTN_PRIMARY" :disabled="cfgBusy" @click="configure({ install: true, target: 'plugin' })">
+                    <Loader2 v-if="cfgBusy" class="h-3.5 w-3.5 animate-spin" />
+                    Install and configure
+                  </button>
+                  <button :class="[BTN, BTN_FILLED]" :disabled="cfgBusy" @click="configure({ target: 'global' })">
+                    I run it myself — just configure
+                  </button>
+                  <a :class="[BTN, BTN_FILLED]" :href="pluginDirectoryPath" target="_top">
+                    Open the plugin directory
+                  </a>
+                </div>
+              </div>
+
+              <div v-else-if="gameConfig" class="space-y-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <button :class="BTN_PRIMARY" :disabled="cfgBusy" @click="configure({})">
+                    <Loader2 v-if="cfgBusy" class="h-3.5 w-3.5 animate-spin" />
+                    {{ configuredSomewhere ? "Re-apply the cvars" : "Configure my servers" }}
+                  </button>
+                  <a
+                    v-if="gameConfig.plugin.inCatalog"
+                    :class="[BTN, BTN_FILLED]"
+                    :href="pluginDirectoryPath"
+                    target="_top"
+                  >
+                    Open the plugin directory
+                  </a>
+                </div>
+
+                <p class="text-xs text-muted-foreground">
+                  <template v-if="gameConfig.target === 'plugin'">
+                    Written to the CS2 plugin's own config, so it applies only on servers that
+                    load it.
+                  </template>
+                  <template v-else-if="gameConfig.target === 'global'">
+                    Written to your panel's Global config, so it applies to every match. Scope it
+                    from the panel's Game Type Configs page.
+                  </template>
+                  <template v-else>
+                    Written to your Competitive, Wingman and Duel configs — this panel has no
+                    Global config to put them in.
+                  </template>
+                </p>
+              </div>
+
+              <div
+                v-if="needsGuidelinesOff"
                 class="rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5 text-sm"
               >
-                <template v-if="!serverApiKey">
-                  Generate a key above — it lands at the top of your game configs automatically.
-                </template>
-                <template v-else>
-                  Couldn't write configs for <b>{{ cfgMissing.join(", ") }}</b> — check the plugin backend
-                  logs, or paste the lines above at the very top yourself.
-                </template>
+                This plugin cannot change what players see until Valve's server guidelines are
+                turned off for it, which your panel asks you to accept separately &mdash; it
+                risks every Steam game server token on your account.
+                <a :class="[BTN, BTN_FILLED, 'mt-2']" :href="pluginDirectoryPath" target="_top">
+                  Open its page to turn them off
+                </a>
               </div>
-              <p v-else-if="cfgMissing" class="flex items-center gap-2 text-sm text-muted-foreground">
-                <Check class="h-3.5 w-3.5 text-[hsl(var(--tac-amber))]" />
-                All game configs carry the invsim commands at the top.
-              </p>
+
+              <div
+                v-if="cfgPinned && cfgPinned.length"
+                class="rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5 text-sm"
+              >
+                Couldn't reach the stock configs, so <b>{{ cfgPinned.join(", ") }}</b> kept a
+                pinned copy instead of being cleared. Revert them by hand if you want them
+                tracking the defaults again.
+              </div>
+
+              <div
+                v-if="cfgMoved && cfgMoved.length && !cfgDismissed"
+                class="flex items-start justify-between gap-3 rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5 text-sm"
+              >
+                <span>
+                  Cleaned the old auto-added block out of <b>{{ cfgMoved.join(", ") }}</b> — these
+                  cvars now live in one place instead of three.
+                </span>
+                <button :class="[BTN, 'shrink-0']" @click="cfgDismissed = true">Dismiss</button>
+              </div>
+
+              <div
+                v-else-if="gameConfig && gameConfig.legacy.length && gameConfig.canMigrate"
+                class="rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5 text-sm"
+              >
+                Your <b>{{ gameConfig.legacy.join(", ") }}</b> configs still carry the block this
+                plugin used to write into each of them. Configuring above moves it to one place and
+                takes it back out.
+              </div>
             </div>
           </section>
         </template>
