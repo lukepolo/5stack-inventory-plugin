@@ -239,6 +239,12 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v29 (2026-08-21): the first-person assets are a STEP, not a script someone
+# remembers to run. `/anims` — every weapon's viewmodel clips, the sounds they
+# cue, the muzzle-flash textures and CS2's equipment icons — existed only on the
+# one instance where the extractor had been run by hand. Everywhere else the
+# first-person view offered a fire button that could do nothing, because there
+# was no clip to play. Re-run needed on every instance that wants first person.
 # Rendered raw, that is a chrome mirror where the game shows dull white.
 # v15 (2026-07-29): the KV3 parser now understands binary blobs (`#[ 07 00 ... ]`).
 # Every charm material carries one, so all 23 failed to parse in v14 with
@@ -251,7 +257,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=28
+EXTRACT_VERSION=29
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -350,7 +356,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art music-audio stamp)
+STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -4578,6 +4584,34 @@ if (( staged > 0 )); then
 else
   rm -rf "$MUSIC_DEST"
   echo "!! No music decoded — keeping the previously extracted audio (if any) rather than emptying it."
+fi
+
+fi
+
+# ---- 5c. First-person viewmodel animations, sounds and UI icons ---------------
+if step_if "viewmodel-anims"; then
+# WHAT THE FIRST-PERSON VIEW IS MADE OF. Everything under /anims: each weapon's
+# own viewmodel clips (idle, draw, reload, fire, inspect), the sounds those clips
+# ask for at the frames they ask for them, the muzzle-flash textures, and CS2's
+# equipment icon set. Without them a weapon still renders and can still be held —
+# and then does nothing at all when you press fire, because there is no clip to
+# play, no sound to play it with and no flash to draw.
+#
+# THIS STEP EXISTED AS A SCRIPT LONG BEFORE IT EXISTED AS A STEP, which is the
+# whole reason it is here: the extractor was run BY HAND on one instance while
+# every other install produced no /anims at all. The symptom on those was
+# "firing doesn't work", and nothing about it pointed at a missing asset — the
+# UI offered the button either way. An asset the app depends on belongs in the
+# pipeline that produces assets.
+echo ""
+echo "--- Extracting first-person viewmodel clips, sounds and icons…"
+ANIMS_DEST="${OUT_DIR:-$WORK}/anims"
+if node "$(dirname "$0")/extract-viewmodel-anims.mjs" --out "$ANIMS_DEST" 2>&1 | tail -20; then
+  echo "--- Viewmodel assets: $(du -sh "$ANIMS_DEST" 2>/dev/null | cut -f1)"
+else
+  # Not fatal. A weapon with no clip falls back to the item view, which is what
+  # this app did for its whole life before first person existed.
+  echo "!! Viewmodel extraction failed — first person will have no animations on this instance."
 fi
 
 fi

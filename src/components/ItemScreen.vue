@@ -76,13 +76,34 @@ onBeforeUnmount(() => panelRO?.disconnect());
 </script>
 
 <template>
-  <div class="relative flex min-h-0 min-w-0 flex-1 flex-col gap-3">
+  <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
     <!-- The header row. `items-start` because the identity is three lines tall
          and the actions are one — they align to the top of the name, not to the
          middle of the block. -->
-    <div class="relative z-[2] flex flex-none items-start justify-between gap-4">
-      <ItemIdentity v-bind="identity" />
-      <div class="flex flex-none items-center gap-2.5"><slot name="actions" /></div>
+    <!-- ABOVE the info column (z-5) and its reopen tab (z-6), not level with the
+         stage at z-2. The actions slot opens popovers that hang DOWN from the
+         header across both of them, and at z-2 the column painted straight
+         through them — the sticker chip, PATTERN, the wear bar and the StatTrak
+         readout all sat on top of the panel they were covering. A popover's own
+         z is no defence: ShareMenu asks for 1001 and still lost, because that
+         number is spent INSIDE this row's stacking context, not against the
+         column outside it. Header chrome and anything it opens go last; the two
+         never overlap geometrically (the column starts at top-12), so nothing
+         else about the screen moves. -->
+    <!-- OVER THE STAGE, not above it. The header used to hold a row of its own,
+         which cost the model the height of the item's name — a band of card at
+         the top with nothing in it but text on a flat background. The pane now
+         runs the card's full height and the chrome sits ON it.
+         NOTHING BEHIND THE TEXT. A scrim across the top was the obvious way to
+         keep it legible and the wrong one: it greys the picture the panorama
+         was chosen for, and it does it across the whole width whether anything
+         is written there or not. The type carries its own contrast instead —
+         see `over-art` in the stylesheet, a shadow that costs the image
+         nothing. Pointer-transparent except the controls: the gap between the
+         name and the buttons is stage, and dragging there turns the model. -->
+    <div class="over-art pointer-events-none absolute inset-x-0 top-0 z-[7] flex items-start justify-between gap-4">
+      <div class="pointer-events-auto"><ItemIdentity v-bind="identity" /></div>
+      <div class="pointer-events-auto flex flex-none items-center gap-2.5"><slot name="actions" /></div>
     </div>
     <div class="relative z-[2] flex min-h-0 flex-1 gap-5"><slot /></div>
 

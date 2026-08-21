@@ -21,3 +21,4 @@ tools/shadertest/snapshots/
 # one carries its own .git file, which git will happily commit as a plain file.
 # The branches are the durable artifact; these directories are scratch.
 /.claude/worktrees/
+tools/shadertest/envsrc/

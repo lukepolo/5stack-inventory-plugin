@@ -41,6 +41,8 @@ import { applyStickerSfx, type StickerSfx } from "./stickerShader";
 import { compositeGlove, loadGlovePaintDef } from "./gloveComposite";
 import { compositeGloveModern, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
+import { hasModel, modelUrlFor } from "./modelAvailability";
+import { INCOMPLETE } from "./viewerSentinel";
 // The one media query the viewer answers to. Everything else about layout is a
 // component's business, but "should this move on its own" is the renderer's.
 import { reducedMotion } from "./responsive";
@@ -223,50 +225,11 @@ function loadThree(): Promise<ThreeBundle> {
   return threePromise;
 }
 
-// Encoded per PATH SEGMENT, not whole: shared models live in subdirectories
-// (extra/stattrak_module), and encodeURIComponent on the whole key turns the
-// separator into %2F and 404s.
-//
-// Version-stamped for exactly the reason the paint materials are: an extraction
-// rewrites these files in place under unchanged names, so the URL cannot
-// self-version and the server only marks a response immutable once `v` is
-// present. Without the stamp the models mount — the largest in the pipeline, an
-// AK's GLB alone pulling ~65MB of 4096-square textures — revalidated hourly in
-// production and re-downloaded outright in dev.
-export const modelUrlFor = (model: string) =>
-  withAssetVersion(`${getAssetOrigin()}/models/${model.split("/").map(encodeURIComponent).join("/")}.glb`);
-
-// HEAD-check whether a .glb exists for this weapon model; results are cached
-// for the session so grids/toggles can query freely.
-const availability = new Map<string, Promise<boolean>>();
-// The same answers, already settled. `hasModel` can only ever be awaited, and
-// awaiting yields to the renderer even on a cache hit — which is why the craft
-// modal painted its 2D still first and then swapped to 3D a frame later, on
-// every open, for a model it already knew about. Callers that must decide
-// before first paint peek here and fall back to the promise on a real miss.
-const settled = new Map<string, boolean>();
-/** Resolved availability, or null if not yet known. Never triggers a fetch. */
-export function hasModelSync(model: string): boolean | null {
-  if (isQuadModel(model)) return true;
-  return settled.has(model) ? settled.get(model)! : null;
-}
-export function hasModel(model: string): Promise<boolean> {
-  // Generated meshes never touch the mount, so probing for one is a guaranteed
-  // 404 that would read as "this item has no 3D form".
-  if (isQuadModel(model)) return Promise.resolve(true);
-  let cached = availability.get(model);
-  if (!cached) {
-    cached = fetch(modelUrlFor(model), { method: "HEAD" })
-      .then((res) => res.ok && !(res.headers.get("content-type") ?? "").includes("text/html"))
-      .catch(() => false)
-      .then((ok) => {
-        settled.set(model, ok);
-        return ok;
-      });
-    availability.set(model, cached);
-  }
-  return cached;
-}
+// Model availability moved to ./modelAvailability. It is asked on paths that
+// never mount anything — a slot's context menu, the card-art backfill walking
+// the whole inventory — so it must not sit behind this module's chunk. Still
+// exported from here; nothing that imports it had to change.
+export { hasModel, hasModelSync, modelUrlFor } from "./modelAvailability";
 
 /**
  * ONE WebGLRenderer and one prefiltered environment map for every viewer.
@@ -293,6 +256,66 @@ interface SharedGL {
   env: import("three").Texture;
 }
 let sharedGL: SharedGL | null = null;
+function loadSceneEnvironment(
+  THREE: ThreeBundle["THREE"],
+  renderer: import("three").WebGLRenderer,
+  url: string,
+): Promise<{ env: import("three").Texture; bg: import("three").Texture } | null> {
+  const key = url;
+  const hit = sceneEnvCache.get(key);
+  if (hit) return hit;
+  const p = new Promise<{ env: import("three").Texture; bg: import("three").Texture } | null>((resolve) => {
+    new THREE.TextureLoader().load(
+      withAssetVersion(`${getAssetOrigin()}${url}`),
+      (tex) => {
+        tex.mapping = THREE.EquirectangularReflectionMapping;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        // The backdrop asks for a blurred mip level rather than carrying a
+        // second, pre-blurred image — see `uBlur`.
+        tex.generateMipmaps = true;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.anisotropy = 4;
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        const env = pmrem.fromEquirectangular(tex).texture;
+        pmrem.dispose();
+        resolve({ env, bg: tex });
+      },
+      undefined,
+      // A missing panorama is a normal answer — an instance that has not run
+      // the map extraction still has every studio rig, and the item still
+      // renders under the shared HDRI.
+      () => resolve(null),
+    );
+  });
+  sceneEnvCache.set(key, p);
+  return p;
+}
+
+function loadPlate(THREE: ThreeBundle["THREE"], url: string): Promise<import("three").Texture | null> {
+  const hit = platesCache.get(url);
+  if (hit) return hit;
+  const p = new Promise<import("three").Texture | null>((resolve) => {
+    new THREE.TextureLoader().load(
+      withAssetVersion(`${getAssetOrigin()}${url}`),
+      (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        // The backdrop asks for a blurred mip level rather than shipping a
+        // second, pre-blurred image — see `uBlur`.
+        tex.generateMipmaps = true;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.anisotropy = 4;
+        resolve(tex);
+      },
+      undefined,
+      // An instance whose extraction has not baked plates still gets the
+      // panorama's lighting; it simply has nothing behind the model.
+      () => resolve(null),
+    );
+  });
+  platesCache.set(url, p);
+  return p;
+}
+
 function getSharedGL(
   THREE: ThreeBundle["THREE"],
   RoomEnvironment: ThreeBundle["RoomEnvironment"],
@@ -300,7 +323,16 @@ function getSharedGL(
 ): SharedGL {
   if (sharedGL) return sharedGL;
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  /**
+   * A FLOOR, NOT A CAP — `max(1.5, min(dpr, 3))`.
+   *
+   * These are skincraft's numbers, and the shape of them is the point: capping
+   * at the display's own ratio means a 1x monitor renders a weapon at 1x, where
+   * every specular edge on a gun barrel aliases. Rendering at 1.5x and letting
+   * the browser downsample is the cheapest antialiasing there is, and it is why
+   * their frames look resolved on a laptop screen where ours crawl.
+   */
+  renderer.setPixelRatio(Math.max(1.5, Math.min(window.devicePixelRatio, 3)));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   // Khronos PBR-neutral: color-accurate product rendering (ACES pushes
   // saturated skin colors toward orange/teal — wrong for a skin inspector).
@@ -875,6 +907,19 @@ function mountTimer(): MountTimer {
 
 // Shared texture cache (sticker/charm images are tiny and reused across
 // viewer mounts — never disposed with a viewer).
+/**
+ * BAKED CS2 SCENES, prefiltered once each.
+ *
+ * A map environment is one equirectangular JPEG that has to become two things:
+ * a PMREM cube for lighting and reflections, and a plain texture to draw behind
+ * the model. Both are expensive to build and identical for every viewer, so
+ * they are made once per URL and shared — switching between Mirage and Dust II
+ * and back costs nothing the second time.
+ */
+const sceneEnvCache = new Map<string, Promise<{ env: import("three").Texture; bg: import("three").Texture } | null>>();
+/** Backdrop plates, one texture per URL — see `ViewerEnvironment.plate`. */
+const platesCache = new Map<string, Promise<import("three").Texture | null>>();
+
 const texCache = new Map<string, Promise<import("three").Texture>>();
 // Resolved half of texCache. A drag rebuilds the decal on every frame and the
 // texture is always already loaded by then, so awaiting the promise only bought
@@ -2027,10 +2072,10 @@ export const bakesInFlight = () => snapshotsInFlight;
 const BAKE_PREEMPT_RETRIES = 3;
 /** Distinct from null: "yielded the GPU, ask again" rather than "this failed". */
 const PREEMPTED = Symbol("preempted");
-/** "The assets aren't on the mount yet" — the render would be a white gun.
- *  Distinct from null (a real failure) so callers can keep the item queued and
- *  show a pending state instead of caching a wrong picture forever. */
-export const INCOMPLETE = Symbol("incomplete");
+/** Lives in ./viewerSentinel so a caller can compare a blob against it without
+ *  pulling this module's chunk in. Still exported from here — identity is the
+ *  whole point of the symbol, and there is only ever the one. */
+export { INCOMPLETE };
 
 async function snapshotModelNow(
   model: string,
@@ -11504,11 +11549,192 @@ async function buildViewer(
    * runs. A card is cached forever against its render key, so a preset baked
    * into one is indistinguishable from a rendering bug.
    */
+  /**
+   * THE MAP BEHIND THE MODEL — and why it is not `scene.background`.
+   *
+   * This viewer is ORTHOGRAPHIC (see the projection note above). three draws an
+   * equirectangular background by taking each pixel's view direction, and under
+   * a parallel projection every pixel has the SAME direction — so the whole
+   * pane shows one tiny patch of the panorama blown up to fill it, which is
+   * what "the map is enormous and blurry behind my gun" was.
+   *
+   * A backdrop under an ortho camera has to invent its own perspective, so this
+   * is a screen-filling quad pinned to the far plane whose shader spreads the
+   * panorama across a VIRTUAL field of view. It never occludes anything, and
+   * because it is part of the scene it goes through the bloom composer with
+   * everything else.
+   *
+   * IT DOES NOT TURN WITH THE CAMERA. Dragging the model spins the MODEL —
+   * that is what the gesture means here, and it is what the game's own inspect
+   * does. Sweeping the room past the weapon at the same time makes the whole
+   * pane move when the user asked one object to, and it turns a still backdrop
+   * into a camera pan nobody requested. The view direction is taken once, at
+   * the framing the viewer opens on, and left there; reflections still move,
+   * because those come from the environment map and follow the camera on their
+   * own.
+   */
+  let backdrop: import("three").Mesh | null = null;
+  const backdropDir = new THREE.Matrix3();
+  function setBackdrop(tex: import("three").Texture | null, isPlate: boolean) {
+    if (!tex) {
+      if (backdrop) backdrop.visible = false;
+      return;
+    }
+    if (!backdrop) {
+      backdrop = new THREE.Mesh(
+        new THREE.PlaneGeometry(2, 2),
+        new THREE.ShaderMaterial({
+          depthTest: false,
+          depthWrite: false,
+          uniforms: {
+            tPano: { value: tex },
+            uDir: { value: backdropDir },
+            uAspect: { value: 1 },
+            uTan: { value: Math.tan((42 * Math.PI) / 180 / 2) },
+            /**
+             * DEPTH OF FIELD, as a mip bias.
+             *
+             * A backdrop that is pin-sharp behind a hand-held object is the one
+             * thing that reads as a render rather than a photograph — nothing
+             * focuses on a weapon at arm's length AND a wall thirty metres
+             * behind it. skincraft bake the blur into their plates outright
+             * (they parse the map's own dof_near/far entities and discard
+             * them). We can do it at draw time for nothing: the panorama has a
+             * mip chain, so asking for a lower level IS the blur, and the level
+             * is one uniform rather than a second texture to ship.
+             *
+             * It also earns its keep on our own bakes: an out-of-focus wall
+             * hides the seams a flat-albedo capture leaves in one.
+             */
+            uBlur: { value: 2.6 },
+            /** 1 = the texture is a framed plate, 0 = an equirect panorama. */
+            uPlate: { value: 0 },
+            /** The plate's own aspect, for the cover fit. */
+            uPlateAspect: { value: 16 / 9 },
+          },
+          vertexShader: "varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 1.0, 1.0); }",
+          fragmentShader: `
+            varying vec2 vUv;
+            uniform sampler2D tPano;
+            uniform mat3 uDir;
+            uniform float uAspect;
+            uniform float uTan;
+            uniform float uBlur;
+            uniform float uPlate;
+            uniform float uPlateAspect;
+            #define PI 3.14159265359
+            void main() {
+              // A ray through this pixel, as a perspective camera would have
+              // cast it, then turned to where the real camera is looking.
+              vec3 d = normalize(uDir * vec3((vUv.x - 0.5) * 2.0 * uTan * uAspect, (vUv.y - 0.5) * 2.0 * uTan, -1.0));
+              vec2 uv = vec2(atan(d.x, -d.z) / (2.0 * PI) + 0.5, asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5);
+              if (uPlate > 0.5) {
+                // COVER, not stretch: a plate is a photograph of the scene at
+                // its own aspect, and squashing it to the pane would bend every
+                // straight edge in a room built entirely of them. The excess is
+                // cropped off the long side instead, which is what a backdrop
+                // is for.
+                vec2 c = vUv - 0.5;
+                float paneAspect = uAspect;
+                if (paneAspect > uPlateAspect) c.y *= uPlateAspect / paneAspect;
+                else c.x *= paneAspect / uPlateAspect;
+                uv = c + 0.5;
+              }
+              gl_FragColor = texture2D(tPano, uv, uBlur);
+              // A raw ShaderMaterial writes exactly what it is given: without
+              // these two the panorama is sampled to linear (the texture is
+              // flagged sRGB) and then written into an sRGB buffer as though it
+              // were already encoded — which crushes the shadows to black and
+              // pushes the lit walls to white. The same two chunks every built-
+              // in material ends with.
+              #include <tonemapping_fragment>
+              #include <colorspace_fragment>
+            }`,
+        }),
+      );
+      // The direction the room is seen from, taken once. `camera` rather than
+      // activeCamera(): first person has its own framing and its own reasons to
+      // move, and a backdrop that jumped when the view mode changed would be a
+      // second surprise on top of the first.
+      camera.updateMatrixWorld();
+      backdropDir.setFromMatrix4(camera.matrixWorld);
+      backdrop.frustumCulled = false;
+      // Behind everything, including the weapon's own transparent passes.
+      backdrop.renderOrder = -1000;
+      scene.add(backdrop);
+    } else {
+      (backdrop.material as import("three").ShaderMaterial).uniforms.tPano.value = tex;
+    }
+    const u = (backdrop.material as import("three").ShaderMaterial).uniforms;
+    u.tPano.value = tex;
+    u.uPlate.value = isPlate ? 1 : 0;
+    const img = tex.image as { width?: number; height?: number } | undefined;
+    if (isPlate && img?.width && img?.height) u.uPlateAspect.value = img.width / img.height;
+    // A plate is already a photograph of a room at a distance; the panorama
+    // slice is not, and needs more help.
+    u.uBlur.value = isPlate ? 1.1 : 2.6;
+    backdrop.visible = true;
+  }
+
+  /**
+   * A MAP RIG AT MOUNT, not only when switched to.
+   *
+   * `setEnvironment` early-exits on the key it is already holding, so a viewer
+   * that OPENS with Mirage chosen would never fetch its panorama — the studio
+   * HDRI would light it and nothing would stand behind it, which reads as the
+   * setting having quietly stopped working.
+   *
+   * Down here rather than beside the rest of the rig setup, because everything
+   * it touches is declared in this half of the file: calling it up there read
+   * `backdrop` inside its temporal dead zone, and Vue is not the only thing
+   * that swallows that kind of throw.
+   */
+  if (rig.scene && !opts?.still) {
+    void loadSceneEnvironment(THREE, renderer, rig.scene).then((loaded) => {
+      if (disposed || rigKey !== rig.key || !loaded) return;
+      scene.environment = loaded.env;
+      setBackdrop(loaded.bg, false);
+    });
+    if (rig.plate) {
+      void loadPlate(THREE, rig.plate).then((plate) => {
+        if (disposed || rigKey !== rig.key || !plate) return;
+        setBackdrop(plate, true);
+      });
+    }
+  }
+
   function setEnvironment(name: string) {
     if (opts?.still) return;
     const next = viewerEnvironment(name);
     if (next.key === rigKey) return;
     rigKey = next.key;
+    /**
+     * A MAP RIG BRINGS ITS OWN SKY. The four studio rigs share one prefiltered
+     * HDRI and draw nothing behind the model; a CS2 scene replaces both — it
+     * lights the item AND stands behind it, which is the whole point of picking
+     * Mirage over Studio.
+     *
+     * Applied asynchronously and re-checked on arrival: the fetch outlives a
+     * fast second click, and a panorama landing after the user has moved on to
+     * another rig would otherwise light the item with the map they left.
+     */
+    if (next.scene) {
+      void loadSceneEnvironment(THREE, renderer, next.scene).then((loaded) => {
+        if (disposed || rigKey !== next.key) return;
+        if (!loaded) return;
+        scene.environment = loaded.env;
+        setBackdrop(loaded.bg, false);
+      });
+      if (next.plate) {
+        void loadPlate(THREE, next.plate).then((plate) => {
+          if (disposed || rigKey !== next.key || !plate) return;
+          setBackdrop(plate, true);
+        });
+      }
+    } else {
+      scene.environment = envTex;
+      setBackdrop(null, false);
+    }
     const lit = { ...next.lighting, ...(opts?.lighting ?? {}) };
     scene.environmentIntensity = lit.env;
     ambient.intensity = lit.ambient;
@@ -12071,9 +12297,17 @@ async function buildViewer(
    * what setViewport/setScissor take.
    */
   const fpvViewport = () => {
-    const dpr = renderer.getPixelRatio();
-    const w = Math.max(1, Math.round(cssW * dpr));
-    const h = Math.max(1, Math.round(cssH * dpr));
+    /**
+     * CSS UNITS, NOT DEVICE PIXELS. `renderer.setViewport` multiplies by the
+     * pixel ratio itself, so handing it device pixels scales twice. That bug
+     * sat here harmlessly for as long as most ratios were 1 — and went off the
+     * moment the render-scale floor made every ratio at least 1.5: the
+     * viewport became 1.5x the canvas and the weapon flung into the top-right
+     * corner. The rig reproduced it with SHIPPED dials, which is what ruled
+     * out stored settings.
+     */
+    const w = Math.max(1, cssW);
+    const h = Math.max(1, cssH);
     /**
      * THE WHOLE PANE. There was a 16:9 letterbox here, on the theory that a
      * fixed aspect is what makes a viewmodel look like the game — but the pane
@@ -12119,6 +12353,11 @@ async function buildViewer(
 
   const drawFrame = () => {
     renderer.setSize(cssW, cssH, false);
+    // Only the pane's shape. The backdrop's DIRECTION is deliberately fixed —
+    // see setBackdrop.
+    if (backdrop?.visible) {
+      (backdrop.material as import("three").ShaderMaterial).uniforms.uAspect.value = cssW / Math.max(1, cssH);
+    }
     // Letterbox first person. SCISSOR as well as viewport: without it the bars
     // keep whatever the last frame drew there, which reads as the model
     // smearing rather than as a frame around it.

@@ -20,7 +20,10 @@ import {
   ThumbsUp, ThumbsDown, Box, X, ChevronLeft, ChevronRight,
   Search, FilterX,
 } from "lucide-vue-next";
-import { hasModel, mountViewer, snapshotModel, INCOMPLETE, type ViewerHandle } from "../viewer3d";
+import { hasModel } from "../modelAvailability";
+import { INCOMPLETE } from "../viewerSentinel";
+import { mountViewer, snapshotModel } from "../viewer3dLazy";
+import type { ViewerHandle } from "../viewer3d";
 import { takeVerifyFailures } from "../compositeStore";
 import {
   fetchTestCatalog,

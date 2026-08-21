@@ -20,7 +20,8 @@
 // node, and two canvases in one host is the "gun renders below the pane" bug.
 import { nextTick, ref } from "vue";
 import { mdebug } from "../mdebug";
-import { mountViewer, type ViewerHandle, type ViewerOpts } from "../viewer3d";
+import { mountViewer } from "../viewer3dLazy";
+import type { ViewerHandle, ViewerOpts } from "../viewer3d";
 
 export interface ViewerMountSpec {
   /** Names this slot in the mdebug trace, e.g. "focus" or "craft modal". */

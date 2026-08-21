@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, type ComputedRef, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, type ComputedRef, watch } from "vue";
 import { cn } from "@5stack/ui";
 import { useI18n } from "./composables/useI18n";
 import {
@@ -86,7 +86,9 @@ import {
   type ShareLink,
   type Draft,
 } from "./routes";
-import AdminConsole from "./components/AdminConsole.vue";
+// /admin and the render-test sweep it owns are ~170kB of component that a
+// player never reaches. Async so they arrive with the route.
+const AdminConsole = defineAsyncComponent(() => import("./components/AdminConsole.vue"));
 import { activeFlags, flagValue, flagsVersion } from "./devFlags";
 import Armory from "./components/Armory.vue";
 import InventoryScreen from "./components/InventoryScreen.vue";
@@ -153,7 +155,10 @@ import { stackByDesign, TINT_SUFFIX } from "./decks";
 import { loadPaintDef, seedMovesPattern } from "./paintComposite";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
-import { hasModel, hasModelSync, mountViewer, snapshotModel, viewersIdle, viewerStats, INCOMPLETE, type CameraState, type ViewerHandle, type ViewerKind, type StickerPlacement, type CharmPlacement } from "./viewer3d";
+import { hasModel, hasModelSync } from "./modelAvailability";
+import { INCOMPLETE } from "./viewerSentinel";
+import { prefetchViewer3d, snapshotModel, viewersIdle, viewerStats } from "./viewer3dLazy";
+import type { CameraState, ViewerHandle, ViewerKind, StickerPlacement, CharmPlacement } from "./viewer3d";
 import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
 
@@ -6905,6 +6910,9 @@ const { staleBuild, reloadPage } = useBuildCheck();
 onMounted(() => {
   window.addEventListener("keydown", onGlobalKey);
   load();
+  // Idle-time fetch of the viewer chunk, so the first item opened doesn't pay
+  // for it — see prefetchViewer3d.
+  prefetchViewer3d();
   // Admin app load asks the panel where the invsim cvars stand — that answer is
   // what lights the gear badge before /admin is ever opened. Read-only: this
   // used to write three of the operator's server configs as a side effect.
@@ -7994,7 +8002,7 @@ if (MDEBUG) {
               can-save
               bleed
               class="min-h-0 flex-1"
-              :class="isCompact ? '-mx-4 -mb-4' : '-mx-8 -mb-6'"
+              :class="isCompact ? '-m-4' : '-mx-8 -mb-6 -mt-6'"
               @update:is3d="setFocus3d"
               @update:held="(v) => (fpvOn = v)"
               @inspect-play="focusInspect.play"
@@ -8961,7 +8969,7 @@ if (MDEBUG) {
               :report-href="craftReportHref"
               :can-save="viewOnly"
               :bleed="viewOnly"
-              :class="viewOnly ? (isCompact ? '-mx-2 -mb-2' : '-mx-5 -mb-5') : ''"
+              :class="viewOnly ? (isCompact ? '-m-2' : '-mx-5 -mb-5 -mt-5') : ''"
               @update:is3d="(v) => (modal3d = v)"
               @update:held="(v) => (craftHeld = v)"
               @inspect-play="craftInspect.play"

@@ -20,7 +20,11 @@
  * the blue ones is the job; quoting a tier is not.
  */
 import { loadPaintDef, loadWeaponInputs, compositePaint, type PaintDef } from "./paintComposite";
-import { withSharedRenderer } from "./viewer3d";
+// Through the façade: a pattern scan is a rendering job, so it can afford to
+// wait for the viewer chunk — but App.vue imports SCAN_READ_SIZE from this
+// file, and a static edge here would have dragged viewer3d back into the boot
+// bundle whatever ./viewer3dLazy did.
+import { viewer3d } from "./viewer3dLazy";
 
 /** Composite resolution for a scan. A coverage fraction is a statistic over
  *  thousands of texels — it converges long before the resolution a human needs
@@ -253,6 +257,7 @@ export async function comparePatterns(
   const def = await loadPaintDef(r.paintMaterial);
   if (!def) return null;
   const weapon = await loadWeaponInputs(r.model, r.legacy);
+  const { withSharedRenderer } = await viewer3d();
   return withSharedRenderer(async (THREE, renderer) => {
     const rt = new THREE.WebGLRenderTarget(READ_SIZE, READ_SIZE, {
       depthBuffer: false,
@@ -322,6 +327,7 @@ export async function scanPatterns(r: ScanRequest): Promise<PatternScan | null> 
   const weapon = await loadWeaponInputs(r.model, r.legacy);
   const scores = new Float32Array(max - min + 1);
 
+  const { withSharedRenderer } = await viewer3d();
   const done = await withSharedRenderer(async (THREE, renderer) => {
     // One target, one quad, reused for every pattern — a thousand allocations
     // of each is its own cost, and this is the whole readback rig.

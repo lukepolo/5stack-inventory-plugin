@@ -238,6 +238,22 @@ const REPORT_LINK =
     >
       Report a problem
     </a>
+    <!-- THE VIGNETTE, and it is CSS rather than a shader pass.
+         A frame reads as photographed rather than rendered largely because its
+         corners fall off, and the cheapest honest way to do that is one
+         gradient over the canvas: no pass, no render target, nothing in the
+         way of the model. skincraft ship exactly this — their shader carries a
+         vignette that is compiled in and never enabled, while the one you
+         actually see is a CSS overlay at 0.6. The stop table is theirs; the
+         mid-stops are what stop it banding on a flat sky.
+         3D only: the flat artwork is a cut-out on a card and darkening its
+         corners just dirties the card. -->
+    <span
+      v-if="is3d"
+      class="pointer-events-none absolute inset-0 z-[4]"
+      style="background: radial-gradient(ellipse at center, rgba(0,0,0,0) 0%, rgba(0,0,0,0.02) 25%, rgba(0,0,0,0.08) 50%, rgba(0,0,0,0.22) 75%, rgba(0,0,0,0.38) 90%, rgba(0,0,0,0.48) 95%, rgba(0,0,0,0.6) 100%)"
+    ></span>
+
     <!-- Bottom CENTRE: how you move the picture. -->
     <ViewerControls
       v-if="is3d && !busy"

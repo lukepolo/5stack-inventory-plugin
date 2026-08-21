@@ -345,8 +345,13 @@ const key = (name: string) => `viewer3d.${name}`;
  * next time the shipped pose changes; do NOT bump it for anything else, because
  * this throws away a deliberate setting along with a stale one.
  */
-const FPV_POSE_VERSION = "2";
-const FPV_DIALS = ["fpvyaw", "fpvpitch", "fpvfov", "fpvx", "fpvy", "fpvz"];
+const FPV_POSE_VERSION = "3";
+// v3 adds the frame-shift pair: the first-person frame changed shape twice
+// today (letterboxed 16:9, then the full pane), and dials tuned against either
+// earlier frame land the weapon somewhere else in the current one. The shipped
+// defaults ARE the tuned pose; stored leftovers from the tuning sessions are
+// what a reset clears.
+const FPV_DIALS = ["fpvyaw", "fpvpitch", "fpvfov", "fpvx", "fpvy", "fpvz", "fpvshiftx", "fpvshifty"];
 try {
   if (localStorage.getItem(key("fpvpose")) !== FPV_POSE_VERSION) {
     for (const n of FPV_DIALS) localStorage.removeItem(key(n));

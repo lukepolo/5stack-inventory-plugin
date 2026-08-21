@@ -33,7 +33,16 @@ export default defineConfig({
     buildStamp(),
     sharedGlobals(),
     vue(),
-    cssInjectedByJs(),
+    cssInjectedByJs({
+      // Three chunks come out marked `entry`: remoteEntry.js, the exposed
+      // ./App, and the standalone dev index. With no filter the plugin picks
+      // whichever is last and warns that it guessed — so name them. The two
+      // that mount UI get the CSS; remoteEntry deliberately does not (the host
+      // loads it eagerly on every page, long before anything renders, and it
+      // has to stay a ~1.5kB container).
+      jsAssetsFilterFunction: (chunk) =>
+        chunk.isEntry && (chunk.name === "__federation_expose_App" || chunk.name === "index"),
+    }),
     federation({
       name: "inventory",
       filename: "remoteEntry.js",
@@ -50,6 +59,16 @@ export default defineConfig({
     exclude: ["vue"],
   },
   build: {
+    rollupOptions: {
+      // @vueuse/core's published dist puts `/* #__PURE__ */` in spots Rollup
+      // can't attach to a call, and warns once per occurrence. It's third-party
+      // build output we can't fix, and the only consequence is a lost
+      // tree-shaking hint — so drop those, and only those, on the floor.
+      onwarn(warning, defaultHandler) {
+        if (warning.code === "INVALID_ANNOTATION" && warning.id?.includes("/node_modules/")) return;
+        defaultHandler(warning);
+      },
+    },
     // remoteEntry.js itself still uses top-level await. That one is safe: it is
     // a single isolated entry, not fanned out across the whole app.
     target: "esnext",

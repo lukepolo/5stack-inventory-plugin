@@ -57,6 +57,22 @@ const pickValue = (c: DevChoice) => {
  *  thing you just chose does. */
 const pickHint = (c: DevChoice) =>
   c.options.find((o) => o.value === pickValue(c))?.hint ?? c.hint;
+/**
+ * A picker's options, in sections.
+ *
+ * Only the lighting rig has enough of them to need it: four studio rigs and
+ * every CS2 map the extraction has baked. `map:` on the option's key is what
+ * separates them, so a new map appears in the right half without anything here
+ * knowing its name.
+ */
+function sections(c: DevChoice): { title: string; options: DevChoice["options"] }[] {
+  const scenes = c.options.filter((o) => o.value.startsWith("map:"));
+  if (!scenes.length) return [{ title: "", options: c.options }];
+  return [
+    { title: "Studio", options: c.options.filter((o) => !o.value.startsWith("map:")) },
+    { title: "Maps", options: scenes },
+  ];
+}
 const userPicks = computed(() => userChoices());
 const userSwitches = computed(() => userFlags());
 const userKnobs = computed(() => shown(userNumbers()));
@@ -109,15 +125,24 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
 
 <template>
   <!-- NO POSITIONING OF ITS OWN — the caller supplies it.
-       This started as `position: fixed`, which never appeared: the plugin is
-       federated into the 5stack panel, and a fixed element is positioned against
-       the nearest ancestor with a transform, not the viewport. The panel has
-       several. Rendering inside the viewer pane and letting that pane's own
-       absolute context place it is the thing that actually works — and it is
-       also where the switches belong, next to the model they change. -->
+       This started as `position: fixed` and never appeared, because a fixed
+       element is contained by the nearest transformed ancestor rather than the
+       viewport, and the host panel had several between here and the document.
+       Rendering inside the viewer pane and letting that pane place it was the
+       fix. That then cost the panel its bottom edge — the pane's card clips
+       with overflow-hidden — so ViewerSettingsButton now teleports this to
+       <body> and pins it under the cog, where `fixed` finally means what it
+       says. The lesson survives the change: this element still positions
+       nothing, and the caller is still the only one that knows where it goes. -->
+  <!-- OPAQUE. This was bg-background/95 + backdrop-blur, which is a fine surface
+       over a still page and the wrong one here: it floats over a lit 3D model
+       and a card that is itself bg-card, so every label in it was competing with
+       whatever was moving underneath. Solid `background` also keeps it distinct
+       from the `card` it sits on rather than blending into it, and with nothing
+       showing through there is no backdrop left to blur. -->
   <div
     v-if="open"
-    class="w-[320px] rounded-lg border border-border bg-background/95 shadow-xl backdrop-blur"
+    class="w-[320px] rounded-lg border border-border bg-background shadow-xl"
   >
     <div class="flex items-center gap-2 border-b border-border px-3 py-2">
       <span class="text-f10 uppercase tracking-cs2 text-muted-foreground">{{ tr('inventory.devhud.heading', 'Viewer settings') }}</span>
@@ -137,7 +162,11 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
       ><X class="h-3.5 w-3.5" /></button>
     </div>
 
-    <div class="max-h-[60vh] overflow-y-auto p-2">
+    <!-- The cap is the CALLER's now. The panel is teleported to body and pinned
+         under the cog, so how much room is left below it is something only the
+         thing doing the pinning can measure; 60vh stays the answer whenever the
+         viewport allows it. -->
+    <div class="overflow-y-auto p-2" :style="{ maxHeight: 'var(--devhud-max, 60vh)' }">
       <!-- USER SETTINGS. No group heading: this IS the panel as far as most
            people are concerned, and a heading over a single section is chrome. -->
 
@@ -147,9 +176,16 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
            dropdown would be the only OS-chrome control in it. -->
       <div v-for="c in userPicks" :key="c.name" class="rounded px-1.5 py-1.5">
         <span class="block text-f11 text-foreground">{{ c.label }}</span>
+        <!-- SPLIT INTO SECTIONS. The lighting picker used to be four studio
+             rigs; it is now those four plus fifteen CS2 maps, and nineteen
+             buttons in one wrap read as a wall rather than as a choice. The
+             split is on the option's own key (`map:` prefixes a scene), so
+             nothing here has to be told which is which. -->
+        <template v-for="sec in sections(c)" :key="sec.title">
+        <span v-if="sec.title" class="mt-2 block text-f9 uppercase tracking-cs2 text-muted-foreground/60">{{ sec.title }}</span>
         <div class="mt-1.5 flex flex-wrap gap-1">
           <button
-            v-for="o in c.options"
+            v-for="o in sec.options"
             :key="o.value"
             type="button"
             class="rounded border px-2 py-1 text-f10 transition-colors"
@@ -160,6 +196,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
             @click="setChoice(c.name, o.value)"
           >{{ o.label }}</button>
         </div>
+        </template>
         <span class="mt-1 block text-f10 leading-snug text-muted-foreground/70">{{ pickHint(c) }}</span>
         <!-- Same note the flags carry: read when the rig is built, so an open
              viewer keeps the old one until it is rebuilt. -->

@@ -56,6 +56,10 @@ const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : [])
 /** A CHARM's own pattern, as opposed to a weapon's: the seed on a keychain is a
  *  colourway, and the rail renders it as one. */
 const seedIsCharm = computed(() => props.inst?.item?.type === "keychain");
+/**
+ * The box each reading sits in. The surface is what separates one reading from
+ * the next — it stays, over a map environment as much as on a card.
+ */
 const box = "animate-sheet-in rounded-md bg-secondary/40 p-2.5";
 const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground";
 </script>
