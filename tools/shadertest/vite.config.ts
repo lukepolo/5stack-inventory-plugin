@@ -124,6 +124,10 @@ export default defineConfig({
       // /paints — rewrite rather than expecting a bare-rooted layout.
       "/materials": { target: ASSET_HOST, changeOrigin: true, rewrite: (p) => `/paints${p}` },
       "/textures": { target: ASSET_HOST, changeOrigin: true, rewrite: (p) => `/paints${p}` },
+      // The viewmodel tree: clips, their sounds, the fx textures and the game's
+      // own UI icons. Same host, same shape as production — the rig fetching a
+      // flash texture over the real URL is part of what it is testing.
+      "/anims": { target: ASSET_HOST, changeOrigin: true },
       "/images": { target: ASSET_HOST, changeOrigin: true },
       "/models": { target: ASSET_HOST, changeOrigin: true },
       "/paints": { target: ASSET_HOST, changeOrigin: true },

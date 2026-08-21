@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch, provide, type ComputedRef } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, type ComputedRef, watch } from "vue";
 import { cn } from "@5stack/ui";
 import { useI18n } from "./composables/useI18n";
 import {
@@ -87,8 +87,7 @@ import {
   type Draft,
 } from "./routes";
 import AdminConsole from "./components/AdminConsole.vue";
-import DevHud from "./components/DevHud.vue";
-import { activeFlags, flagsVersion } from "./devFlags";
+import { activeFlags, flagValue, flagsVersion } from "./devFlags";
 import Armory from "./components/Armory.vue";
 import InventoryScreen from "./components/InventoryScreen.vue";
 import LoadoutGrid from "./components/LoadoutGrid.vue";
@@ -114,6 +113,12 @@ import PatternScoreRail from "./components/PatternScoreRail.vue";
 import { SCAN_READ_SIZE } from "./patternScan";
 import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
 import ViewerControls from "./components/ViewerControls.vue";
+import ItemStage from "./components/ItemStage.vue";
+import ItemIdentity from "./components/ItemIdentity.vue";
+import ItemScreen from "./components/ItemScreen.vue";
+import CraftActions from "./components/CraftActions.vue";
+import ViewerSettingsButton from "./components/ViewerSettingsButton.vue";
+import StageTabs from "./components/StageTabs.vue";
 import PillTabs from "./components/PillTabs.vue";
 import DeckCard from "./components/DeckCard.vue";
 import DeckFan from "./components/DeckFan.vue";
@@ -137,6 +142,8 @@ import { useSlotLongPress } from "./composables/useSlotLongPress";
 import { useAppHeight } from "./composables/useAppHeight";
 import { useBuildCheck } from "./composables/useBuildCheck";
 import { useViewerMount } from "./composables/useViewerMount";
+import type { ClipAction } from "./viewmodelClip";
+import { useViewerStage, type StageIcon, type StageKey } from "./composables/useViewerStage";
 import { useDebouncedSearch } from "./composables/useDebouncedSearch";
 import { useInventoryView } from "./composables/useInventoryView";
 import { useAttachmentPicker, type PickerRow } from "./composables/useAttachmentPicker";
@@ -2756,7 +2763,19 @@ function viewerTransport(slot: ReturnType<typeof useViewerMount>) {
 // 3D preview inside the craft/edit modal.
 const modal3d = ref(false);
 const modal3dAvailable = ref(false);
-const modalViewerEl = ref<HTMLElement | null>(null);
+/**
+ * First person, in the modal — in both modes.
+ *
+ * Editing gets it too. Most of the weapon's surface points away from you while
+ * it is held, so it is a poor pose to place a sticker in, but that is the
+ * user's call to make and the toggle back is right there: what you cannot do is
+ * check how your craft actually looks in the game without leaving the editor.
+ */
+const craftHeld = ref(false);
+const craftHeldAvailable = computed(() => craftTarget.value?.kind === "weapon");
+const craftStageCmp = ref<InstanceType<typeof ItemStage> | null>(null);
+const craftPanelW = ref(0);
+const modalViewerEl = computed<HTMLElement | null>(() => craftStageCmp.value?.hostEl ?? null);
 const modalViewer = useViewerMount({
   label: "craft modal",
   host: () => modalViewerEl.value,
@@ -2767,6 +2786,38 @@ const modalViewer = useViewerMount({
   },
 });
 const craftInspect = viewerTransport(modalViewer);
+/**
+ * The box that goes fullscreen — the STAGE, not `modalViewerEl`.
+ *
+ * The canvas host is `absolute inset-0` inside this, so fullscreening it would
+ * take the loading spinner, the 2D/3D pill and the settings cog out of the
+ * fullscreen subtree: the browser paints only the fullscreen element and its
+ * descendants, so every overlay would simply vanish for the duration.
+ */
+const craftStageEl = computed<HTMLElement | null>(() => craftStageCmp.value?.stageEl ?? null);
+const craftStage = useViewerStage({
+  stage: () => craftStageEl.value,
+  handle: () => modalViewer.current(),
+  // Held: the same weapon actions the focus stage offers, against this viewer.
+  // Two screens showing one item should answer the same keys.
+  viewmodel: () => craftHeld.value,
+  extraKeys: () =>
+    craftHeld.value
+      ? FPV_ACTIONS.map((a) => ({
+          key: a.key,
+          cap: a.cap,
+          label: a.label,
+          icon: a.icon,
+          on: fpvAction.value === a.action,
+          run: () => (a.action === "fire" ? holdFpvFire(true, modalViewer) : fireFpvAction(a.action, modalViewer)),
+          ...(a.action === "fire" ? { release: () => holdFpvFire(false, modalViewer) } : {}),
+        }))
+      : [],
+  // 3D only. The keys move a camera, and the 2D branch of this stage is an
+  // <img> — binding "R" to reset a camera that is not on screen is how a
+  // shortcut earns a reputation for doing nothing.
+  enabled: () => !!craft.value && modal3d.value,
+});
 const teardownModalViewer = () => {
   charmPending.value = false;
   modalViewer.teardown();
@@ -3198,6 +3249,18 @@ async function mountModalViewer() {
       // standalone overlay did. Orbit/pan/zoom are gated on `still`, not this,
       // so they stay available either way.
       interactive: !viewOnly.value,
+      frameInset: { right: craftPanelW.value },
+      // Held, on the same terms as the focus view: the equipped gloves wear
+      // their finish and the equipped agent lends a sleeve.
+      firstPerson:
+        craftHeld.value && craftHeldAvailable.value
+          ? {
+              arms: fpvArms.value,
+              action: "idle" as const,
+              armsPaint: fpvArmsPaint.value,
+              sleeve: fpvSleeve.value,
+            }
+          : null,
       // Live 3D, so a real readout — the owned item's count when the modal is
       // showing one (craftInstId covers editing AND duplicating, which
       // editingId does not), and 0 for a brand-new craft that has no kills.
@@ -3254,9 +3317,16 @@ async function mountModalViewer() {
     },
   );
 }
-watch(modal3d, (on) => {
-  if (on) void mountModalViewer();
-  else teardownModalViewer();
+watch([modal3d, craftHeld], ([on, held], [was3d]) => {
+  // Same shape as the focus stage's mode watcher: the arms are a second GLB and
+  // the weapon has to be re-parented onto a hand bone, so holding it is a
+  // remount — and both flags changing at once must still mount exactly once.
+  if (!on) {
+    if (was3d) teardownModalViewer();
+    return;
+  }
+  void mountModalViewer();
+  void held;
 });
 // Culling the forearms changes GEOMETRY, so it cannot be flipped on a live
 // scene the way a material flag could — the viewer has to be rebuilt.
@@ -4158,8 +4228,9 @@ const sheetModeTabs = computed(() => [
   { key: "craft", label: "Craft" },
 ]);
 
-/** The 2D/3D stage toggle, shared by the focus view and the craft modal. */
-const STAGE_TABS = ["2D", "3D"] as const;
+// The 2D/3D switch and the held toggle both live in ItemStage now — one pane,
+// one set of chrome, in both of the screens that show an item.
+
 const linkOpening = ref(false);
 // The handoff is silent by design (see openInspectLink) — nothing in the page
 // changes and CS2 may take a while to surface, so without this the click reads
@@ -5109,11 +5180,47 @@ watch(
  * slid across a gun fires a change per frame, and every one of those would be a
  * request. 250ms after the hand stops is indistinguishable from live.
  */
-const craftQuote = ref<Quote | null>(null);
-const craftQuoting = ref(false);
+/**
+ * THE ITEM BEING PRICED — whichever item screen is on top.
+ *
+ * The quote, the sale history, the wear standing and every tooltip built on
+ * them used to read `craft.value` directly, so they existed only inside the
+ * modal. That is why the focus view showed a bare figure while the modal showed
+ * a figure, a spread, a volume and a verdict: not a different component, a
+ * different amount of DATA. One subject fixes it at the source — the same
+ * pipeline runs for whichever screen is up, and ItemPrice draws what it is
+ * given.
+ *
+ * Only one of them is ever on top (the modal covers focus, and suspends its
+ * viewer), so a single pipeline is not a race.
+ *
+ * A REF, FED BY THE FOCUS SCREEN — not a computed reaching down the file for
+ * `focusPriceable`. This module is one long `<script setup>`, so a computed
+ * declared here that reads a `const` declared 1,100 lines below throws
+ * `ReferenceError: Cannot access … before initialization` the first time
+ * anything evaluates it, which during setup is immediately. Vue catches that
+ * inside a watcher's getter and carries on, so nothing crashes and nothing
+ * works: the watcher never finishes tracking its dependencies and the price
+ * never arms. The screen below assigns into this instead, which cannot happen
+ * before it exists.
+ */
+const focusSubject = shallowRef<{
+  skin: Skin;
+  wear: number;
+  seed: number;
+  stattrak: boolean;
+  nametag: string;
+  stickers: (Attach | null)[];
+  patches: (Attach | null)[];
+  charm: Attach | null;
+} | null>(null);
+const priceSubject = computed(() => craft.value ?? focusSubject.value);
+
+const itemQuote = ref<Quote | null>(null);
+const itemQuoting = ref(false);
 let quoteTimer: ReturnType<typeof setTimeout> | undefined;
 
-function quoteKeyOf(c: NonNullable<typeof craft.value>) {
+function quoteKeyOf(c: NonNullable<typeof priceSubject.value>) {
   // Only the inputs a PRICE depends on. Deliberately not the placement — moving
   // a sticker across the gun changes the render, never the bill — so dragging
   // one costs nothing here.
@@ -5128,21 +5235,38 @@ function quoteKeyOf(c: NonNullable<typeof craft.value>) {
 }
 
 let quoteToken = 0;
-function scheduleCraftQuote() {
-  const c = craft.value;
+/**
+ * The price path, out loud.
+ *
+ * This pipeline has now been wrong three times in ways that all LOOKED the same
+ * from outside — a figure with nothing under it — and each cause was a
+ * different link in the chain: a watcher that never armed, a debounce that kept
+ * re-arming, a reading gated on the editor's own state. A chain that fails
+ * silently in three places gets to say which one it was.
+ *
+ * `?pricelog=1` (or the flag in the developer panel) prints one line per step:
+ * what was armed, what went out, what came back.
+ */
+const priceLog = (...args: unknown[]) => {
+  if (flagValue("pricelog")) console.log("[price]", ...args);
+};
+
+function scheduleQuote() {
+  const c = priceSubject.value;
+  priceLog("quote: arm", { subject: c ? c.skin.name : null, id: c?.skin?.id, on: pricesOn.value });
   clearTimeout(quoteTimer);
   // Supersedes any request already in flight as well as any timer not yet fired
   // — see the token note below.
   quoteToken++;
   if (!c || !pricesOn.value) {
-    craftQuote.value = null;
+    itemQuote.value = null;
     // The cleared timer's `finally` will never run, so this is the only place
     // the busy flag can be lowered — left set, the whole value block sits at 40%
     // opacity for the rest of the editor session, looking permanently mid-load.
-    craftQuoting.value = false;
+    itemQuoting.value = false;
     return;
   }
-  craftQuoting.value = true;
+  itemQuoting.value = true;
   // Which request owns the busy flag. Without it the flag was lowered by whichever
   // quote settled FIRST: change a sticker just after a timer has fired and the
   // older request's `finally` clears it while the newer one is still ~500ms away,
@@ -5163,11 +5287,14 @@ function scheduleCraftQuote() {
       });
       // The form may have moved on while that was in flight; a late answer for a
       // gun that no longer exists on screen is worse than none.
-      if (craft.value && quoteKeyOf(craft.value) === key) craftQuote.value = quote;
-    } catch {
-      if (token === quoteToken) craftQuote.value = null;
+      const match = !!priceSubject.value && quoteKeyOf(priceSubject.value) === key;
+      priceLog("quote: back", { total: quote?.total, kept: match });
+      if (match) itemQuote.value = quote;
+    } catch (e) {
+      priceLog("quote: FAILED", e);
+      if (token === quoteToken) itemQuote.value = null;
     } finally {
-      if (token === quoteToken) craftQuoting.value = false;
+      if (token === quoteToken) itemQuoting.value = false;
     }
   }, 250);
 }
@@ -5176,41 +5303,41 @@ function scheduleCraftQuote() {
 // sticker around the gun never triggers a quote. Closing the editor clears it,
 // or the next open flashes the last craft's total.
 watch(
-  () => (craft.value ? quoteKeyOf(craft.value) : null),
+  () => (priceSubject.value ? quoteKeyOf(priceSubject.value) : null),
   (key) => {
     if (key === null) {
-      craftQuote.value = null;
+      itemQuote.value = null;
       return;
     }
-    scheduleCraftQuote();
-    scheduleCraftDetail();
+    scheduleQuote();
+    scheduleDetail();
   },
 );
 // Turning values on mid-edit should fill the line in, not wait for the next
 // sticker change.
 watch(pricesOn, () => {
-  if (craft.value) {
-    scheduleCraftQuote();
-    scheduleCraftDetail();
+  if (priceSubject.value) {
+    scheduleQuote();
+    scheduleDetail();
   } else {
-    craftQuote.value = null;
-    craftDetail.value = null;
+    itemQuote.value = null;
+    itemDetail.value = null;
   }
 });
 
 /** The quote, spelled out. Line by line so it is obvious what the total is made
  *  of, and explicit about what could not be priced — an estimate silently
  *  missing the expensive sticker is worse than no estimate. */
-const craftQuoteTip = computed(() => {
-  const quote = craftQuote.value;
+const itemQuoteTip = computed(() => {
+  const quote = itemQuote.value;
   if (!quote) return "";
   // Nothing priced at all. The most useful thing to say is WHAT was looked for:
   // an item with no listing and a feed that never synced look identical from
   // here, and the bracket is usually the answer — markets list per bracket, and
   // the ends of the range often have no copies for sale at all.
   if (quote.total === 0) {
-    const bracket = craftHasWear.value && craft.value?.wear != null ? ` (${wearTier(craft.value.wear)})` : "";
-    const st = craft.value?.stattrak ? "StatTrak™ " : "";
+    const bracket = priceSubject.value?.wear != null ? ` (${wearTier(priceSubject.value.wear)})` : "";
+    const st = priceSubject.value?.stattrak ? "StatTrak™ " : "";
     return (
       `No ${priceSourceLabel.value} listing for ${st}${quote.base.name ?? "this item"}${bracket}.\n` +
       (quote.attachments.length
@@ -5221,8 +5348,8 @@ const craftQuoteTip = computed(() => {
   }
   // The substitution leads, when there is one: it changes what the total means.
   const note =
-    quote.base.price && craft.value
-      ? approxNote(quote.base.price, craft.value.wear ?? null, craft.value.stattrak)
+    quote.base.price && priceSubject.value
+      ? approxNote(quote.base.price, priceSubject.value.wear ?? null, priceSubject.value.stattrak)
       : "";
   const lines = [
     ...(note ? [`No exact listing for this variant — priced from the ${note} one.`, ""] : []),
@@ -5296,38 +5423,45 @@ function stockPriceTip(id?: number | null) {
  * them — CSFloat and Waxpeer both require an account. A fabricated figure on a
  * $1,400 knife is worse than an honest range.
  */
-const craftDetail = ref<PriceDetail | null>(null);
+const itemDetail = ref<PriceDetail | null>(null);
 let detailTimer: ReturnType<typeof setTimeout> | undefined;
 
-function scheduleCraftDetail() {
-  const c = craft.value;
+function scheduleDetail() {
+  const c = priceSubject.value;
+  priceLog("detail: arm", { subject: c ? c.skin.name : null, id: c?.skin?.id, on: pricesOn.value });
   clearTimeout(detailTimer);
   if (!c || !pricesOn.value) {
-    craftDetail.value = null;
+    itemDetail.value = null;
     return;
   }
   const key = `${c.skin.id}:${wearTier(c.wear ?? 0)}:${c.stattrak ? 1 : 0}`;
   detailTimer = setTimeout(async () => {
     try {
       const detail = await fetchPriceDetail(c.skin.id, c.wear ?? null, c.stattrak);
-      const still = craft.value;
+      priceLog("detail: back", { available: detail?.available, rows: detail?.history?.length });
+      const still = priceSubject.value;
       if (still && `${still.skin.id}:${wearTier(still.wear ?? 0)}:${still.stattrak ? 1 : 0}` === key) {
-        craftDetail.value = detail.available ? detail : null;
+        itemDetail.value = detail.available ? detail : null;
       }
-    } catch {
-      craftDetail.value = null;
+    } catch (e) {
+      priceLog("detail: FAILED", e);
+      itemDetail.value = null;
     }
   }, 400);
 }
 
 /** The window worth quoting, once. */
-const craftSales = computed(() => (craftDetail.value ? bestSaleWindow(craftDetail.value.history) : null));
+const itemSales = computed(() => (itemDetail.value ? bestSaleWindow(itemDetail.value.history) : null));
 
 /** Where the edited float sits in its own bracket, and what that means in words.
  *  Only for items that HAVE a float — a charm has no bracket to be at the end of. */
-const craftWearStanding = computed(() => {
-  const c = craft.value;
-  if (!c || !craftHasWear.value || c.wear == null) return null;
+const itemWearStanding = computed(() => {
+  const c = priceSubject.value;
+  // `hasWear(c.skin)`, not the craft form's own flag: this reading is about the
+  // ITEM being priced, and gating it on the editor's state is what left the
+  // focus view showing a figure with no standing under it — the line existed,
+  // the screen that could produce it did not.
+  if (!c || !hasWear(c.skin) || c.wear == null) return null;
   const { tier, pct } = wearPositionInTier(c.wear);
   const rank = Math.max(1, Math.round(pct * 100));
   return {
@@ -5340,9 +5474,9 @@ const craftWearStanding = computed(() => {
 });
 
 /** One sentence tying the two together, and one saying what it can't see. */
-const craftValueTip = computed(() => {
-  const sales = craftSales.value;
-  const standing = craftWearStanding.value;
+const itemValueTip = computed(() => {
+  const sales = itemSales.value;
+  const standing = itemWearStanding.value;
   if (!sales) return "";
   const range =
     sales.min != null && sales.max != null && sales.max > sales.min
@@ -5792,7 +5926,23 @@ const focus3dAvailable = ref(false);
 // initial ResizeObserver fire can position the indicator on its own.
 // Sheet origin tabs only exist in Owned mode (and behind the compact filter
 // disclosure), so re-seed on every condition that (re)mounts them.
-const viewer3dEl = ref<HTMLElement | null>(null);
+/**
+ * The focus stage, and the two elements the viewer plumbing needs off it: the
+ * PANE (what goes fullscreen) and the 3D HOST (what the renderer mounts into).
+ * Both `useViewerMount` and `useViewerStage` take getters, so these stay plain
+ * reads rather than props threaded down.
+ */
+const focusStageCmp = ref<InstanceType<typeof ItemStage> | null>(null);
+/**
+ * What the floating spec panel covers, per stage — see ItemStage's
+ * `panel-width` and the viewer's `frameInset`. Kept as state rather than read
+ * at mount time because it changes with the breakpoint and with whether the
+ * item has anything to say about itself, neither of which is a remount.
+ */
+const focusPanelW = ref(0);
+/** Any overlay sitting on top of the focus screen — see the suspend watcher. */
+const overlayOpen = ref(false);
+const viewer3dEl = computed<HTMLElement | null>(() => focusStageCmp.value?.hostEl ?? null);
 /**
  * What the focus stage mounts, as a TARGET rather than a bare key.
  *
@@ -5993,6 +6143,175 @@ const focusViewer = useViewerMount({
   },
 });
 const focusInspect = viewerTransport(focusViewer);
+/**
+ * The focus stage's fullscreen box.
+ *
+ * Unlike the craft modal this one needs no second control bar: the focus stage
+ * already floats its ViewerControls INSIDE this element (`variant="overlay"`),
+ * so the bar comes along into the fullscreen subtree for free.
+ */
+/**
+ * First person: OFF by default, and deliberately not persisted.
+ *
+ * The item view is what this app is for — you open a skin to look at the skin —
+ * so holding it is a thing you ask for, not a mode you can get stranded in. Not
+ * persisted for the same reason: a preference that survives a reload would have
+ * every future item open in the hands, which is exactly the "why is my weapon
+ * gone" a sticky viewer setting causes.
+ */
+const fpvOn = ref(false);
+/**
+ * What the held weapon is doing — CS2's own four actions plus the resting pose.
+ *
+ * Resets to `idle` whenever first person is left, because an action is a thing
+ * you press rather than a mode: coming back to a weapon frozen mid-reload would
+ * read as broken.
+ */
+const fpvAction = ref<ClipAction>("idle");
+/** The action buttons, in the order the game lists them. */
+const FPV_ACTIONS: { action: ClipAction; key: string; cap: string; label: string; icon: StageIcon }[] = [
+  { action: "fire", key: "k", cap: "K", label: "Fire", icon: "fire" },
+  { action: "reload", key: "r", cap: "R", label: "Reload", icon: "reload" },
+  // I, not the game's F: F is FULLSCREEN on every stage in this app, and one
+  // key cannot be two things on a screen that offers both.
+  { action: "inspect", key: "i", cap: "I", label: "Inspect", icon: "inspect" },
+  { action: "draw", key: "1", cap: "1", label: "Deploy", icon: "deploy" },
+];
+/**
+ * The arms to wear — the equipped gloves, else the team's stock pair.
+ *
+ * The glove GLB is where the arm skeleton and the inspect clip live (see
+ * viewerArms.ts), so there is always an answer: a player wearing no gloves still
+ * has hands, and `ct_gloves`/`t_gloves` are the models the game gives them.
+ */
+const fpvArms = computed<string>(() => {
+  const worn = cellItem("gloves") ?? specialDefault("gloves");
+  const resolved = worn ? resolveViewerModelSync(worn)?.model : null;
+  return resolved ?? (team.value === "CT" ? "ct_gloves" : "t_gloves");
+});
+/**
+ * The equipped glove's FINISH, so the hands wear what the loadout says.
+ *
+ * Null for the stock pair, which has no finish and is correct unpainted — the
+ * default gloves' own textures are the real thing rather than a placeholder.
+ */
+const fpvArmsPaint = computed<{ material: string; wear: number | null } | null>(() => {
+  const row = rowFor("gloves");
+  const inst = isSkinned(row) ? row?.item ?? null : null;
+  const material = inst?.paintMaterial ?? null;
+  return material ? { material, wear: row?.wear ?? null } : null;
+});
+/**
+ * The equipped agent's model, for the first-person sleeve.
+ *
+ * Falls back to the team's stock agent so the arms are dressed either way — a
+ * player who has equipped nothing still wears something in game.
+ */
+const fpvSleeve = computed<string | null>(() => {
+  const worn = cellItem("agent") ?? specialDefault("agent");
+  return worn ? resolveViewerModelSync(worn)?.model ?? null : null;
+});
+/** Only weapons go in a hand. A glove, an agent or a music kit has no grip. */
+const fpvAvailable = computed(() => (focusTarget.value?.kind ?? "weapon") === "weapon");
+
+const focusStageEl = computed<HTMLElement | null>(() => focusStageCmp.value?.stageEl ?? null);
+const focusStage = useViewerStage({
+  stage: () => focusStageEl.value,
+  handle: () => focusViewer.current(),
+  // Not while a modal is over the top: the craft sheet opens on top of the
+  // focus view and has its own stage with the same keys, and two handlers
+  // answering "R" would reset a camera nobody is looking at as well as the one
+  // they are.
+  enabled: () => view.value === "focus" && focus3d.value && !craft.value && !loadout3d.value,
+  viewmodel: () => fpvOn.value,
+  extraKeys: () => {
+    if (!fpvAvailable.value) return [];
+    const rows: StageKey[] = [
+      {
+        key: "v",
+        cap: "V",
+        label: fpvOn.value
+          ? tr("inventory.viewer.controls.fpv_exit", "Put it down")
+          : tr("inventory.viewer.controls.fpv", "Hold it"),
+        icon: "inspect",
+        on: fpvOn.value,
+        // The SHORTCUT for the stage strip's HELD tab, which is where this
+        // choice is now made and drawn. Hidden so it is not offered twice.
+        hidden: true,
+        run: () => (fpvOn.value = !fpvOn.value),
+      },
+    ];
+    // The weapon's own actions, only while it is being held. `idle` is not
+    // among them: it is where the weapon RESTS, so pressing an action again
+    // returns to it rather than needing a button of its own.
+    if (fpvOn.value) {
+      for (const a of FPV_ACTIONS) {
+        rows.push({
+          key: a.key,
+          cap: a.cap,
+          label: a.label,
+          icon: a.icon,
+          on: fpvAction.value === a.action,
+          run: () => (a.action === "fire" ? holdFpvFire(true) : fireFpvAction(a.action)),
+          // Fire is a TRIGGER, not a button: run on press, release on let-go,
+          // and the viewer repeats it at the weapon's own cycle time while held.
+          ...(a.action === "fire" ? { release: () => holdFpvFire(false) } : {}),
+        });
+      }
+    }
+    return rows;
+  },
+});
+// Toggling rebuilds the viewer: the arms are a second GLB and the weapon has to
+// be re-parented onto a hand bone, neither of which is a live setter. That
+// remount is watched next to the 3D switch itself — see the mode watcher — so
+// changing both at once still mounts exactly once.
+/**
+ * Play one of the weapon's actions on the LIVE viewer.
+ *
+ * Not a remount. An action is a thing you press — it plays once and the weapon
+ * settles back to idle — so the state here is "what is playing right now", lit
+ * on the button while it runs and cleared by the viewer when the clip ends.
+ * Pressing the same action again restarts it.
+ */
+function fireFpvAction(a: ClipAction, slot: ReturnType<typeof useViewerMount> = focusViewer) {
+  const h = slot.current();
+  if (!h) return;
+  // The button lights only for a press the viewer TOOK — a reload cannot be
+  // interrupted and an inspect never interrupts, so a rejected press changing
+  // the lit button would claim something the arms are not doing.
+  const taken = h.setFpvAction(a, () => {
+    if (fpvAction.value === a) fpvAction.value = "idle";
+  });
+  if (taken) fpvAction.value = a;
+}
+/** The trigger. Press-and-hold is full auto where the weapon is. */
+function holdFpvFire(held: boolean, slot: ReturnType<typeof useViewerMount> = focusViewer) {
+  const h = slot.current();
+  if (!h) return;
+  const taken = h.setFpvFire(held, () => {
+    if (fpvAction.value === "fire") fpvAction.value = "idle";
+  });
+  if (held && taken) fpvAction.value = "fire";
+}
+/**
+ * A MODAL OVER THE FOCUS VIEW STOPS IT DRAWING.
+ *
+ * Opening Edit from focus left two live viewers on one GPU — the modal's, and
+ * the focus one behind it still turning a weapon nobody can see, at full rate,
+ * with its own composite and its own charm simulation. The hidden one keeps
+ * everything it has loaded and simply stops its loop, so closing the modal is
+ * instant rather than a remount.
+ *
+ * `craft` covers both ways in (edit and view); `loadout3d` is the other overlay
+ * that can sit on top of this screen.
+ */
+watch([craft, overlayOpen], ([c, l]) => focusViewer.current()?.setSuspended(!!c || !!l));
+
+// Live: a breakpoint change or an item with nothing to show swaps the panel in
+// and out under a viewer that is already mounted.
+watch(focusPanelW, (w) => focusViewer.current()?.setFrameInset(w));
+watch(craftPanelW, (w) => modalViewer.current()?.setFrameInset(w));
 const teardownViewer = focusViewer.teardown;
 watch([focusModelKey, focusPaint], async ([key]) => {
   teardownViewer();
@@ -6046,6 +6365,96 @@ const focusAttachments = computed<AttachSource | null>(
  * to say — a crafted cell in someone else's loadout, which is where the stickers
  * and the charm the visitor came to see actually live.
  */
+/**
+ * The focused item, in the shape the price pipeline takes.
+ *
+ * Deliberately the SAME shape the craft form has rather than a second flavour
+ * of "priceable": `quoteKeyOf` and `quoteCraft` then work on either without
+ * knowing which screen they are serving, which is what makes the two show the
+ * same reading. Null for a default finish — there is nothing to price.
+ */
+const focusPriceable = computed(() => {
+  // Only while the focus SCREEN is up. `focusRow` answers for the selected slot
+  // whatever view is showing, and quoting on every click around the loadout
+  // grid would be a request per selection for a figure nothing is drawing.
+  if (view.value !== "focus") return null;
+  const row = focusRow.value;
+  if (!row?.item || !isSkinned(row)) return null;
+  const a = focusAttachments.value;
+  return {
+    skin: row.item as Skin,
+    wear: row.wear ?? 0,
+    seed: row.seed ?? 0,
+    stattrak: !!row.stattrak,
+    nametag: "",
+    stickers: (a?.stickers ?? []) as (Attach | null)[],
+    patches: (a?.patches ?? []) as (Attach | null)[],
+    charm: (a?.charm ?? null) as Attach | null,
+  };
+});
+/**
+ * LANDING ON AN ITEM IS NOT A CHANGE TO ONE.
+ *
+ * The pipeline's own watcher fires on the quote KEY changing, which covers
+ * editing but not arriving: open focus on a weapon nobody has touched and the
+ * key was already what it is. `immediate` on that watcher would have been the
+ * obvious fix and was the wrong one — it lives above `focusPriceable` in this
+ * file, so running it at creation read a `const` in its temporal dead zone. The
+ * throw was swallowed by Vue's watcher error handling, the effect never
+ * finished registering its dependencies, and the price appeared only after
+ * something ELSE it had managed to track changed — opening the editor and
+ * coming back. Declared here instead, after the thing it reads.
+ */
+// The focus screen hands its item to the pipeline. Declared HERE, after the
+// computed it reads — see the note on `focusSubject`.
+watch(focusPriceable, (p) => (focusSubject.value = p), { immediate: true });
+watch(
+  // THE KEY, NOT THE OBJECT. `focusPriceable` builds a fresh object every time
+  // it evaluates, so watching it fires on any tick that touches one of its
+  // sources — and both schedulers begin by CLEARING their debounce timer.
+  // Anything re-evaluating faster than the 400ms detail debounce therefore kept
+  // pushing the request into the future and it never went out at all, which is
+  // exactly what "the figure loads but the sale history never does" looks like.
+  // The key is a string of the facts a price depends on: it changes when the
+  // answer would change, and not otherwise.
+  () => (focusPriceable.value ? quoteKeyOf(focusPriceable.value) : null),
+  (k) => {
+    priceLog("focus: key", k, craft.value ? "(editor open — it owns the pipeline)" : "");
+    if (k === null || craft.value) return;
+    scheduleQuote();
+    scheduleDetail();
+  },
+  { immediate: true },
+);
+/**
+ * The focus screen's price, as data — see ItemPrice.
+ *
+ * THE FIGURE COMES FIRST. The quote is a round trip and the slot's own value is
+ * already in hand, so the line renders immediately with what is known and the
+ * quote's extra readings (the spread, the volume, the float's standing) fill in
+ * underneath when it lands. Waiting for the round trip meant an item screen
+ * that showed no price at all until something happened to trigger one.
+ */
+const focusPrice = computed(() => {
+  if (!pricesOn.value) return null;
+  // Three sources, nearest first: the quote (the whole reading), the slot's
+  // cached value, and the item's own market price. The last one is on the row
+  // already — a deep link into focus has no slot values fetched yet, which is
+  // how this screen managed to show no figure at all while the modal showed
+  // one for the same weapon.
+  const q = itemQuote.value;
+  const total = q?.total ?? cellValue(selected.value) ?? focusInstance.value?.price?.value ?? null;
+  if (total == null) return null;
+  return {
+    total,
+    extra: q?.attachmentTotal,
+    approx: !!q?.base.price?.approx,
+    sales: itemSales.value,
+    standing: itemWearStanding.value,
+    tip: q ? itemQuoteTip.value : slotValueTip.value,
+    busy: itemQuoting.value && !q,
+  };
+});
 const focusSpecs = computed<AttachSource | null>(() =>
   focusInstance.value ?? (viewerId.value && isSkinned(focusRow.value) ? focusRow.value ?? null : null),
 );
@@ -6130,6 +6539,19 @@ async function mount3d() {
         focusAttachments.value?.stattrak || focusRow.value?.stattrak
           ? { count: focusAttachments.value?.stattrak_count ?? focusRow.value?.stattrak_count ?? 0 }
           : null,
+      // The spec panel floats over the pane's right edge; the viewer frames the
+      // model around it rather than the pane giving up the width.
+      frameInset: { right: focusPanelW.value },
+      // Absent unless asked for, which is what keeps the item view the default.
+      firstPerson:
+        isWeapon && fpvOn.value
+          ? {
+              arms: fpvArms.value,
+              action: "idle",
+              armsPaint: fpvArmsPaint.value,
+              sleeve: fpvSleeve.value,
+            }
+          : null,
     };
   });
 }
@@ -6146,6 +6568,10 @@ async function mount3d() {
 // can offer the link the same way every other stage does. It just can't ask the
 // saved route for it — there is no owned row — so it goes out as a bare draft.
 const loadout3d = ref<{ pos: string; model: string; name: string; id: number | null } | null>(null);
+// What the suspend watcher above actually watches — assigned here because that
+// watcher is declared before this ref exists. See `focusSubject` for the same
+// trap and why reaching down the file is not an option in one long setup.
+watch(loadout3d, (v) => (overlayOpen.value = !!v));
 const loadout3dEl = ref<HTMLElement | null>(null);
 // Mounting downloads a GLB and composites the paint — seconds on a cold cache,
 // during which the canvas is just empty black. Covered by a spinner instead
@@ -6239,9 +6665,23 @@ function view3dForInstance(inst: InventoryItem) {
 // spec column and the 2D fallback for weapons with no extracted GLB. The
 // overlay below survives only for the case with no instance behind it — a
 // default weapon straight off the loadout grid, which has nothing to view.
-watch(focus3d, (on) => {
-  if (on) mount3d();
-  else teardownViewer();
+/**
+ * The focus stage's MODE, watched as one thing.
+ *
+ * `focus3d` and `fpvOn` change together — the stage strip going 2D → HELD sets
+ * both — and two watchers each calling `mount3d()` in the same flush is how a
+ * host ends up with two canvases in it. One watcher, one mount.
+ */
+watch([focus3d, fpvOn], ([on, held], [was3d]) => {
+  // Leaving first person puts the weapon back down.
+  if (!held) fpvAction.value = "idle";
+  if (!on) {
+    // Only on the way OUT of 3D: toggling the hands while the flat art is up
+    // has nothing mounted to tear down.
+    if (was3d) teardownViewer();
+    return;
+  }
+  void mount3d();
 });
 onBeforeUnmount(() => {
   clearTimeout(pulseTimer);
@@ -7471,67 +7911,32 @@ if (MDEBUG) {
 
         <!-- ============ FOCUS VIEW ============ -->
         <div v-else data-role="focus" class="animate-view-in flex flex-1 flex-col overflow-hidden" :class="isCompact ? 'p-2' : 'p-5'">
+          <!-- FLEX, NOT A THREE-ROW GRID. The grid's rows were header / stage /
+               footer back when this file laid those out itself; ItemScreen owns
+               that stack now and went into the FIRST row — the `auto` one — so
+               the card sized it to its content and left the `1fr` row empty
+               underneath. The model sat in the top half of a card with a third
+               of its height unused below it. -->
           <div
-            class="relative grid flex-1 grid-rows-[auto_1fr_auto] overflow-hidden rounded-2xl border border-border bg-card"
+            class="relative flex flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-card"
             :class="isCompact ? 'px-4 py-4' : 'px-8 py-6'"
           >
             <span
               class="pointer-events-none absolute inset-0"
               :style="rarityOf(selected) ? { background: `radial-gradient(56% 66% at 50% 44%, ${rarityOf(selected)}, transparent 62%)`, filter: 'blur(30px)', opacity: 0.5 } : {}"
             ></span>
-            <div class="relative z-[2] flex items-start justify-between gap-4">
-              <div class="min-w-0">
-                <div class="text-f9 uppercase tracking-cs4 text-muted-foreground/70">{{ focusSlotLabel }}</div>
-                <h2 class="mt-1.5 truncate font-bold leading-none" :class="isCompact ? 'text-2xl' : 'text-4xl'">{{ sheetWeaponName }}</h2>
-                <div class="mt-1.5 flex min-w-0 flex-wrap items-center gap-2">
-                  <span class="truncate font-medium" :class="isCompact ? 'text-f13' : 'text-base'" style="color: var(--acc)">
-                    {{ isSkinned(focusRow) ? focusRow!.item!.name : '— default finish —' }}
-                  </span>
-                  <!-- StatTrak and what's applied, from the same component the
-                       tiles and the loadout cells use. This line used to spell
-                       "· StatTrak™" by hand and show nothing at all about the
-                       stickers or the charm. -->
-                  <ItemBadges :inst="focusSpecs" :max="6" count />
-                  <!-- Rarity rides with the name it describes, not the stage
-                       controls on the far side of the panel. -->
-                  <span
-                    v-if="rarityOf(selected)"
-                    class="inline-flex flex-none items-center gap-1.5 rounded-sm border px-2 py-0.5 text-f10 uppercase tracking-cs2"
-                    :style="{ borderColor: rarityOf(selected), color: rarityOf(selected), background: `color-mix(in srgb, ${rarityOf(selected)} 12%, transparent)` }"
-                  >
-                    <span class="h-1.5 w-1.5 rounded-[1px]" :style="{ background: rarityOf(selected) }"></span>{{ rarityName(rarityOf(selected)) }}
-                  </span>
-                  <!-- Focus was the one screen with no price on it, which made the
-                       header total look like it was counting something the screen
-                       wasn't showing. It rides with the name and the rarity chip for
-                       the same reason they do: this is a fact about the ITEM, not
-                       about the stage. Spine rather than chip — the rarity chip
-                       beside it is already a bordered pill, and two of those read as
-                       a pair of buttons. -->
-                  <Tooltip v-if="pricesOn && cellValue(selected)" :text="slotValueTip">
-                    <PriceTag frame="spine" size="md" :value="cellValue(selected)" suffix="est" />
-                  </Tooltip>
-                </div>
-              </div>
-              <!-- Stage controls live in the header, on the same baseline as the
-                   rarity chip. The 3D toggle used to float over the artwork
-                   anchored to nothing. The spec column is NOT in here — see the
-                   body row below. -->
-              <div class="flex flex-none items-center gap-2.5">
-                <!-- Same sliding-pill animated tabs as every other tab group. -->
-                <PillTabs
-                  v-if="focus3dAvailable"
-                  :items="STAGE_TABS"
-                  :item-key="(s) => s"
-                  :active="focus3d ? '3D' : '2D'"
-                  list-class="h-8"
-                  button-class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
-                  @select="(s) => setFocus3d(s === '3D')"
-                >
-                  <template #default="{ item: s }">
-                    <component :is="s === '3D' ? Box : ImageIcon" class="h-3.5 w-3.5" /> {{ s }}
-                  </template>
-                </PillTabs>
+            <!-- ONE SCREEN. The identity, the actions, the stage and the row
+                 under it are ordered by ItemScreen rather than by this file —
+                 the item modal mounts the same one, so the two cannot drift
+                 into looking like different screens again. -->
+            <ItemScreen :held="fpvOn && focus3d" @panel-width="(w) => (focusPanelW = w)" :identity="{ slotLabel: focusSlotLabel, weapon: sheetWeaponName, finish: isSkinned(focusRow) ? stripName(focusRow!.item!.name) : '— default finish —', price: focusPrice }">
+              <template #actions>
+                <!-- The same three controls the modal carries, in the same
+                     order. Focus had no settings cog at all for a while, which
+                     meant lighting, bloom and motion were unreachable on the
+                     screen you land on to look at a weapon. -->
+                <ViewerSettingsButton v-if="focus3d" v-model:open="devHudOpen" :changed="devFlagCount" />
+                <StageTabs v-if="focus3dAvailable" :is3d="focus3d" list-class="h-8" @update:is3d="setFocus3d" />
                 <!-- Edit + Inspect + Share live top right, same corner as every
                      other surface (3D overlay, craft modal, item detail).
                      Edit leads: focus is where you land on a slot, and until now
@@ -7568,120 +7973,85 @@ if (MDEBUG) {
                   :note="ITEM_LINK_NOTE"
                   :btn-class="FOCUS_STAGE"
                 />
-              </div>
-            </div>
-
-            <!-- BODY: the stage beside the spec column, laid out the way the
-                 craft modal lays out the same two things — preview left, a
-                 300px column of the same boxes on the right. Focus and the modal
-                 are the two screens you open to study one item, and laying its
-                 facts out differently in each is how people learn to distrust
-                 both.
-                 The column used to hang off the header's control cluster as a
-                 right-aligned stack of shrink-wrapped boxes, which (a) looked
-                 nothing like the modal's stretched column and (b) sat in the
-                 `auto` header row of the card grid, so four boxes of specs made
-                 the header ~300px tall and the stage row that much shorter and
-                 lower — the model was centred in what was left, i.e. shoved
-                 down the card. In the body row the column is a sibling of the
-                 stage, so the stage keeps its full height, centres the model in
-                 the space BESIDE the column (as the modal does), and gets a
-                 squarer pane into the bargain. -->
-            <div class="relative z-[2] flex min-h-0 gap-5">
-            <!-- ONE grid cell for the 3D host and the 2D art. Both carry
-                 col-start-1 row-start-1 because they can coexist for a moment:
-                 a 2D→3D flip shows the host while the art's leave transition
-                 is still playing, and as two auto rows the host took the first
-                 and the leaving art was laid out UNDER it — a flat icon drawn
-                 a pane lower for 100ms, which read as the model jumping. -->
-            <div class="relative grid min-h-0 min-w-0 flex-1 place-items-center">
-              <div v-show="focus3d" ref="viewer3dEl" class="col-start-1 row-start-1 h-full min-h-[240px] w-full"></div>
-              <div v-if="focus3d && focusViewer.busy.value" class="absolute inset-0 z-[3] grid place-items-center">
-                <div class="flex flex-col items-center gap-3 text-muted-foreground">
-                  <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
-                  <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
-                </div>
-              </div>
-              <!-- Slot switches swap the art with a quick settle instead of a
-                   hard cut. The transition rides a wrapper because the art
-                   itself runs animate-float — an animation would override the
-                   enter transform on the same element. -->
-              <Transition
-                mode="out-in"
-                enter-active-class="transition duration-200 ease-out"
-                enter-from-class="opacity-0 translate-y-3 scale-95"
-                leave-active-class="transition duration-100 ease-in"
-                leave-to-class="opacity-0 scale-105"
-              >
-                <div v-if="!focus3d" :key="selected" class="col-start-1 row-start-1 grid h-full w-full min-h-0 place-items-center">
-                  <ItemArt
-                    :inst="isSpecial(selected) ? null : cellInstance(selected)"
-                    :image="isSpecial(selected) ? focusRow?.item?.image : cellImage(selected)"
-                    :class="cn('w-[min(64%,520px)] object-contain animate-float motion-reduce:animate-none', !isSkinned(focusRow) && 'opacity-50')"
-                    style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
-                  />
-                  <!-- A second grid row under the art, and only for a music kit.
-                       This stage has no 3D for one (isNo3d), so the flat icon was
-                       the entire focus view of an item whose whole content is a
-                       sound. Wider than the tile's copy because there is room:
-                       this is the screen you land on to study one item. -->
-                  <MusicPlayer
-                    v-if="focusRow?.item?.audio"
-                    :src="focusRow.item.audio"
-                    class="w-[min(80%,420px)]"
-                  />
-                </div>
-              </Transition>
-              <!-- Report link sits opposite the drag hint. Not gated on the
-                   load finishing — "it never renders" is itself a report. -->
-              <a
-                v-if="focus3d"
-                :href="focusReportHref"
-                target="_blank"
-                rel="noopener noreferrer"
-                :class="['absolute bottom-1 left-1 z-[3]', REPORT_LINK]"
-                title="Open a GitHub issue pre-filled with this item's details"
-              >
-                Report a problem
-              </a>
-              <!-- Save. Opposite corner from the report link, on the same row,
-                   because both are things you do WITH the picture rather than to
-                   the item. -->
-              <button
-                v-if="focus3d && !focusViewer.busy.value"
-                :class="['absolute bottom-1 right-1 z-[3]', REPORT_LINK]"
-                title="Save this view as a PNG"
-                @click="downloadStageImage(focusViewer, itemName(focusRow?.item) || 'item')"
-              >
-                Save image
-              </button>
-              <!-- Camera legend. Floats over the canvas at the bottom edge, where
-                   the model almost never is, and sits at 70% until hovered so it
-                   reads as chrome rather than as part of the item. -->
-              <ViewerControls
-                v-if="focus3d && !focusViewer.busy.value"
-                variant="overlay"
-                :inspect="focusInspect.read"
-                class="absolute bottom-1 left-1/2 z-[3] -translate-x-1/2"
-                @inspect-play="focusInspect.play"
-                @inspect-seek="focusInspect.seek"
-              />
-            </div>
-            <!-- Same column, same boxes, same width as the modal's spec sheet
-                 (App.vue, the craft modal's options column): ItemSpecs renders
-                 a fragment of boxes, so the wrapper is what makes them a
-                 stretched column rather than a stack — a class on the component
-                 itself has no single root to land on and was being dropped.
-                 `still`: this column does not animate in, the view does. -->
-            <div
-              v-if="focusSpecs && !isCompact"
-              class="flex w-[300px] min-h-0 flex-none flex-col gap-2.5 overflow-y-auto"
+              </template>
+            <!-- THE STAGE, the same component the item modal mounts. See
+                 ItemStage: the backdrop, the 2D/3D switch, the held toggle, the
+                 control bar and the corner links all live in there now, which
+                 is what makes these two screens one picture of an item instead
+                 of two. -->
+            <ItemStage
+              ref="focusStageCmp"
+              :available="focus3dAvailable"
+              :is3d="focus3d"
+              :held="fpvOn"
+              :held-available="fpvAvailable"
+              :busy="focusViewer.busy.value"
+              :rarity="rarityOf(selected)"
+              :fullscreen="focusStage.fullscreen.value"
+              :stage-keys="focusStage.keys.value"
+              :inspect="focusInspect.read"
+              :report-href="focusReportHref"
+              can-save
+              bleed
+              class="min-h-0 flex-1"
+              :class="isCompact ? '-mx-4 -mb-4' : '-mx-8 -mb-6'"
+              @update:is3d="setFocus3d"
+              @update:held="(v) => (fpvOn = v)"
+              @inspect-play="focusInspect.play"
+              @inspect-seek="focusInspect.seek"
+              @save="downloadStageImage(focusViewer, itemName(focusRow?.item) || 'item')"
             >
+              <template #flat>
+                <!-- Slot switches swap the art with a quick settle instead of a
+                     hard cut. The transition rides a wrapper because the art
+                     itself runs animate-float — an animation would override the
+                     enter transform on the same element. -->
+                <Transition
+                  mode="out-in"
+                  enter-active-class="transition duration-200 ease-out"
+                  enter-from-class="opacity-0 translate-y-3 scale-95"
+                  leave-active-class="transition duration-100 ease-in"
+                  leave-to-class="opacity-0 scale-105"
+                >
+                  <div :key="selected" class="grid h-full w-full min-h-0 place-items-center">
+                    <ItemArt
+                      :inst="isSpecial(selected) ? null : cellInstance(selected)"
+                      :image="isSpecial(selected) ? focusRow?.item?.image : cellImage(selected)"
+                      :class="cn('w-[min(64%,520px)] object-contain animate-float motion-reduce:animate-none', !isSkinned(focusRow) && 'opacity-50')"
+                      style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
+                    />
+                    <!-- A second grid row under the art, and only for a music kit.
+                         This stage has no 3D for one (isNo3d), so the flat icon was
+                         the entire focus view of an item whose whole content is a
+                         sound. Wider than the tile's copy because there is room:
+                         this is the screen you land on to study one item. -->
+                    <MusicPlayer
+                      v-if="focusRow?.item?.audio"
+                      :src="focusRow.item.audio"
+                      class="w-[min(80%,420px)]"
+                    />
+                  </div>
+                </Transition>
+              </template>
+              <!-- The item's facts, floating over the stage rather than taking
+                   a column beside it — see ItemStage. Desktop only: on compact
+                   the pane is barely wider than the panel would be, and the
+                   readings are printed under the stage there instead.
+                   `still`: this panel does not animate in, the view does. -->
+            </ItemStage>
+            <template v-if="focusSpecs && !isCompact" #panel>
               <ItemSpecs :inst="focusSpecs" still />
-            </div>
-            </div>
+            </template>
+            </ItemScreen>
 
-            <div class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5">
+            <!-- Compact only, now that the actions have gone: on desktop the
+                 float and the pattern live in the details panel, so this row had
+                 nothing left in it but its own top border and 14px of padding
+                 taken off the model. -->
+            <div
+              v-if="isCompact || !focusSpecs"
+              class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5"
+            >
               <!-- Float and pattern used to be spelled out here by hand, and
                    after the spec column landed they were being printed TWICE,
                    three inches apart. They live in that column now, with
@@ -7710,27 +8080,10 @@ if (MDEBUG) {
                   <span class="font-mono text-f13">{{ focusRow?.seed != null ? '#' + focusRow.seed : '—' }}</span>
                 </div>
               </template>
-              <div v-if="isSkinned(focusRow) && canEdit" class="ml-auto flex items-center gap-2">
-                <!-- Active StatTrak carried a full-strength gold border while
-                     Unequip's sat at border-border, and the contrast made the
-                     identically-sized pill look bigger than its neighbour. The
-                     gold fill + gold label already say "on", so the border only
-                     needs to hint at it. -->
-                <button
-                  :class="[FOCUS_ACTION, focusRow?.stattrak
-                    ? 'border-[#e0a92e]/55 bg-[#e0a92e]/10 text-[hsl(var(--tac-stattrak))]'
-                    : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground']"
-                  @click="toggleStatTrak"
-                >
-                  StatTrak™
-                </button>
-                <button
-                  :class="[FOCUS_ACTION, 'border-border text-muted-foreground hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]']"
-                  @click="clearSlot(selected)"
-                >
-                  Unequip
-                </button>
-              </div>
+              <!-- StatTrak and Unequip used to sit here. They are edits, and
+                   this screen is for LOOKING — the item modal owns both, one
+                   click away, and the row they were holding open is height the
+                   model now gets. -->
             </div>
           </div>
         </div>
@@ -8476,12 +8829,20 @@ if (MDEBUG) {
       v-if="craft"
       class="fixed inset-0 flex items-center justify-center bg-background/85 backdrop-blur-sm" :style="{ zIndex: Z.modal }"
       role="dialog" aria-modal="true" aria-label="Item editor"
-      :class="isCompact ? 'p-0' : 'p-4'"
+      :class="isCompact || !viewOnly ? 'p-0' : 'p-4'"
       @click.self="picker ? (picker = null) : closeCraft()"
     >
+      <!-- EDITING FILLS THE SCREEN; VIEWING IS A CARD.
+           They are different acts. Looking at an item is a glance at one thing,
+           and a card floating over your inventory says so — the grid behind it
+           is where you came from and where you are going back to. Editing is
+           work: five sticker wells, a charm, wear and pattern, all aimed at a
+           model you are dragging things onto, and every pixel the card spent on
+           being a layer came out of that model. So edit takes the whole
+           viewport and drops the rounding, the border and the inset with it. -->
       <div
         class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
-        :class="isCompact
+        :class="isCompact || !viewOnly
           ? 'h-full w-full'
           : 'h-[min(92vh,940px)] w-[min(96vw,1320px)] rounded-lg border border-border'"
       >
@@ -8496,7 +8857,11 @@ if (MDEBUG) {
                  with the room the action buttons need to be thumb-sized. The
                  provenance icon and equip dots stay — those appear nowhere
                  else on this screen. -->
-            <ItemName v-if="!isCompact" :item="craft.skin" class="min-w-0 truncate" name-class="text-f13 font-semibold uppercase tracking-cs1" />
+            <!-- No name here. The identity block below carries it at full size,
+                 the same one the focus view uses, and printing it twice on one
+                 screen is how the two started looking different in the first
+                 place. What stays is what appears nowhere else: where this item
+                 came from, and where it is equipped. -->
             <!-- Provenance stays an ICON while equip state is dots. It was a dot
                  too for one revision, and Steam blue (#66c0f4) against CT blue
                  (#7ea6ff) is not a distinction anyone can make — "synced" read as
@@ -8529,74 +8894,6 @@ if (MDEBUG) {
             <RefreshCw class="h-3 w-3" /> synced items are read-only — saving crafts your own copy
           </span>
           <div class="flex flex-none items-center gap-3">
-            <!-- UNCONDITIONAL, bar the one thing that makes a link impossible.
-                 This modal IS the item — 2D or 3D, view or edit — so it always
-                 offers to open it in game. Every previous gate here was a
-                 different reason the button vanished on a screen showing a
-                 perfectly inspectable gun: `signedIn` (now a message from
-                 sendInspect, not an absence), `isCoarse` (a phone can't launch
-                 CS2, but it can be a Steam Deck or a touchscreen desktop, and
-                 hiding it on every touch device to spare the minority the
-                 no-op was the wrong trade), and asking only the current mode's
-                 copy of the item for its defindex.
-
-                 View and edit are the SAME item, so either source answering
-                 "this has a defindex" is enough. -->
-            <button
-              v-if="canInspect(craft.skin) || canInspect(craftInst?.item)"
-              class="flex flex-none items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground tac-action"
-              :class="isCompact ? 'h-10 w-10' : 'px-2.5 py-1 text-f10'"
-              :title="viewOnly ? 'Launch CS2 and inspect this item in-game' : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
-              @click="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"
-            >
-              <!-- Icon-only on compact: the header already carries share, edit,
-                   delete and close at 40px each, and the label is what pushed
-                   that row past a phone's width. -->
-              <ExternalLink :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3 w-3'" />
-              <template v-if="!isCompact">{{ linkOpening ? 'Opening…' : 'Inspect in game' }}</template>
-            </button>
-            <ShareMenu
-              :links="craftShareLinks"
-              :note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE"
-              :btn-class="isCompact ? MODAL_HEAD_BTN : undefined"
-            />
-            <!-- Also in the footer, deliberately. This row is where the eye goes
-                 for "what can I do with this item", and on a tall spec column the
-                 footer copy can be a scroll away. Icon-only and square, paired
-                 with the trash: same handler and same read-only Craft branch as
-                 the footer button, so it's one control in two places. -->
-            <button
-              v-if="viewOnly && canEdit && craftInst && isCustomizable(craftInst.item)"
-              class="grid place-items-center rounded-md border border-border text-muted-foreground tac-action"
-              :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
-              :title="isReadOnly(craftInst) ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
-              @click="craftViewEdit"
-            >
-              <Copy v-if="isReadOnly(craftInst)" :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3.5 w-3.5'" /><Pencil v-else :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3.5 w-3.5'" />
-            </button>
-            <!-- Destructive, so it keeps its distance from the action row at the
-                 bottom and lives up here beside Close, the way it did on the
-                 detail modal this screen replaced. -->
-            <button
-              v-if="viewOnly && craftInst && canEdit"
-              class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
-              :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
-              title="Delete from inventory"
-              @click="deleteOwned(craftInst, closeCraft)"
-            >
-              <Trash2 :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3.5 w-3.5'" />
-            </button>
-            <button
-              v-if="!viewOnly"
-              class="flex items-center gap-1.5 rounded-md border border-border text-muted-foreground tac-action"
-              :class="isCompact ? 'h-10 px-3 text-f11 uppercase tracking-wider' : 'px-2.5 py-1 text-f10 uppercase tracking-wider'"
-              title="Reset all options"
-              @click="resetCraft"
-            >
-              <RotateCcw :class="isCompact ? 'h-4 w-4' : 'h-3 w-3'" /> Reset
-            </button>
-            <!-- Was a bare ✕ glyph with no box: a ~14px target, and the single
-                 most-used control on the screen. -->
             <button
               class="grid place-items-center rounded-md text-muted-foreground transition-colors hover:text-foreground"
               :class="isCompact ? 'h-10 w-10 border border-border' : 'h-7 w-7'"
@@ -8608,276 +8905,146 @@ if (MDEBUG) {
           </div>
         </div>
         <div class="flex min-h-0 flex-1 flex-wrap overflow-y-auto" :class="isCompact ? 'gap-3 p-2' : 'gap-5 p-5'">
-          <!-- Preview -->
-          <div class="flex min-w-[220px] flex-1 flex-col items-center justify-center gap-2">
-            <div class="relative flex min-h-[320px] w-full flex-1 items-center justify-center">
-              <span class="pointer-events-none absolute inset-0" :style="glowStyle(craft.skin.rarity, 0.3)"></span>
-              <span
-                class="pointer-events-none absolute inset-0 z-[1] opacity-[0.045]"
-                style="background-image: linear-gradient(rgba(255,255,255,0.7) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.7) 1px, transparent 1px); background-size: 44px 44px; -webkit-mask-image: radial-gradient(ellipse at center, black 25%, transparent 72%); mask-image: radial-gradient(ellipse at center, black 25%, transparent 72%)"
-              ></span>
-              <!-- One editor, two views. The form on the right stays put in
-                   both, so wear/pattern/name tag/StatTrak are always reachable
-                   — the old fullscreen 3D overlay hid all of them. -->
-              <div v-show="!modal3d" class="relative z-[2] flex h-full w-full items-center justify-center">
-                <!-- The waist feather belongs to the ICON, which is cropped at
-                     the waist. A rendered agent is a whole standing figure, so
-                     the same mask takes its legs instead. -->
-                <img
-                  :src="craftPreview ?? craft.skin.image ?? undefined"
-                  alt=""
-                  class="max-h-full max-w-full object-contain drop-shadow-[0_28px_30px_rgba(0,0,0,0.45)]"
-                  :class="craftIsAgent && !craftPreviewRendered && ART_FADE_B"
-                  @error="craftPreviewFailed"
-                />
-              </div>
-              <!-- absolute, not h-full: the canvas is height:100%, so against a
-                   flex-sized (indefinite) host it falls back to its drawing-
-                   buffer height and grows the column, shoving everything below
-                   it off-screen the moment the model finishes loading. Taking
-                   the host out of flow makes that impossible — the parent's
-                   min-h-[320px] still sets the stage height. -->
-              <div v-show="modal3d" ref="modalViewerEl" class="absolute inset-0 z-[2]"></div>
-              <div v-if="modal3d && modalViewer.busy.value" class="absolute inset-0 z-[3] grid place-items-center">
-                <div class="flex flex-col items-center gap-3 text-muted-foreground">
-                  <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
-                  <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
-                </div>
-              </div>
-              <!-- Agent poses. An agent's patch positions sit on the chest,
-                   sides and sleeves, and no single pose shows all of them — the
-                   arms cover the sides in any stance a person actually stands
-                   in. So the pose is the user's to pick rather than something
-                   to compromise on. Agents only: nothing else has a skeleton to
-                   re-pose. -->
-              <!-- Developer cog, INSIDE the pane. It was `position: fixed` in
-                   the app root and never rendered: this plugin is federated into
-                   the 5stack panel, and `fixed` resolves against the nearest
-                   transformed ancestor rather than the viewport. The pane is
-                   already an absolute context that demonstrably works — the
-                   2D/3D pill lives in it — and the switches belong next to the
-                   model they change anyway.
+          <!-- THE SAME SCREEN THE FOCUS VIEW IS. Identity, actions, stage,
+               footer — in that order, decided by ItemScreen rather than here,
+               which is the only way two surfaces stay one surface. -->
+          <ItemScreen class="min-w-[220px]" :held="craftHeld && modal3d" @panel-width="(w) => (craftPanelW = w)" :identity="{ weapon: craftWeaponLabel ?? (craft.skin.name.includes(' | ') ? craft.skin.name.split(' | ')[0] : craft.skin.name), finish: stripName(craft.skin.name), price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
+            <template #actions>
+            <!-- Settings, then which picture, then what you can do with the
+                 item — broadest question first. Both screens carry the same
+                 three; only the third differs, because only editing has a form
+                 to put its buttons in. -->
+            <ViewerSettingsButton v-if="modal3d" v-model:open="devHudOpen" :changed="devFlagCount" />
+            <StageTabs v-if="modal3dAvailable" :is3d="modal3d" @update:is3d="(v) => (modal3d = v)" />
+            <!-- VIEWING keeps these here; EDITING moves them to the top of the
+                 form — see CraftActions. -->
+            <CraftActions
+              v-if="viewOnly"
+              :view-only="viewOnly"
+              :can-inspect="canInspect(craft?.skin) || canInspect(craftInst?.item)"
+              :link-opening="linkOpening"
+              :share-links="craftShareLinks"
+              :share-note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE"
+              :can-edit-item="canEdit && !!craftInst && isCustomizable(craftInst.item)"
+              :read-only="!!craftInst && isReadOnly(craftInst)"
+              :can-delete="!!craftInst && canEdit"
+              :compact-btn-class="MODAL_HEAD_BTN"
+              @inspect="viewOnly && craftInstId != null ? openInspectLink(craftInstId) : openCraftInspect()"
+              @edit="craftViewEdit"
+              @delete="deleteOwned(craftInst!, closeCraft)"
+              @reset="resetCraft"
+            />
+            </template>
+            <!-- THE STAGE — the same component the focus view mounts. What used
+                 to be ~230 lines of pane here is now the shared one; only the
+                 things that belong to CRAFTING stayed behind, in slots.
 
-                   Beside the 2D/3D pill: it is a view control like the others,
-                   and that spot came free when the pose tabs moved to their own
-                   row. The panel drops below both rows (top-20) so it never
-                   covers the controls that opened it. -->
-              <template v-if="modal3d">
-                <!-- Click-away catcher, the same idiom FilterDropdown and
-                     ShareMenu use. `absolute inset-0`, not `fixed`: a fixed
-                     element in this plugin resolves against the nearest
-                     TRANSFORMED ancestor rather than the viewport, and the host
-                     panel has several — see the note on DevHud itself. The stage
-                     is the right scope anyway.
-
-                     It sits UNDER the cog so the cog stays live and the button
-                     toggles the panel shut, and OVER the 2D/3D and pose pills so
-                     the first click anywhere else just dismisses. -->
-                <div v-if="devHudOpen" class="absolute inset-0 z-[4]" @click="devHudOpen = false"></div>
-                <!-- Wrapped in the same `bg-muted p-1` shell the 2D/3D pill
-                     uses, so the two sit on one baseline at one height. A bare
-                     button here was 2px shorter and read as misaligned.
-                     `relative` is on the wrapper too so the panel below can hang
-                     off the BUTTON rather than off the stage corner. -->
-                <div class="absolute left-[5rem] top-0 z-[5] inline-flex items-center rounded-lg bg-muted p-1">
-                  <!-- OPEN gets the same amber indicator an active pill tab
-                       gets, because it sits in the same `bg-muted` shell as the
-                       2D/3D pill and "this one is engaged" should look the same
-                       in both. Without it the cog was identical open or shut —
-                       only ever its hover state — so nothing said the click had
-                       landed except the panel appearing.
-
-                       An INSET ring, not a border: this plugin ships without
-                       Tailwind's preflight, so `box-sizing` is not guaranteed to
-                       be border-box and a real 1px border would grow the 22×26
-                       button and shift the count badge pinned to its corner.
-                       `active:scale-95` is the press itself. -->
-                  <button
-                    class="relative grid h-[22px] w-[26px] place-items-center rounded-md transition-all active:scale-95"
-                    :class="devHudOpen
-                      ? 'text-foreground'
-                      : devFlagCount > 0 ? 'text-[#f2c14e]' : 'text-muted-foreground hover:text-foreground'"
-                    :style="devHudOpen
-                      ? {
-                          background: 'hsl(var(--tac-amber, 33 94% 58%) / 0.12)',
-                          boxShadow: 'inset 0 0 0 1px hsl(var(--tac-amber, 33 94% 58%) / 0.45), 0 0 12px hsl(var(--tac-amber, 33 94% 58%) / 0.25)',
-                        }
-                      : {}"
-                    :title="`Developer options (Ctrl/Cmd + Shift + D)${devFlagCount ? ` — ${devFlagCount} flag(s) on` : ''}`"
-                    :aria-expanded="devHudOpen"
-                    @click="devHudOpen = !devHudOpen"
-                  >
-                    <Settings class="h-3.5 w-3.5" />
-                    <span
-                      v-if="devFlagCount"
-                      class="absolute -right-0.5 -top-0.5 grid h-3 w-3 place-items-center rounded-full bg-[#e0a92e] font-mono text-[8px] text-background"
-                    >{{ devFlagCount }}</span>
-                  </button>
-                  <!-- Anchored to the cog (`top-full`) and scaling out of its own
-                       top-left corner, so it reads as belonging to the button
-                       that opened it. It used to be parked at `left-0 top-20` —
-                       a slab in the stage's corner that sat over the model
-                       whether or not you had just asked for it. -->
-                  <DevHud
-                    :open="devHudOpen"
-                    class="absolute left-0 top-full z-[6] mt-1.5 origin-top-left animate-menu-in"
-                    @close="devHudOpen = false"
-                  />
-                </div>
-              </template>
-              <!-- BELOW the 2D/3D toggle, not beside it: they are different
-                   questions (which renderer vs which pose), and stacking keeps
-                   the top edge free for the model. Not the bottom-left corner
-                   either — that is where the perf HUD draws, and the two
-                   overlapped. top-10 clears the 2D/3D pill's own height. -->
-              <PillTabs
-                v-if="modal3d && craftTarget?.kind === 'agent'"
-                :items="AGENT_POSES"
-                :item-key="(p) => p.id"
-                :item-title="(p) => p.hint"
-                :active="agentPose"
-                position="absolute"
-                list-class="left-0 top-10 z-[3]"
-                button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
-                @select="(id) => setAgentPose(id as 'stand' | 'open' | 'ready')"
-              >
-                <template #default="{ item: p }">{{ p.label }}</template>
-              </PillTabs>
-              <span v-if="craftPreviewBusy && !modal3d" class="animate-sheen pointer-events-none absolute inset-0 z-[3]"></span>
-              <span
-                v-if="craftPreviewBusy && !modal3d"
-                class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
-              ><Loader2 class="h-3 w-3 animate-spin" /> rendering</span>
-              <!-- 2D / 3D toggle: same sliding-pill animated tabs as the rest -->
-              <PillTabs
-                v-if="modal3dAvailable"
-                :items="STAGE_TABS"
-                :item-key="(s) => s"
-                :active="modal3d ? '3D' : '2D'"
-                position="absolute"
-                list-class="left-0 top-0 z-[3]"
-                button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
-                @select="(s) => (modal3d = s === '3D')"
-              />
-              <!-- Live cost, stacked under the 2D/3D + cog row so it reads as part
-                   of the same top-left column of chrome — the same corner the
-                   inventory card puts it in, under the model label. It was up in
-                   the modal header competing with the item's name and the action
-                   buttons; here it sits beside the thing it is a fact about, with
-                   room for the label to say "est." out loud.
-                   Falls back to `top-0` when there is no 2D/3D toggle to sit
-                   beneath (items with no 3D model) rather than hanging in a gap. -->
-              <Tooltip v-if="pricesOn && craftQuote" :text="craftQuoteTip">
-                <span
-                  class="absolute left-0 z-[4] flex flex-col gap-1 transition-opacity"
-                  :class="[modal3dAvailable ? 'top-9' : 'top-0', craftQuoting && 'opacity-40']"
-                >
-                  <PriceTag
-                    frame="spine"
-                    stack
-                    size="lg"
-                    label="est. cost"
-                    :value="craftQuote.total"
-                    :extra="craftQuote.attachmentTotal"
-                    :missing="craftQuote.total === 0"
-                    :approx="!!craftQuote.base.price?.approx"
-                  />
-                  <!-- The spread behind that figure, and where THIS copy sits in
-                       it. Two measured facts; the sentence joining them lives in
-                       the tooltip, because "yours is probably worth more" is an
-                       inference and printing it as a number would dress a guess
-                       as a measurement. Knives are the reason this exists — one
-                       bracket price covers a 0.0001 Karambit and a 0.069 one. -->
-                  <span
-                    v-if="craftSales"
-                    class="flex flex-col gap-0.5 pl-2.5 text-f9 leading-tight"
-                    :title="craftValueTip"
-                  >
-                    <span class="font-mono tabular-nums text-muted-foreground">
-                      <template v-if="craftSales.min != null && craftSales.max != null && craftSales.max > craftSales.min">
-                        {{ formatPrice(craftSales.min) }}–{{ formatPrice(craftSales.max) }}
-                      </template>
-                      <template v-else>{{ formatPrice(craftSales.median ?? craftSales.avg ?? craftSales.min ?? 0) }}</template>
-                      <span class="text-muted-foreground/50">
-                        · {{ craftSales.volume }} sold {{ HISTORY_WINDOW_LABEL[craftSales.window] }}</span
-                      >
-                    </span>
-                    <span
-                      v-if="craftWearStanding"
-                      class="uppercase tracking-cs4"
-                      :class="craftWearStanding.verdict === 'better'
-                        ? 'text-[#37c46a]'
-                        : craftWearStanding.verdict === 'worse'
-                          ? 'text-[#e0a24a]'
-                          : 'text-muted-foreground/60'"
-                      >{{ craftWearStanding.caption }}</span
-                    >
-                  </span>
-                </span>
-              </Tooltip>
-            </div>
-            <!-- Footer. The report link used to hold a column of its own on the
-                 same baseline as the name and the controls legend, which meant
-                 the name — the one thing here anyone reads — was squeezed
-                 between two pieces of chrome and truncated first. It now stacks
-                 ABOVE the controls in a single side column, so the name plate
-                 gets the width back and stays optically centred under the
-                 model. -->
-            <!-- Desktop keeps the three-column baseline so the name plate stays
-                 optically centred under the model with the chrome beside it.
-                 Compact STACKS: at phone width the centre column collapses to
-                 whatever's left after the controls legend, which pushed the
-                 name into a narrow ribbon with dead space either side of it.
-                 Full width each, name first — it's the line people read. -->
-            <div
-              class="w-full"
-              :class="isCompact
-                ? 'mb-1 flex flex-col gap-1.5'
-                : 'mb-3 grid grid-cols-[1fr_auto_1fr] items-end gap-3 pb-1'"
+                 The control bar moved INSIDE the pane with it, which retires the
+                 copy this file used to keep for fullscreen: a fullscreen element
+                 paints only itself and its descendants, so a bar living outside
+                 the pane simply is not on screen while the pane is full, and the
+                 fix for that was a second bar. One bar, in the pane, is on
+                 screen in both. -->
+            <ItemStage
+              ref="craftStageCmp"
+              :available="modal3dAvailable"
+              :is3d="modal3d"
+              :held="craftHeld"
+              :held-available="craftHeldAvailable"
+              :busy="modalViewer.busy.value"
+              :rarity="craft.skin.rarity"
+              :fullscreen="craftStage.fullscreen.value"
+              :stage-keys="craftStage.keys.value"
+              :edit="!viewOnly"
+              :rotate="craft.stickers.some(Boolean)"
+              :inspect="viewOnly ? craftInspect.read : null"
+              :report-href="craftReportHref"
+              :can-save="viewOnly"
+              :bleed="viewOnly"
+              :class="viewOnly ? (isCompact ? '-mx-2 -mb-2' : '-mx-5 -mb-5') : ''"
+              @update:is3d="(v) => (modal3d = v)"
+              @update:held="(v) => (craftHeld = v)"
+              @inspect-play="craftInspect.play"
+              @inspect-seek="craftInspect.seek"
+              @save="downloadStageImage(modalViewer, itemName(craft.skin) || 'item')"
             >
-              <div :class="isCompact ? 'w-full text-center' : 'col-start-2 text-center'">
-                <div class="mx-auto mb-1.5 h-px" :class="isCompact ? 'w-40' : 'w-28'" :style="{ background: `linear-gradient(90deg, transparent, ${craft.skin.rarity}, transparent)` }"></div>
-                <div v-if="craftWeaponLabel" class="text-f11 uppercase tracking-cs1 text-muted-foreground">{{ craftWeaponLabel }}</div>
-                <ItemName :item="craft.skin" strip name-class="text-f13 font-semibold" :style="{ color: craft.skin.rarity }" />
-              </div>
-              <!-- Controls legend. Overlaying the model put it on top of the
-                   thing being dragged; on the footer baseline it sits out of the
-                   way but still in eyeline. Compact spreads report and legend to
-                   opposite ends of their own full-width row. -->
-              <div
-                v-if="modal3d"
-                :class="isCompact
-                  ? 'flex w-full items-center justify-between gap-3'
-                  : 'col-start-1 row-start-1 flex flex-col items-start gap-1 justify-self-start'"
-              >
-                <a
-                  :href="craftReportHref"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  :class="[REPORT_LINK, 'min-w-0 truncate']"
-                  title="Open a GitHub issue pre-filled with this item's details"
+              <template #flat>
+                <!-- The waist feather belongs to the ICON, which is cropped at
+                       the waist. A rendered agent is a whole standing figure, so
+                       the same mask takes its legs instead. -->
+                  <img
+                    :src="craftPreview ?? craft.skin.image ?? undefined"
+                    alt=""
+                    class="max-h-full max-w-full object-contain drop-shadow-[0_28px_30px_rgba(0,0,0,0.45)]"
+                    :class="craftIsAgent && !craftPreviewRendered && ART_FADE_B"
+                    @error="craftPreviewFailed"
+                  />
+                <span v-if="craftPreviewBusy && !modal3d" class="animate-sheen pointer-events-none absolute inset-0 z-[3]"></span>
+                <span
+                  v-if="craftPreviewBusy && !modal3d"
+                  class="absolute bottom-1 right-1 z-[3] flex items-center gap-1 rounded border border-border/60 bg-background/85 px-1.5 py-0.5 text-f9 uppercase tracking-cs1 text-[color:var(--acc)]"
+                ><Loader2 class="h-3 w-3 animate-spin" /> rendering</span>
+              </template>
+              <!-- Viewing: the item's facts float over the model, the same way
+                   the focus view shows them. EDITING keeps its column beside the
+                   stage instead — the form is tall, it is what you are working
+                   in, and parking it over the model would cover the surface you
+                   are dragging stickers onto. -->
+              <template #chrome>
+                <!-- Click-away for the developer panel, the same idiom
+                     FilterDropdown and ShareMenu use. `absolute inset-0`, not
+                     `fixed`: a fixed element in this plugin resolves against the
+                     nearest TRANSFORMED ancestor rather than the viewport, and
+                     the host panel has several. The pane is the right scope
+                     anyway. It lives here rather than beside the cog because
+                     this slot is a direct child of the pane — inset-0 in the
+                     control ROW would only cover the row.
+
+                     UNDER the cog (z-[4] vs the row's own stacking) so the cog
+                     stays live and its button toggles the panel shut, and OVER
+                     the pose pills so the first click anywhere else dismisses. -->
+                <div v-if="modal3d && devHudOpen" class="absolute inset-0 z-[4]" @click="devHudOpen = false"></div>
+                <!-- BELOW the 2D/3D toggle, not beside it: they are different
+                     questions (which renderer vs which pose), and stacking keeps
+                     the top edge free for the model. Not the bottom-left corner
+                     either — that is where the perf HUD draws, and the two
+                     overlapped. top-10 clears the 2D/3D pill's own height. -->
+                <PillTabs
+                  v-if="modal3d && craftTarget?.kind === 'agent'"
+                  :items="AGENT_POSES"
+                  :item-key="(p) => p.id"
+                  :item-title="(p) => p.hint"
+                  :active="agentPose"
+                  position="absolute"
+                  list-class="left-0 top-10 z-[3]"
+                  button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
+                  @select="(id) => setAgentPose(id as 'stand' | 'open' | 'ready')"
                 >
-                  Report a problem
-                </a>
-                <!-- The legend is fixed-size chrome; the link is the elastic
-                     half of this row. Without the two rules the link's text
-                     wrapped to a second line at phone widths and shoved the
-                     legend down with it. -->
-                <!-- Transport in VIEW mode only. The viewer pauses itself on
-                     entering edit mode (setInteractive), and offering a play
-                     button that would start the camera turning under a sticker
-                     someone is aiming is the same mistake with an extra step. -->
-                <ViewerControls
-                  class="flex-none"
-                  :edit="!viewOnly"
-                  :rotate="craft.stickers.some(Boolean)"
-                  :inspect="viewOnly ? craftInspect.read : null"
-                  @inspect-play="craftInspect.play"
-                  @inspect-seek="craftInspect.seek"
-                />
-              </div>
+                  <template #default="{ item: p }">{{ p.label }}</template>
+                </PillTabs>
+                <!-- Live cost, stacked under the 2D/3D + cog row so it reads as part
+                     of the same top-left column of chrome — the same corner the
+                     inventory card puts it in, under the model label. It was up in
+                     the modal header competing with the item's name and the action
+                     buttons; here it sits beside the thing it is a fact about, with
+                     room for the label to say "est." out loud.
+                     Falls back to `top-0` when there is no 2D/3D toggle to sit
+                     beneath (items with no 3D model) rather than hanging in a gap. -->
+              </template>
+            </ItemStage>
+            <template v-if="viewOnly && !isCompact" #panel>
+              <ItemSpecs :inst="craftInst" :charm-albedo="charmAlbedo" :charm-loading="charmRailLoading" />
+            </template>
+            <template #footer>
+            <!-- Compact stacks the readings under the model. The floating panel
+                 is a desktop affordance: at phone width it would be the whole
+                 pane, i.e. a spec sheet with a gun behind it. -->
+            <div v-if="viewOnly && isCompact" class="flex w-full flex-col gap-2.5">
+              <ItemSpecs :inst="craftInst" :charm-albedo="charmAlbedo" :charm-loading="charmRailLoading" />
             </div>
-          </div>
+
+            </template>
+          </ItemScreen>
           <!-- Options (edit) / spec (view). Same column, same boxes, same
                order — view mode just states what edit mode lets you change.
                `sheet-settled`: the two modes are separate template branches, so
@@ -8889,11 +9056,25 @@ if (MDEBUG) {
                wraps under the preview and owns the whole modal, so the cap just
                left a dead gutter down the right-hand side. -->
           <div
-            v-if="craftHasOptions"
+            v-if="craftHasOptions && !viewOnly"
             class="flex w-full flex-none flex-col gap-2.5"
             :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px]']"
           >
-            <template v-if="!viewOnly">
+            <!-- Inspect, share and reset, at the top of the form rather than in
+                 the screen's actions row — see CraftActions. Editing is work
+                 done in this column, and Reset in particular is about the form
+                 and not about the item. -->
+            <CraftActions
+              :view-only="viewOnly"
+              :can-inspect="canInspect(craft?.skin) || canInspect(craftInst?.item)"
+              :link-opening="linkOpening"
+              :share-links="craftShareLinks"
+              :share-note="route.name === 'draft' ? undefined : ITEM_LINK_NOTE"
+              :compact-btn-class="MODAL_HEAD_BTN"
+              class="flex-wrap"
+              @inspect="openCraftInspect()"
+              @reset="resetCraft"
+            />
             <!-- FIRST, above the attachment slots. The name is the one field
                  that is pure text entry and it applies to the item itself
                  rather than to a slot on it — buried under five sticker wells
@@ -9210,22 +9391,6 @@ if (MDEBUG) {
                 ></span>
               </button>
             </div>
-            </template>
-
-            <!-- Read-only spec. Deliberately the same chrome as the form boxes
-                 above rather than a prettier bespoke panel: switching to Edit
-                 should feel like the numbers became typable, not like the page
-                 changed. -->
-            <!-- The read-only spec is its own component now — the focus view
-                 needs the same panel, and answering "what is this item" two
-                 different ways in two places is what left focus showing a float
-                 and nothing about the stickers or the charm. -->
-            <ItemSpecs
-              v-else
-              :inst="craftInst"
-              :charm-albedo="charmAlbedo"
-              :charm-loading="charmRailLoading"
-            />
 
           </div>
         </div>

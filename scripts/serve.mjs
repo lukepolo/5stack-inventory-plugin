@@ -30,6 +30,10 @@ const compositesDir = process.env.COMPOSITES_DIR ?? "/cs2-models/composites";
 // total, and the only asset here anyone STREAMS rather than downloads — see the
 // Range handling below, which exists for this directory and benefits the rest.
 const musicDir = process.env.MUSIC_DIR ?? "/cs2-models/music";
+// Per-weapon first-person inspect animations (extract-viewmodel-anims.mjs).
+// ~300KB of JSON each, ~18MB in total — mount-side for the same reason the
+// models are: it has no business in the bundle.
+const animsDir = process.env.ANIMS_DIR ?? "/cs2-models/anims";
 // Production nginx falls back to the backend when a mount-backed path misses
 // (`try_files $uri @backend`), for the case where the frontend and backend pods
 // land on different nodes and only one of them can see the file. Mirror that
@@ -96,7 +100,7 @@ function cacheControlFor(base, pathname, query) {
   // MUSIC is the same shape again: `valve_cs2_01.mp3` is a name the extractor
   // reuses on every run while a CS2 update can change the bytes behind it, so it
   // is only immutable once the client has stamped the extraction version on it.
-  if (base === paintsDir || base === modelsDir || base === musicDir) {
+  if (base === paintsDir || base === modelsDir || base === musicDir || base === animsDir) {
     return query.get("v") ? IMMUTABLE : "no-cache";
   }
   return HEADERS["Cache-Control"];
@@ -129,6 +133,9 @@ createServer(async (req, res) => {
     } else if (pathname.startsWith("/music/")) {
       base = musicDir;
       pathname = pathname.slice("/music".length);
+    } else if (pathname.startsWith("/anims/")) {
+      base = animsDir;
+      pathname = pathname.slice("/anims".length);
     }
     const file = normalize(join(base, pathname));
     if (!file.startsWith(base + sep) && file !== join(root, "index.html")) {

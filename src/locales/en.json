@@ -98,7 +98,14 @@
         "turn_hint": "Shift-drag a sticker to rotate it",
         "pause": "Pause",
         "play": "Play",
-        "scrub": "Scrub the inspect animation"
+        "scrub": "Scrub the inspect animation",
+        "reset": "Reset camera",
+        "flip_front": "Show the front",
+        "flip_back": "Show the other side",
+        "fullscreen": "Fullscreen",
+        "fullscreen_exit": "Exit fullscreen",
+        "fpv": "Hold it",
+        "fpv_exit": "Put it down"
       }
     },
     "pattern": {

@@ -112,9 +112,35 @@ browser at a known angle.
 
 ## Inspect animation: confirm the clip, then decide about moving parts
 
-**Status: code landed, never seen running.** It was written without access to a
-CS2 models mount, so every claim below about what a weapon GLB contains is
-inference from the comments already in `viewer3d.ts`, not observation.
+**Status: check 1 ANSWERED 2026-08-20 — there is no weapon inspect clip, and
+there never was.** Checks 2 and 3 are moot on weapons as a result, and stay open
+only for whatever plays a clip next.
+
+Parsing the GLB JSON chunk of every weapon and knife on the `/cs2-models` mount,
+the AK ships exactly five clips and every other weapon matches:
+
+| clip | duration | keys |
+|---|---|---|
+| `dropped` | 0.000s | 1 |
+| `reload` | 2.433s | 74 |
+| `shoot` | 0.267s | 9 |
+| `inventory_inspect` | **0.000s** | **1** |
+| `inventory_icon` | 0.000s | 1 |
+
+`inventory_inspect` is a POSE. It could never have passed `INSPECT_MIN_DEGREES`,
+so the transport has never once appeared on a weapon — which is the measurement
+gate doing its job rather than a bug. `--gltf_export_animations` is already
+passed to VRF, so this is the `.vmdl_c`'s own declaration and not an export gap:
+CS2 keeps the real first-person sequences in an anim graph the export does not
+reach.
+
+**The real inspect animation is in the GLOVE tree.** Every glove family ships
+`inspect_loop` — 6.167s, 186 keys, 156 channels over a 52-joint arm skeleton —
+and it animates the hands, not the weapon. See the first-person work: the arms
+are what move, so `bakePose` is not in the way after all.
+
+The rest of this section is the original note, kept for the reasoning in "THEN:
+moving parts", which still stands for the weapon's own slide and magazine.
 
 ### What landed
 
@@ -132,9 +158,9 @@ bone by more than `INSPECT_MIN_DEGREES` before it is accepted. A model that
 matches nothing, or matches a single-key pose, stays exactly as static as it is
 today.
 
-### THE CHECKS (this is the blocking bit)
+### THE CHECKS (1 is answered above; 2 and 3 await something that moves)
 
-1. **Which clip actually gets picked.** Open a rifle in the 3D viewer with
+1. ~~**Which clip actually gets picked.**~~ Answered: none. Open a rifle in the 3D viewer with
    `?perf=1` and read the `inspect` line: it prints the chosen clip, the play
    head, the current turn in degrees, and — the important half — every clip the
    GLB shipped. `inspectClips` currently names `inspect_loop` and

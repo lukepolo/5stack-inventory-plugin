@@ -67,6 +67,23 @@ export const FLAGS: DevFlag[] = [
     audience: "developer",
   },
   {
+    name: "pricelog",
+    label: "Log the price path",
+    hint: "Prints one console line per step of the price pipeline — what was armed, what request went out, what came back and whether it was kept. The figure and its readings arrive from three different calls, and when one of them goes missing this says which.",
+    dflt: false,
+    group: "3D viewer",
+    audience: "developer",
+  },
+  {
+    name: "fpvhud",
+    label: "Viewmodel readout",
+    hint: "Draws the copyable line of first-person dials over the model. It is a tuning instrument — the numbers only mean anything while you are dialling the pose in — so it is off unless you are. Needs a remount: the readout is built with the first-person rig.",
+    dflt: false,
+    remount: true,
+    group: "3D viewer",
+    audience: "developer",
+  },
+  {
     name: "charmmap",
     label: "Show the charm quads",
     hint: "Paint the game's authored charm surfaces on the weapon (debug). They no longer restrict a drag — placement is free inside their bounding box — but they seat the unplaced default, and this shows whether they sit on the rendered mesh.",
@@ -116,11 +133,37 @@ export const FLAGS: DevFlag[] = [
   {
     name: "inspectanim",
     label: "Motion",
-    hint: "Play the weapon's own inspect animation in the 3D viewer instead of turning it on a turntable. Item cards are always rendered from the still pose.",
+    hint: "Play a model's own inspect animation in the 3D viewer instead of turning it on a turntable — where it has one, which measurement says is nowhere in the weapon tree: every weapon's inspect clip is a single static keyframe. Item cards are always rendered from the still pose.",
     dflt: true,
     // Live: the clip drives the camera and the light rig, never the mesh, so the
     // viewer makes and unmakes a mixer instead of being rebuilt. Explicit for the
     // same reason as bloom above — absent reads as "needs a remount".
+    remount: false,
+    group: "3D viewer",
+    audience: "user",
+  },
+  {
+    name: "notwist",
+    label: "Disable the twist solver",
+    hint: "Stop distributing forearm roll onto the _TWIST helper bones. A diagnostic: if a wrung-out arm looks the SAME with this on, the solver is not what is wringing it.",
+    dflt: false,
+    remount: true,
+    group: "Diagnostics",
+  },
+  {
+    name: "pivotdot",
+    label: "Show the orbit pivot",
+    hint: "Draw a dot at the point a drag rotates around, through the model. If it is not sitting on the item, that is why dragging feels like it is swinging the model rather than turning it.",
+    dflt: false,
+    remount: true,
+    group: "Diagnostics",
+  },
+  {
+    name: "fpvsound",
+    label: "Weapon sounds",
+    hint: "Play the weapon's own sounds in first person — the shot, the mag out and in, the bolt — at the moments the game's animation asks for them.",
+    dflt: true,
+    // Live: the flag is read at the moment a cue fires, nothing is built on it.
     remount: false,
     group: "3D viewer",
     audience: "user",
@@ -207,9 +250,111 @@ export const NUMBERS: DevNumber[] = [
     dflt: 0.18, min: 0, max: 1.5, step: 0.02,
     group: "3D viewer", requires: "bloom", audience: "user",
   },
+  // First-person tuning. Developer-audience: these TRIM a pose that is already
+  // right, and a viewer with no arms in it would show six sliders that move
+  // nothing.
+  //
+  // THE DEFAULTS BELOW ARE THE SHIPPED POSE, dialled in by hand against the
+  // real thing and then written down here — yaw -7, pitch -12, offset
+  // (0.06, 0.01, 0.12), FOV 54. They are not neutral values waiting to be
+  // found; zeroing them puts the weapon back to the raw clip framing, which
+  // sits too central and too level to read as a viewmodel.
+  //
+  // WHY FOV IS 54 AND NOT CS2'S 68: `viewmodel_fov` is roughly a HORIZONTAL
+  // measure at 4:3 and three's `fov` is VERTICAL. 68 there works out near 54
+  // here — feeding 68 straight in is nearly 100 degrees across, which is what
+  // made the weapon look stretched.
+  {
+    name: "fpvfov",
+    label: "Viewmodel FOV",
+    hint: "Vertical field of view for the first-person camera, in degrees, letterboxed to 16:9 so it means the same thing whatever shape the pane is. CS2's viewmodel_fov is a HORIZONTAL angle measured at 4:3 and does not transfer directly: its 54-68 range works out as 44-54 here. Larger is wider and distorts more — 68 here is nearly 100 degrees across, which is what made the weapon look stretched.",
+    dflt: 54, min: 30, max: 90, step: 1,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvx",
+    label: "Viewmodel offset X",
+    hint: "Moves the eye right (+) or left (-), in metres, along the camera's own axis.",
+    dflt: 0.06, min: -1, max: 1, step: 0.01,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvy",
+    label: "Viewmodel offset Y",
+    hint: "Raises (+) or lowers (-) the eye, in metres, along the camera's own up axis.",
+    dflt: 0.01, min: -1, max: 1, step: 0.01,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvz",
+    label: "Viewmodel offset Z",
+    hint: "Moves the eye along its own view axis, in metres. Forward (+) is the safe direction: the arms are cut at the shoulder, and pulling BACK drags those cuts into shot.",
+    dflt: 0.12, min: -1.5, max: 1.5, step: 0.01,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvyaw",
+    label: "Viewmodel yaw",
+    hint: "Turns the first-person view left or right, in degrees, FROM the framing the viewer works out for itself. Zero is that framing — these dials trim it, they no longer have to find it.",
+    dflt: -7, min: -180, max: 180, step: 1,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvpitch",
+    label: "Viewmodel pitch",
+    hint: "Tilts the first-person camera up (+) or down (-), in degrees.",
+    dflt: -12, min: -90, max: 90, step: 1,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvshiftx",
+    label: "Viewmodel frame X",
+    hint: "Slides the whole first-person PICTURE across its frame, as a fraction of the frame's width. Positive moves the weapon right. This moves the image, not the eye — the pose, the perspective and the scale are untouched, which is why it is the dial for composition and the offsets above are the dials for the pose.",
+    dflt: 0.1, min: -0.5, max: 0.5, step: 0.01,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvshifty",
+    label: "Viewmodel frame Y",
+    hint: "Slides the first-person picture down (+) or up (-) its frame, as a fraction of the frame's height. Down is what seats the weapon in the corner instead of leaving it floating mid-air.",
+    dflt: 0.12, min: -0.5, max: 0.5, step: 0.01,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "idlespin",
+    label: "Idle spin delay",
+    hint: "How long the item sits still before the turntable starts. Any drag restarts the wait. Zero spins immediately, as it always used to; the whole point of a wait is that the first look at a skin is a still one.",
+    dflt: 6, min: 0, max: 30, step: 1,
+    group: "3D viewer", audience: "user",
+  },
 ];
 
 const key = (name: string) => `viewer3d.${name}`;
+
+/**
+ * THE FIRST-PERSON POSE, RESET ONCE.
+ *
+ * The six viewmodel dials are stored like every other setting — and while
+ * free-look was on, DRAGGING wrote them. That is what the gesture was for, but
+ * it means anyone who ever moved the view is pinned to wherever they let go,
+ * and the shipped pose (yaw -7, pitch -12, offset 0.06/0.01/0.12) can never
+ * reach them: a stored value always beats a default.
+ *
+ * So the pose carries a version. Bump it and every browser drops its stored
+ * dials exactly once, landing on whatever this build ships. Bump it again the
+ * next time the shipped pose changes; do NOT bump it for anything else, because
+ * this throws away a deliberate setting along with a stale one.
+ */
+const FPV_POSE_VERSION = "2";
+const FPV_DIALS = ["fpvyaw", "fpvpitch", "fpvfov", "fpvx", "fpvy", "fpvz"];
+try {
+  if (localStorage.getItem(key("fpvpose")) !== FPV_POSE_VERSION) {
+    for (const n of FPV_DIALS) localStorage.removeItem(key(n));
+    localStorage.setItem(key("fpvpose"), FPV_POSE_VERSION);
+  }
+} catch {
+  // A browser with storage denied has nothing stored to reset.
+}
 
 /** Bumped on every write, so the HUD re-renders without polling storage. */
 export const flagsVersion = ref(0);

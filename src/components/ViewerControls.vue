@@ -20,9 +20,12 @@
 // the catalogue does not: a transport bar over a model that cannot move is worse
 // than no transport at all.
 import { computed, inject, onBeforeUnmount, ref, watch } from "vue";
+import { FlipHorizontal2, Maximize2, Minimize2, RotateCcw } from "lucide-vue-next";
 import Tooltip from "./Tooltip.vue";
 import { isCoarse } from "../responsive";
 import { CONTROL_ICON, CONTROL_ICON_VIEWBOX, TRANSPORT_ICON, TRANSPORT_ICON_VIEWBOX, type ControlIcon } from "../viewerControlIcons";
+import { ACTION_ICON, ACTION_ICON_VIEWBOX, type ActionIcon } from "../weaponActionIcons";
+import type { StageIcon, StageKey } from "../composables/useViewerStage";
 import type { InspectTransport } from "../viewer3d";
 
 const props = withDefaults(
@@ -44,8 +47,18 @@ const props = withDefaults(
      * the group entirely.
      */
     inspect?: (() => InspectTransport | null) | null;
+    /**
+     * Stage actions — reset, flip, fullscreen — from `useViewerStage`.
+     *
+     * They ride THIS bar rather than a second strip of their own because a
+     * viewer with two control rows makes the user pick which one to read before
+     * they can look for anything. The distinction that matters is not
+     * "gestures vs buttons" but where the cell sits: the groups run
+     * CAMERA · ITEM · MOTION · VIEW, and VIEW is the frame around the render.
+     */
+    stage?: StageKey[];
   }>(),
-  { edit: false, rotate: false, variant: "plain", inspect: null },
+  { edit: false, rotate: false, variant: "plain", inspect: null, stage: () => [] },
 );
 
 const emit = defineEmits<{
@@ -124,6 +137,32 @@ const playHint = computed(() => {
 const TRANSPORT_BTN =
   "flex flex-none cursor-pointer flex-col items-center gap-0.5 whitespace-nowrap rounded px-1.5 py-1 " +
   "text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground";
+
+/**
+ * Semantic name → glyph. The mapping lives here rather than in the composable
+ * so that module stays free of an icon-set dependency — see StageIcon.
+ */
+/** Lucide glyphs for the stage controls. The four weapon actions are NOT here —
+ *  they draw CS2's own artwork instead, so this covers the remainder. */
+const STAGE_GLYPH: Partial<Record<StageIcon, unknown>> = {
+  reset: RotateCcw,
+  flip: FlipHorizontal2,
+  expand: Maximize2,
+  collapse: Minimize2,
+};
+
+/** The four weapon actions draw CS2's OWN artwork — see weaponActionIcons. */
+const GAME_ICON = new Set<string>(["fire", "reload", "inspect", "deploy"]);
+/** A `hidden` key still fires; it just is not offered here. See StageKey. */
+const shownStage = computed(() => props.stage.filter((s) => !s.hidden));
+// `ActionIcon` also covers glyphs no stage key uses (the stage strip's own
+// weapon/held pair), so the predicate narrows to the OVERLAP rather than
+// claiming every ActionIcon is a StageIcon.
+const isGameIcon = (i: StageIcon): i is StageIcon & ActionIcon => GAME_ICON.has(i);
+
+/** "Reset camera · R" — the key printed with the action it performs, in the one
+ *  place someone is already asking what the button does. */
+const stageHint = (k: StageKey) => `${k.label} · ${k.cap}`;
 
 interface Control {
   key: string;
@@ -306,6 +345,68 @@ const controls = computed<Control[]>(() => {
         @input="onScrub"
         @change="scrubAt = null"
       />
+    </template>
+
+    <!-- VIEW. The frame around the render rather than the render itself: put
+         the camera back, look at the other side, get the chrome out of the way,
+         fill the screen. Buttons, so they take the same pointer cursor and
+         hover the transport does — and the tooltip carries the key, because
+         these are the four things anyone doing this repeatedly wants a key for.
+
+         Coarse pointers get the same buttons with the label printed under the
+         glyph (there is no hover to reveal a tooltip on) minus the key cap,
+         which means nothing on a device with no keyboard. -->
+    <template v-if="shownStage.length">
+      <span class="mx-1 h-5 w-px flex-none bg-border/70"></span>
+
+      <template v-for="s in shownStage" :key="s.key">
+        <button
+          v-if="isCoarse"
+          type="button"
+          :class="[TRANSPORT_BTN, s.on && 'text-[color:var(--acc)]']"
+          :aria-label="s.label"
+          @click="!s.release && s.run()"
+          @pointerdown="s.release && s.run()"
+          @pointerup="s.release?.()"
+          @pointerleave="s.release?.()"
+        >
+          <svg
+            v-if="isGameIcon(s.icon)"
+            :viewBox="ACTION_ICON_VIEWBOX"
+            style="width: 21px; height: 21px"
+            fill="currentColor"
+            aria-hidden="true"
+            v-html="ACTION_ICON[s.icon]"
+          ></svg>
+          <component v-else :is="STAGE_GLYPH[s.icon]" class="h-[21px] w-[21px]" />
+          <span class="text-f8 uppercase tracking-cs2 text-muted-foreground/70">{{ s.label }}</span>
+        </button>
+
+        <Tooltip v-else :text="stageHint(s)" side="top" :delay="180">
+          <!-- A key with `release` is a HOLD control (the trigger): press and
+               let-go, on pointer events, with pointerleave standing in for a
+               drag off the button mid-burst. Everything else stays a click. -->
+          <button
+            type="button"
+            :class="[TRANSPORT_BTN, s.on && 'text-[color:var(--acc)]']"
+            :aria-label="stageHint(s)"
+            @click="!s.release && s.run()"
+            @pointerdown="s.release && s.run()"
+            @pointerup="s.release?.()"
+            @pointerleave="s.release?.()"
+          >
+            <svg
+              v-if="isGameIcon(s.icon)"
+              :viewBox="ACTION_ICON_VIEWBOX"
+              style="width: 18px; height: 18px"
+              fill="currentColor"
+              aria-hidden="true"
+              v-html="ACTION_ICON[s.icon]"
+            ></svg>
+            <component v-else :is="STAGE_GLYPH[s.icon]" class="h-[18px] w-[18px]" />
+          </button>
+        </Tooltip>
+      </template>
     </template>
   </div>
 </template>

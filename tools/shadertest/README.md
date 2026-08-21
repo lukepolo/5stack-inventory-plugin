@@ -42,6 +42,8 @@ Then open one of:
 | page | what it does |
 |---|---|
 | `http://localhost:5199/batch.html` | runs every fixture + a wear sweep, prints a PASS/FAIL table |
+| `http://localhost:5199/fpv.html?model=aug` | mounts the REAL viewer in first person, fires, and captures consecutive frames off the visible canvas — for anything that only goes wrong while a weapon is being held |
+| `http://localhost:5199/flash.html` | the muzzle flash alone, plain and through the bloom composer, with each sprite's blend state printed |
 | `http://localhost:5199/?model=famas&pm=/materials/<file>.vcompmat.json&wear=0.4&seed=821` | one skin, full resolved detail as JSON |
 
 Vite proxies `/materials`, `/textures`, `/images`, `/models`, `/paints` and

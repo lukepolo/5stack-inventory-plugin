@@ -15,7 +15,10 @@
 // Skin rendering is a faithful port of CS2's compositing pipeline — see
 // paintComposite.ts for the shader and its provenance.
 import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
-import { CHOICES, FLAGS, NUMBERS, choicesVersion, choiceValue, flagValue, flagsVersion, numberValue, setChoice, setFlag, setNumber } from "./devFlags";
+import { buildArms, buildTwistSolver, weaponSeat, type ArmsRig, type Hand, type TwistSolver } from "./viewerArms";
+import { buildViewmodelClip, loadViewmodelClip, viewmodelAssetUrl, type ClipAction, type ClipCue } from "./viewmodelClip";
+import { buildMuzzleFlash, type MuzzleFlash } from "./muzzleFlash";
+import { CHOICES, FLAGS, NUMBERS, choicesVersion, choiceValue, flagValue, flagsVersion, numberValue, numbersVersion, setChoice, setFlag, setNumber } from "./devFlags";
 import { BAKE_ENVIRONMENT, viewerEnvironment } from "./viewerEnvironments";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
@@ -69,7 +72,7 @@ import HDR_URL from "./assets/venice_sunset_1k.hdr?url";
 
 export { loadPaintDef, type PaintDef } from "./paintComposite";
 
-type ThreeBundle = {
+export type ThreeBundle = {
   THREE: typeof import("three");
   GLTFLoader: typeof import("three/examples/jsm/loaders/GLTFLoader.js").GLTFLoader;
   OrbitControls: typeof import("three/examples/jsm/controls/OrbitControls.js").OrbitControls;
@@ -614,6 +617,41 @@ function debugChoice(name: string): string {
  * it names a specific animation clip, and a name you set last week silently
  * overriding the model's own choice is a bug report nobody could diagnose.
  */
+/**
+ * Yield to the frame scheduler — but never wait on it forever.
+ *
+ * A bare `requestAnimationFrame` is the right pacer while the tab is visible: it
+ * hands the slice back exactly when the compositor is ready for more. In a
+ * HIDDEN tab it never fires at all, and anything awaiting it stops dead.
+ *
+ * That is not hypothetical. The texture pre-upload below yields whenever a slice
+ * runs over budget, and a cold mount uploads tens of megabytes — so switching
+ * away from the tab while a viewer is loading left the build parked on this
+ * await with the spinner up, permanently, until the tab was looked at again.
+ * (Found while adding first person, which pushes the slice over budget on every
+ * mount rather than just cold ones, and so turned an intermittent stall into a
+ * reliable one.)
+ *
+ * The timeout is the floor, not a replacement: whichever comes first wins, and
+ * the loser is cancelled so a resumed tab does not run the slice twice. 32ms is
+ * two frames at 60Hz — slow enough not to fight rAF when rAF is working, quick
+ * enough that a hidden tab still finishes in a reasonable time.
+ */
+function yieldToFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      cancelAnimationFrame(raf);
+      clearTimeout(timer);
+      resolve();
+    };
+    const raf = requestAnimationFrame(finish);
+    const timer = setTimeout(finish, 32);
+  });
+}
+
 function debugText(name: string): string | null {
   try {
     return new URLSearchParams(location.search).get(name);
@@ -2130,6 +2168,42 @@ export interface ViewerHandle {
    */
   cameraState: () => CameraState;
   /**
+   * Put the camera back where the mount would have opened it — orbit, zoom AND
+   * pan together. `front`/`back` land on the two faces of the item instead.
+   *
+   * Deliberately NOT `cameraState`'s inverse: this restores the CANONICAL
+   * framing, not whatever pose was handed in at mount. See the implementation.
+   */
+  resetCamera: (side?: "home" | "front" | "back") => void;
+  /**
+   * Stop drawing without unmounting — for a viewer that is still on the page but
+   * behind something. See the note on `suspended`: a modal over the focus view
+   * otherwise leaves two viewers rendering, one of them invisible.
+   */
+  setSuspended: (on: boolean) => void;
+  /**
+   * Page chrome floating over the pane's right-hand edge, in CSS pixels — see
+   * `frameInset`. Live, because the panel comes and goes with the breakpoint
+   * and with what the item has to say about itself.
+   */
+  setFrameInset: (right: number) => void;
+  /**
+   * First person only: play one of the weapon's actions once and return to
+   * idle. `onDone` fires when the clip has run its length. Returns whether the
+   * press was TAKEN — a reload cannot be interrupted, an inspect never
+   * interrupts, and fire is limited to the weapon's cycle time — so a caller
+   * lighting a button only lights it for a press that actually played. Always
+   * false on a viewer that is not in first person.
+   */
+  setFpvAction: (action: ClipAction, onDone?: () => void) => boolean;
+  /**
+   * Hold-to-fire. `true` fires at once (same gate as setFpvAction) and keeps
+   * firing at the weapon's real cycle time while held — but only if the weapon
+   * is full-auto in scripts/weapons.vdata; a Deagle needs a press per shot.
+   * `false` releases the trigger.
+   */
+  setFpvFire: (held: boolean, onDone?: () => void) => boolean;
+  /**
    * The charm's authored albedo, downsampled — what the pattern grade operates
    * on, for anything that wants to predict a pattern's colour without rendering.
    *
@@ -2404,6 +2478,24 @@ interface Presentation {
    * This list only ever names something we have evidence for.
    */
   inspectClips: RegExp[];
+  /**
+   * Clips played on a LIVE SKELETON, per-vertex, every frame.
+   *
+   * The third and last thing a clip can be here, and the only one that actually
+   * moves geometry. `poseClips` pick a stance and are then BAKED away
+   * (bakePose flattens the skin into static vertices); `inspectClips` never
+   * touch the mesh at all — they read one bone and turn the camera by it, which
+   * is right for a rigid weapon and useless for a hand.
+   *
+   * A hand is the case that needs this: `inspect_loop` on a glove is
+   * per-finger, so there is no rigid bone to read and nothing survives the bake.
+   * Setting this keeps the SkinnedMeshes, skips the bake, and runs a mixer.
+   *
+   * NEVER on a `still` viewer. A card is cached forever against its render key,
+   * so an animated one would freeze at whatever frame the shutter caught — the
+   * same reason bloom and first person are forced off for bakes.
+   */
+  liveClips?: RegExp[];
   /** Lay a dual-wield pair out parallel. Weapons only — keys off `weapon_*` bones. */
   dualLayout: boolean;
   /** Both bodies stacked in one GLB, pick by the finish's era. Weapons only. */
@@ -2435,19 +2527,32 @@ interface Presentation {
 const PRESENTATION: Record<ViewerKind, Presentation> = {
   weapon: {
     poseClips: [/inventory_icon/i, /inventory_inspect/i],
-    // The only tree that animates today.
+    // MEASURED, 2026-08-20, and the answer is that a weapon has no inspect
+    // motion at all. Parsing the GLB JSON chunk of every weapon and knife on the
+    // mount, the AK ships exactly five clips:
     //
-    // `inventory_inspect` is the one clip we know by name in a weapon vmdl
-    // besides `inventory_icon` — it is already the second link in the pose chain
-    // above, and the elite measurement in bakePose names the same family
-    // ("icon/inspect/dropped" against "shoot/reload"). Whether it carries real
-    // motion or is a single-key pose is NOT assumed: setupInspect measures every
-    // candidate and drops the ones that do not move.
+    //   dropped            0.000s   1 key
+    //   reload             2.433s  74 keys
+    //   shoot              0.267s   9 keys
+    //   inventory_inspect  0.000s   1 key   <- a POSE, not an animation
+    //   inventory_icon     0.000s   1 key
     //
-    // `inspect_loop` rides along because the glove tree ships one under that
-    // name, so the exporter emits the name at least somewhere; if a weapon has
-    // it, it is by definition the loop we want. Nothing else is listed, and
-    // there is no fallback — a weapon whose clips are all static stays static.
+    // and every other weapon matches. So `inventory_inspect` was never going to
+    // pass setupInspect's INSPECT_MIN_DEGREES gate, and the transport has never
+    // appeared on a weapon since this shipped. That is the code working: it
+    // measures every candidate rather than trusting the name, which is exactly
+    // why a wrong guess here cost nothing.
+    //
+    // The entries STAY. They are a filter, not a promise — nothing is spent on a
+    // name that does not match, and if an extraction ever reaches the anim graph
+    // where CS2 keeps the real first-person sequences (the vmdl_c declares only
+    // these five; `--gltf_export_animations` is already passed, so this is the
+    // model's own list and not an export gap) the gate adopts it on sight.
+    //
+    // WHERE THE REAL INSPECT ANIMATION LIVES: the GLOVE tree. Every glove family
+    // ships `inspect_loop` at 6.167s over 186 keys on a 52-joint arm skeleton —
+    // it animates the hands holding the weapon, not the weapon. Playing it needs
+    // the arms on screen, which is the first-person work, not this list.
     inspectClips: [/^inspect_loop$/i, /^inventory_inspect$/i],
     dualLayout: true,
     bodyPrune: true,
@@ -2476,9 +2581,14 @@ const PRESENTATION: Record<ViewerKind, Presentation> = {
     // EMPTY even though a glove ships `inspect_loop`, because the motion in it
     // is per-finger and the driver here is RIGID: it reads one bone and turns
     // the view by it, which on a hand rig would flex nothing and only wag the
-    // wrist. Playing a hand properly means keeping the skeleton and skinning
-    // live, i.e. undoing bakePose for gloves — see TODO.md.
+    // wrist. That clip is played properly by `liveClips` below instead.
     inspectClips: [],
+    // THE GLOVE SHOWCASE. `inspect_loop` is what CS2 plays when you inspect a
+    // pair of gloves — the hands turn over and flex to show the material off.
+    // It is authored for exactly this and for nothing else: the fingers are
+    // spread to display the glove, not curled around a grip, which is why it
+    // makes a poor weapon-holding animation and a very good glove one.
+    liveClips: [/^inspect_loop$/i],
     dualLayout: false,
     bodyPrune: false,
     cullViewmodel: true,
@@ -2624,6 +2734,85 @@ function buildDecalQuad(THREE: typeof import("three"), kind: ViewerKind) {
   return group;
 }
 
+// ---- First-person sound ----------------------------------------------------------
+// One AudioContext and one decoded-buffer cache for the module: a shot is the
+// same bytes whichever viewer fires it, and a context per viewer is how a tab
+// runs out of them. The context is created lazily on the first cue, which is
+// always downstream of a key press or a click, so autoplay policy is satisfied
+// by construction — and `resume()` is called anyway for the browsers that
+// suspend a context created before any gesture reached the document.
+let fpvAudio: AudioContext | null = null;
+const fpvSfx = new Map<string, Promise<AudioBuffer | null>>();
+function playSfx(url: string, gain = 0.7): void {
+  try {
+    fpvAudio ??= new AudioContext();
+  } catch {
+    return;
+  }
+  const ctx = fpvAudio;
+  if (ctx.state === "suspended") void ctx.resume();
+  let p = fpvSfx.get(url);
+  if (!p) {
+    p = fetch(url)
+      .then((r) => (r.ok ? r.arrayBuffer() : null))
+      .then((b) => (b ? ctx.decodeAudioData(b) : null))
+      .catch(() => null);
+    fpvSfx.set(url, p);
+    // A failed fetch is not a permanent no — see loadViewmodelClip.
+    void p.then((buf) => {
+      if (!buf) fpvSfx.delete(url);
+    });
+  }
+  void p.then((buf) => {
+    if (!buf) return;
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.value = gain;
+    src.connect(g).connect(ctx.destination);
+    src.start();
+  });
+}
+
+/** What first person needs to know. See ViewerOpts.firstPerson. */
+export interface FirstPersonSpec {
+  /**
+   * The glove GLB that supplies the ARMS — `sporty_gloves`, `ct_gloves`, …
+   *
+   * Always required, even for a player wearing no gloves: `ct_gloves` and
+   * `t_gloves` are the default pair and are the only place the arm skeleton and
+   * `inspect_loop` exist. An agent GLB carries the same bones but ships no
+   * inspect clip at all, so it can never be the source of the motion.
+   */
+  arms: string;
+  /** Which hand holds the weapon. Both arms always draw. */
+  hand?: Hand;
+  /**
+   * What the weapon is doing — see ClipAction.
+   *
+   * `idle` (the default) is the resting pose the game holds a weapon in. The
+   * others are the same actions CS2 binds: fire, reload, inspect, deploy.
+   */
+  action?: ClipAction;
+  /**
+   * The equipped glove FINISH for the arms, if there is one.
+   *
+   * Without this the hands render in the GLB's own base textures, which for a
+   * paintable glove is a near-black placeholder meant to be replaced — so a
+   * player wearing Sport Gloves would see black hands rather than their gloves.
+   */
+  armsPaint?: { material: string; wear?: number | null } | null;
+  /** The equipped AGENT's model, for its first-person sleeve. Absent leaves the
+   *  forearms bare, which is right for an agent that has bare arms. */
+  sleeve?: string | null;
+  /** Vertical FOV in degrees. CS2's viewmodel default reads about this. */
+  fov?: number;
+  /** Shifts the ARMS relative to the eye, in metres — the game's viewmodel
+   *  offset. Moving the rig rather than the camera keeps the eye at the origin,
+   *  which is where the measurement says the arms were authored around. */
+  offset?: { x: number; y: number; z: number };
+}
+
 export interface ViewerOpts {
   /** What is mounted. Defaults to "weapon" — see PRESENTATION. */
   kind?: ViewerKind;
@@ -2653,6 +2842,21 @@ export interface ViewerOpts {
    * both dominates the frame and makes two finishes hard to compare.
    */
   gloveArms?: boolean;
+  /**
+   * Render this weapon IN THE HANDS instead of on a turntable.
+   *
+   * The arms come from a glove GLB — see viewerArms.ts for why that is where
+   * they live and where the only real inspect animation in the asset set is.
+   * Absent (the default) is the item view, unchanged in every respect: first
+   * person builds a SECOND camera and leaves the orthographic one and all of
+   * its framing, pan, zoom and placement machinery untouched, so nothing here
+   * can reach a card bake or the 2D stage.
+   *
+   * Placement is off in this mode by construction. Dragging a sticker means
+   * raycasting against a weapon that is now parented to a moving bone, and
+   * "aim at the gun while it swings" is not a gesture worth having.
+   */
+  firstPerson?: FirstPersonSpec | null;
   paintMaterial?: string | null;
   // Pre-CS2 finish → render the legacy body (its UV unwrap is what the
   // pattern was authored against). CS2-native finishes use the HD body.
@@ -2673,6 +2877,14 @@ export interface ViewerOpts {
    */
   persistWrite?: boolean;
   frame?: number | "fit"; // distance multiplier, or "fit" = largest no-clip framing
+  /**
+   * Page chrome that floats OVER the pane, in CSS pixels per edge.
+   *
+   * The pane stays full-width — the model gets all of it and so does the rarity
+   * light — and the framing shifts instead, so the weapon sits in the middle of
+   * what is actually visible rather than half under the item's spec panel.
+   */
+  frameInset?: { right?: number };
   stickers?: StickerPlacement[];
   /**
    * Patches on an AGENT, slot-ordered, by inventory image — `kind: "agent"`.
@@ -3036,6 +3248,10 @@ async function buildViewer(
   // pointing at the ORIGINAL scene's bones, so posing one viewer would pose
   // every other viewer sharing the cached glTF (and disposing one would break
   // the rest). SkeletonUtils.clone() rebuilds the bone graph per clone.
+  /** Set when a `liveClips` match keeps the skeleton — see below. */
+  let liveMixer: import("three").AnimationMixer | null = null;
+  /** Forearm roll distribution, for whichever skeleton is live. */
+  let twist: TwistSolver | null = null;
   const isSkinned = (() => {
     let found = false;
     gltf.scene.traverse((n) => {
@@ -3068,7 +3284,28 @@ async function buildViewer(
         undefined,
       ) ?? gltf.animations?.find((a) => !NEVER_POSE.test(a.name)))
     : undefined;
-  if (poseClip) {
+  /**
+   * `?fpv=ct_gloves` — first person without a caller.
+   *
+   * The same door `?inspectclip=` opens onto the clip choice. It exists because
+   * the arms are a rendering question (does the gun sit in the hand, is the
+   * scale right, does the clip drive it) that has nothing to do with which
+   * gloves a player owns, and waiting on the loadout wiring to answer it would
+   * mean debugging two new things at once.
+   *
+   * Resolved HERE, before the pose is applied, because first person changes
+   * what happens to the weapon's skeleton from this point on — see below.
+   *
+   * NEVER on a `still` viewer. Those are card bakes, and a card is cached
+   * forever against its render key — one baked with arms in the frame would
+   * outlive the debug session by months. Same reasoning that forces bloom off
+   * for bakes.
+   */
+  const fpvSpec: FirstPersonSpec | null =
+    opts?.firstPerson ??
+    (!opts?.still && kind === "weapon" && debugText("fpv") ? { arms: debugText("fpv")! } : null);
+
+  if (poseClip && !fpvSpec) {
     const clip = poseClip;
     const mixer = new THREE.AnimationMixer(object);
     mixer.clipAction(clip).play();
@@ -3076,6 +3313,39 @@ async function buildViewer(
     // not the posed vertex positions — see flattenToBindPose for why baking the
     // pose into the geometry breaks every coordinate we hand to the game.
     mixer.update(0);
+  } else if (poseClip && fpvSpec) {
+    // FIRST PERSON KEEPS THE SKELETON, AT BIND.
+    //
+    // The weapon's own clips move its PARTS — measured on the AK, `reload`
+    // pulls `clip` (the magazine) 21 units out and scales it through zero for
+    // the swap, and racks `bolt` 6.5 units; `shoot` cycles `bolt` and twitches
+    // `trigger`. None of that survives bakePose, which flattens the skin into
+    // static vertices, so a held weapon stays skinned and a mixer drives those
+    // bones while the clip plays (see the FPV block).
+    //
+    // And it stays at BIND rather than the icon pose, for the stickers: a UV
+    // decal is cut from the geometry as stored, which is bind-pose data, and
+    // rendered as an unskinned child. With the body posed to the icon the
+    // `weapon` bone moves 18cm from bind and every sticker would be left
+    // floating that far off the gun. At bind the two agree.
+    //
+    // The one thing the icon pose is still needed for is the PROPS — the
+    // Revolver's speed loader, the XM1014's loose shells — which Valve hides by
+    // scaling their bones to zero in every clip. Those scales are read straight
+    // off the clip's tracks and applied to the bones by hand, and nothing else
+    // from the clip is.
+    const hidden = new Set<string>();
+    for (const t of poseClip.tracks) {
+      const m = /^(.+)\.scale$/.exec(t.name);
+      if (!m) continue;
+      let mn = Infinity;
+      for (let i = 0; i < t.values.length; i++) mn = Math.min(mn, Math.abs(t.values[i]));
+      if (mn < 1e-4) hidden.add(m[1]);
+    }
+    object.traverse((n) => {
+      if (hidden.has(n.name)) n.scale.setScalar(0);
+    });
+    propStats = `first person — live skin, ${hidden.size} prop bones hidden`;
   }
   // Agents have no rest clip, so their stand is authored here — see restArms.
   //
@@ -3131,7 +3401,37 @@ async function buildViewer(
     agentPose = pose;
   };
   if (pres.restArms) applyAgentPose(DEFAULT_AGENT_POSE);
-  if (poseClip) {
+  /**
+   * A clip to PLAY rather than bake — see Presentation.liveClips.
+   *
+   * Excluded from `still` viewers, which is what keeps every baked card exactly
+   * as it is: a bake takes the branch below and gets the flattened pose it
+   * always got.
+   */
+  const liveClip =
+    !opts?.still && pres.liveClips?.length
+      ? pres.liveClips.reduce<import("three").AnimationClip | undefined>(
+          (found, re) => found ?? gltf.animations?.find((a) => re.test(a.name)),
+          undefined,
+        )
+      : undefined;
+  if (liveClip) {
+    // Keep the skeleton, skip the bake. The mixer is advanced by the render
+    // loop; `still` never reaches here, so nothing offscreen pays for it.
+    liveMixer = new THREE.AnimationMixer(object);
+    liveMixer.clipAction(liveClip).play();
+    // Evaluate frame zero before anything measures the model — the framing
+    // below reads the POSED silhouette, and at bind the arms are flung out to
+    // an arm-span that would frame the gloves as a speck in the middle of it.
+    // BUILT BEFORE THE FIRST EVALUATION. The solver measures each joint's REST
+    // rotation, and the moment the mixer runs there is no rest left to read —
+    // frame zero of a clip is a pose like any other. Build, then evaluate, then
+    // apply, so the framing below sees the corrected silhouette.
+    twist = buildTwistSolver(THREE, object, debugFlag("notwist"));
+    liveMixer.update(0);
+    twist?.apply();
+    object.updateMatrixWorld(true);
+  } else if (poseClip && !fpvSpec) {
     object.updateMatrixWorld(true);
     // Drop the props and the skeleton, keeping the bind pose. This also settles
     // the framing problem the bounding boxes used to paper over: the parked
@@ -3251,7 +3551,19 @@ async function buildViewer(
     });
     // Only when BOTH are present — a future export shipping one body must not
     // have it culled out from under it.
-    if (bodies.world.length && bodies.view.length) bodies.view.forEach((v) => v.parent?.remove(v));
+    //
+    // INVERTED WHEN A CLIP IS PLAYING. The two bodies carry SEPARATE SKINS
+    // (skin 0 is the worldmodel, skin 1 the viewmodel) over the same 52 bones,
+    // and `inspect_loop` is authored against the VIEWMODEL bind. Driving the
+    // worldmodel with it drags geometry through a pose its own bind never
+    // matched — which is the wrung-out twist at the wrist. The animation was
+    // right; the body under it was wrong. So a live clip keeps the body the
+    // clip was made for.
+    //
+    // The STILL path is untouched and still shows the worldmodel: that IS the
+    // item, and it is what every baked card has always been.
+    const drop = liveClip ? bodies.world : bodies.view;
+    if (bodies.world.length && bodies.view.length) drop.forEach((v) => v.parent?.remove(v));
   }
   // Gloves ship as ARMS. `bare_arm_*` is the skin the glove is worn on — real
   // geometry with its own material, not a prop — so it is culled by material
@@ -3793,13 +4105,92 @@ async function buildViewer(
   }
 
   // Auto-frame: center the model and pull the camera back to fit.
-  const box = new THREE.Box3().setFromObject(object);
+  // PRECISE when the skeleton is live. Box3's cheap path reads
+  // `geometry.boundingBox`, which for a SkinnedMesh is the BIND pose — arms
+  // straight out, a 1.6m span — so a posed pair of gloves would be framed
+  // inside a box an arm-span wide and render as a speck. The precise path runs
+  // `getVertexPosition`, which applies the bone transforms. One pass over the
+  // vertices, once, at mount.
+  /**
+   * The silhouette across the WHOLE CLIP, not one frame of it.
+   *
+   * A single-frame box centres the model on wherever the hands happen to be at
+   * t=0, and `inspect_loop` then walks them a long way from it — so the gloves
+   * sit off to one side of the frame and orbit around a point behind
+   * themselves. Neither is a framing bug exactly; the framing is correct for a
+   * frame nobody is looking at.
+   *
+   * Sampling the clip and taking the union gives one box that contains every
+   * pose, so the centre is the centre of the MOTION. That is the point a
+   * turntable should turn about and the point the frame should sit on.
+   *
+   * 16 samples: the arc a wrist travels is smooth and low-frequency, so this
+   * lands within a millimetre or two of the true extent, and it is a one-off at
+   * mount rather than anything the render loop pays for.
+   */
+  const clipMeasure = (() => {
+    if (!liveMixer || !liveClip) return null;
+    const SAMPLES = 16;
+    const acc = new THREE.Box3();
+    const one = new THREE.Box3();
+    /**
+     * The bones a person means when they say "the gloves".
+     *
+     * The union box's centre is NOT that point. The box has to contain every
+     * pose including the ones where the hands drop lowest, so its centre sits
+     * below where the hands actually spend their time — which is why the pivot
+     * marker first came out under the gloves rather than between them.
+     *
+     * WRIST AND FINGERTIP, not the wrist alone. `hand_L`/`hand_R` are the WRIST
+     * joints, and a glove runs from there out to the fingers — so pivoting on
+     * the wrists alone still sits low, at the cuff rather than the middle of the
+     * glove. Averaging each wrist with its middle fingertip puts the point
+     * halfway along the hand, which is where the glove actually looks centred.
+     *
+     * Averaged over the clip so the pivot does not chase the animation.
+     */
+    const FOCUS_BONES = /^(hand|finger_middle_2)_[LR]$/;
+    const hands: import("three").Object3D[] = [];
+    object.traverse((o) => {
+      if (FOCUS_BONES.test(o.name)) hands.push(o);
+    });
+    const focus = new THREE.Vector3();
+    const tmp = new THREE.Vector3();
+    let n = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      liveMixer.setTime((liveClip.duration * i) / SAMPLES);
+      twist?.apply();
+      object.updateMatrixWorld(true);
+      acc.union(one.setFromObject(object, true));
+      for (const h of hands) {
+        focus.add(tmp.setFromMatrixPosition(h.matrixWorld));
+        n++;
+      }
+    }
+    // Put the clip back where the rest of the mount expects to find it.
+    liveMixer.setTime(0);
+    twist?.apply();
+    object.updateMatrixWorld(true);
+    // A rig with no hands (a future live-clipped kind that is not a glove) falls
+    // back to the box, which is the old behaviour rather than a broken one.
+    return { box: acc, focus: n ? focus.divideScalar(n) : acc.getCenter(new THREE.Vector3()) };
+  })();
+  const clipBox = clipMeasure?.box ?? null;
+
+  const box = clipBox ?? new THREE.Box3().setFromObject(object, !!liveMixer);
   const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
+  // SIZE comes from the box (it must contain every pose), but the point put at
+  // the origin is the hands' midpoint — see clipMeasure. Centring on the box
+  // instead hangs the gloves above centre for most of the clip.
+  const center = clipMeasure?.focus.clone() ?? box.getCenter(new THREE.Vector3());
   object.position.sub(center);
   object.updateMatrixWorld(true);
   const radius = Math.max(size.x, size.y, size.z) || 1;
-  const cboxFit = new THREE.Box3().setFromObject(object);
+  // The same union, moved by the recentre that just happened. Re-sampling would
+  // give the identical answer for sixteen more passes over the vertices.
+  const cboxFit = clipBox
+    ? clipBox.clone().translate(center.clone().negate())
+    : new THREE.Box3().setFromObject(object, !!liveMixer);
 
   // The default vector is X-dominant, so it looks partly DOWN the long axis.
   // A gun has real depth and reads well from there; a knife is essentially a
@@ -4041,6 +4432,19 @@ async function buildViewer(
   /** Last pair actually pushed into the projection — see applyPan. */
   const panApplied = new THREE.Vector2(NaN, NaN);
   /**
+   * How many CSS pixels down the right-hand edge are SPOKEN FOR by the page —
+   * the item's spec panel floats over the pane there.
+   *
+   * The pane is deliberately the full width (the model gets all of it, and the
+   * rarity light with it), so the only thing that has to move is what the
+   * camera calls the middle. Half the panel's width, shifted left, puts the
+   * weapon in the centre of what is actually VISIBLE — the same frustum shift
+   * the pan uses, so it composes with a pan for free and costs nothing at all
+   * when no panel is up.
+   */
+  let frameInsetRight = opts?.frameInset?.right ?? 0;
+  let insetApplied = NaN;
+  /**
    * World units per CSS pixel — the conversion both the pan leash and the
    * sticker grab radius are stated in.
    *
@@ -4067,18 +4471,36 @@ async function buildViewer(
     panPx.y = clamp(panPx.y, -maxPx, maxPx);
     // Cheap enough to call every frame from the zoom re-clamp below, because
     // rebuilding the projection is skipped whenever nothing actually moved.
-    if (panPx.x === panApplied.x && panPx.y === panApplied.y) return;
+    if (panPx.x === panApplied.x && panPx.y === panApplied.y && frameInsetRight === insetApplied) return;
     panApplied.copy(panPx);
+    insetApplied = frameInsetRight;
     // Negated: setViewOffset picks the sub-window's top-left out of the full
-    // image, so shifting the window left is what moves the content right.
-    if (panPx.x === 0 && panPx.y === 0) camera.clearViewOffset();
-    else camera.setViewOffset(cssW, cssH, -panPx.x, -panPx.y, cssW, cssH);
+    // image, so shifting the window left is what moves the content right. The
+    // inset is NOT negated for exactly that reason — moving the window right is
+    // what walks the weapon out from under the panel.
+    const dx = -panPx.x + frameInsetRight / 2;
+    if (dx === 0 && panPx.y === 0) camera.clearViewOffset();
+    else camera.setViewOffset(cssW, cssH, dx, -panPx.y, cssW, cssH);
   };
   // Zooming OUT shrinks the leash — a pan made at full zoom is a long way in
   // world units — so re-clamp as the distance changes rather than only while
   // dragging. Without this, zooming out after a deep pan leaves the weapon
   // stranded off-frame.
   controls.addEventListener("change", applyPan);
+  // TOUCHING THE MODEL STOPS IT DEAD; LETTING GO STARTS THE WAIT.
+  //
+  // Two events, not one, and the split is the whole point. `start` (pointer
+  // down) only stops the turntable — it must NOT arm the timer, because the
+  // timer would then be counting down THROUGH the drag and a drag longer than
+  // the delay would hand the spin back while the user still had hold of the
+  // model. `end` (pointer up) is where the wait actually begins, which is also
+  // what "wait until they are done" means in the first place.
+  //
+  // Neither of them is `change`: that is what the turntable itself fires sixty
+  // times a second, so hanging any of this off it would make the spin
+  // perpetually defer itself and never run at all.
+  controls.addEventListener("start", () => holdIdleSpin());
+  controls.addEventListener("end", () => syncIdleSpin());
   /** Pan by a pointer delta in CSS pixels. */
   const panBy = (dx: number, dy: number) => {
     if (!dx && !dy) return;
@@ -4091,18 +4513,106 @@ async function buildViewer(
   // Weapons lie along their longest axis; height is Y unless Y IS the length.
   // Sticker offsets from the game map linearly onto (length, height) with one
   // scale constant, clamped to the weapon's cs2-lib bounds.
-  const cbox = new THREE.Box3().setFromObject(object); // recomputed after centering
+  // PRECISE when the skeleton is live, for the same reason as the framing boxes
+  // above and with a consequence you feel rather than see: this box is what
+  // pins the ORBIT PIVOT. Box3's cheap path reads `geometry.boundingBox`, which
+  // on a SkinnedMesh is the BIND pose — a pair of gloves binds as an arm-span
+  // nearly two metres wide — so the pivot landed way out in empty space beside
+  // the model and a drag swung the gloves around it in an arc instead of
+  // turning them. The precise path skins the vertices first, putting the pivot
+  // where the gloves actually are.
+  const cbox = clipBox
+    ? clipBox.clone().translate(center.clone().negate())
+    : new THREE.Box3().setFromObject(object, !!liveMixer); // recomputed after centering
   // The pivot, pinned for the life of the viewer. Nothing moves it now that pan
   // is a frustum shift, so "rotate around the weapon" holds however the user has
   // framed it. The load-time centering puts this at ~the origin; taking the real
   // box centre keeps it honest for models whose mesh sits off it.
-  controls.target.copy(cbox.getCenter(new THREE.Vector3()));
+  // The recentre above already put the focus point at the origin, so that IS
+  // the pivot for a live rig. Only the static path needs the box's centre.
+  if (clipMeasure) controls.target.set(0, 0, 0);
+  else controls.target.copy(cbox.getCenter(new THREE.Vector3()));
   // A character's box centre is its WAIST, and orbiting about the waist reads as
   // the model toppling rather than turning — the head swings through a much
   // bigger arc than the feet. Lift the pivot toward the chest, where a person
   // actually appears to rotate. Fraction of the box height rather than an
   // absolute, so it holds for the shortest and tallest agents alike.
   if (pres.frame === "upright") controls.target.y = cbox.min.y + (cbox.max.y - cbox.min.y) * 0.62;
+
+  // THE PIVOT, DRAWN — `?pivotdot=1`. "Rotation feels wrong" is one of the few
+  // complaints with no visible cause: the pivot is a point in empty space and
+  // every symptom of it being in the wrong place (the model swinging in an arc,
+  // not knowing which way a drag will go) is equally consistent with the
+  // framing being off. Drawing it settles which.
+  //
+  // `depthTest: false` and a high renderOrder so it shows THROUGH the model —
+  // the interesting case is the pivot being buried behind the item, which is
+  // exactly when a depth-tested marker would be invisible.
+  if (debugFlag("pivotdot") && !opts?.still) {
+    const dot = new THREE.Mesh(
+      new THREE.SphereGeometry(radius * 0.03, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0xff3860, depthTest: false, depthWrite: false, toneMapped: false }),
+    );
+    dot.position.copy(controls.target);
+    dot.renderOrder = 999;
+    dot.name = "pivot-dot";
+    scene.add(dot);
+  }
+
+  /**
+   * THE HOME FRAMING — captured here, one line before a handed-in camera can
+   * overwrite it.
+   *
+   * "Reset" has to mean the pose the mount would have OPENED at, not the pose it
+   * was handed. `opts.camera` exists so a remount can carry the orbit the user
+   * was already in (see cameraState on the handle), and resetting to that would
+   * make the button a no-op in precisely the case people reach for it: a remount
+   * that carried a bad angle across. So the home pose is read before the
+   * adoption below, which therefore cannot reach it.
+   */
+  const homeCamPos = camera.position.clone();
+  const homeTarget = controls.target.clone();
+
+  /**
+   * Put the camera back, optionally on a named side.
+   *
+   * Undoes ORBIT, DOLLY AND PAN together, because they are not separable in the
+   * head: the three of them are one thing called "where I am looking from", and
+   * a reset that restores the angle but leaves the weapon zoomed in and shoved
+   * off-frame reads as a button that does not work. Pan is a frustum shift
+   * rather than a camera move (see applyPan), which is exactly why it needs
+   * naming here — nothing about restoring `camera.position` touches it.
+   *
+   * `front`/`back` reuse this seam rather than owning a second one. They are the
+   * home pose turned about the pivot's vertical, so they inherit the tuned
+   * standoff and every per-kind `camDir` above for free. A flat 180 rather than
+   * a hand-picked rear angle, because the two faces of a weapon are a
+   * COMPARISON — an angle that flattered the back would be comparing it against
+   * a front it does not match.
+   */
+  const resetCamera = (side: "home" | "front" | "back" = "home") => {
+    if (disposed) return;
+    camera.position.copy(homeCamPos);
+    controls.target.copy(homeTarget);
+    if (side === "back") {
+      // Turned about the PIVOT, not the origin. An agent's pivot is lifted to
+      // the chest (just above), so turning about the origin would swing the
+      // camera down and look at the model from its knees.
+      const d = camera.position.clone().sub(controls.target);
+      camera.position.x = controls.target.x - d.x;
+      camera.position.z = controls.target.z - d.z;
+    }
+    camera.zoom = 1;
+    panPx.set(0, 0);
+    applyPan();
+    camera.lookAt(controls.target);
+    camera.updateProjectionMatrix();
+    controls.update();
+    // A reset is an interaction, so the idle turntable's wait starts over.
+    // Without this the model begins turning the moment you re-centre it, which
+    // is the exact thing the wait exists to prevent.
+    syncIdleSpin();
+  };
 
   // Adopt a handed-in camera, if there is one. Guarded on all six numbers being
   // finite: a partially-populated pose would put the eye at NaN, and three
@@ -4112,6 +4622,7 @@ async function buildViewer(
     controls.target.fromArray(opts.camera.target);
     controls.update();
   }
+
 
   // Every decision PRESENTATION drives, in one line, for
   // tools/shadertest/item3d.html. Off unless the rig sets the flag, so
@@ -8884,6 +9395,19 @@ async function buildViewer(
 
   function paintCursor() {
     if (!cursor) return;
+    // FIRST PERSON HAS NO ORBIT AND NO PLACEMENT, so it has none of these
+    // states either — the reticle was answering presses with "SPIN" and "PAN"
+    // over a weapon that does neither, while a click there fires.
+    //
+    // The custom reticle goes; the NATIVE cursor comes back. Hiding both left
+    // the pane with no pointer at all, and the controls, the toggle and the
+    // save button are all inside it — you cannot aim at a button you cannot
+    // see.
+    if (fpvCamera) {
+      cursor.show(false);
+      el.style.cursor = "default";
+      return;
+    }
     let mode: CursorMode;
     if (drag) mode = "grab";
     else if (panning) mode = "pan";
@@ -9016,6 +9540,11 @@ async function buildViewer(
     paintCursor();
   }
   function onCursorEnter(e: PointerEvent) {
+    // First person draws no reticle at all — see paintCursor.
+    if (fpvCamera) {
+      el.style.cursor = "default";
+      return;
+    }
     cursor?.move(e.clientX, e.clientY);
     cursor?.show(true);
   }
@@ -9917,6 +10446,768 @@ async function buildViewer(
   if (pres.attachments && opts?.nametag) await mountNameTag(opts.nametag.trim());
   mt.mark("attach");
 
+  /**
+   * Composite a glove finish onto whatever object is handed in.
+   *
+   * The glove item view does this inline for `object`; first person needs the
+   * same thing for the ARMS, which are a different object entirely. Factored to
+   * a function rather than copied so the two generations of
+   * `csgo_customglove.vfx` — the g_tDetail/g_tLayerMask set and the
+   * g_tSubstrate/g_tSurface set — keep being tried in the same order in both
+   * places. See gloveComposite/gloveCompositeModern for why both exist.
+   *
+   * Failure here is NOT fatal, unlike the item view's: a weapon with unpainted
+   * hands is still a weapon being held, whereas a glove that fails to composite
+   * is a black blob under a named finish.
+   */
+  async function paintGloveOnto(root: import("three").Object3D, material: string, wear: number) {
+    try {
+      const def = await loadGlovePaintDef(material);
+      let maps: GloveMaps | null = def ? await compositeGlove(THREE, renderer, def, { wear }) : null;
+      if (!maps) {
+        const mdef = await loadGloveModernDef(material);
+        maps = mdef ? await compositeGloveModern(THREE, renderer, mdef, { wear }) : null;
+      }
+      if (!maps) return;
+      const comp = maps;
+      root.traverse((n) => {
+        const mesh = n as import("three").Mesh;
+        if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
+        const mat = mesh.material as import("three").MeshStandardMaterial;
+        // Skin is not painted — the finish has no say over the forearm.
+        if (!mat || /bare_arm/i.test(mat.name ?? "")) return;
+        mat.map = comp.albedo;
+        mat.color.setScalar(1);
+        mat.roughnessMap = comp.rm;
+        mat.metalnessMap = comp.rm;
+        mat.aoMap = comp.rm;
+        mat.roughness = 1;
+        mat.metalness = 1;
+        mat.normalMap = comp.normal;
+        mat.needsUpdate = true;
+      });
+      // Freed with the viewer, alongside the item view's own composite.
+      const prev = gloveRelease;
+      gloveRelease = () => {
+        prev?.();
+        comp.dispose();
+      };
+    } catch (e) {
+      console.warn(`[viewer3d] first-person glove paint failed (${material})`, e);
+    }
+  }
+
+  // ---- First person ------------------------------------------------------------
+  //
+  // LAST, DELIBERATELY. Everything above has finished measuring the weapon in
+  // the canonical frame the item view puts it in — the paint composite, the
+  // sticker cuts, the charm's pivot and collision grid, the StatTrak seating
+  // ray, the name plate. Several of those seat by casting rays in WORLD space,
+  // so moving the weapon into a posed hand before they run does not merely
+  // misplace them: the first attempt hung the mount outright. Build the item
+  // exactly as the item view does, then lift the finished thing into the hand.
+  //
+  // A SECOND CAMERA, not a second projection threaded through the first. The
+  // orthographic camera above and every piece of machinery hanging off it —
+  // frameHalfH, setZoomRange, applyPan, resetCamera, the placement raycasts —
+  // stay exactly as they are and keep operating on it. All that changes is which
+  // camera drawFrame hands to the renderer. That is one touch point instead of
+  // the hundred and sixty places `camera` is read, and it is why a fault in here
+  // cannot reach a card bake or the item view.
+  //
+  // WHERE THE EYE GOES, measured rather than fitted. Sampling `inspect_loop` off
+  // the mount and mapping bone space to ours (the (y, z, x) × 0.0254 swizzle the
+  // charm anchors already use) puts the posed right shoulder at
+  // (0.18, -0.40, -0.37) and the right hand at (-0.24, -0.09, -0.14) metres.
+  // Shoulders below and ahead, hands up in the middle: the clip is authored
+  // around the EYE at the origin, looking down -Z. So the camera is placed at
+  // the origin and nothing has to be framed or solved.
+  let arms: ArmsRig | null = null;
+  let fpvCamera: import("three").PerspectiveCamera | null = null;
+  /** Set only on the clip-driven path — see the two ways to hold it, below. */
+  let fpvSeat: import("three").Object3D | null = null;
+  let fpvWpn: import("three").Object3D | null = null;
+  let fpvUnbake: import("three").Matrix4 | null = null;
+  /** The auto-framed orientation. Yaw and pitch are offsets ON this. */
+  let fpvBase: import("three").Quaternion | null = null;
+  /** The weapon's own PARTS — mag, bolt, trigger — see the FPV block. */
+  let weaponMixer: import("three").AnimationMixer | null = null;
+  const weaponActions = new Map<ClipAction, import("three").AnimationAction>();
+  /** Crossfade for the parts on the way back to rest, matched to the rig's. */
+  const PARTS_FADE = 0.12;
+  let flash: MuzzleFlash | null = null;
+  // Scratch for the per-frame decompose — allocating three of these inside the
+  // render loop is the kind of garbage that shows up as a stutter, not a leak.
+  const fpvPos = new THREE.Vector3();
+  const fpvQuat = new THREE.Quaternion();
+  const fpvScale = new THREE.Vector3();
+  const ONE = new THREE.Vector3(1, 1, 1);
+  /**
+   * The rig's basis, measured (see the eye block below): the clip is authored
+   * with X left, Y up, Z forward, and the model root maps (x,y,z) -> (y,z,x).
+   */
+  const FPV_UP = new THREE.Vector3(1, 0, 0);
+  const FPV_FORWARD = new THREE.Vector3(0, 1, 0);
+  const FPV_RIGHT = new THREE.Vector3(0, 0, 1);
+  /** Viewmodels are composed for a 16:9 screen. See the camera build. */
+  const FPV_ASPECT = 16 / 9;
+  const fpvTune = new THREE.Quaternion();
+  const fpvEuler = new THREE.Euler();
+  /**
+   * Place the weapon from the clip's own `wpn` track.
+   *
+   * A function rather than inline in the render loop because the framing pass
+   * has to step the clip and re-measure, and it must see the weapon where the
+   * loop would have put it.
+   *
+   * POSITION AND ROTATION ONLY — the scale is deliberately dropped. The two
+   * trees measure in different units and put the conversion in different
+   * places: the glove skeleton is authored in INCHES under a root that scales
+   * by 0.0254, so `wpn.matrixWorld` carries that factor, while the weapon's
+   * geometry is already in METRES because bakePose flattened the skin,
+   * conversion and all, into its vertices. Taking the whole matrix applied
+   * 0.0254 a second time and rendered a two-centimetre AUG — correctly placed,
+   * correctly oriented, and forty times too small.
+   */
+  function syncFpvSeat() {
+    if (!fpvSeat || !fpvWpn || !fpvUnbake) return;
+    fpvWpn.updateMatrixWorld(true);
+    // wpn -> (undo the weapon's own attachment bone) -> (undo the object's own
+    // transform). See fpvUnbake for what the middle term is and why the scales
+    // cancel to exactly 1.
+    fpvSeat.matrix.multiplyMatrices(fpvWpn.matrixWorld, fpvUnbake);
+    fpvSeat.updateMatrixWorld(true);
+  }
+
+  if (fpvSpec) {
+    const spec = fpvSpec;
+    const hand = spec.hand ?? "R";
+    try {
+      // The weapon's OWN clip, in parallel with the arms model — both are
+      // needed before anything can be built and neither depends on the other.
+      const [armsGltf, vm, sleeveGltf] = await Promise.all([
+        loadGltf(spec.arms, { legacy: false, painted: false }),
+        loadViewmodelClip(model, spec.action ?? "idle"),
+        // Never fatal: an agent that fails to load costs a sleeve, not the view.
+        spec.sleeve
+          ? loadGltf(spec.sleeve, { legacy: false, painted: false }).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      if (signal?.aborted) throw new DOMException("aborted", "AbortError");
+      const rig = buildArms(THREE, cloneSkeleton, armsGltf, { hand, still: opts?.still, viewmodel: vm, noTwist: debugFlag("notwist"), sleeve: sleeveGltf });
+      // The seat is computed against the weapon AS IT STANDS — after bakePose,
+      // after the recentre — because that is the transform the wrapper has to
+      // undo. See weaponSeat.
+      // TWO WAYS TO HOLD IT, and which one applies says everything about the
+      // result. With the weapon's own viewmodel clip the gun rides the `wpn`
+      // track — its motion is authored by Valve alongside the hands. Without
+      // one there is only the glove's showcase loop, and the best available is
+      // to bolt the weapon to the hand bone by its `ag1_hand_r` attachment,
+      // which is what produced a gun held backwards by fingers that never
+      // closed. The second path stays only as a fallback for a weapon the
+      // extraction has no clip for.
+      const seatM = rig && !rig.wpn ? weaponSeat(THREE, object, hand) : null;
+      if (rig && rig.wpn) {
+        // The weapon is placed each frame from the clip — see `driveWeapon`.
+        const seat = new THREE.Group();
+        seat.name = "fpv-seat";
+        seat.matrixAutoUpdate = false;
+        object.removeFromParent();
+        seat.add(object);
+        scene.add(seat);
+        scene.add(rig.root);
+        if (spec.offset) rig.root.position.set(spec.offset.x, spec.offset.y, spec.offset.z);
+        // THE HANDS WEAR THE EQUIPPED FINISH. Same compositor the glove item
+        // view uses, pointed at the arms instead — a glove is a glove whichever
+        // way round it is being looked at.
+        if (spec.armsPaint?.material) await paintGloveOnto(rig.root, spec.armsPaint.material, spec.armsPaint.wear ?? 0);
+        arms = rig;
+
+        // THE WEAPON'S OWN MOVING PARTS — one clip on each skeleton, played
+        // together, exactly as the game composes them.
+        //
+        // The viewmodel clip (on the arms rig) owns the gun's PLACEMENT through
+        // `wpn`. The weapon GLB's own `reload`/`shoot` own its PARTS. They are a
+        // synchronised pair: `reload_ak` is 2.400s and the AK's `reload` 2.433s.
+        // So the weapon's clip is played on the weapon's skeleton — but with its
+        // `weapon`/`weapon_offset` tracks REMOVED, because the `weapon` bone's
+        // translation differs per clip (icon at -4.3, reload at +3.4 on x) and
+        // playing it whole would jump the entire gun 18cm against the hand. Only
+        // the parts are taken; `wpn` keeps the gun where it is.
+        weaponMixer = new THREE.AnimationMixer(object);
+        const PART_CLIP: Partial<Record<ClipAction, RegExp>> = {
+          reload: /^reload$/i,
+          fire: /^shoot$/i,
+          draw: /^draw$/i,
+        };
+        for (const [action, re] of Object.entries(PART_CLIP) as [ClipAction, RegExp][]) {
+          const src = gltf.animations?.find((a) => re.test(a.name));
+          if (!src) continue;
+          const tracks = src.tracks.filter((t) => !/^(weapon|weapon_offset|ag1_hand_[lr])\./i.test(t.name));
+          if (!tracks.length) continue;
+          const a = weaponMixer.clipAction(new THREE.AnimationClip(`parts:${action}`, src.duration, tracks));
+          a.setLoop(THREE.LoopOnce, 1);
+          // Held on the last frame until the arm clip ends, then faded back —
+          // the parts should settle with the hands, not before them.
+          a.clampWhenFinished = true;
+          weaponActions.set(action, a);
+        }
+        // The flash rides the clip's own muzzle bone.
+        const tipBone = rig.root.getObjectByName("wpnTip");
+        if (tipBone) flash = buildMuzzleFlash(THREE, scene, tipBone, rig.wpn, FPV_UP);
+        fpvSeat = seat;
+        fpvWpn = rig.wpn;
+        /**
+         * THE CLIP'S `wpn` DESCRIBES THE WEAPON'S OWN ATTACHMENT BONE, NOT ITS
+         * ROOT — which is the difference between a weapon held correctly and one
+         * rotated ninety degrees.
+         *
+         * Every weapon GLB carries a `weapon` bone, and on the AUG it sits at
+         * euler (-90, 0, -90) relative to the model root with the inch→metre
+         * scale on it. Seating the ROOT at `wpn` therefore leaves the gun turned
+         * by exactly that: measured, the barrel ran along world +X, which is the
+         * camera's up vector, so the weapon stood vertically in frame while the
+         * clip's own `wpnEnd`→`wpnTip` bones correctly reported it pointing away.
+         * Bones said one thing, mesh did another, and the bone was right.
+         *
+         * So the seat undoes the attachment bone as well as the object's own
+         * transform. The scales cancel to exactly 1 on their own — `wpn` carries
+         * the skeleton's 0.0254 and this bone's inverse carries 39.37 — which is
+         * why the earlier version had to strip scale by hand to paper over the
+         * missing term.
+         */
+        const attach = object.getObjectByName("weapon");
+        const relToRoot = new THREE.Matrix4();
+        if (attach) {
+          object.updateMatrixWorld(true);
+          attach.updateMatrixWorld(true);
+          relToRoot.copy(object.matrixWorld).invert().multiply(attach.matrixWorld);
+        }
+        fpvUnbake = relToRoot.clone().invert().multiply(new THREE.Matrix4().copy(object.matrix).invert());
+        // FOV IS CS2's viewmodel_fov, CONVERTED. That cvar is a HORIZONTAL angle
+        // measured at 4:3; three wants a vertical one. viewmodel_fov 68 (the
+        // game's maximum, and what skincraft ships) is 83.9 degrees across at
+        // 16:9, which is 53.8 vertical — so 54, not 68. Using 68 directly gave a
+        // ~100-degree horizontal frustum and the wide-angle stretch that made
+        // the weapon look elongated.
+        //
+        // 16:9 REGARDLESS OF THE PANE, and letterboxed to match (see drawFrame).
+        // A viewmodel is composed for a screen shape, not for whatever box the
+        // host gives us: the focus stage is nearly square (~1.34) and the craft
+        // modal is squarer still, so the same rig framed to the pane reads
+        // completely differently in each. skincraft exposes this as a setting
+        // and says so outright — "simulates how the viewmodel looks in-game at
+        // this ratio, independent of the browser window's shape".
+        fpvCamera = new THREE.PerspectiveCamera(spec.fov ?? debugNumber("fpvfov", 54), FPV_ASPECT, 0.01, 100);
+        scene.add(fpvCamera);
+        // THE EYE IS THE ORIGIN, AND THE AXES ARE MEASURED — no framing solve.
+        //
+        // Composing the clip offline from its own rest pose and channels gives
+        // the arrangement it was authored in, in source units:
+        //
+        //   root_motion  (0, 0, 0)          the EYE
+        //   wpn          (-5.2, -2.5, 14.8) 15.8 units out, i.e. 0.40m
+        //   wpnEnd       (-5.0, -3.0,  0.4) the stock, nearly at the eye
+        //   wpnTip       (-5.0, -3.4, 38.0) the muzzle, straight ahead
+        //   shoulders     x +4.4 / -4.4     left and right of centre
+        //
+        // So in the CLIP's space X is left, Y is up, Z is forward, and the
+        // camera belongs at the origin looking down +Z. The model root maps
+        // (x, y, z) -> (y, z, x), which lands in OUR space as:
+        //
+        //   three +X = UP     three +Y = FORWARD     three +Z = LEFT
+        //
+        // That is the whole reason every previous attempt failed: three's +Y is
+        // not up in this rig, so a camera built with a (0,1,0) up vector was
+        // rolled ninety degrees and aimed sideways, and no amount of yaw fixed
+        // it. Nothing here is fitted — the eye, the facing and the up vector
+        // are all read off the rig.
+        fpvCamera.position.set(0, 0, 0);
+        fpvCamera.up.copy(FPV_UP);
+        fpvCamera.lookAt(FPV_FORWARD);
+        // The dials tune FROM here rather than replacing it — see
+        // applyFpvTuning, which composes yaw and pitch onto this.
+        fpvBase = fpvCamera.quaternion.clone();
+      } else if (rig && seatM) {
+        // A WRAPPER around the weapon, never a change to the weapon itself. The
+        // item view has already recentred `object` on the origin and a dozen
+        // coordinate systems downstream are stated against that — sticker
+        // offsets, the charm pivot, the collision grid, every world-space probe.
+        // Re-parenting it under a group whose matrix undoes the recentre leaves
+        // all of them arithmetically untouched.
+        const seat = new THREE.Group();
+        seat.name = "fpv-seat";
+        seat.matrixAutoUpdate = false;
+        seat.matrix.copy(seatM);
+        object.removeFromParent();
+        seat.add(object);
+        rig.hand.add(seat);
+        if (spec.offset) rig.root.position.set(spec.offset.x, spec.offset.y, spec.offset.z);
+        scene.add(rig.root);
+        arms = rig;
+        // Near plane is TIGHT: the weapon sits ~15cm from the eye, so the item
+        // view's `radius / 100` would clip the muzzle clean off.
+        fpvCamera = new THREE.PerspectiveCamera(spec.fov ?? debugNumber("fpvfov", 54), cssW / cssH || 1, 0.01, 100);
+        // At the origin, looking down -Z — three's default orientation, so no
+        // lookAt is needed and none should be added: a lookAt would re-derive
+        // the basis from a target and quietly reintroduce roll.
+        scene.add(fpvCamera);
+      } else {
+        rig?.dispose();
+        console.warn(
+          `[viewer3d] first person unavailable for ${model}` +
+            (rig ? ` — no ag1_hand_${hand.toLowerCase()} on the weapon` : ` — ${spec.arms} is not an arm rig`),
+        );
+      }
+    } catch (e) {
+      // Never fatal. Arms are an alternative way to look at the item, so failing
+      // to find them falls back to the item view rather than losing the weapon
+      // the user actually asked to see. Aborts rethrow — a superseded mount must
+      // not carry on building.
+      if ((e as { name?: string })?.name === "AbortError") throw e;
+      console.warn(`[viewer3d] first person failed for ${model}`, e);
+    }
+  }
+  /**
+   * FREE LOOK, while first person is on.
+   *
+   * OrbitControls is turned off rather than reused: it orbits a TARGET, and
+   * there is no target here — the camera is an eye at a fixed point and the only
+   * question is which way it faces. Bolting that onto an orbit rig means
+   * fighting its pivot, its damping and its zoom, all of which mean something
+   * else in this mode.
+   *
+   * The gestures WRITE THE DIALS rather than holding their own state. That is
+   * the point: whatever you find by dragging is immediately the same
+   * `fpvyaw=…` the settings panel shows and a URL can carry, so a good angle is
+   * reportable instead of being trapped in one session's closure.
+   */
+  const bindFreeLook = () => {
+    if (!fpvCamera || opts?.still) return;
+    // OrbitControls would otherwise keep rotating the orthographic camera that
+    // nothing is drawing through — invisible, but it also swallows the drags.
+    controls.enabled = false;
+    /**
+     * THE TRIGGER, not a camera.
+     *
+     * First person has no camera to move: the pose IS the game's, and a viewer
+     * who drags it somewhere else is looking at something CS2 never shows. So
+     * the mouse does here what it does in game — left button fires, held for as
+     * long as the weapon is full auto.
+     *
+     * The aim and slide gestures below are the instrument the pose was dialled
+     * in WITH, and they live behind the same flag as the readout that reports
+     * their numbers. Turn that on and the drags come back.
+     */
+    if (!debugFlag("fpvhud", false)) {
+      const onFireDown = (e: PointerEvent) => {
+        if (e.button !== 0 || e.target !== view) return;
+        e.preventDefault();
+        view.setPointerCapture?.(e.pointerId);
+        setFpvFire(true);
+      };
+      const onFireUp = () => setFpvFire(false);
+      // NO BROWSER MENU. A right click over a weapon held at the eye is a
+      // player's hand reaching for the thing it does in game, and answering it
+      // with a page menu over the model is the most jarring thing this view can
+      // do. It stays swallowed here whether or not anything is bound to it.
+      const onContext = (e: Event) => e.preventDefault();
+      view.addEventListener("pointerdown", onFireDown);
+      view.addEventListener("pointerup", onFireUp);
+      view.addEventListener("pointercancel", onFireUp);
+      view.addEventListener("pointerleave", onFireUp);
+      view.addEventListener("contextmenu", onContext);
+      freeLookOff = () => {
+        view.removeEventListener("pointerdown", onFireDown);
+        view.removeEventListener("pointerup", onFireUp);
+        view.removeEventListener("pointercancel", onFireUp);
+        view.removeEventListener("pointerleave", onFireUp);
+        view.removeEventListener("contextmenu", onContext);
+      };
+      return;
+    }
+    /** 0 = aiming (left drag), 2 = sliding (right drag). */
+    let dragBtn: 0 | 2 | null = null;
+    let lastX = 0;
+    let lastY = 0;
+    /** Nudge a dial by `delta`, clamped. `numberValue` already answers with the
+     *  registry default when nothing is stored, so there is no separate
+     *  "unset" case to carry. */
+    const dial = (name: string, delta: number, lo: number, hi: number) =>
+      setNumber(name, clamp(numberValue(name) + delta, lo, hi));
+    const onDown = (e: PointerEvent) => {
+      // RIGHT-DRAG SLIDES, matching the item view, where right-drag has always
+      // been pan. Shift-left does the same thing — a trackpad without a right
+      // button is not an excuse to lose half the gesture set.
+      if ((e.button !== 0 && e.button !== 2) || e.target !== view) return;
+      dragBtn = e.button === 2 ? 2 : 0;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      view.setPointerCapture?.(e.pointerId);
+    };
+    const onMove = (e: PointerEvent) => {
+      if (dragBtn === null) return;
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      if (dragBtn === 2 || e.shiftKey) {
+        // SLIDE the arms, in metres. Scaled well below the aim rate: an offset
+        // is measured in centimetres and a 1:1 pixel mapping would throw the
+        // rig out of frame in half a gesture.
+        dial("fpvx", dx * 0.002, -1, 1);
+        dial("fpvy", -dy * 0.002, -1, 1);
+      } else {
+        // AIM. Negated so the world follows the cursor rather than fleeing it,
+        // which is the convention every viewer in this app already uses.
+        dial("fpvyaw", -dx * 0.25, -180, 180);
+        dial("fpvpitch", -dy * 0.25, -90, 90);
+      }
+    };
+    const onUp = (e: PointerEvent) => {
+      dragBtn = null;
+      view.releasePointerCapture?.(e.pointerId);
+    };
+    // Without this the right-drag is interrupted by the browser menu on the
+    // very first movement, which is exactly what "right click doesn't let me
+    // drag" looks like from the outside.
+    const onContext = (e: Event) => e.preventDefault();
+    // NO WHEEL IN FIRST PERSON. It used to dial the eye along its own view axis,
+    // which reads as a zoom — and a viewmodel's framing is the GAME's, not a
+    // preference: CS2 gives you one field of view over the weapon and every
+    // player sees the same one. Pushing the eye in or out just produced a shot
+    // nobody could reproduce in game. Aim and slide stay; they move you around
+    // the pose rather than changing it. The wheel now scrolls the page, which is
+    // what a wheel does everywhere else on it.
+    view.addEventListener("pointerdown", onDown);
+    view.addEventListener("pointermove", onMove);
+    view.addEventListener("pointerup", onUp);
+    view.addEventListener("pointercancel", onUp);
+    view.addEventListener("contextmenu", onContext);
+    freeLookOff = () => {
+      view.removeEventListener("pointerdown", onDown);
+      view.removeEventListener("pointermove", onMove);
+      view.removeEventListener("pointerup", onUp);
+      view.removeEventListener("pointercancel", onUp);
+      view.removeEventListener("contextmenu", onContext);
+    };
+  };
+  let freeLookOff: (() => void) | null = null;
+
+  /** Which camera the frame is drawn through. */
+  const activeCamera = () => fpvCamera ?? camera;
+  /**
+   * The four first-person dials, applied to a LIVE viewer.
+   *
+   * Pose work is iterative by nature — the answer is "that, but 4cm left" — and
+   * a remount per attempt loses the clip's play head and costs a rebuild each
+   * time. These ride syncLiveSettings' version gate, so they cost nothing on a
+   * frame where nothing was dragged.
+   *
+   * THE OFFSET MOVES THE RIG, NOT THE CAMERA. The clip is authored around an
+   * origin the eye sits at, so moving the camera would walk away from the frame
+   * every measurement here is stated in; moving the arms is also what the game's
+   * own viewmodel_offset does. A caller's `spec.offset` and the dials ADD, so a
+   * wired-up preset stays the baseline the sliders explore around.
+   */
+  /**
+   * The tuning readout — a copyable line of the six dials, drawn over the model.
+   *
+   * Sliders in a panel are the wrong instrument for an ANGLE: you cannot see
+   * what -12 degrees looks like without trying it, and the panel is not where
+   * you are looking while you try. So the gesture is the control (drag to aim,
+   * shift- or right-drag to slide) and this is the readout — a single
+   * line in the exact `name=value` shape the dials take, so whoever finds a good
+   * angle can hand the numbers over verbatim instead of describing them.
+   */
+  const fpvHud = (() => {
+    // Behind a flag. It is an instrument for dialling the pose in, and once the
+    // pose is dialled in it is a black box of numbers over someone's gun.
+    if (!fpvCamera || opts?.still || !debugFlag("fpvhud", false)) return null;
+    const el = document.createElement("div");
+    // CLICKABLE, unlike the perf HUD next to it. This one exists to be handed to
+    // someone else — the whole point is that a good angle leaves the session as
+    // text — so it takes pointer events, selects like text, and copies itself on
+    // a click. `e.target !== view` in the free-look handler already keeps a
+    // press in here from being read as an aim gesture.
+    // BELOW the pane's control row, not under it. The stage floats its held
+    // toggle and the developer cog in this same corner, and at top:4 this box
+    // sat across them — an unreadable overlap over the one control that gets
+    // you out of first person.
+    el.style.cssText =
+      "position:absolute;top:40px;left:4px;z-index:50;cursor:copy;user-select:text;-webkit-user-select:text;" +
+      "font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;" +
+      "white-space:pre;color:#ffd479;background:rgba(0,0,0,.72);padding:5px 8px;border-radius:4px;text-shadow:0 1px 0 #000";
+    el.title = "Click to copy these settings";
+    el.addEventListener("click", () => {
+      // The HINT LINE IS DROPPED. What gets pasted should be the settings and
+      // nothing else — "drag aim · right-drag slide" is instructions for the
+      // person already looking at it, not data.
+      const text = (el.dataset.settings ?? "").trim();
+      if (!text) return;
+      void navigator.clipboard
+        ?.writeText(text)
+        .then(() => {
+          const was = el.style.color;
+          el.style.color = "#9fe8b0";
+          setTimeout(() => (el.style.color = was), 700);
+        })
+        // A denied clipboard permission must not look like a dead button: fall
+        // back to selecting the text so ⌘C still works.
+        .catch(() => {
+          const r = document.createRange();
+          r.selectNodeContents(el);
+          const sel = getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(r);
+        });
+    });
+    if (getComputedStyle(container).position === "static") container.style.position = "relative";
+    container.appendChild(el);
+    return el;
+  })();
+
+  const applyFpvTuning = () => {
+    if (!fpvCamera || !arms) return;
+    const fov = debugNumber("fpvfov", 54);
+    if (fpvCamera.fov !== fov) {
+      fpvCamera.fov = fov;
+      fpvCamera.updateProjectionMatrix();
+    }
+    // ORDER MATTERS: rotation before position is meaningless here, because the
+    // camera sits at the origin and only turns — but stating it explicitly keeps
+    // the two dials independent, which is the whole point of tuning with them.
+    // YXZ so yaw and pitch stay separable: under three's default XYZ order a
+    // pitch applied after a yaw tilts the horizon instead of raising the view.
+    // Composed ONTO the auto-framed orientation, so zero means "as framed"
+    // rather than "looking down -Z into whatever happens to be there".
+    fpvTune.setFromEuler(
+      fpvEuler.set(
+        (debugNumber("fpvpitch", 0) * Math.PI) / 180,
+        (debugNumber("fpvyaw", 0) * Math.PI) / 180,
+        0,
+        "YXZ",
+      ),
+    );
+    if (fpvBase) fpvCamera.quaternion.copy(fpvBase).multiply(fpvTune);
+    else fpvCamera.quaternion.copy(fpvTune);
+    // THE DIALS MOVE THE CAMERA, IN ITS OWN BASIS.
+    //
+    // They used to slide the rig along WORLD axes, which stopped meaning
+    // anything once the rig's real basis turned out to be
+    // (+X up, +Y forward, +Z left): "push it away" moved the weapon sideways.
+    // Stated against the camera instead, right/up/forward are what they say,
+    // whatever the exporter's axes happen to be.
+    const base = fpvSpec?.offset;
+    fpvCamera.position
+      .set(0, 0, 0)
+      .addScaledVector(FPV_RIGHT, (base?.x ?? 0) + debugNumber("fpvx", 0))
+      .addScaledVector(FPV_UP, (base?.y ?? 0) + debugNumber("fpvy", 0))
+      // Negative is BACK, matching every other "distance" control here.
+      //
+      // DEFAULT ZERO — the eye belongs exactly where the clip puts it. Pulling
+      // back to fit more of the weapon in frame is a trap: the arms are cut at
+      // the shoulder (CS2's viewmodel meshes end there), and at the clip's own
+      // origin those cuts sit BEHIND the eye where nobody sees them. Measured,
+      // a 0.22m pull-back moved the right shoulder to 0.30m IN FRONT of the
+      // camera and put its hollow open end on screen.
+      //
+      // Not fitting the whole weapon is the correct behaviour, not a
+      // compromise: CS2 doesn't, and neither does skincraft — their AUG's stock
+      // runs off the bottom edge exactly like this.
+      .addScaledVector(FPV_FORWARD, (base?.z ?? 0) + debugNumber("fpvz", 0));
+    if (fpvHud) {
+      const n = (v: number, d = 2) => v.toFixed(d);
+      // One line, space-separated `name=value` — the shape the dials take AND a
+      // valid query string once the spaces become `&`, so a pasted readout can
+      // be replayed either way.
+      const settings =
+        `fpvyaw=${n(debugNumber("fpvyaw", 80), 0)} fpvpitch=${n(debugNumber("fpvpitch", 0), 0)} ` +
+        `fpvfov=${n(debugNumber("fpvfov", 54), 0)} ` +
+        `fpvx=${n(debugNumber("fpvx", 0))} fpvy=${n(debugNumber("fpvy", 0))} fpvz=${n(debugNumber("fpvz", 0))}`;
+      fpvHud.dataset.settings = settings;
+      fpvHud.textContent =
+        "drag aim · right-drag slide · click to copy\n" + settings;
+    }
+  };
+  bindFreeLook();
+  applyFpvTuning();
+
+  // ---- First-person actions ------------------------------------------------------
+  /** Viewmodel clips built on demand, one per action, with their sound cues. */
+  const fpvClips = new Map<ClipAction, { clip: import("three").AnimationClip; cues: ClipCue[] }>();
+  /** Cues still to fire for the action playing, in clip order. */
+  let fpvCues: ClipCue[] = [];
+  let fpvPlayToken = 0;
+  /**
+   * Play one of the weapon's actions — fire, reload, inspect, draw — ONCE, and
+   * settle back to idle.
+   *
+   * Live, on the mounted rig: a remount per action (how this first shipped)
+   * rebuilds the whole viewer, loops the clip forever, and loses the play head
+   * in the teardown. Here the clip is fetched the first time it is asked for,
+   * kept, and crossfaded in over the resting pose; the weapon's own parts clip
+   * starts on the same frame; the sound cues the clip itself carries fire as
+   * the play head passes them.
+   */
+  /** What is playing right now — the gates below read it. */
+  let fpvNow: ClipAction = "idle";
+  let fireHeld = false;
+  let lastShot = -1e9;
+  /**
+   * The weapon's real rate of fire, from scripts/weapons.vdata — carried on the
+   * fire clip's JSON and adopted when it loads. Conservative until then: a slow
+   * semi-auto, so the first press is never faster than the truth.
+   */
+  let fireCycle = 0.3;
+  let fireAuto = false;
+  let fireDone: (() => void) | undefined;
+
+  /**
+   * The gate every press goes through. Returns whether the press was taken —
+   * the caller keeps its button state honest with it.
+   *
+   * The rules are the game's: a reload or a draw runs to completion (firing
+   * mid-reload is not a thing, and interrupting the mag swap strands it half
+   * out); an inspect is a pastime, interrupted by anything but never
+   * interrupting; fire repeats no faster than the weapon's cycle time.
+   */
+  function requestFpvAction(action: ClipAction, onDone?: () => void): boolean {
+    if (!arms || disposed) return false;
+    if (action === "idle") {
+      fireHeld = false;
+      void playFpvAction("idle", onDone);
+      return true;
+    }
+    if (fpvNow === "reload" || fpvNow === "draw") return false;
+    if (action === "inspect" && fpvNow !== "idle") return false;
+    if (action === "fire") {
+      fireDone = onDone;
+      return tryFire();
+    }
+    fireHeld = false;
+    void playFpvAction(action, onDone);
+    return true;
+  }
+  function tryFire(): boolean {
+    const now = performance.now();
+    // A millisecond of slack, or a hold at exactly the cycle time misses every
+    // other frame boundary and fires at half rate.
+    if (fpvNow === "fire" && now - lastShot < fireCycle * 1000 - 1) return false;
+    lastShot = now;
+    void playFpvAction("fire", fireDone);
+    return true;
+  }
+  /** Hold-to-fire. Press fires through the gate; the render loop repeats it at
+   *  the weapon's cycle while held — full auto only if the weapon is. */
+  function setFpvFire(held: boolean, onDone?: () => void): boolean {
+    if (!held) {
+      fireHeld = false;
+      return true;
+    }
+    fireDone = onDone;
+    fireHeld = true;
+    if (fpvNow === "reload" || fpvNow === "draw") return false;
+    return tryFire();
+  }
+  function pumpFpvAuto() {
+    if (!fireHeld || !fireAuto || fpvNow !== "fire") return;
+    tryFire();
+  }
+
+  async function playFpvAction(action: ClipAction, onDone?: () => void): Promise<void> {
+    if (!arms || disposed) {
+      onDone?.();
+      return;
+    }
+    const token = ++fpvPlayToken;
+    fpvCues = [];
+    if (action === "idle") {
+      fpvNow = "idle";
+      arms.rest();
+      for (const a of weaponActions.values()) a.fadeOut(PARTS_FADE);
+      onDone?.();
+      return;
+    }
+    fpvNow = action;
+    let entry = fpvClips.get(action);
+    if (!entry) {
+      const raw = await loadViewmodelClip(model, action);
+      // A newer press, or a teardown, while this was loading: it wins.
+      if (disposed || token !== fpvPlayToken) return;
+      if (!raw) {
+        if (fpvNow === action) fpvNow = "idle";
+        onDone?.();
+        return;
+      }
+      const built = buildViewmodelClip(THREE as unknown as typeof import("three"), raw);
+      entry = { clip: built.clip, cues: [...(raw.sounds ?? [])].sort((a, b) => a.t - b.t) };
+      fpvClips.set(action, entry);
+      // The fire clip carries the weapon's rate of fire — see the extractor.
+      if (action === "fire") {
+        if (typeof raw.cycle === "number" && raw.cycle > 0) fireCycle = raw.cycle;
+        if (typeof raw.auto === "boolean") fireAuto = raw.auto;
+      }
+    }
+    if (!arms) return;
+    const parts = weaponActions.get(action);
+    arms.play(entry.clip, () => {
+      parts?.fadeOut(PARTS_FADE);
+      if (fpvNow === action) fpvNow = "idle";
+      onDone?.();
+    });
+    if (parts) {
+      /**
+       * THE PARTS RUN ON THE ARMS' CLOCK.
+       *
+       * The two clips are authored as a pair and MOSTLY agree — measured, the
+       * weapon GLB's clip is one 30fps frame longer than the viewmodel's:
+       *
+       *   aug 3.767 / 3.734    ak47 2.433 / 2.400    awp 3.667 / 3.634
+       *
+       * — but three weapons do not, and by a lot:
+       *
+       *   m4a1 2.533 / 3.034   m4a1_silencer 2.433 / 3.034   glock 1.733 / 2.234
+       *
+       * Both start the mag out at the same moment (m4a1: parts 0.433s, the
+       * clip's own clipout cue 0.429s), so the parts do not START early — they
+       * RUN AHEAD, and by the end of the reload the magazine is home half a
+       * second before the hand that is carrying it gets there. Scaling the
+       * parts onto the arms' duration keeps every landmark in between in
+       * proportion, and on the weapons that already agree it is a 1% nudge.
+       */
+      const pd = parts.getClip().duration;
+      const ad = entry.clip.duration;
+      parts.stop();
+      parts.reset();
+      parts.setEffectiveTimeScale(pd > 0 && ad > 0 ? pd / ad : 1);
+      parts.play();
+    }
+    fpvCues = entry.cues.slice();
+    if (action === "fire") flash?.fire();
+  }
+  /** Fire any cue the play head has passed. Called once a frame. */
+  function pumpFpvCues() {
+    if (!fpvCues.length || !arms) return;
+    const t = arms.playhead();
+    if (t == null) {
+      fpvCues = [];
+      return;
+    }
+    while (fpvCues.length && fpvCues[0].t <= t) {
+      const cue = fpvCues.shift()!;
+      if (debugFlag("fpvsound", true)) playSfx(viewmodelAssetUrl(`sfx/${cue.file}`));
+    }
+  }
+  /**
+   * Wall clock for the arm mixer.
+   *
+   * Its own, rather than the frame timings the perf HUD keeps: those are only
+   * computed when the HUD is on, and a clip driven by a delta that is zero
+   * whenever diagnostics are off would simply never move.
+   */
+  const armsClock = new THREE.Clock();
+
   // ---- Perf HUD ----------------------------------------------------------------
   // Opt in with ?perf=1 (sticky via localStorage "viewer3d.perf" so it survives
   // the reloads you do while chasing a stall). Costs nothing when off: the
@@ -10448,8 +11739,55 @@ async function buildViewer(
    * Reduced motion silences both. The idle spin is unrequested motion by the
    * same definition the media query uses, and it has simply never been asked.
    */
+  /**
+   * Is the turntable allowed AT ALL — ignoring the wait below.
+   *
+   * Split out from syncIdleSpin so the timer can re-ask when it fires: six
+   * seconds is long enough for the answer to have changed (an edit began, a clip
+   * was switched on), and a timer that just sets `autoRotate = true` would spin
+   * a model that has since been handed to an editor.
+   */
+  function idleSpinWanted() {
+    return !placeable && !opts?.still && !inspectAction && !reducedMotion.value;
+  }
+
+  let idleSpinTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * Stop turning NOW, and do not arm the wait.
+   *
+   * For the duration of a gesture. Separate from syncIdleSpin because arming
+   * the timer on pointer-down means it expires mid-drag: hold the model still
+   * for longer than the delay and the turntable takes it back out from under
+   * your cursor, which feels like the viewer fighting you. The wait belongs to
+   * the moment you let go.
+   */
+  function holdIdleSpin() {
+    clearTimeout(idleSpinTimer);
+    idleSpinTimer = undefined;
+    controls.autoRotate = false;
+  }
+
   function syncIdleSpin() {
-    controls.autoRotate = !placeable && !opts?.still && !inspectAction && !reducedMotion.value;
+    holdIdleSpin();
+    if (!idleSpinWanted()) return;
+    // THE WAIT. A turntable that starts on frame one means the first look at a
+    // skin is a moving one — you cannot read a pattern that is turning, and the
+    // reflex is to grab it, which is a fight with the auto-rotate rather than an
+    // inspection. Sitting still first and drifting in later gives both: a still
+    // frame to read, and motion for anyone who walks away and comes back.
+    //
+    // Read per call rather than captured at mount, so changing the setting takes
+    // effect on the viewer already open.
+    const wait = debugNumber("idlespin", 6) * 1000;
+    if (wait <= 0) {
+      controls.autoRotate = true;
+      return;
+    }
+    idleSpinTimer = setTimeout(() => {
+      idleSpinTimer = undefined;
+      if (idleSpinWanted()) controls.autoRotate = true;
+    }, wait);
   }
 
   /** How far the weapon has turned, for wherever the clip currently sits. */
@@ -10658,7 +11996,11 @@ async function buildViewer(
     // threshold separates real highlights from lit surfaces again.
     const rt = new THREE.WebGLRenderTarget(cssW, cssH, { type: THREE.HalfFloatType });
     const c = new EffectComposer(renderer, rt);
-    c.addPass(new RenderPass(scene, camera));
+    // activeCamera(), not `camera`: first person renders through a perspective
+    // camera and the composer is built lazily, so a viewer that turns bloom on
+    // while in first person would otherwise bake the ORTHOGRAPHIC view into the
+    // pass and draw the item view with the arms nowhere in it.
+    c.addPass(new RenderPass(scene, activeCamera()));
     // THEIR NUMBERS DO NOT TRANSFER, and it is worth knowing why before reaching
     // for them again. csgoskins use strength 1.2 / radius 1 / threshold 0.06, and
     // 0.06 washes our render to white: three forces NoToneMapping when rendering
@@ -10722,8 +12064,77 @@ async function buildViewer(
     composer = null;
     bloomPass = null;
   }
+  /**
+   * The largest 16:9 box that fits the pane, centred — the letterbox.
+   *
+   * Returned in the renderer's pixel space rather than CSS, because that is
+   * what setViewport/setScissor take.
+   */
+  const fpvViewport = () => {
+    const dpr = renderer.getPixelRatio();
+    const w = Math.max(1, Math.round(cssW * dpr));
+    const h = Math.max(1, Math.round(cssH * dpr));
+    /**
+     * THE WHOLE PANE. There was a 16:9 letterbox here, on the theory that a
+     * fixed aspect is what makes a viewmodel look like the game — but the pane
+     * is wider than 16:9 on a desktop, so it drew bars down both sides, and
+     * once the weapon was seated toward the corner the box's edge CUT it: a
+     * hard vertical line through the barrel with empty pane either side of it.
+     * The aspect is not what sells this; the weapon sitting in the corner of
+     * the frame is, and for that the frame has to be the frame.
+     */
+    return { x: 0, y: 0, w, h };
+  };
+
+
+  /** Last frame shift pushed into the first-person projection. */
+  let fpvShiftKey = "";
+  /**
+   * WHERE THE WEAPON SITS IN ITS FRAME — composition, not pose.
+   *
+   * CS2 does not hold the weapon in the middle of the screen: it sits low and
+   * to the right, with the arm running out of the bottom-right corner, and that
+   * corner is what stops it reading as an object floating in front of you. Our
+   * framing was centred, so the gun hung in the middle of the pane with air all
+   * round it.
+   *
+   * A PROJECTION SHIFT, not a rig move. Moving the eye is how the pose was
+   * dialled in (yaw, pitch, the three offsets) and nudging it again to fix the
+   * composition would change the perspective and the scale along with it —
+   * everything that was tuned. Sliding the frustum's window moves the picture
+   * and nothing else.
+   */
+  const applyFpvShift = (w: number, h: number) => {
+    if (!fpvCamera) return;
+    const fx = debugNumber("fpvshiftx", 0.1);
+    const fy = debugNumber("fpvshifty", 0.12);
+    const key = `${w}x${h}:${fx}:${fy}`;
+    if (key === fpvShiftKey) return;
+    fpvShiftKey = key;
+    // Negated: the offset picks the window's top-left out of the full image, so
+    // moving the window LEFT is what walks the weapon right.
+    if (!fx && !fy) fpvCamera.clearViewOffset();
+    else fpvCamera.setViewOffset(w, h, -w * fx, -h * fy, w, h);
+  };
+
   const drawFrame = () => {
     renderer.setSize(cssW, cssH, false);
+    // Letterbox first person. SCISSOR as well as viewport: without it the bars
+    // keep whatever the last frame drew there, which reads as the model
+    // smearing rather than as a frame around it.
+    if (fpvCamera) {
+      const v = fpvViewport();
+      applyFpvShift(v.w, v.h);
+      // CLEAR THE WHOLE CANVAS FIRST. Clearing only inside the scissor leaves
+      // whatever the last frame drew in the bars — which was invisible while the
+      // box never changed size, and became a second ghosted weapon smeared down
+      // the side the moment it did. Clear everything, then draw into the box.
+      renderer.setScissorTest(false);
+      renderer.clear();
+      renderer.setViewport(v.x, v.y, v.w, v.h);
+    } else {
+      renderer.setScissorTest(false);
+    }
     if (bloomOn) {
       const c = (composer ??= buildComposer());
       if (bloomPass) {
@@ -10736,7 +12147,7 @@ async function buildViewer(
       c.setSize(cssW, cssH);
       c.render();
     } else {
-      renderer.render(scene, camera);
+      renderer.render(scene, activeCamera());
     }
     if (!viewCtx) return;
     viewCtx.clearRect(0, 0, view.width, view.height);
@@ -10764,21 +12175,74 @@ async function buildViewer(
    */
   let flagsAt = flagsVersion.value;
   let choicesAt = choicesVersion.value;
+  let numbersAt = -1;
   const syncLiveSettings = () => {
-    if (flagsVersion.value === flagsAt && choicesVersion.value === choicesAt) return;
+    if (
+      flagsVersion.value === flagsAt &&
+      choicesVersion.value === choicesAt &&
+      numbersVersion.value === numbersAt
+    )
+      return;
     setEnvironment(debugChoice("env"));
     setInspectMotion(debugFlag("inspectanim", true));
     setBloom(debugFlag("bloom", true));
+    // Numbers joined this gate for the first-person dials. Bloom's three read
+    // themselves every frame inside drawFrame instead, which predates the gate
+    // and is left alone — they are only read when bloom is actually on.
+    applyFpvTuning();
     flagsAt = flagsVersion.value;
     choicesAt = choicesVersion.value;
+    numbersAt = numbersVersion.value;
   };
+  /**
+   * SUSPENDED — mounted, warm, and not drawing.
+   *
+   * A modal over the focus view leaves TWO live viewers on one GPU: the one you
+   * are looking at, and the one behind it still turning a weapon nobody can
+   * see. Tearing the hidden one down would work and would also throw away its
+   * scene, its textures and its composite, so reopening would pay for all of it
+   * again — for a modal you close in five seconds. Stopping the loop keeps
+   * everything and costs nothing while it is stopped.
+   */
+  let suspended = false;
   const renderLoop = () => {
-    if (disposed) return;
+    if (disposed || suspended) return;
     const t0 = perfHud ? performance.now() : 0;
     // Before anything reads the rig or the clip this frame — a preset applied
     // between applyInspect and clearInspect would be reverted by the latter.
     syncLiveSettings();
     controls.update();
+    // The arms, if there are any. BEFORE stepInspect and the charm: the weapon
+    // is parented to a hand bone in this mode, so its world transform for this
+    // frame is not settled until the clip has been advanced — and the charm
+    // hangs off the weapon and would otherwise be solving against last frame's
+    // position of it.
+    // ONE read of the clock for both mixers. getDelta() reports time since it
+    // was last READ and resets, so calling it twice hands the second mixer ~0
+    // and freezes it — invisible today (gloves and first person never coexist)
+    // and a genuinely baffling bug the day they do.
+    //
+    // The delta is consumed even while paused: skipping the read would bank the
+    // whole pause and snap the animation forward on resume.
+    {
+      const dt = armsClock.getDelta();
+      // Same Motion gate for both. A live skeleton (gloves) and the first-person
+      // arms are the same kind of thing — geometry that moves — so one switch
+      // stops both.
+      if (liveMixer) liveMixer.update(motionOn ? dt : 0);
+      // AFTER the mixer, never before: it overwrites every bone it keys, so a
+      // constraint applied first is simply thrown away on the same frame.
+      twist?.apply();
+      if (arms) arms.update(motionOn ? dt : 0);
+      // The weapon's own parts, on the same clock and the same Motion gate.
+      if (weaponMixer) weaponMixer.update(motionOn ? dt : 0);
+      // The weapon follows the clip's own `wpn` track. AFTER the mixer, because
+      // that is what moved the node this reads.
+      syncFpvSeat();
+      flash?.update(dt);
+      pumpFpvCues();
+      pumpFpvAuto();
+    }
     // The rig rides the clip from here to clearInspect below — deliberately
     // BEFORE the charm steps, because the charm's gravity comes from the camera
     // and the motion is supposed to swing it.
@@ -10845,6 +12309,17 @@ async function buildViewer(
     // the new dimensions even when the pan itself has not moved.
     panApplied.set(NaN, NaN);
     applyPan();
+    // The perspective camera has an `aspect` where the orthographic one encodes
+    // the same thing in its left/right. Nothing above touches it, so it is
+    // restated here or a resized first-person view renders stretched.
+    // The first-person camera keeps its FIXED 16:9 — the letterbox in drawFrame
+    // is what adapts to the pane, not the projection.
+    if (fpvCamera) {
+      // The pane's own shape — see fpvViewport. A fixed aspect meant bars, and
+      // bars meant the weapon was cut by an edge that was not the pane's.
+      fpvCamera.aspect = cssW / Math.max(1, cssH);
+      fpvCamera.updateProjectionMatrix();
+    }
   };
   // If the browser drops the context (mobile Safari sheds the oldest one when
   // too many are live), the rAF loop would otherwise keep calling render() on a
@@ -10903,6 +12378,28 @@ async function buildViewer(
       pos: camera.position.toArray() as [number, number, number],
       target: controls.target.toArray() as [number, number, number],
     }),
+    resetCamera: (side) => resetCamera(side),
+    setSuspended: (on) => {
+      if (on === suspended || disposed) return;
+      suspended = on;
+      if (on) {
+        cancelAnimationFrame(raf);
+        return;
+      }
+      // Drop the gap rather than banking it: the clocks report time since they
+      // were last READ, so a resume would otherwise advance every animation by
+      // the length of the pause in a single frame.
+      clock.getDelta();
+      armsClock.getDelta();
+      raf = requestAnimationFrame(renderLoop);
+    },
+    setFrameInset: (right) => {
+      if (right === frameInsetRight) return;
+      frameInsetRight = Math.max(0, right);
+      applyPan();
+    },
+    setFpvAction: (action, onDone) => requestFpvAction(action, onDone),
+    setFpvFire: (held, onDone) => setFpvFire(held, onDone),
     setCharmSeed(seed) {
       if (disposed) return;
       // The standalone mount: the charm is the model, so it has no charm record
@@ -11501,6 +12998,20 @@ async function buildViewer(
       disposed = true;
       release();
       cancelAnimationFrame(raf);
+      freeLookOff?.();
+      freeLookOff = null;
+      flash?.dispose();
+      flash = null;
+      weaponMixer?.stopAllAction();
+      weaponMixer = null;
+      weaponActions.clear();
+      arms?.dispose();
+      arms = null;
+      // The turntable's pending wait. Harmless if it fires — it re-asks
+      // idleSpinWanted and sets a flag on controls nothing reads any more — but
+      // a timer holding this closure alive is what keeps a disposed viewer's
+      // whole scene graph off the collector for six seconds.
+      clearTimeout(idleSpinTimer);
       observer.disconnect();
       contextLostSubscribers.delete(onContextLost);
       // Five mip levels of float render targets per viewer — not something to
@@ -11631,7 +13142,7 @@ async function buildViewer(
       let sliceStart = performance.now();
       for (const t of seen) {
         if (performance.now() - sliceStart > 12) {
-          await new Promise((r) => requestAnimationFrame(() => r(null)));
+          await yieldToFrame();
           sliceStart = performance.now();
         }
         const t0 = PERF ? performance.now() : 0;
