@@ -40,7 +40,11 @@ import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 
-const CLI = process.env.CLI ?? "/app/cs2-model-extract/cli/Source2Viewer-CLI";
+// The CLI lives under the extractor's WORK dir (EXTRACT_WORK_DIR in the pod
+// spec), not under /app — same resolution as extract-viewmodel-anims.mjs.
+const CLI =
+  process.env.CLI ??
+  path.join(process.env.WORK_DIR ?? process.env.EXTRACT_WORK_DIR ?? "/cs2-models/.work", "cs2-model-extract/cli/Source2Viewer-CLI");
 const MAPS = process.env.MAPS ?? "/cs2-game/game/csgo/maps";
 const PAK = process.env.PAK ?? "/cs2-game/game/csgo/pak01_dir.vpk";
 /** Panoramas ship from here. */

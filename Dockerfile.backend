@@ -22,8 +22,19 @@ WORKDIR /app
 COPY backend/package.json ./
 RUN npm install
 COPY backend/ ./
-# Same script the manual/host workflow uses — one copy, one behaviour.
-COPY scripts/extract-models.sh /usr/local/bin/extract-models.sh
-RUN chmod +x /usr/local/bin/extract-models.sh
+# Same scripts the manual/host workflow uses — one copy, one behaviour — and in
+# the SAME LAYOUT as the repo, which is load-bearing: extract-models.sh runs
+# `$(dirname "$0")/extract-viewmodel-anims.mjs`, and that imports
+# `../tools/nmclip.mjs`. Shipping only the .sh to /usr/local/bin (as this did)
+# made the viewmodel-anims step fail on every image install with "Cannot find
+# module" — and non-fatally, so the run still reported success and first person
+# had no clips, no sounds and no flash. /app/scripts is also where dev sync puts
+# it, so main.ts resolves one path for both.
+#
+# tools/ is NOT copied whole: tools/shadertest is ~700MB of rig. Only the two
+# modules the extractor imports.
+COPY scripts/ /app/scripts/
+COPY tools/nmclip.mjs tools/dmx.mjs /app/tools/
+RUN chmod +x /app/scripts/extract-models.sh
 EXPOSE 3000
 CMD ["npm", "start"]

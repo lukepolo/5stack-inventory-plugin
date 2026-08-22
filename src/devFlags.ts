@@ -250,6 +250,21 @@ export const NUMBERS: DevNumber[] = [
     dflt: 0.18, min: 0, max: 1.5, step: 0.02,
     group: "3D viewer", requires: "bloom", audience: "user",
   },
+  // The level of the first-person sounds. ONE DIAL, TWO HANDLES: this knob and
+  // the slider beside the fire button in the viewer bar read and write the same
+  // stored value, so neither can disagree with what is actually playing. Gated
+  // on the sounds flag for the same reason the bloom knobs are gated on bloom.
+  // A FIFTH by default — the game's shot samples are authored hot, mixed to sit
+  // under a game's own bus, and a first press at full level in a quiet room is a
+  // flinch, not a preview. 0.2 is audible on laptop speakers and does not make
+  // anyone reach for the system volume; the slider is right there for louder.
+  {
+    name: "fpvvolume",
+    label: "Weapon volume",
+    hint: "How loud the first-person sounds play — the shot, the mag, the bolt. The speaker slider in the viewer's own control bar is this same setting.",
+    dflt: 0.2, min: 0, max: 1, step: 0.05,
+    group: "3D viewer", requires: "fpvsound", audience: "user",
+  },
   // First-person tuning. Developer-audience: these TRIM a pose that is already
   // right, and a viewer with no arms in it would show six sliders that move
   // nothing.

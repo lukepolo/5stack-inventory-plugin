@@ -16,9 +16,16 @@
 // Usage:
 //   node scripts/extract-viewmodel-anims.mjs \
 //     --vpk /cs2-game/game/csgo/pak01_dir.vpk \
-//     --cli /app/cs2-model-extract/cli/Source2Viewer-CLI \
+//     --cli /cs2-models/.work/cs2-model-extract/cli/Source2Viewer-CLI \
 //     --models /cs2-models/models \
 //     --out /cs2-models/anims
+//
+// extract-models.sh (step 5c) passes all four. Run by hand, the defaults come
+// from the same environment the backend gives that script — CS2_DIR, OUT_DIR,
+// WORK_DIR (EXTRACT_WORK_DIR in the pod spec) — and fall back to the in-cluster
+// mounts. The CLI in particular lives under the WORK dir, never under /app:
+// a hard-coded /app/cs2-model-extract was the hand-run layout of the one
+// instance this was first written against, and an ENOENT everywhere else.
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -29,10 +36,13 @@ const arg = (name, dflt) => {
   const i = process.argv.indexOf(`--${name}`);
   return i > 0 ? process.argv[i + 1] : dflt;
 };
-const VPK = arg("vpk", "/cs2-game/game/csgo/pak01_dir.vpk");
-const CLI = arg("cli", "/app/cs2-model-extract/cli/Source2Viewer-CLI");
-const MODELS = arg("models", "/cs2-models/models");
-const OUT = arg("out", "/cs2-models/anims");
+const CS2_DIR = process.env.CS2_DIR ?? "/cs2-game";
+const OUT_DIR = process.env.OUT_DIR ?? "/cs2-models";
+const WORK_DIR = process.env.WORK_DIR ?? process.env.EXTRACT_WORK_DIR ?? path.join(OUT_DIR, ".work");
+const VPK = arg("vpk", path.join(CS2_DIR, "game/csgo/pak01_dir.vpk"));
+const CLI = arg("cli", path.join(WORK_DIR, "cs2-model-extract/cli/Source2Viewer-CLI"));
+const MODELS = arg("models", path.join(OUT_DIR, "models"));
+const OUT = arg("out", path.join(OUT_DIR, "anims"));
 const ONLY = arg("only", null);
 
 /**

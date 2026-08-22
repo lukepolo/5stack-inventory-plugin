@@ -20,13 +20,14 @@
 // the catalogue does not: a transport bar over a model that cannot move is worse
 // than no transport at all.
 import { computed, inject, onBeforeUnmount, ref, watch } from "vue";
-import { FlipHorizontal2, Maximize2, Minimize2, RotateCcw } from "lucide-vue-next";
+import { FlipHorizontal2, Maximize2, Minimize2, RotateCcw, Volume1, Volume2, VolumeX } from "lucide-vue-next";
 import Tooltip from "./Tooltip.vue";
 import { isCoarse } from "../responsive";
 import { CONTROL_ICON, CONTROL_ICON_VIEWBOX, TRANSPORT_ICON, TRANSPORT_ICON_VIEWBOX, type ControlIcon } from "../viewerControlIcons";
 import { ACTION_ICON, ACTION_ICON_VIEWBOX, type ActionIcon } from "../weaponActionIcons";
 import type { StageIcon, StageKey } from "../composables/useViewerStage";
 import type { InspectTransport } from "../viewer3d";
+import { flagValue, flagsVersion, numberValue, numbersVersion, setNumber } from "../devFlags";
 
 const props = withDefaults(
   defineProps<{
@@ -163,6 +164,55 @@ const isGameIcon = (i: StageIcon): i is StageIcon & ActionIcon => GAME_ICON.has(
 /** "Reset camera · R" — the key printed with the action it performs, in the one
  *  place someone is already asking what the button does. */
 const stageHint = (k: StageKey) => `${k.label} · ${k.cap}`;
+
+// ---- Volume -------------------------------------------------------------------
+// The weapon's sounds have a level, and it lives beside the trigger: a slider
+// under the fire button is found by the hand that just made the noise, where a
+// knob in the debug menu is found by nobody. Offered only with a trigger to
+// pull — it is the level of what the weapon actions play, and a viewer with no
+// fire button has nothing for it to turn down.
+//
+// NOT ITS OWN STORAGE. The value is the `fpvvolume` dial from devFlags, the same
+// one the debug menu draws as "Weapon volume", so the two can never disagree and
+// this component persists nothing of its own. The version ref is what makes a
+// localStorage read reactive — see DevHud.
+const VOLUME = "fpvvolume";
+const hasFire = computed(() => shownStage.value.some((s) => s.icon === "fire"));
+/** Sounds off altogether (the debug menu's "Weapon sounds") hides the level:
+ *  a slider for a sound that is switched off is a control that does nothing. */
+const soundOn = computed(() => {
+  void flagsVersion.value;
+  return flagValue("fpvsound");
+});
+const volume = computed(() => {
+  void numbersVersion.value;
+  return Math.min(1, Math.max(0, numberValue(VOLUME)));
+});
+const setVolume = (v: number) => setNumber(VOLUME, Math.round(v * 100) / 100);
+function onVolume(e: Event) {
+  setVolume(Number((e.target as HTMLInputElement).value));
+}
+/** Where the level was before the mute, so un-muting returns there rather than
+ *  to the default. Per mount: a remembered level that outlives the bar is a
+ *  surprise a session later. */
+let beforeMute = 0.2;
+function toggleMute() {
+  if (volume.value > 0) {
+    beforeMute = volume.value;
+    setVolume(0);
+  } else {
+    setVolume(beforeMute > 0 ? beforeMute : 0.2);
+  }
+}
+const volumePct = computed(() => Math.round(volume.value * 100));
+/** The glyph reads the level back: off, quiet, loud. */
+const volumeGlyph = computed(() => (volume.value === 0 ? VolumeX : volume.value < 0.5 ? Volume1 : Volume2));
+const volumeHint = computed(() => `${tr("inventory.viewer.controls.volume", "Weapon volume")} · ${volumePct.value}%`);
+const muteHint = computed(() =>
+  volume.value > 0
+    ? tr("inventory.viewer.controls.mute", "Mute weapon sounds")
+    : tr("inventory.viewer.controls.unmute", "Unmute weapon sounds"),
+);
 
 interface Control {
   key: string;
@@ -407,6 +457,40 @@ const controls = computed<Control[]>(() => {
           </button>
         </Tooltip>
       </template>
+    </template>
+
+    <!-- VOLUME. How loud the weapon actions are, beside the button that makes
+         the noise. The speaker is the mute; the slider is the level. On touch
+         the readout prints under the glyph, where every other cell prints its
+         label. -->
+    <template v-if="hasFire && soundOn">
+      <span class="mx-1 h-5 w-px flex-none bg-border/70"></span>
+
+      <button v-if="isCoarse" type="button" :class="TRANSPORT_BTN" :aria-label="muteHint" @click="toggleMute">
+        <component :is="volumeGlyph" class="h-[21px] w-[21px]" />
+        <span class="text-f8 uppercase tracking-cs2 text-muted-foreground/70">{{ volumePct }}%</span>
+      </button>
+
+      <Tooltip v-else :text="muteHint" side="top" :delay="180">
+        <button type="button" :class="TRANSPORT_BTN" :aria-label="muteHint" @click="toggleMute">
+          <component :is="volumeGlyph" class="h-[18px] w-[18px]" />
+        </button>
+      </Tooltip>
+
+      <!-- Narrower than the scrub: a level has no position worth reading off
+           the track, so the thumb's travel is all the width it needs. -->
+      <input
+        type="range"
+        class="clip-range mx-1 flex-none"
+        style="width: 56px"
+        min="0"
+        max="1"
+        step="0.05"
+        :value="volume"
+        :aria-label="volumeHint"
+        :title="volumeHint"
+        @input="onVolume"
+      />
     </template>
   </div>
 </template>

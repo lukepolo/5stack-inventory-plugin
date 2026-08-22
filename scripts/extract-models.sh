@@ -239,6 +239,15 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v30 (2026-08-22): v29 made /anims a step. THE STEP NEVER RAN. The image copied
+# only extract-models.sh to /usr/local/bin, so the sibling .mjs it spawns was not
+# there, then tools/nmclip.mjs was not there, then the CLI path it guessed
+# (/app/cs2-model-extract) was the hand-run layout rather than WORK_DIR's — three
+# failures deep, and every one of them landed inside the step's own `if`, which
+# is non-fatal by design. The run reported success, the stamp said v29, and the
+# mount had no /anims at all. So v29's version can NOT be trusted to mean "has
+# first-person assets": this bump is what makes every instance stamped v29 run
+# the step that v29 only claimed to have run.
 # v29 (2026-08-21): the first-person assets are a STEP, not a script someone
 # remembers to run. `/anims` — every weapon's viewmodel clips, the sounds they
 # cue, the muzzle-flash textures and CS2's equipment icons — existed only on the
@@ -257,7 +266,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=29
+EXTRACT_VERSION=30
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -4606,7 +4615,13 @@ if step_if "viewmodel-anims"; then
 echo ""
 echo "--- Extracting first-person viewmodel clips, sounds and icons…"
 ANIMS_DEST="${OUT_DIR:-$WORK}/anims"
-if node "$(dirname "$0")/extract-viewmodel-anims.mjs" --out "$ANIMS_DEST" 2>&1 | tail -20; then
+# EVERY PATH IS PASSED, none guessed: the script's own defaults were the
+# hand-run layout (/app/cs2-model-extract/cli/…) and in the container the CLI is
+# under WORK_DIR — it was "spawnSync ENOENT" on every image install, and only
+# the one instance it was first run on by hand ever had clips. This script
+# already resolved all four; the child gets them.
+if node "$(dirname "$0")/extract-viewmodel-anims.mjs" \
+    --cli "$CLI" --vpk "$VPK" --models "$DEST" --out "$ANIMS_DEST" 2>&1 | tail -20; then
   echo "--- Viewmodel assets: $(du -sh "$ANIMS_DEST" 2>/dev/null | cut -f1)"
 else
   # Not fatal. A weapon with no clip falls back to the item view, which is what

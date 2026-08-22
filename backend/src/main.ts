@@ -5481,12 +5481,15 @@ const EXTRACT_STATE_FILE = path.join(MODELS_ROOT, "extract-state.json");
 // (and the pod restarting) so a failure can actually be handed to someone.
 const EXTRACT_LOG_FILE = path.join(MODELS_ROOT, "extract-last.log");
 // Where the script lives differs by how the backend is running: the image
-// copies it to /usr/local/bin, while dev syncs the whole repo at /app (so it's
-// the repo's own scripts/). Resolve at request time — under dev sync the file
-// can appear after boot.
+// copies scripts/ (and the tools/ modules it imports) to /app/scripts, and dev
+// syncs the whole repo at /app — the same path either way. Resolve at request
+// time — under dev sync the file can appear after boot.
+//
+// It used to be /usr/local/bin/extract-models.sh in the image, on its own.
+// The script is not on its own: it runs a sibling .mjs that imports
+// ../tools/, so it has to ship in the repo's layout. See Dockerfile.backend.
 const EXTRACT_SCRIPT_CANDIDATES = [
-  "/usr/local/bin/extract-models.sh", // container image
-  "/app/scripts/extract-models.sh", // dev: repo synced at /app
+  "/app/scripts/extract-models.sh", // container image AND dev: repo synced at /app
   path.resolve("scripts/extract-models.sh"), // running from the repo root
   path.resolve("../scripts/extract-models.sh"), // running from backend/
 ];

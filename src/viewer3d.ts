@@ -2788,7 +2788,20 @@ function buildDecalQuad(THREE: typeof import("three"), kind: ViewerKind) {
 // suspend a context created before any gesture reached the document.
 let fpvAudio: AudioContext | null = null;
 const fpvSfx = new Map<string, Promise<AudioBuffer | null>>();
-function playSfx(url: string, gain = 0.7): void {
+/**
+ * The user's level for every first-person cue — the `fpvvolume` dial, shared by
+ * the debug menu's knob and the slider in the viewer bar. Read at the moment a
+ * cue fires rather than cached, so a drag on the slider is heard on the very
+ * next shot; clamped because it comes out of localStorage.
+ */
+function fpvVolume(): number {
+  return clamp(debugNumber("fpvvolume", 0.2), 0, 1);
+}
+/** `gain` is the cue's own trim, on top of the user's level. */
+function playSfx(url: string, gain = 1): void {
+  const level = fpvVolume() * gain;
+  // Muted is muted: no context to spin up, nothing to fetch, nothing to decode.
+  if (level <= 0) return;
   try {
     fpvAudio ??= new AudioContext();
   } catch {
@@ -2813,7 +2826,7 @@ function playSfx(url: string, gain = 0.7): void {
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const g = ctx.createGain();
-    g.gain.value = gain;
+    g.gain.value = level;
     src.connect(g).connect(ctx.destination);
     src.start();
   });
