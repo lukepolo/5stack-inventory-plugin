@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS inventory.owned_items (
 CREATE INDEX IF NOT EXISTS owned_items_steam_id_idx ON inventory.owned_items (steam_id);
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS stickers jsonb;   -- up to 5 sticker item ids
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS charm_id integer; -- keychain item id
-ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS patches jsonb;    -- up to 5 patch item ids (agents)
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS patches jsonb;    -- up to 3 patch item ids (agents)
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS stattrak_count integer NOT NULL DEFAULT 0;
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'crafted'; -- crafted | steam | copied
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS steam_asset_id text; -- Steam asset id for import dedupe

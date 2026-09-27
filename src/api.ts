@@ -533,17 +533,18 @@ export async function uploadTestSnap(key: string, blob: Blob): Promise<{ ok: boo
 export const MAX_STICKERS = 5;
 
 /**
- * How many patches an agent can carry — `CS2_MAX_PATCHES`, five.
+ * How many patches an agent can carry — `CS2_MAX_PATCHES`, three: the game's
+ * `max_num_patches`, and the three `g_tPatch` slots csgo_character.vfx declares.
  *
- * Equal to MAX_STICKERS today and still its own constant: they are unrelated
- * numbers that happen to match, and this file exists to stop that kind of
- * coincidence from being written down once and read as one rule.
- *
- * The equivalent of the anchor count here is `patchSlots` on /api/catalog (3-5,
- * from the agent's own materials) — and unlike sticker anchors that one IS a cap,
- * because the compositor has nowhere to stamp a patch the model never placed.
+ * The equivalent of the anchor count here is `patchSlots` on /api/catalog (from
+ * the agent's own materials, capped at this) — and unlike sticker anchors that
+ * one IS a cap, because the compositor has nowhere to stamp a patch the model
+ * never placed.
  */
-export const MAX_PATCHES = 5;
+export const MAX_PATCHES = 3;
+
+/** cs2-lib's name tag limit, counted in code points rather than UTF-16 units. */
+export const NAMETAG_MAX_LENGTH = 20;
 
 // Per-weapon sticker geometry (cached — schema data only moves on a CS2 model
 // change). `slots` carries the game's own per-slot UV anchors; `bounds` is the

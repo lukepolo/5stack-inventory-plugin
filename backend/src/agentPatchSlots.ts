@@ -1,9 +1,8 @@
 // How many patches an agent can actually wear.
 //
-// The craft form offers five slots because that is what the inventory schema
-// carries, but an agent only has as many POSITIONS as its model declares, and
-// that is 3 to 5 depending on the model. Without this the form let you equip
-// five and silently dropped the overflow at render time.
+// An agent only has as many POSITIONS as its model declares, and the game carries
+// at most CS2_MAX_PATCHES (`max_num_patches`, three) whatever the model says.
+// Without this the form let you equip slots the viewer silently dropped.
 //
 // The count is read from the GLB the viewer already loads: every agent export
 // carries its source vmat under `material.extras.vmat`, so `g_flPatch<n>Scale`
@@ -59,16 +58,13 @@ function countSlots(json: Record<string, unknown>): number {
   for (const m of materials) {
     const vmat = m?.extras?.vmat;
     if (!vmat || !num(vmat.IntParams?.F_PATCHES)) continue;
-    // CS2_MAX_PATCHES, not 3. This used to stop at 3, which is the LOW end of
-    // the 3-to-5 range described above rather than the high end — so a material
-    // declaring four or five positions had the last one or two counted as
-    // nothing. Totals only ever passed 3 by summing across several materials,
-    // which made the cap look like a real model limit instead of an off-by-two.
     for (let i = 0; i < CS2_MAX_PATCHES; i++) {
       if (Math.abs(num(vmat.FloatParams?.[`g_flPatch${i}Scale`])) > 0) n++;
     }
   }
-  return n;
+  // Summed across materials, a multi-material agent can declare more positions
+  // than the game will carry.
+  return Math.min(n, CS2_MAX_PATCHES);
 }
 
 const cache = new Map<string, { mtimeMs: number; slots: number }>();

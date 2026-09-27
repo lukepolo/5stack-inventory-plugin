@@ -67,6 +67,7 @@ import {
   fetchStickerGeometry,
   MAX_STICKERS,
   MAX_PATCHES,
+  NAMETAG_MAX_LENGTH,
   uploadRender,
   renderUrlFor,
   type GameConfigState,
@@ -3109,26 +3110,32 @@ watch(
 /**
  * Patch slots the CURRENT agent actually has.
  *
- * The inventory schema stores five for every agent, but the positions belong to
- * the model — most declare three, some five (see /api/catalog `patchSlots`). The
- * form used to show five regardless, so you could fill all of them and the
- * viewer would silently drop the overflow. A missing count means the backend
- * could not read the model, and that has to fall back to five rather than to
- * zero: capping on a failed lookup would make every agent unpatchable.
+ * The positions belong to the model (see /api/catalog `patchSlots`), capped at
+ * MAX_PATCHES. A missing count means the backend could not read the model, and
+ * that has to fall back to MAX_PATCHES rather than to zero: capping on a failed
+ * lookup would make every agent unpatchable.
  */
 const patchSlotCount = computed(() => {
   const skin = craft.value?.skin;
-  if (!skin) return 5;
+  if (!skin) return MAX_PATCHES;
   // TWO SOURCES ON PURPOSE. The craft page opens an owned item through the
   // inventory row, whose item comes from the backend's synchronous getItem() —
   // and that reads a cache warmed at boot, so a cold or failed warm silently
-  // yields null and the form falls back to five slots for every agent. The
+  // yields null and the form falls back to MAX_PATCHES for every agent. The
   // catalog's agents list is computed per request and cannot go stale that way,
   // so it backstops the item. Matching on id, not model: the id is what both
   // sides key on.
   const n = skin.patchSlots ?? catalogAgents.value.find((a) => a.id === skin.id)?.patchSlots;
-  return typeof n === "number" && n > 0 ? Math.min(n, 5) : 5;
+  return typeof n === "number" && n > 0 ? Math.min(n, MAX_PATCHES) : MAX_PATCHES;
 });
+function onNametagInput(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const capped = [...el.value].slice(0, NAMETAG_MAX_LENGTH).join("");
+  if (capped !== el.value) {
+    el.value = capped;
+  }
+  craft.value!.nametag = capped;
+}
 /** Slots beyond that count are cleared, so a saved craft cannot carry a patch
  *  the model has nowhere to put — including one equipped before this cap, or
  *  copied from another agent by the duplicate flow. */
@@ -9094,10 +9101,10 @@ if (MDEBUG) {
             >
               <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
               <input
-                v-model="craft.nametag"
-                maxlength="24"
+                :value="craft.nametag"
                 placeholder="Type a custom name…"
                 class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                @input="onNametagInput"
               />
             </label>
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">

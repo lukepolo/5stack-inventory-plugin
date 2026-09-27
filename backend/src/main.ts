@@ -170,6 +170,46 @@ async function dropImpossibleScalars() {
   }
 }
 
+/**
+ * Move patches out of slots the game does not have.
+ *
+ * cs2-lib 9.3 cut CS2_MAX_PATCHES from 5 to 3, so rows crafted before it can
+ * hold patches in slots 3 and 4. Same repair cs2-lib runs on its own inventories:
+ * each one moves into the first free slot below the cap, and whatever does not
+ * fit is dropped. A dropped patch that was a linked instance stays owned, just
+ * no longer attached.
+ */
+async function repairPatchSlots() {
+  const max = STICKER_LIMITS.maxPatches;
+  const { rows } = await pool.query<{ id: string; patches: unknown[] }>(
+    `SELECT id, patches FROM inventory.owned_items
+     WHERE jsonb_typeof(patches) = 'array' AND jsonb_array_length(patches) > $1`,
+    [max],
+  );
+  let moved = 0;
+  for (const row of rows) {
+    const slots = Array.from({ length: max }, (_, i) => row.patches[i] ?? null);
+    for (const patch of row.patches.slice(max)) {
+      if (patch == null) {
+        continue;
+      }
+      const free = slots.indexOf(null);
+      if (free === -1) {
+        break;
+      }
+      slots[free] = patch;
+      moved++;
+    }
+    await pool.query(`UPDATE inventory.owned_items SET patches = $2::jsonb WHERE id = $1`, [
+      row.id,
+      slots.some((p) => p != null) ? JSON.stringify(slots) : null,
+    ]);
+  }
+  if (rows.length) {
+    app.log.info(`[schema] trimmed patches to ${max} slots on ${rows.length} item(s), ${moved} moved`);
+  }
+}
+
 const TEAMS = new Set(["CT", "T"]);
 
 // ---- Catalog (CS2 item data; no auth needed, it's public reference data) ----
@@ -177,10 +217,9 @@ const TEAMS = new Set(["CT", "T"]);
 app.get("/api/catalog", async () => {
   // assetVersion rides along here because the client needs it before it can
   // request a single paint file, and this is the one call it always makes first.
-  // `patchSlots` is how many patches the agent's MODEL can actually carry (3-5,
-  // read from its own materials). The craft form offers five because that is
-  // what the inventory schema stores; without this it let you fill all five and
-  // the viewer silently dropped the overflow. Null when the model is not on the
+  // `patchSlots` is how many patches the agent's MODEL can actually carry (read
+  // from its own materials, capped at CS2_MAX_PATCHES); without it the form let
+  // you fill slots the viewer silently dropped. Null when the model is not on the
   // mount — the client must read that as "unknown, do not restrict".
   const agents = await Promise.all(
     getAgents().map(async (a) => ({ ...a, patchSlots: a.model ? await patchSlotsFor(a.model) : null })),
@@ -1738,8 +1777,7 @@ app.get<{ Querystring: { ids?: string } }>("/api/catalog/items", async (request)
   if (!ids.length) return [];
   // Agents carry their patch-slot count here too, not only on /api/catalog.
   // This is the route the CRAFT page resolves an owned item through, so without
-  // it the form fell back to five slots for every agent — which is wrong for 62
-  // of the 63 (they have three). See patchSlotsFor.
+  // it the form fell back to the maximum for every agent. See patchSlotsFor.
   return Promise.all(
     getItemsByIds(ids).map(async (i) =>
       i.type === "agent" && i.model ? { ...i, patchSlots: await patchSlotsFor(i.model) } : i,
@@ -1944,7 +1982,9 @@ function checkAttachments(
     if (badWear) return badWear;
   }
   if (patches != null) {
-    if (!Array.isArray(patches) || patches.length > STICKER_LIMITS.maxPatches) {
+    // Occupied slots, not array length: a client built before the cap dropped to
+    // three still posts five, the last two empty, on every craft.
+    if (!Array.isArray(patches) || patches.findLastIndex((p) => p != null) >= STICKER_LIMITS.maxPatches) {
       return `Up to ${STICKER_LIMITS.maxPatches} patches can be applied.`;
     }
     for (const spec of normSpecs(patches)) {
@@ -2172,7 +2212,7 @@ type AttachBody = {
  */
 async function linkAttachments(steamId: string, body: AttachBody, selfId: number | null): Promise<AttachBody> {
   const stickers = normSpecs(body.stickers);
-  const patches = normSpecs(body.patches);
+  const patches = normSpecs(body.patches).slice(0, STICKER_LIMITS.maxPatches);
   const charmId = body.charm_id ?? null;
   const charmOffset = normCharmOffset(body.charm_offset);
 
@@ -6563,9 +6603,16 @@ async function start() {
   // requesting origin and allows credentials, so the panel (any origin/site) can
   // call the API without any ingress config.
   const cors = (await import("@fastify/cors")).default;
-  await app.register(cors, { origin: true, credentials: true });
+  // Methods spelled out: @fastify/cors 11 narrowed the default to GET/HEAD/POST,
+  // which fails the preflight for every PUT, PATCH and DELETE route here.
+  await app.register(cors, {
+    origin: true,
+    credentials: true,
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE"],
+  });
   await applySchema();
   await dropImpossibleScalars();
+  await repairPatchSlots();
   await app.listen({ port, host: "0.0.0.0" });
   // Agent patch-slot counts, so the synchronous getItem() can answer. Fire and
   // forget: a cold cache reads as "unknown", the form falls back to five slots
