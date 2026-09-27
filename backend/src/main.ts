@@ -95,6 +95,8 @@ import {
   itemStoresWear,
   itemStoresSeed,
   STICKER_LIMITS,
+  CHARM_LIMITS,
+  stickerSchemaFor,
   truncateToPrecision,
   normStickerRotation,
   getRenderTestCatalog,
@@ -1819,6 +1821,28 @@ const normInst = (v: unknown): number | null => {
   const n = typeof v === "string" ? Number(v) : v;
   return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : null;
 };
+/**
+ * The feed goes to the plugin as one JSON document, so a single non-number here
+ * (a cleared `v-model.number` input is `""`) fails the whole deserialise and the
+ * player gets no loadout at all. Normalised on write and again on read, because
+ * rows saved before this existed can still hold one.
+ */
+function normCharmOffset(v: unknown): AttachBody["charm_offset"] {
+  if (!v || typeof v !== "object") {
+    return null;
+  }
+  const o = v as Record<string, unknown>;
+  const axis = (a: unknown) =>
+    typeof a === "number" && Number.isFinite(a) ? truncateToPrecision(a, CHARM_LIMITS.offsetFactor) : null;
+  const seed =
+    typeof o.seed === "number" &&
+    Number.isInteger(o.seed) &&
+    o.seed >= CHARM_LIMITS.seedMin &&
+    o.seed <= CHARM_LIMITS.seedMax
+      ? o.seed
+      : null;
+  return { x: axis(o.x), y: axis(o.y), z: axis(o.z), seed, inst: normInst(o.inst) };
+}
 function normSpecs(arr: unknown): AttachSpec[] {
   if (!Array.isArray(arr)) return [];
   return arr.map((entry) => {
@@ -2150,7 +2174,7 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
   const stickers = normSpecs(body.stickers);
   const patches = normSpecs(body.patches);
   const charmId = body.charm_id ?? null;
-  const charmOffset = body.charm_offset ?? null;
+  const charmOffset = normCharmOffset(body.charm_offset);
 
   // Trust nothing: an `inst` is user input, so it only survives if the row is
   // the caller's AND is actually the item the spec claims. A mismatch falls
@@ -2446,14 +2470,15 @@ function inspectLinkFor(
   if (!item || item.def == null) return null;
 
   // Agents carry patches through the sticker slots, same as the equipped feed.
-  const attachments = normSpecs(item.type === "agent" ? row.patches : row.stickers);
+  const isAgent = item.type === "agent";
+  const attachments = normSpecs(isAgent ? row.patches : row.stickers);
   const stickers: InspectSticker[] = [];
   attachments.forEach((spec, slot) => {
     if (!spec) return;
     const kit = getItem(spec.id)?.index;
     if (kit == null) return;
     stickers.push({
-      slot,
+      slot: isAgent ? slot : stickerSchemaFor(itemId, slot),
       id: kit as number,
       wear: spec.w ?? null,
       offsetX: spec.x ?? null,
@@ -2465,16 +2490,17 @@ function inspectLinkFor(
   const keychains: InspectSticker[] = [];
   const charm = row.charm_id != null ? getItem(row.charm_id) : null;
   if (charm?.index != null) {
+    const charmOffset = normCharmOffset(row.charm_offset);
     keychains.push({
       slot: 0,
       id: charm.index as number,
       // Must match what the equipped feed sends as `keychains[].sticker`, or
       // the slab you inspect is not the slab the server puts on the gun.
       wrappedSticker: charm.stickerIndex ?? null,
-      offsetX: row.charm_offset?.x ?? null,
-      offsetY: row.charm_offset?.y ?? null,
-      offsetZ: row.charm_offset?.z ?? null,
-      pattern: row.charm_offset?.seed ?? 0,
+      offsetX: charmOffset?.x ?? null,
+      offsetY: charmOffset?.y ?? null,
+      offsetZ: charmOffset?.z ?? null,
+      pattern: charmOffset?.seed ?? CHARM_LIMITS.seedMin,
     });
   }
 
@@ -6302,7 +6328,7 @@ interface EquippedItem {
   wear?: number | null;
   stattrak?: number;
   nametag?: string;
-  stickers?: { def: number; slot: number; wear: number; x?: number; y?: number; rotation?: number }[];
+  stickers?: { def: number; slot: number; schema?: number; wear: number; x?: number; y?: number; rotation?: number }[];
   keychains?: { def: number; seed: number; slot: number; sticker?: number; x?: number; y?: number; z?: number }[];
   musicId?: number;
   tint?: number;
@@ -6340,7 +6366,7 @@ function hashed<T extends EquippedItem>(entry: T): T {
   return entry;
 }
 
-function equippedStickers(specs?: unknown[] | null) {
+function equippedStickers(specs?: unknown[] | null, weaponId?: number) {
   const out: NonNullable<EquippedItem["stickers"]> = [];
   normSpecs(specs).forEach((spec, slot) => {
     if (!spec) return;
@@ -6350,6 +6376,9 @@ function equippedStickers(specs?: unknown[] | null) {
     // wear" attribute when it's absent, and an explicit 0 keeps pristine
     // stickers behaving exactly as they did before wear existed.
     const entry: (typeof out)[number] = { def: kit as number, slot, wear: spec.w ?? 0 };
+    if (weaponId != null) {
+      entry.schema = stickerSchemaFor(weaponId, slot);
+    }
     if (spec.x != null) entry.x = spec.x;
     if (spec.y != null) entry.y = spec.y;
     if (spec.r != null) entry.rotation = spec.r;
@@ -6467,23 +6496,30 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
         paint: (item.index as number | undefined) ?? 0,
         seed: row.seed ?? 1,
         stattrak,
-        stickers: equippedStickers(row.stickers),
+        stickers: equippedStickers(row.stickers, row.item_id as number),
         keychains: [],
         uid,
         wear: row.wear ?? 0,
       };
       const charm = row.charm_id != null ? getItem(row.charm_id) : null;
       if (charm?.index != null) {
+        const charmOffset = normCharmOffset(row.charm_offset);
         const keychain: NonNullable<EquippedItem["keychains"]>[number] = {
-          def: charm.index as number, seed: row.charm_offset?.seed ?? 0, slot: 0,
+          def: charm.index as number, seed: charmOffset?.seed ?? CHARM_LIMITS.seedMin, slot: 0,
         };
         // A Sticker Slab is one model wearing one sticker, and 10.5k of the
         // 10.6k charms are slabs — the charm's own def only picks the slab, so
         // without this every slab in the game arrived as the same blank hanger.
         if (charm.stickerIndex != null) keychain.sticker = charm.stickerIndex;
-        if (row.charm_offset?.x != null) keychain.x = row.charm_offset.x;
-        if (row.charm_offset?.y != null) keychain.y = row.charm_offset.y;
-        if (row.charm_offset?.z != null) keychain.z = row.charm_offset.z;
+        if (charmOffset?.x != null) {
+          keychain.x = charmOffset.x;
+        }
+        if (charmOffset?.y != null) {
+          keychain.y = charmOffset.y;
+        }
+        if (charmOffset?.z != null) {
+          keychain.z = charmOffset.z;
+        }
         entry.keychains = [keychain];
       }
       hashed(entry);

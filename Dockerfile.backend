@@ -19,8 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl unzip python3 libicu72 imagemagick webp \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY backend/package.json ./
-RUN npm install
+# The lockfile pins cs2-lib, and a cs2-lib bump renames artwork and changes item
+# rules — `npm install` against ^9 would take one silently on any rebuild.
+COPY backend/package.json backend/package-lock.json ./
+RUN npm ci
 COPY backend/ ./
 # Same scripts the manual/host workflow uses — one copy, one behaviour — and in
 # the SAME LAYOUT as the repo, which is load-bearing: extract-models.sh runs

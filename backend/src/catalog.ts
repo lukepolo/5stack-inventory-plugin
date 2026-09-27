@@ -8,6 +8,9 @@ import {
   CS2_MAX_STICKERS,
   CS2_MAX_STICKER_ROTATION,
   CS2_MAX_KEYCHAINS,
+  CS2_KEYCHAIN_POSITION_FACTOR,
+  CS2_MIN_KEYCHAIN_SEED,
+  CS2_MAX_KEYCHAIN_SEED,
   CS2_MIN_STICKER_ROTATION,
   CS2_STICKER_OFFSET_FACTOR,
   CS2_STICKER_ROTATION_STEP,
@@ -1583,6 +1586,28 @@ export const STICKER_LIMITS = {
   maxPatches: CS2_MAX_PATCHES,
   maxKeychains: CS2_MAX_KEYCHAINS,
 } as const;
+
+export const CHARM_LIMITS = {
+  offsetFactor: CS2_KEYCHAIN_POSITION_FACTOR,
+  seedMin: CS2_MIN_KEYCHAIN_SEED,
+  seedMax: CS2_MAX_KEYCHAIN_SEED,
+} as const;
+
+/**
+ * The anchor a sticker in `slot` is drawn on, for the plugin's `schema` and the
+ * inspect protobuf's `slot`. A stack deeper than the body's anchors (the fifth
+ * sticker on the 16 four-anchor weapons) has no anchor of its own, so the
+ * schema has to name the one it shares. It goes on anchor 0 because that
+ * is where the viewer draws it (slotMarkup's firstAnchor in viewer3d.ts), and
+ * its stored x/y are relative to that anchor — change one, change both.
+ */
+export function stickerSchemaFor(itemId: number, slot: number): number {
+  try {
+    return slot < CS2Economy.getById(itemId).getStickerSchemaCount() ? slot : 0;
+  } catch {
+    return slot;
+  }
+}
 
 /**
  * Truncate to an attribute's stored PRECISION.
