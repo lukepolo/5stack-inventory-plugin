@@ -23,8 +23,12 @@ import * as vueNs from "vue";
 const VIRTUAL = "\0__5stack_shared__:";
 
 // Enumerated at build time from the installed vue, because ESM named exports
-// must be static — they cannot be spread off a runtime object.
-const VUE_EXPORTS = Object.keys(vueNs).filter((name) => name !== "default");
+// must be static — they cannot be spread off a runtime object. Identifiers only:
+// Node 23+ adds a `module.exports` key to a CommonJS namespace, and vue's node
+// entry is CommonJS.
+const VUE_EXPORTS = Object.keys(vueNs).filter(
+  (name) => name !== "default" && /^[A-Za-z_$][\w$]*$/.test(name),
+);
 
 export function sharedGlobals() {
   return {
