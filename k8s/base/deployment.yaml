@@ -52,7 +52,7 @@ spec:
               mountPath: /cs2-models
               readOnly: true
           # Requests only, no limits: `codepier up` swaps this container for
-          # node:22 and runs `vite build` in the same cgroup, and a limit sized
+          # node:24 and runs `vite build` in the same cgroup, and a limit sized
           # for nginx OOM-kills that build with no error message.
           resources:
             requests:

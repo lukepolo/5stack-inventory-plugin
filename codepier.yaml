@@ -9,7 +9,7 @@
 #   Backend:   codepier up --deployment inventory-backend
 #              codepier ssh   ->   yarn dev:api    (node --watch hot reload)
 namespaces: [5stack]
-image: node:22
+image: node:24
 workload:
   - inventory-backend
   - inventory-frontend

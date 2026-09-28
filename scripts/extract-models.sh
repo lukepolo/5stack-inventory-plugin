@@ -239,6 +239,10 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v31 (2026-09-27): no pipeline change. cs2-lib 9.0.0 -> 9.4.0 renamed the
+# hash suffix on 2,481 icons and every paint material, and added 112 patch
+# materials, so a mount extracted against the old names 404s its art. Bump this
+# with every cs2-lib bump: the file names come from cs2-lib, not from the game.
 # v30 (2026-08-22): v29 made /anims a step. THE STEP NEVER RAN. The image copied
 # only extract-models.sh to /usr/local/bin, so the sibling .mjs it spawns was not
 # there, then tools/nmclip.mjs was not there, then the CLI path it guessed
@@ -266,7 +270,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=30
+EXTRACT_VERSION=31
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the

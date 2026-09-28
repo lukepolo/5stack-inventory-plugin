@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import federation from "@originjs/vite-plugin-federation";
 import cssInjectedByJs from "vite-plugin-css-injected-by-js";
-import { sharedGlobals } from "./shared-globals";
+import { sharedGlobals } from "./shared-globals.ts";
 
 // No @types/node in this project — declare just enough for the env check below.
 declare const process: { env: Record<string, string | undefined> };
@@ -20,6 +20,24 @@ function buildStamp() {
         source: JSON.stringify({ builtAt }),
       });
       void bundle;
+    },
+  };
+}
+
+// @originjs/vite-plugin-federation rewrites its CSS placeholder only when it is
+// a quoted string, and Rolldown (vite 8) emits it as a template literal. Left in
+// place, remoteEntry hands the host a path where it expects a list and the
+// expose throws on `.forEach`. The list is empty: CSS is injected by JS here.
+function federationCssPlaceholder() {
+  return {
+    name: "federation-css-placeholder",
+    enforce: "post" as const,
+    generateBundle(_opts: unknown, bundle: Record<string, { type: string; fileName: string; code?: string }>) {
+      for (const chunk of Object.values(bundle)) {
+        if (chunk.type === "chunk" && chunk.fileName.endsWith("remoteEntry.js") && chunk.code) {
+          chunk.code = chunk.code.replace(/`__v__css__[^`]*`/g, "[]");
+        }
+      }
     },
   };
 }
@@ -52,6 +70,7 @@ export default defineConfig({
       // Intentionally no `shared` — see shared-globals.ts. Adding anything here
       // reintroduces the top-level await that breaks the panel in Safari.
     }),
+    federationCssPlaceholder(),
   ],
   // `vue` resolves to the virtual bridge module, so Vite must not try to
   // pre-bundle the real package into an optimized dep.
@@ -72,6 +91,10 @@ export default defineConfig({
     // remoteEntry.js itself still uses top-level await. That one is safe: it is
     // a single isolated entry, not fanned out across the whole app.
     target: "esnext",
+    // Not vite 8's default Lightning CSS: it rewrites `min-width` media queries
+    // into range syntax, which Safari before 16.4 drops, and this CSS is injected
+    // into the panel's page.
+    cssMinify: "esbuild",
     cssCodeSplit: false,
     // reka-ui / lucide are bundled into this remote now (only Vue comes from
     // the panel), so their size is expected.
@@ -91,7 +114,7 @@ export default defineConfig({
           watch: {
             buildDelay: 300,
             exclude: ["**/node_modules/**", "**/dist/**"],
-            chokidar: { usePolling: true, interval: 500 },
+            watcher: { usePolling: true, pollInterval: 500 },
           },
         }
       : {}),

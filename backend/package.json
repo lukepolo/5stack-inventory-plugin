@@ -10,14 +10,14 @@
     "migrate": "node --experimental-strip-types src/migrate.ts"
   },
   "dependencies": {
-    "@fastify/cors": "^10.0.1",
-    "@ianlucas/cs2-lib": "^9.0.0",
-    "fastify": "^5.2.0",
-    "pg": "^8.13.1"
+    "@fastify/cors": "^11.3.0",
+    "@ianlucas/cs2-lib": "^9.4.0",
+    "fastify": "^5.12.5",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
-    "@types/pg": "^8.11.10",
-    "typescript": "^5.8.3"
+    "@types/node": "^24.19.0",
+    "@types/pg": "^8.23.1",
+    "typescript": "^7.0.2"
   }
 }
