@@ -1,0 +1,66 @@
+{
+  "inventory": {
+    "notify": {
+      "craft_link_missing": "Esse link de craft aponta para um item que não existe mais.",
+      "sign_in_to_save": "Faça login para salvar isso no seu inventário.",
+      "sign_in_to_inspect": "Faça login para abrir isso no jogo.",
+      "crafted": "Craft concluído — está no seu inventário.",
+      "copy_created": "Cópia editável criada no seu inventário.",
+      "inspect_sent": "Enviado para o cliente do jogo — o CS2 abrirá a visualização de inspeção.",
+      "synced": "Sincronizado com a Steam — {summary}.",
+      "synced_partial": "Sincronizado com a Steam — {summary}. Inventário muito grande para leitura completa.",
+      "synced_no_changes": "Sincronizado com a Steam — tudo já estava atualizado.",
+      "render_upload_failed": "Render feito localmente, mas salvar falhou: {error}. Verifique deploy/mount do backend.",
+      "render_not_served": "Render SALVO (backend OK), mas /renders/ não está servindo — pods frontend + backend não compartilham o mount, ou um cache está servindo um 404 antigo."
+    },
+    "admin": {
+      "cache": {
+        "cleared_renders": "Renders de cards limpos — cada um será reprocessado na próxima visualização.",
+        "cleared_composites": "Composites de pintura limpos — cada skin será recomposta uma vez e depois compartilhada novamente.",
+        "heading": "Assets em disco",
+        "description": "O que este servidor gerou ou extraiu no mount de modelos.",
+        "section_cache": "Cache",
+        "section_extracted": "Extraído da instalação de CS2 deste servidor",
+        "clear_renders": "Limpar renders",
+        "clear_composites": "Limpar composites",
+        "rows": {
+          "renders": "Renders de cards",
+          "renders_hint": "Cards de itens processados — podem ser limpos com segurança, re-renderizam ao visualizar",
+          "composites": "Composites de pintura",
+          "composites_hint": "Texturas de skins compartilhadas — permite que cada viewer pule ~38MB de inputs por arma",
+          "models": "Modelos 3D",
+          "models_hint": "GLBs de armas + inputs de composite",
+          "paints": "Materiais de pintura",
+          "paints_hint": "Acabamentos de skins — sem isso, skins renderizam brancas",
+          "images": "Ícones de itens",
+          "images_hint": "Arte plana de catálogo para cada item"
+        }
+      },
+      "server": {
+        "key_reissued": "Nova chave de servidor emitida — a antiga foi invalidada.",
+        "cfg_synced": "Comandos invsim atualizados em: {files}"
+      },
+      "extract": {
+        "started": "Job de extração iniciado — pode levar bastante tempo.",
+        "finished": "Extração de modelos concluída — assets 3D estão disponíveis no mount.",
+        "steps": {
+          "decompile-models": "Descompilando modelos de armas",
+          "rename-models": "Mapeando modelos para chaves de catálogo",
+          "model-textures": "Comprimindo texturas de modelos",
+          "composite-inputs": "Extraindo inputs de composite",
+          "charm-anchors": "Lendo âncoras de charms",
+          "sticker-markup": "Lendo slots de adesivos",
+          "econ-icons": "Extraindo ícones de itens",
+          "paint-chain": "Extraindo cadeia de pintura",
+          "sticker-art": "Extraindo arte de adesivos",
+          "stamp": "Registrando a build"
+        },
+        "time_left": "~{duration} restantes"
+      },
+      "tests": {
+        "cleared": "{count} arquivos limpos.",
+        "verdict_failed": "Veredito não salvo: {error}"
+      }
+    }
+  }
+}

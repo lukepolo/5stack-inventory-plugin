@@ -1,67 +1,65 @@
-# 5stack Inventory Plugin
+# Plugin de Inventário 5stack
 
-A CS2 inventory simulator that renders **natively inside the 5stack panel** as a
-[plugin](https://github.com/5stackgg). It is **not** part of the 5stack
-brand or codebase — it's an independent micro-frontend, loaded at runtime via
-Module Federation, that reuses 5stack's Steam login instead of its own auth.
+Um simulador de inventário do CS2 renderizado **nativamente dentro do painel 5stack** como um [plugin](https://github.com/5stackgg).  
+Ele **não** faz parte da marca ou do código-base do 5stack — é um micro-frontend independente, carregado em tempo de execução via *Module Federation*, que reutiliza o login da Steam do 5stack em vez de ter sua própria autenticação.  
 
-This repo doubles as the **reference template** for building any 5stack Custom
-Page.
+Este repositório também serve como **modelo de referência** para construir qualquer *Custom Page* do 5stack.
 
-## How it fits together
+---
+
+## Como funciona
 
 ```
-5stack panel (host)                        this plugin
+5stack panel (host)                        este plugin
 ─────────────────────                      ────────────────
 pages/apps/[...slug].vue ─Module Federation─▶  remoteEntry.js  (Vue "./App")
-  resolves the remote by slug,                  exposes InventoryApp
-  passes :user + the route props
-  renders it in the real sidebar/header
+  resolve o remoto pelo slug,                  expõe InventoryApp
+  passa :user + props da rota
+  renderiza na barra lateral/cabeçalho reais
                                             backend (Fastify)
-cookie ──▶ /plugins/authorize ──▶ identity   validates the session itself,
+cookie ──▶ /plugins/authorize ──▶ identidade   valida a sessão itself,
                                               owns its `inventory` schema
 ```
 
-- **No iframe** — the plugin is a real Vue component in the host's Vue app.
-- **Shared design system** via `@5stack/ui` (Federation shared singleton), so it
-  looks native and tracks the host's live branding.
-- **Identity** comes from handing the inbound 5stack session cookie back to the
-  panel's `/plugins/authorize`, never a cookie parse or Steam OpenID.
 
-## Layout
+- **Sem iframe** — o plugin é um componente Vue real dentro do app Vue do host.  
+- **Sistema de design compartilhado** via `@5stack/ui` (singleton compartilhado pela Federation), garantindo aparência nativa e seguindo a identidade visual do host.  
+- **Identidade** vem do cookie de sessão do 5stack, repassado ao endpoint `/plugins/authorize`, sem parsing de cookie ou uso de Steam OpenID.  
 
-| Path | What |
-| --- | --- |
-| `src/App.vue` | the loadout UI (exposed `./App` remote; receives the host props) |
-| `src/pluginRouter.ts` | the routing contract — host props in, `go()`/`href()` out |
-| `src/AdminConsole.vue` | the `/admin` route (server key, asset cache, extraction) |
-| `vite.config.ts` | Federation `exposes` + shared singletons |
-| `shared-globals.ts` | resolves `vue` to the panel's instance (replaces Federation `shared`) |
-| `backend/src/catalog.ts` | CS2 item catalog via `@ianlucas/cs2-lib` |
-| `backend/` | Fastify API + `inventory` Postgres schema |
-| `k8s/` | kustomize package — `base/` plus an `http` and an `https` overlay |
-| `public/5stack-plugin.json` | the manifest: what the panel registers, and its `install` block |
-| `codepier.yaml` | live-sync the backend into its pod for dev |
+---
 
-## Plugin routes (the routing contract)
+## Estrutura
 
-A plugin owns **every URL under its slug**. The panel matches
-`/apps/<slug>/:path*`, resolves the remote from the slug, and passes the rest
-down as props — so a plugin gets real, linkable, back-button-able routes without
-bundling `vue-router` (a second router instance inside a federated remote fights
-the host's for the URL).
+| Caminho | Função |
+|---------|--------|
+| `src/App.vue` | UI do inventário (exposto como remoto `./App`; recebe props do host) |
+| `src/pluginRouter.ts` | Contrato de roteamento — props do host entram, `go()` / `href()` saem |
+| `src/AdminConsole.vue` | Rota `/admin` (chave do servidor, cache de assets, extração) |
+| `vite.config.ts` | Configuração da Federation: `exposes` + singletons compartilhados |
+| `shared-globals.ts` | Resolve `vue` para a instância do painel |
+| `backend/src/catalog.ts` | Catálogo de itens CS2 via `@ianlucas/cs2-lib` |
+| `backend/` | API Fastify + schema `inventory` em Postgres |
+| `k8s/` | Pacote kustomize — `base/` mais overlays `http` e `https` |
+| `public/5stack-plugin.json` | Manifesto: o que o painel registra e seu bloco `install` |
+| `codepier.yaml` | Live-sync do backend no pod para desenvolvimento |
 
-| Prop | What the host passes |
-| --- | --- |
-| `user` | the authenticated 5stack user (or `null`) |
-| `base` | where the plugin is mounted, e.g. `/apps/inventory` |
-| `path` | the path *below* the slug — `/` or `/admin` |
-| `query` | the current query object |
-| `navigate` | `(to, { replace?, query? }) => void`, `to` is plugin-relative |
+---
 
-`src/pluginRouter.ts` wraps those into a tiny router and — when the props are
-absent (standalone `npm run dev`) — falls back to the History API, so the same
-call sites work in both modes:
+## Rotas do Plugin
+
+Um plugin controla **todas as URLs sob seu slug**.  
+O painel mapeia ` /apps/<slug>/:path* `, resolve o remoto pelo slug e passa o restante como props — assim o plugin ganha rotas reais, com suporte a links e botão de voltar, sem precisar embutir um `vue-router`.
+
+| Prop | O que o host passa |
+|------|--------------------|
+| `user` | Usuário autenticado do 5stack (ou `null`) |
+| `base` | Onde o plugin é montado, ex: `/apps/inventory` |
+| `path` | Caminho abaixo do slug — `/` ou `/admin` |
+| `query` | Objeto de query atual |
+| `navigate` | Função `(to, { replace?, query? }) => void`, relativa ao plugin |
+
+O `src/pluginRouter.ts` encapsula isso em um mini-roteador e, quando os props não estão presentes (modo standalone `npm run dev`), usa a *History API*, permitindo que os mesmos pontos de chamada funcionem em ambos os modos.
+
 
 ```ts
 const router = usePluginRouter(props);   // props = { base, path, query, navigate }
