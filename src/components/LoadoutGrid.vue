@@ -105,12 +105,17 @@ export interface LoadoutGridProps {
 // WHAT DID NOT MOVE: the drag-to-equip, drag-to-reorder and long-press wiring.
 // It is the most delicate code in the app, and it stays whole in App.vue with
 // only its handlers reaching across. Same rule LoadoutCell.vue already follows.
+import { computed } from "vue";
 import { isCompact } from "../responsive";
 import { accentSoft, selRing } from "../itemVisuals";
 import { EXTRAS, RAIL } from "../loadoutModel";
 import LoadoutCell from "./LoadoutCell.vue";
 
-defineProps<LoadoutGridProps>();
+const props = defineProps<LoadoutGridProps>();
+
+// The rail's equipment chip already carries this count; the desktop header
+// reads the same entry so the two layouts can't disagree.
+const equipmentCount = computed(() => props.compactCats.find((c) => c.key === "equipment"));
 
 defineEmits<{
   /** The compact rail switched category. */
@@ -247,9 +252,15 @@ const LIFT_SPACER_PAD = 12;
                out of the flex line and squeeze every flex-1 card toward its
                min-height, which is the reflow the floating sheet exists to
                avoid. min-h-full keeps the cards stretching exactly as before. -->
-          <aside class="animate-grid-in flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col overflow-y-auto py-3 pl-4 pr-1" :style="liftScrollStyle">
+          <!-- Header sits OUTSIDE the scroller and matches the weapon columns'
+               exactly, so all four labels share one baseline and one rule. -->
+          <aside class="animate-grid-in flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col pb-3 pl-4 pr-1 pt-3">
+            <header class="flex items-baseline gap-2 border-b border-border/60 px-1 pb-2">
+              <span class="text-f11 font-semibold uppercase tracking-cs2 text-muted-foreground">Equipment</span>
+              <span v-if="equipmentCount" class="ml-auto font-mono text-f9 text-muted-foreground/60">{{ equipmentCount.skinned }}/{{ equipmentCount.total }}</span>
+            </header>
+            <div class="flex flex-1 flex-col overflow-y-auto pt-2" :style="liftScrollStyle">
             <div class="flex min-h-full flex-col gap-2.5">
-            <div class="px-1 text-f9 uppercase tracking-cs3 text-muted-foreground/70">Equipment</div>
             <LoadoutCell
               v-for="(s, si) in [RAIL[2], RAIL[1]]"
               :key="s.slot"
@@ -335,6 +346,7 @@ const LIFT_SPACER_PAD = 12;
             </div>
             </div>
             <div v-if="liftIntrusion" aria-hidden="true" class="flex-none" :style="{ height: liftIntrusion + LIFT_SPACER_PAD + 'px' }"></div>
+            </div>
           </aside>
 
           <!-- Positional weapon columns (CS2: 5 slots each) -->
