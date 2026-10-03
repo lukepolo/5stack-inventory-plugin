@@ -177,7 +177,7 @@ if you're looking for it in git history, this section is what it became.
   of the file rather than all 3.5MB of it.
 - **Loadout model**: one row per `(steam_id, team, slot)` in `inventory.loadout`,
   where `slot` is a weapon model (`ak47`) or a special slot (`knife`, `gloves`,
-  `agent`, `zeus`, `c4`, `musickit`, `graffiti`, `collectible`) and `item_id` is
+  `agent`, `zeus`, `c4`, `musickit`, `graffiti`, `collectible`, `pet`) and `item_id` is
   a cs2-lib item id. The set of legal slots lives in **two** places that must
   agree — `SLOT_RE` in `backend/src/main.ts` and the whitelist in the boot-time
   `DELETE` in `backend/src/schema.sql`. A slot the API accepts and the SQL
@@ -207,7 +207,7 @@ if you're looking for it in git history, this section is what it became.
   catalog listing (`wearMin`/`wearMax`), so the UI and the door agree.
 - **API**:
   - `GET /api/catalog` → base weapons (grouped by category client-side) + agents
-  - `GET /api/catalog/skins?slot=<model|knife|gloves|agent|musickit|graffiti|collectible>`
+  - `GET /api/catalog/skins?slot=<model|knife|gloves|agent|musickit|graffiti|collectible|pet>`
     → skins for a slot
   - `GET /api/loadout` → the user's equipped slots (enriched with item name/image)
   - `POST /api/loadout` `{team, slot, item_id}` → equip
@@ -319,6 +319,12 @@ failure modes rather than cosmetic mismatches:
   `SprayGraffiti()` returns early when `Tint` is null, and 438 of the 2,205
   graffiti carry no tint of their own — so an omitted field is a spray that
   silently does nothing.
+- **`pet.upgradeLevel`** always goes out, even at the pet's default. The plugin
+  deploys a pet whose level is unset as a grown one, so an egg that omitted it
+  would hatch on spawn. `pet.style` is the one pet field left off when unset
+  (the stock look), and `pet.seed` is read as the "pet seed" attribute — not a
+  paint seed — because `petId` is present
+  ([cs2-css-inventory-simulator#150][invsim-pets]).
 - **`charges`** is *deliberately absent*. Upstream uses it to make graffiti a
   consumable (50 sprays, then the item is gone); a missing `charges` is the
   plugin's "unlimited", which is what a loadout sandbox wants. That is also why
@@ -326,6 +332,7 @@ failure modes rather than cosmetic mismatches:
 
 [invsim]: https://github.com/ianlucas/cs2-ss2-inventory-simulator
 [invsim-css]: https://github.com/ianlucas/cs2-css-inventory-simulator
+[invsim-pets]: https://github.com/ianlucas/cs2-css-inventory-simulator/pull/150
 [authdocs]: https://docs.5stack.gg/plugins/backend#optional-forward-auth-at-the-ingress
 
 ## Development (in-cluster, via CodePier)

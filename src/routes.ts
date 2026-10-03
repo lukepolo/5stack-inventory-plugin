@@ -130,7 +130,7 @@ export const STICKY_QUERY_KEYS = ["team", "slot", "q", "origin", "sort", "cat", 
 // more: an old link that still carries one gets scrubbed on navigation instead of
 // trailing a key no screen owns.
 const DRAFT_KEYS = [
-  "wear", "seed", "st", "name", "charm",
+  "wear", "seed", "st", "name", "charm", "style", "stage",
   "s0", "s1", "s2", "s3", "s4", "s5",
   "p0", "p1", "p2", "p3", "p4",
 ] as const;
@@ -175,6 +175,10 @@ export interface Draft {
   stickers: (DraftAttach | null)[];
   patches: (number | null)[];
   charm: DraftCharm | null;
+  /** PETS only. null is the default (stock look / the pet's own stage), and
+   *  that is what an older link without the keys decodes to. */
+  style: number | null;
+  stage: number | null;
 }
 
 // Fields are joined with "_", NOT ".". Sticker offsets are signed decimals, so
@@ -201,6 +205,8 @@ export function encodeDraft(d: Draft, defaultWear: number): Record<string, strin
   if (d.seed !== 1) out.seed = String(d.seed);
   if (d.stattrak) out.st = "1";
   if (d.nametag.trim()) out.name = d.nametag.trim();
+  if (d.style != null) out.style = String(d.style);
+  if (d.stage != null) out.stage = String(d.stage);
 
   d.stickers.forEach((s, i) => {
     if (!s) return;
@@ -259,6 +265,13 @@ export function decodeDraft(
 
   const wear = parseNum(q.wear);
   const seed = parseNum(q.seed);
+  // Small whole numbers or nothing. The per-pet range (13 styles on a Catalana,
+  // 9 on a Silkie; which stages a pet has) is the editor's and the backend's to
+  // enforce — this only stops a mangled link carrying garbage that far.
+  const small = (raw: string | undefined, max: number) => {
+    const n = parseNum(raw);
+    return n !== null && Number.isInteger(n) && n >= 0 && n <= max ? n : null;
+  };
 
   return {
     // Clamped, not just parsed — ?wear=99 from a mangled link would otherwise
@@ -283,6 +296,8 @@ export function decodeDraft(
       return Number.isInteger(n) && n > 0 ? n : null;
     }),
     charm: parseCharm(q.charm),
+    style: small(q.style, 99),
+    stage: small(q.stage, 9),
   };
 }
 

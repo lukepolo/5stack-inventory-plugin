@@ -24,7 +24,7 @@ import {
   writeTypeCfg,
   type GamePluginState,
 } from "./panel.ts";
-import { buildInspectLink, type InspectSticker } from "./inspect.ts";
+import { buildInspectLink, type CS2BaseInventoryItem } from "./inspect.ts";
 import {
   getStickerMarkup,
   slotCount,
@@ -72,6 +72,7 @@ import {
   getGloves,
   getMusicKits,
   getCollectibles,
+  getPets,
   getCollections,
   getCollection,
   searchAttachments,
@@ -1681,6 +1682,7 @@ function catalogForSlot(slot: string) {
   if (slot === "agent") return { base: null, skins: getAgents() };
   if (slot === "musickit") return { base: null, skins: getMusicKits() };
   if (slot === "collectible") return { base: null, skins: getCollectibles() };
+  if (slot === "pet") return { base: null, skins: getPets() };
   // Spreads the sheet's facet metadata (groups, tints) alongside `skins` —
   // graffiti is the one catalog whose splits aren't in any item field.
   if (slot === "graffiti") return { base: null, ...getGraffiti() };
@@ -1924,6 +1926,9 @@ interface ItemRow {
   stattrak: boolean;
   stattrak_count?: number | null;
   nametag: string | null;
+  /** Pets only — see the column comments in schema.sql. null = the pet's default. */
+  style?: number | null;
+  upgrade_level?: number | null;
   stickers?: unknown[] | null;
   charm_id?: number | null;
   /** Placement plus the charm's own PATTERN. `seed` rides in the same jsonb as
@@ -2115,6 +2120,8 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     // re-bake treadmill every time a kill lands.
     stattrak_count: row.stattrak ? row.stattrak_count ?? 0 : 0,
     nametag: row.nametag,
+    style: row.style ?? null,
+    upgrade_level: row.upgrade_level ?? null,
     // Drives the "Recently added" sort. Emitted for every instance rather than
     // only when that sort is active: the client sorts in memory over the list it
     // already holds, so a field the row omits is a mode that silently does
@@ -2133,7 +2140,8 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers, charm_id, charm_offset, patches, origin, created_at
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level,
+              stickers, charm_id, charm_offset, patches, origin, created_at
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
@@ -2355,7 +2363,8 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
-  const { item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches } = request.body;
+  const { item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
+    request.body;
   if (typeof item_id !== "number" || !getItem(item_id)) {
     return reply.status(400).send({ error: "That item doesn't exist." });
   }
@@ -2369,7 +2378,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   // Scalars were going into the column unchecked and straight on into the feed
   // the CS2 server applies. cs2-lib knows each item's real float range, pattern
   // range and whether it can be StatTrak'd at all — see validateCraftAttrs.
-  const checked = validateCraftAttrs(item_id, { wear, seed, stattrak, nametag });
+  const checked = validateCraftAttrs(item_id, { wear, seed, stattrak, nametag, style, upgrade_level });
   if ("error" in checked) {
     return reply.status(400).send({ error: checked.error });
   }
@@ -2379,9 +2388,10 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   // nothing of its own to preserve.
   const linked = await linkAttachments(identity.steamId, { stickers, patches, charm_id, charm_offset }, null);
   const { rows } = await pool.query<ItemRow>(
-    `INSERT INTO inventory.owned_items (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)
-     RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
+    `INSERT INTO inventory.owned_items
+       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12)
+     RETURNING id, item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
     [
       identity.steamId, item_id,
       checked.clean.wear ?? null, checked.clean.seed ?? null,
@@ -2389,6 +2399,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
       normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null, charm_id ?? null,
       linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
       normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
+      checked.clean.style ?? null, checked.clean.upgrade_level ?? null,
     ],
   );
   return {
@@ -2423,7 +2434,8 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
       return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
     }
     const id = Number(request.params.id);
-    const { wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches } = request.body;
+    const { wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
+      request.body;
     const attachErr = checkAttachments(chk.rows[0].item_id, stickers, charm_id, patches);
     if (attachErr) {
       return reply.status(400).send({ error: attachErr });
@@ -2432,7 +2444,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
     // where a float gets dragged, and the row it writes is already equipped, so
     // an impossible value reaches the game server on the next poll rather than
     // waiting to be equipped.
-    const checked = validateCraftAttrs(chk.rows[0].item_id, { wear, seed, stattrak, nametag });
+    const checked = validateCraftAttrs(chk.rows[0].item_id, { wear, seed, stattrak, nametag, style, upgrade_level });
     if ("error" in checked) {
       return reply.status(400).send({ error: checked.error });
     }
@@ -2461,9 +2473,13 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
          stickers = CASE WHEN $7 THEN $8::jsonb ELSE stickers END,
          charm_id = CASE WHEN $9 THEN $10 ELSE charm_id END,
          charm_offset = CASE WHEN $9 THEN $11::jsonb ELSE charm_offset END,
-         patches = CASE WHEN $12 THEN $13::jsonb ELSE patches END
+         patches = CASE WHEN $12 THEN $13::jsonb ELSE patches END,
+         -- CASE, not COALESCE: null is a real answer for these two ("back to the
+         -- stock look"), so only a key the request never sent leaves them alone.
+         style = CASE WHEN $14 THEN $15::integer ELSE style END,
+         upgrade_level = CASE WHEN $16 THEN $17::integer ELSE upgrade_level END
        WHERE id = $1 AND steam_id = $2
-       RETURNING id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches`,
+       RETURNING id, item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
       [
         // `?? null` keeps the COALESCE contract: a key validateCraftAttrs left
         // unset is one the request never sent, and null means "leave it alone".
@@ -2474,6 +2490,8 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
         hasCharm, hasCharm ? charm_id ?? null : null,
         hasCharm && linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
         hasPatches, hasPatches && normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
+        "style" in checked.clean, checked.clean.style ?? null,
+        "upgrade_level" in checked.clean, checked.clean.upgrade_level ?? null,
       ],
     );
     if (!rows.length) {
@@ -2490,6 +2508,10 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
 // by the saved-instance route and the live draft route below. They MUST agree:
 // the whole point of previewing a draft is that what you inspect is what you
 // will get, so a second copy of this that drifts is worse than useless.
+//
+// Speaks cs2-lib's CS2BaseInventoryItem and nothing lower: ids are economy ids
+// (not kit indexes), stickers are keyed by slot and carry their schema, and the
+// wire format is cs2-lib-inspect's problem — see inspect.ts.
 function inspectLinkFor(
   itemId: number,
   row: {
@@ -2504,57 +2526,66 @@ function inspectLinkFor(
     // seed included, or "Inspect in game" on an UNSAVED craft would drop the
     // charm pattern the user just set and show 0.
     charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+    style?: number | null;
+    upgrade_level?: number | null;
   },
 ): string | null {
   const item = getItem(itemId);
   if (!item || item.def == null) return null;
 
-  // Agents carry patches through the sticker slots, same as the equipped feed.
-  const isAgent = item.type === "agent";
-  const attachments = normSpecs(isAgent ? row.patches : row.stickers);
-  const stickers: InspectSticker[] = [];
-  attachments.forEach((spec, slot) => {
-    if (!spec) return;
-    const kit = getItem(spec.id)?.index;
-    if (kit == null) return;
-    stickers.push({
-      slot: isAgent ? slot : stickerSchemaFor(itemId, slot),
-      id: kit as number,
-      wear: spec.w ?? null,
-      offsetX: spec.x ?? null,
-      offsetY: spec.y ?? null,
-      rotation: spec.r ?? null,
-    });
-  });
+  const base: CS2BaseInventoryItem = {
+    id: itemId,
+    wear: row.wear ?? undefined,
+    seed: row.seed ?? undefined,
+    statTrak: row.stattrak ? clampCount(row.stattrak_count) : undefined,
+    nameTag: row.nametag || undefined,
+    style: row.style ?? undefined,
+    upgradeLevel: row.upgrade_level ?? undefined,
+  };
 
-  const keychains: InspectSticker[] = [];
-  const charm = row.charm_id != null ? getItem(row.charm_id) : null;
-  if (charm?.index != null) {
-    const charmOffset = normCharmOffset(row.charm_offset);
-    keychains.push({
-      slot: 0,
-      id: charm.index as number,
-      // Must match what the equipped feed sends as `keychains[].sticker`, or
-      // the slab you inspect is not the slab the server puts on the gun.
-      wrappedSticker: charm.stickerIndex ?? null,
-      offsetX: charmOffset?.x ?? null,
-      offsetY: charmOffset?.y ?? null,
-      offsetZ: charmOffset?.z ?? null,
-      pattern: charmOffset?.seed ?? CHARM_LIMITS.seedMin,
+  // Agents carry patches, which cs2-lib keys by slot with the bare patch id.
+  if (item.type === "agent") {
+    const patches: Record<number, number> = {};
+    normSpecs(row.patches).forEach((spec, slot) => {
+      if (spec) patches[slot] = spec.id;
     });
+    if (Object.keys(patches).length) base.patches = patches;
+  } else {
+    const stickers: NonNullable<CS2BaseInventoryItem["stickers"]> = {};
+    normSpecs(row.stickers).forEach((spec, slot) => {
+      if (!spec || getItem(spec.id) == null) return;
+      stickers[slot] = {
+        id: spec.id,
+        // The anchor it is drawn on — the fifth sticker on a four-anchor body
+        // shares anchor 0, and that is what the game must be told.
+        schema: stickerSchemaFor(itemId, slot),
+        wear: spec.w ?? undefined,
+        x: spec.x ?? undefined,
+        y: spec.y ?? undefined,
+        rotation: spec.r ?? undefined,
+      };
+    });
+    if (Object.keys(stickers).length) base.stickers = stickers;
   }
 
-  return buildInspectLink({
-    defindex: item.def as number,
-    paintindex: (item.index as number | undefined) ?? 0,
-    paintseed: row.seed ?? 0,
-    paintwear: row.wear ?? 0,
-    stattrak: row.stattrak ?? false,
-    killeatervalue: row.stattrak ? row.stattrak_count ?? 0 : null,
-    nametag: row.nametag ?? null,
-    stickers,
-    keychains,
-  });
+  if (row.charm_id != null && getItem(row.charm_id) != null) {
+    const charmOffset = normCharmOffset(row.charm_offset);
+    // A Sticker Slab's displayed sticker is derived by cs2-lib-inspect from the
+    // charm's own economy entry — the same `displayedSticker` the equipped feed
+    // sends as `keychains[].sticker`, so the slab you inspect is the slab the
+    // server puts on the gun.
+    base.keychains = {
+      0: {
+        id: row.charm_id,
+        x: charmOffset?.x ?? undefined,
+        y: charmOffset?.y ?? undefined,
+        z: charmOffset?.z ?? undefined,
+        seed: charmOffset?.seed ?? CHARM_LIMITS.seedMin,
+      },
+    };
+  }
+
+  return buildInspectLink(base);
 }
 
 const clampCount = (n: unknown): number =>
@@ -2589,6 +2620,8 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inspect/preview", async (request, rep
     patches: b.patches,
     charm_id: b.charm_id,
     charm_offset: b.charm_offset,
+    style: b.style,
+    upgrade_level: b.upgrade_level,
   });
   if (!link) {
     return reply.status(400).send({ error: "That item can't be expressed as an inspect link." });
@@ -2604,7 +2637,7 @@ app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request
     return reply.status(401).send({ error: "unauthorized" });
   }
   const { rows } = await pool.query<ItemRow & { stattrak_count: number | null }>(
-    `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, stickers,
+    `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers,
             charm_id, charm_offset, patches
      FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
     [Number(request.params.id), identity.steamId],
@@ -2718,6 +2751,8 @@ app.get("/api/loadout", async (request, reply) => {
     stattrak: boolean;
     stattrak_count: number;
     nametag: string | null;
+    style: number | null;
+    upgrade_level: number | null;
   }>(
     `SELECT l.team, l.slot, l.item_instance_id,
        (l.item_instance_id IS NOT NULL) AS skinned,
@@ -2728,7 +2763,9 @@ app.get("/api/loadout", async (request, reply) => {
        -- Only owned instances carry a count; loadout defaults have no such
        -- column, so an unskinned StatTrak default reads 0.
        COALESCE(i.stattrak_count, 0)    AS stattrak_count,
-       COALESCE(i.nametag, l.nametag)   AS nametag
+       COALESCE(i.nametag, l.nametag)   AS nametag,
+       -- Pets only, and only on instances: a loadout row has no such columns.
+       i.style, i.upgrade_level
      FROM inventory.loadout l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
      WHERE l.steam_id = $1`,
@@ -2749,7 +2786,7 @@ app.get("/api/loadout", async (request, reply) => {
 // Over there it is one `legal_slot` CTE cleaning BOTH slot-bearing tables
 // (inventory.loadout and the presets' parked rows), so adding a slot here is
 // still exactly one list to edit there.
-const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti|collectible)$/;
+const SLOT_RE = /^(sp|p[1-4]|m[1-5]|r[1-5]|knife|gloves|agent|zeus|c4|musickit|graffiti|collectible|pet)$/;
 const START_PISTOLS = new Set(["glock", "usp_silencer", "hkp2000"]);
 function slotCategories(slot: string): string[] | null {
   if (slot === "sp" || /^p[1-4]$/.test(slot)) {
@@ -2839,6 +2876,10 @@ async function resolveEquip(
   } else if (slot === "collectible") {
     if (item.type !== "collectible") {
       return { error: `${item.name} isn't a pin or a medal.` };
+    }
+  } else if (slot === "pet") {
+    if (item.type !== "pet") {
+      return { error: `${item.name} isn't a pet.` };
     }
   } else if (slot === "agent") {
     if (item.type !== "agent") {
@@ -3429,7 +3470,8 @@ app.get<{ Params: { steamId: string }; Querystring: { preset?: string } }>(
   const { rows } = await pool.query<{
     team: string; slot: string; item_id: number | null; skinned: boolean;
     wear: number | null; seed: number | null; stattrak: boolean; stattrak_count: number;
-    nametag: string | null; stickers: unknown[] | null; patches: unknown[] | null;
+    nametag: string | null; style: number | null; upgrade_level: number | null;
+    stickers: unknown[] | null; patches: unknown[] | null;
     charm_id: number | null; charm_offset: ItemRow["charm_offset"];
   }>(
     `SELECT l.team, l.slot,
@@ -3440,6 +3482,7 @@ app.get<{ Params: { steamId: string }; Querystring: { preset?: string } }>(
        -- Same as /api/loadout: only owned instances carry a count.
        COALESCE(i.stattrak_count, 0) AS stattrak_count,
        COALESCE(i.nametag, l.nametag) AS nametag,
+       i.style, i.upgrade_level,
        -- Attachments are i.* with no COALESCE: inventory.loadout has no columns
        -- for them, so a free default weapon simply has none. Selecting these at
        -- all is the fix for a viewer seeing a bare gun where the owner had five
@@ -3498,11 +3541,13 @@ app.post<{ Params: { steamId: string } }>(
     const { rows } = await pool.query<{
       team: string; slot: string; base_item_id: number | null; item_id: number | null;
       wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+      style: number | null; upgrade_level: number | null;
       stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
       charm_offset: AttachBody["charm_offset"];
     }>(
       `SELECT l.team, l.slot, l.item_id AS base_item_id, i.item_id, i.wear, i.seed,
-              i.stattrak, i.nametag, i.stickers, i.patches, i.charm_id, i.charm_offset
+              i.stattrak, i.nametag, i.style, i.upgrade_level,
+              i.stickers, i.patches, i.charm_id, i.charm_offset
        FROM inventory.loadout l
        LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
        WHERE l.steam_id = $1`,
@@ -3555,14 +3600,16 @@ app.post<{ Params: { steamId: string } }>(
         );
         const { rows: inserted } = await pool.query<{ id: string }>(
           `INSERT INTO inventory.owned_items
-             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, charm_offset, origin)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10::jsonb,'copied') RETURNING id`,
+             (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, charm_offset,
+              style, upgrade_level, origin)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10::jsonb,$11,$12,'copied') RETURNING id`,
           [
             identity.steamId, row.item_id, row.wear, row.seed, row.stattrak, row.nametag,
             normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null,
             normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
             row.charm_id,
             linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
+            row.style, row.upgrade_level,
           ],
         );
         await pool.query(
@@ -6371,6 +6418,12 @@ interface EquippedItem {
   stickers?: { def: number; slot: number; schema?: number; wear: number; x?: number; y?: number; rotation?: number }[];
   keychains?: { def: number; seed: number; slot: number; sticker?: number; x?: number; y?: number; z?: number }[];
   musicId?: number;
+  /** Pets: the breed's variant index — the plugin's "pet id" attribute. */
+  petId?: number;
+  /** Pets: material group 1..styleCount; omitted for the stock look. */
+  style?: number;
+  /** Pets: 0 egg, 1 chick, 2 pullet, 3 hen. */
+  upgradeLevel?: number;
   tint?: number;
   uid?: number;
   hash?: string;
@@ -6445,13 +6498,16 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     stattrak: boolean;
     stattrak_count: number | null;
     nametag: string | null;
+    style: number | null;
+    upgrade_level: number | null;
     stickers: unknown[] | null;
     patches: unknown[] | null;
     charm_id: number | null;
     charm_offset: { x?: number; y?: number; z?: number; seed?: number } | null;
   }>(
     `SELECT l.team, l.slot, i.id AS uid, i.item_id, i.wear, i.seed, i.stattrak,
-            i.stattrak_count, i.nametag, i.stickers, i.patches, i.charm_id, i.charm_offset
+            i.stattrak_count, i.nametag, i.style, i.upgrade_level,
+            i.stickers, i.patches, i.charm_id, i.charm_offset
      FROM inventory.loadout l
      JOIN inventory.owned_items i ON i.id = l.item_instance_id
      WHERE l.steam_id = $1`,
@@ -6471,6 +6527,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     knives: {} as Record<string, EquippedItem>,
     musicKit: undefined as EquippedItem | undefined,
     graffiti: undefined as EquippedItem | undefined,
+    pet: undefined as EquippedItem | undefined,
   };
 
   for (const row of equippedRows) {
@@ -6517,6 +6574,22 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
       // Pins and medals carry nothing but their defindex — no paint, no wear,
       // no uid to increment. The plugin hangs it off the player as-is.
       out.collectible = hashed({ def: item.def as number | undefined });
+    } else if (row.slot === "pet") {
+      // Field for field what upstream's generate() sends and the plugin's
+      // InventoryItem reads (cs2-css-inventory-simulator#150): `petId` becomes
+      // the "pet id" attribute, and with it present `seed` is written as "pet
+      // seed" instead of a paint seed. The stage ALWAYS goes out — the plugin
+      // deploys a pet whose level is unset as a grown one, so an egg has to say
+      // it is an egg. Style is the one left off when unset (the stock look).
+      out.pet = hashed({
+        def: item.def as number | undefined,
+        nametag,
+        petId: item.index as number | undefined,
+        seed: row.seed ?? (item.seedMin as number | undefined) ?? 1,
+        style: row.style ?? undefined,
+        uid,
+        upgradeLevel: row.upgrade_level ?? (item.defaultUpgradeLevel as number | undefined),
+      });
     } else if (row.slot === "graffiti") {
       out.graffiti = hashed({
         def: item.index as number | undefined,

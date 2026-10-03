@@ -99,6 +99,14 @@ export interface Skin {
   tintName?: string;
   /** MUSIC KITS only: the kit's menu theme, ready to play. See `CatalogItem`. */
   audio?: string | null;
+  /** PETS only: how many alternate looks the breed has (0 for the egg and the
+   *  chick). Style 1..styleCount; unset is the stock look. */
+  styleCount?: number;
+  /** PETS only: the life stages it can be set to — 0 egg, 1 chick, 2 pullet,
+   *  3 hen. One entry means there is nothing to choose. */
+  upgradeLevels?: number[];
+  /** PETS only: what an unset stage resolves to (a hen, for a breed). */
+  defaultUpgradeLevel?: number;
 }
 
 /** Facet metadata a catalog can ship next to its skins, for the values the
@@ -162,6 +170,16 @@ export interface CatalogItem {
    * transport is never rendered against a track that cannot load.
    */
   audio?: string | null;
+  /** The egg is the one pet that cannot be named. */
+  hasNameTag?: boolean;
+  /** PETS only: how many alternate looks the breed has (0 for the egg and the
+   *  chick). Style 1..styleCount; unset is the stock look. */
+  styleCount?: number;
+  /** PETS only: the life stages it can be set to — 0 egg, 1 chick, 2 pullet,
+   *  3 hen. One entry means there is nothing to choose. */
+  upgradeLevels?: number[];
+  /** PETS only: what an unset stage resolves to (a hen, for a breed). */
+  defaultUpgradeLevel?: number;
 }
 
 export interface LoadoutEntry {
@@ -181,6 +199,9 @@ export interface LoadoutEntry {
   stattrak: boolean;
   stattrak_count: number;
   nametag: string | null;
+  /** PETS only — see InventoryItem.style. */
+  style?: number | null;
+  upgrade_level?: number | null;
   item: CatalogItem | null;
   // NO price here. It rode on this type briefly and was never set: slot values
   // come from /inventory/prices, keyed TEAM:slot, so the loadout paints before
@@ -226,6 +247,10 @@ export interface InventoryItem {
    *  3D digit display only — 2D cards render a blank display on purpose. */
   stattrak_count: number;
   nametag: string | null;
+  /** PETS only. Material group 1..styleCount; null is the stock look. */
+  style?: number | null;
+  /** PETS only. Life stage; null is the pet's default (a hen, for a breed). */
+  upgrade_level?: number | null;
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
   charm?: PlacedCharm;
@@ -778,6 +803,8 @@ export const craftItem = (body: {
   seed?: number | null;
   stattrak?: boolean;
   nametag?: string | null;
+  style?: number | null;
+  upgrade_level?: number | null;
   stickers?: AttachSpec[];
   patches?: AttachSpec[];
   charm_id?: number | null;
@@ -795,6 +822,8 @@ export const updateInstance = (
     seed?: number | null;
     stattrak?: boolean;
     nametag?: string | null;
+    style?: number | null;
+    upgrade_level?: number | null;
     stickers?: AttachSpec[];
     patches?: AttachSpec[];
     charm_id?: number | null;
@@ -1390,6 +1419,8 @@ export const fetchDraftInspectLink = (body: {
   /** Kills for the StatTrak module. Comes off the owned row, not the form. */
   stattrak_count?: number | null;
   nametag?: string | null;
+  style?: number | null;
+  upgrade_level?: number | null;
   stickers?: AttachSpec[];
   patches?: AttachSpec[];
   charm_id?: number | null;

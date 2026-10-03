@@ -120,6 +120,18 @@ export interface CatalogSkin {
   wearMax?: number;
   seedMin?: number;
   seedMax?: number;
+  // ---- pets only --------------------------------------------------------------
+  /** How many alternate looks (material groups) the breed has; 0 for the egg and
+   *  the chick, which have none. Style 1..styleCount, unset = the stock look. */
+  styleCount?: number;
+  /** The life stages this pet can be set to (0 egg, 1 chick, 2 pullet, 3 hen).
+   *  One entry means there is nothing to choose. */
+  upgradeLevels?: number[];
+  /** What an unset stage resolves to — the last entry, a hen for a breed. */
+  defaultUpgradeLevel?: number;
+  /** The egg cannot be named; every other pet can. Pets only here — getItem
+   *  answers it for every item. */
+  hasNameTag?: boolean;
 }
 
 /**
@@ -415,6 +427,45 @@ export function getCollectibles(): CatalogSkin[] {
       image: img(c.imagePath),
       type: c.type,
       def: c.definitionIndex,
+    }));
+}
+
+/**
+ * The facts the craft editor needs about a pet, spread into both the listing
+ * and getItem — a pet opened from the armory and one opened from your inventory
+ * must offer the same controls.
+ */
+function petFacts(
+  i: (typeof items)[number],
+): Pick<CatalogSkin, "styleCount" | "upgradeLevels" | "defaultUpgradeLevel" | "hasNameTag"> {
+  if (!i.isPet()) return {};
+  return {
+    styleCount: i.getStyleCount(),
+    upgradeLevels: i.getUpgradeLevels(),
+    defaultUpgradeLevel: i.getDefaultUpgradeLevel(),
+    hasNameTag: i.hasNameTag(),
+  };
+}
+
+// Pets — the chicken that follows you around at round start. One per player
+// (the game's own `pet` loadout slot), so there is no team split. A pet has a
+// seed (1..100,000, which the game reads as a variation pattern, not a paint
+// seed), a style on the breeds, a life stage and a name tag on all but the egg.
+// No float, no StatTrak — cs2-lib answers both false and validateCraftAttrs
+// drops them.
+export function getPets(): CatalogSkin[] {
+  return items
+    .filter((i) => i.isPet())
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      rarity: p.rarityColor as string,
+      image: img(p.imagePath),
+      type: p.type,
+      def: p.definitionIndex,
+      model: p.modelKey ?? null,
+      ...wearRange(p),
+      ...petFacts(p),
     }));
 }
 
@@ -821,6 +872,9 @@ export function getItemsByIds(ids: number[]): (CatalogSkin & {
       image: img(i.imagePath),
       paintMaterial: i.materialPath ?? null,
       legacyPaint: !!i.isLegacyModel,
+      // A shared craft link rehydrates through here too, so a pet needs its
+      // style count and stages or the editor offers it no controls.
+      ...petFacts(i),
       model: (i.modelKey as string) ?? null,
       type: i.type as string,
       // Every other catalog projection carries it, and this one dropping it was
@@ -1406,6 +1460,12 @@ export function getItem(id: number) {
       tintName: i.type === "graffiti" ? /\(([^()]+)\)\s*$/.exec(i.name)?.[1] : undefined,
       paintMaterial: i.materialPath ?? null,
       legacyPaint: !!i.isLegacyModel,
+      // Pets only: style count and life stages — the same facts the listing
+      // carries (petFacts), spelled out because a spread of optional keys does
+      // not survive the union collectionFacet makes of this object's type.
+      styleCount: petFacts(i).styleCount,
+      upgradeLevels: petFacts(i).upgradeLevels,
+      defaultUpgradeLevel: petFacts(i).defaultUpgradeLevel,
       // Music kits only. This is the resolver every OWNED instance comes
       // through, so without it a kit would preview in the picker (which reads
       // the catalog listing) and fall silent the moment it was yours.
@@ -1454,6 +1514,11 @@ export interface CraftAttrs {
   seed?: number | null;
   stattrak?: boolean | null;
   nametag?: string | null;
+  /** Pets. null is a VALUE here — "the stock look" / "the default stage" — so,
+   *  unlike the scalars above, a cleaned null is written, and only a key the
+   *  request never sent is left alone. */
+  style?: number | null;
+  upgrade_level?: number | null;
 }
 export function validateCraftAttrs(
   itemId: number,
@@ -1529,6 +1594,25 @@ export function validateCraftAttrs(
       };
     }
     clean.nametag = tag ?? null;
+  }
+
+  // Pets. Same drop-don't-reject rule as above for an item without the
+  // attribute; cs2-lib's own validators for the range, since the game reads
+  // both straight off the econ item (style picks a material group by name, the
+  // stage picks the model).
+  if (attrs.style !== undefined && item.hasStyle()) {
+    if (attrs.style !== null && !CS2Economy.safeValidateStyle(attrs.style, item)) {
+      return { error: `${item.name} comes in styles 1 to ${item.getStyleCount()}.` };
+    }
+    clean.style = attrs.style;
+  }
+  if (attrs.upgrade_level !== undefined && item.hasUpgradeLevel()) {
+    if (attrs.upgrade_level !== null && !CS2Economy.safeValidateUpgradeLevel(attrs.upgrade_level, item)) {
+      return { error: `${item.name} can't be raised to that stage.` };
+    }
+    // The pet's own default is stored as "unset", the way upstream does it, so a
+    // later cs2-lib that moves the default carries every untouched pet with it.
+    clean.upgrade_level = attrs.upgrade_level === item.getDefaultUpgradeLevel() ? null : attrs.upgrade_level;
   }
 
   return { clean };
@@ -1680,6 +1764,9 @@ export function slotForItem(id: number): string | null {
   }
   if (i.type === "collectible") {
     return "collectible";
+  }
+  if (i.type === "pet") {
+    return "pet";
   }
   if (i.type === "weapon" && i.category === "c4") {
     return "c4";

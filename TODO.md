@@ -16,7 +16,7 @@ the *other way*; the workaround was typing a `-` in front of every ROT value.
 Two separate defects were behind it, both fixed 2026-08-05:
 
 1. **The viewer turned stickers the wrong way.** The stored number is CS2's — it
-   rides the equipped v5 feed and `buildInspectHex` straight to the game — so the
+   rides the equipped v5 feed and `buildInspectLink` straight to the game — so the
    fix is in the render, not the value: `STICKER_ROT_SIGN = -1` in `viewer3d.ts`,
    applied at both the UV cut and the legacy projector, with the drag delta
    negated so the gesture still turns a sticker the same way on screen.
@@ -227,3 +227,32 @@ verification rather than known breakage:
    has no nginx at all) — a 206 with `Content-Range` from each, not a 200.
 3. The other tracks and the graffiti/pin flat presentation from
    `ideas/inventory-music-kit-preview.md` are untouched and stay parked.
+
+---
+
+## Pets: 3D
+
+**Status: deliberately deferred — pets ship as their flat econ icon.**
+
+The slot, the craft attributes (pattern, style, stage, name tag), the equipped
+v5 `pet` entry and the inspect link all landed with cs2-lib 9.5.0. What did not
+is a 3D form: `isNo3d` lists `pet`, and `viewerModel.ts` has no `pet` case, so
+every surface takes the same flat path a pin or a music kit does.
+
+What a 3D pet needs, from what cs2-lib already says:
+
+- **Models.** `modelKey` names them — `models/chicken/egg_pristine`,
+  `models/chicken/chick`, and one per breed (`chicken`, `chicken_silkie`,
+  `chicken_polish`). Nothing in `scripts/extract-models.sh` pulls them yet.
+- **Style is a material group, not a texture swap.** The game plugin sets
+  `m_materialGroup` on the chicken's skeleton to the string token of the style
+  number (`"5"`), so the extraction has to keep every material group of the
+  vmdl, not only the default one. Style null = the default group.
+- **Stage may change the model on a breed.** cs2-lib gives each breed ONE
+  `modelKey`, but a pullet (stage 2) and a hen (stage 3) are different growth
+  stages in game — unverified whether they share a mesh, so check which vmdl a
+  pullet uses before assuming the breed's `modelKey` covers both.
+- **The icons are already handled.** `build-asset-manifest.mjs` takes every
+  cs2-lib `imagePath`, so the next extraction run fetches the `chicken_*` econ
+  icons with no change — a mount extracted before cs2-lib 9.5.0 shows the pet
+  cells blank until then.
