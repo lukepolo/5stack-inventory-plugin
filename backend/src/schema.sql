@@ -23,6 +23,11 @@ ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS stattrak_count intege
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'crafted'; -- crafted | steam | copied
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS steam_asset_id text; -- Steam asset id for import dedupe
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS charm_offset jsonb;  -- {x,y,z} keychain placement
+-- Pets only. Both null means "the pet's default", which is NOT the same as a
+-- value: a null style is the breed's stock look, and a null upgrade_level is the
+-- last stage the pet can reach (a hen for a breed). cs2-lib resolves both.
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS style integer;         -- material group, 1..styleCount
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS upgrade_level integer; -- 0 egg, 1 chick, 2 pullet, 3 hen
 CREATE UNIQUE INDEX IF NOT EXISTS owned_items_steam_asset_idx
   ON inventory.owned_items (steam_id, steam_asset_id) WHERE steam_asset_id IS NOT NULL;
 
@@ -162,7 +167,7 @@ WITH legal_slot (slot) AS (
          ('m1'),('m2'),('m3'),('m4'),('m5'),
          ('r1'),('r2'),('r3'),('r4'),('r5'),
          ('knife'),('gloves'),('agent'),('zeus'),('c4'),
-         ('musickit'),('graffiti'),('collectible')
+         ('musickit'),('graffiti'),('collectible'),('pet')
 ), live AS (
   DELETE FROM inventory.loadout
    WHERE slot NOT IN (SELECT slot FROM legal_slot)

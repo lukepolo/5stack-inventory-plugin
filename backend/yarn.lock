@@ -51,15 +51,29 @@
     "@fastify/forwarded" "^3.0.0"
     ipaddr.js "^2.1.0"
 
-"@ianlucas/cs2-lib@^9.4.0":
-  version "9.4.0"
-  resolved "https://registry.npmjs.org/@ianlucas/cs2-lib/-/cs2-lib-9.4.0.tgz"
-  integrity sha512-zpXzT1JK/fwFJgISFj8SfVo2EH6467UV5XFloUepmBIxdmttN4kNPb3oHb4JBE25blQOY9om1qjfE8CMp9vcjg==
+"@ianlucas/cs2-lib-inspect@^9.5.0":
+  version "9.5.0"
+  resolved "https://registry.npmjs.org/@ianlucas/cs2-lib-inspect/-/cs2-lib-inspect-9.5.0.tgz"
+  integrity sha512-xwxa5Fkfdl/s/2yxOv8ezyAHKBn4AQPY9k2pn7rVmXcgGqdH5WLJ6scADqaCeRez0GCK6iv9DzjzJ9RfkQbipg==
+  dependencies:
+    "@protobuf-ts/runtime" "^2.11.1"
+    buffer "^6.0.3"
+    crc-32 "^1.2.2"
+
+"@ianlucas/cs2-lib@^9.5.0":
+  version "9.5.0"
+  resolved "https://registry.npmjs.org/@ianlucas/cs2-lib/-/cs2-lib-9.5.0.tgz"
+  integrity sha512-2+H4xs5O33dP7F5tqdnx32GjdFNjOD8k1DZe/upB7OFVEGzsaL2WVVK1+C4CKdBNcv9s6WE20b9UldA5wLeTuQ==
 
 "@pinojs/redact@^0.4.0":
   version "0.4.0"
   resolved "https://registry.npmjs.org/@pinojs/redact/-/redact-0.4.0.tgz"
   integrity sha512-k2ENnmBugE/rzQfEcdWHcCY+/FM3VLzH9cYEsbdsoqrvzAKRhUZeRNhAZvB8OitQJ1TBed3yqWtdjzS6wJKBwg==
+
+"@protobuf-ts/runtime@^2.11.1":
+  version "2.11.1"
+  resolved "https://registry.npmjs.org/@protobuf-ts/runtime/-/runtime-2.11.1.tgz"
+  integrity sha512-KuDaT1IfHkugM2pyz+FwiY80ejWrkH1pAtOBOZFuR6SXEFTsnb/jiQWQ1rCIrcKx2BtyxnxW6BWwsVSA/Ie+WQ==
 
 "@types/node@*", "@types/node@^24.19.0":
   version "24.19.0"
@@ -117,10 +131,28 @@ avvio@^9.0.0:
     "@fastify/error" "^4.0.0"
     fastq "^1.17.1"
 
+base64-js@^1.3.1:
+  version "1.5.1"
+  resolved "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz"
+  integrity sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==
+
+buffer@^6.0.3:
+  version "6.0.3"
+  resolved "https://registry.npmjs.org/buffer/-/buffer-6.0.3.tgz"
+  integrity sha512-FTiCpNxtwiZZHEZbcbTIcZjERVICn9yq/pDFkTl95/AxzD1naBctN7YO68riM/gLSDY7sdrMby8hofADYuuqOA==
+  dependencies:
+    base64-js "^1.3.1"
+    ieee754 "^1.2.1"
+
 cookie@^1.0.1:
   version "1.1.1"
   resolved "https://registry.npmjs.org/cookie/-/cookie-1.1.1.tgz"
   integrity sha512-ei8Aos7ja0weRpFzJnEA9UHJ/7XQmqglbRwnf2ATjcB9Wq874VKH9kfjjirM6UhU2/E5fFYadylyhFldcqSidQ==
+
+crc-32@^1.2.2:
+  version "1.2.2"
+  resolved "https://registry.npmjs.org/crc-32/-/crc-32-1.2.2.tgz"
+  integrity sha512-ROmzCKrTnOwybPcJApAA6WBWij23HVfGVNKqqrZpuyZOHqK2CwHSvpGuyt/UNNvaIjEd8X5IFGp4Mh+Ie1IHJQ==
 
 dequal@^2.0.3:
   version "2.0.3"
@@ -207,6 +239,11 @@ find-my-way@^9.6.0:
     fast-deep-equal "^3.1.3"
     fast-querystring "^1.0.0"
     safe-regex2 "^5.0.0"
+
+ieee754@^1.2.1:
+  version "1.2.1"
+  resolved "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz"
+  integrity sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==
 
 ipaddr.js@^2.1.0:
   version "2.4.0"

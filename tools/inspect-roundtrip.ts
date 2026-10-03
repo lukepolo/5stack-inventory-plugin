@@ -11,15 +11,31 @@
 // lands in unknown-fields and is silently dropped). Reading the encoder cannot
 // tell those apart. Decoding the bytes we actually emit can.
 //
-// This decodes with a generic protobuf reader that knows nothing about our
-// writer, so it cannot inherit the writer's assumptions.
-import { buildInspectHex } from "../backend/src/inspect.ts";
+// The encoder is @ianlucas/cs2-lib-inspect now, not ours — which makes this
+// MORE worth running, not less: what it checks is that our rows reach the wire
+// through buildInspectLink's adapter (repair, the rotation restore, the slab's
+// displayed sticker), and that a library bump has not changed what lands there.
+//
+// This decodes with a generic protobuf reader that knows nothing about the
+// encoder, so it cannot inherit the encoder's assumptions.
+import { buildInspectLink } from "../backend/src/inspect.ts";
 // From catalog.ts, not main.ts: main boots a Fastify server on import. This is
-// the same function the craft save, the equipped v5 feed and buildInspectHex all
-// run every rotation through.
+// the same function the craft save, the equipped v5 feed and the inspect link
+// all run every rotation through. Importing it also loads the economy.
 import { normStickerRotation } from "../backend/src/catalog.ts";
 
-const F_KEYCHAINS = 20;
+// Economy ids, not kit indexes: the adapter speaks cs2-lib's own item shape.
+const AK47_REDLINE = 222;
+const STICKER_RUSH_ATL17 = 3548; // sticker kit 1847
+const SLAB_RUSH_ATL17 = 17144; // keychain 37, displays sticker kit 1847
+const PET_CATALANA = 28163; // petindex 3, 13 styles
+const PET_EGG = 28161; // petindex 1, upgrade level 0 only
+
+const F = {
+  paintindex: 4, paintseed: 8, customnames: 11, stickers: 12, petindex: 19,
+  keychains: 20, style: 21, variations: 22, upgrade_level: 23,
+} as const;
+const F_KEYCHAINS = F.keychains;
 // Deliberately a SECOND, independent copy of the wire numbers — importing
 // inspect.ts's own map would make this test agree with the encoder by
 // construction and prove nothing. Keep the literals.
@@ -68,35 +84,41 @@ const check = (name: string, ok: boolean, detail = "") => {
   if (!ok) failures++;
 };
 
+/**
+ * The protobuf body of a link: hex after the steam:// prefix (or the bare
+ * console command cs2-lib-inspect falls back to past the launch-length limit),
+ * minus the leading mask byte and the trailing CRC — the same way a client
+ * strips it before parsing.
+ */
+function body(link: string | null): Uint8Array {
+  if (!link) throw new Error("no link — buildInspectLink refused the item");
+  const hex = link.replace(/^.*csgo_econ_action_preview(%20| )/, "");
+  const bytes = Uint8Array.from((hex.match(/../g) ?? []).map((h) => parseInt(h, 16)));
+  const mask = bytes[0];
+  return bytes.slice(1, bytes.length - 4).map((b) => b ^ mask);
+}
+
 // Values chosen to be distinguishable: a real AK-47 anchor, and a z that would
 // be mangled by any accidental int truncation.
 const OFF = { x: 8.567, y: 0.733, z: 2.24 };
 
-const hex = buildInspectHex({
-  defindex: 7, paintindex: 1023, paintseed: 67, paintwear: 0.0001,
-  stattrak: true, killeatervalue: 0, nametag: "5stuck Sc Test",
-  stickers: [],
-  // wrappedSticker set because a Sticker Slab is 11,144 of the 11,224 charms:
-  // `id` alone picks the blank hanger, and the slab's art rides field 12.
-  keychains: [{ slot: 0, id: 14290, wrappedSticker: 1847, offsetX: OFF.x, offsetY: OFF.y, offsetZ: OFF.z, pattern: 0 }],
+const link = buildInspectLink({
+  id: AK47_REDLINE, wear: 0.15, seed: 67, statTrak: 0, nameTag: "5stuck Sc Test",
+  // A Sticker Slab is 11,144 of the 11,224 charms: its id alone picks the blank
+  // hanger, and the slab's art rides field 12, derived from the economy entry.
+  keychains: { 0: { id: SLAB_RUSH_ATL17, x: OFF.x, y: OFF.y, z: OFF.z, seed: 1 } },
 });
+const unmaskedBody = body(link);
 
-// buildInspectHex returns the payload as hex; strip the leading mask byte and
-// the trailing CRC the same way a client would before parsing.
-const bytes = Uint8Array.from((hex.match(/../g) ?? []).map((h) => parseInt(h, 16)));
-const mask = bytes[0];
-const unmasked = bytes.slice(1).map((b) => b ^ mask);
-const body = unmasked.slice(0, unmasked.length - 4); // drop CRC
-
-console.log(`link payload: ${bytes.length} bytes, mask 0x${mask.toString(16)}\n`);
+console.log(`link: ${link?.slice(0, 48)}…\n`);
 
 let top: Field[] = [];
 try {
-  top = decode(body);
+  top = decode(unmaskedBody);
 } catch (e) {
   // The outer message is itself wrapped in one length-delimited field on some
   // builds; retry one level in before giving up.
-  const inner = decode(body.slice(0, body.length))[0];
+  const inner = decode(unmaskedBody.slice(0, unmaskedBody.length))[0];
   if (inner && inner.wire === 2) top = decode(inner.value as Uint8Array);
   else throw e;
 }
@@ -108,7 +130,7 @@ if (kc.length === 1) {
   const fields = decode(kc[0].value as Uint8Array);
   const byId = new Map(fields.map((f) => [f.field, f]));
 
-  check("keychain id survives", byId.get(SF.id)?.value === 14290, `got ${byId.get(SF.id)?.value}`);
+  check("keychain id survives", byId.get(SF.id)?.value === 37, `got ${byId.get(SF.id)?.value}`);
 
   // A VARINT here, unlike the offsets below — `optional uint32 wrapped_sticker
   // = 12`. Without it every Sticker Slab charm inspects as the same blank slab,
@@ -166,21 +188,21 @@ for (const [input, want, why] of [
         `got ${got} (${why})`);
 }
 
-// Straight through the encoder. `scale` is deliberately left null: the game
+// Straight through the encoder. `scale` is deliberately left unset: the game
 // treats an absent scale as the slot's authored one, and sending a 0 would
 // collapse the sticker to nothing.
-const rotHex = buildInspectHex({
-  defindex: 7, paintindex: 1023,
-  stickers: [{ slot: 0, id: 1847, rotation: normStickerRotation(286.5), offsetX: 0.0484, offsetY: 0.0292 }],
-});
-const rotBytes = Uint8Array.from((rotHex.match(/../g) ?? []).map((h) => parseInt(h, 16)));
-const rotMask = rotBytes[0];
-const rotBody = rotBytes.slice(1).map((b) => b ^ rotMask).slice(0, rotBytes.length - 5);
-const F_STICKERS = 12;
-const stick = decode(rotBody).filter((f) => f.field === F_STICKERS && f.wire === 2);
-check("sticker submessage present", stick.length === 1, `found ${stick.length}`);
-if (stick.length === 1) {
-  const f = new Map(decode(stick[0].value as Uint8Array).map((x) => [x.field, x])).get(SF.rotation);
+const stickerRotation = (r: number) => {
+  const stick = decode(body(buildInspectLink({
+    id: AK47_REDLINE,
+    stickers: { 0: { id: STICKER_RUSH_ATL17, rotation: r, x: 0.0484, y: 0.0292 } },
+  }))).filter((f) => f.field === F.stickers && f.wire === 2);
+  if (stick.length !== 1) return { count: stick.length };
+  return { count: 1, f: new Map(decode(stick[0].value as Uint8Array).map((x) => [x.field, x])).get(SF.rotation) };
+};
+const wrapped = stickerRotation(normStickerRotation(286.5));
+check("sticker submessage present", wrapped.count === 1, `found ${wrapped.count}`);
+if (wrapped.count === 1) {
+  const f = wrapped.f;
   if (!f) check("rotation present", false, "field absent — the game uses the slot's default angle");
   else {
     // Same trap as the offsets: a varint here lands in unknown-fields and the
@@ -190,6 +212,41 @@ if (stick.length === 1) {
           `got ${f.value}, want -73.5`);
   }
 }
+// cs2-lib validates rotation on a 0.5° grid; we store and send 0.1°. The link
+// must carry what the equipped feed carries, so the adapter puts the exact angle
+// back after validation — if it stops doing that, inspect and server disagree.
+const fine = stickerRotation(normStickerRotation(11.94)).f;
+check("off-grid rotation keeps its 0.1° precision", !!fine && Math.abs((fine.value as number) - 11.9) < 1e-3,
+      `got ${fine?.value}, want 11.9 (12 means cs2-lib's 0.5° snap leaked through)`);
+
+// ---- Pets --------------------------------------------------------------------
+//
+// A pet is not a skin: it has no paint index, its seed is the PATTERN of a
+// variation rather than a paint seed, and its life stage and look ride their
+// own fields. Every one of those mistakes inspects as a different chicken.
+console.log("");
+const pet = new Map(decode(body(buildInspectLink({
+  id: PET_CATALANA, seed: 4242, style: 5, upgradeLevel: 2, nameTag: "Nugget",
+}))).map((f) => [f.field, f]));
+check("pet index is the breed", pet.get(F.petindex)?.value === 3, `got ${pet.get(F.petindex)?.value}`);
+check("pet carries no paint index", !pet.has(F.paintindex));
+check("pet carries no paint seed", !pet.has(F.paintseed));
+check("pet style survives", pet.get(F.style)?.value === 5, `got ${pet.get(F.style)?.value}`);
+check("pet stage survives", pet.get(F.upgrade_level)?.value === 2, `got ${pet.get(F.upgrade_level)?.value}`);
+const variation = pet.get(F.variations);
+const pattern = variation?.wire === 2
+  ? new Map(decode(variation.value as Uint8Array).map((x) => [x.field, x])).get(SF.pattern)?.value
+  : undefined;
+check("pet seed rides the variation pattern", pattern === 4242, `got ${pattern}`);
+const name = pet.get(F.customnames);
+check("pet name survives",
+      name?.wire === 2 && new TextDecoder().decode(name.value as Uint8Array) === "Nugget");
+
+// The game deploys a pet whose level is unset as a grown one, so an egg must
+// always say it is an egg — upgrade_level 0, present, not omitted.
+const egg = new Map(decode(body(buildInspectLink({ id: PET_EGG }))).map((f) => [f.field, f]));
+check("egg says it is an egg", egg.get(F.upgrade_level)?.value === 0,
+      egg.has(F.upgrade_level) ? `got ${egg.get(F.upgrade_level)?.value}` : "field absent");
 
 console.log(`\n${failures ? `${failures} FAILED` : "all checks passed"}`);
 process.exit(failures ? 1 : 0);

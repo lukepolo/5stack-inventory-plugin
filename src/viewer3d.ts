@@ -5221,7 +5221,7 @@ async function buildViewer(
    * WHICH WAY A POSITIVE `rotation` TURNS A STICKER — the game's answer, not ours.
    *
    * A stored rotation is in CS2's convention: it rides the equipped v5 feed and
-   * `buildInspectHex` straight to the game, so it is not ours to redefine. Our UV
+   * `buildInspectLink` straight to the game, so it is not ours to redefine. Our UV
    * cut turns the OPPOSITE way for the same number, so the viewer negates on the
    * way in and the two agree.
    *

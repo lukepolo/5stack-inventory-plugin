@@ -1735,6 +1735,10 @@ const craft = ref<{
    *  tradeable attribute in its own right. Purely an attribute: CS2 varies no
    *  charm geometry or art by it, so the 3D viewer never sees it. */
   charm: (Attach & { z?: number | null; seed?: number | null; inst?: string | null }) | null;
+  /** PETS only: material group, null = the stock look. */
+  style: number | null;
+  /** PETS only: life stage (upgrade level), null = the pet's own default. */
+  stage: number | null;
 } | null>(null);
 /**
  * Does the editor's right-hand column have anything IN it?
@@ -1802,8 +1806,35 @@ const craftHasSeed = computed(() =>
   craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible"]),
 );
 const craftHasWear = computed(() =>
-  craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible"]),
+  craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "pet"]),
 );
+/**
+ * A pet's own facts — style count, stages, whether it takes a name — off the
+ * listing it was opened from, or the owned item's resolver when it is an edit.
+ * Both carry the same fields (petFacts in catalog.ts), so either answers.
+ */
+const craftPet = computed(() => {
+  if (craftType.value !== "pet") return null;
+  const i = (craft.value?.skin ?? craftInst.value?.item) as
+    | { styleCount?: number; upgradeLevels?: number[]; defaultUpgradeLevel?: number; hasNameTag?: boolean; seedMin?: number | null; seedMax?: number | null }
+    | undefined;
+  return {
+    styleCount: i?.styleCount ?? 0,
+    stages: i?.upgradeLevels ?? [],
+    defaultStage: i?.defaultUpgradeLevel ?? null,
+    // Only the egg says false; an older listing that does not say at all is
+    // given the field rather than having it silently withheld.
+    hasNameTag: i?.hasNameTag !== false,
+    seedMin: i?.seedMin ?? 1,
+    seedMax: i?.seedMax ?? 100000,
+  };
+});
+/** The breeds have looks to pick from; the egg and the chick have none. */
+const craftHasStyle = computed(() => (craftPet.value?.styleCount ?? 0) > 0);
+/** A breed can be a pullet or a hen. The egg and the chick are one stage each,
+ *  so there is nothing to choose and no control. */
+const craftHasStage = computed(() => (craftPet.value?.stages.length ?? 0) > 1);
+const PET_STAGE_NAMES: Record<number, string> = { 0: "Egg", 1: "Chick", 2: "Pullet", 3: "Hen" };
 /**
  * Can this finish's pattern move its artwork at all?
  *
@@ -1862,7 +1893,7 @@ const craftHasNameTag = computed(() =>
     // will not let you put one on gloves, an agent, a music kit or a charm —
     // the field was offered to gloves and charms purely because the old
     // exclusion list was written before either could be opened on its own.
-    ? ["weapon", "melee"].includes(craftType.value)
+    ? ["weapon", "melee"].includes(craftType.value) || (craftType.value === "pet" && !!craftPet.value?.hasNameTag)
     : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "gloves"]),
 );
 // StatTrak is weapons, knives and music kits — NOT gloves, which do have a float
@@ -1870,7 +1901,7 @@ const craftHasNameTag = computed(() =>
 const craftHasStatTrak = computed(() =>
   craftType.value
     ? ["weapon", "melee", "musickit"].includes(craftType.value)
-    : craftSlotSays(["agent", "graffiti", "collectible"]),
+    : craftSlotSays(["agent", "graffiti", "collectible", "pet"]),
 );
 /**
  * Does the options column have anything to put in it?
@@ -1891,6 +1922,8 @@ const craftHasOptions = computed(
     craftHasWear.value ||
     craftHasScratch.value ||
     craftHasStatTrak.value ||
+    craftHasStyle.value ||
+    craftHasStage.value ||
     attachKind.value !== "none",
 );
 const editingId = ref<number | null>(null);
@@ -2061,7 +2094,7 @@ function openCraft(skin: Skin) {
   const skinIsWeapon = !skin.type || skin.type === "weapon" || skin.type === "melee";
   craftModel.value =
     skin.model ?? (skinIsWeapon && isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
-  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null };
+  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null, style: null, stage: null };
   craftBaseline = ""; // new craft — no stored render to reuse
   // A brand-new craft gets a URL too: /craft/<skinId>, with the draft itself in
   // the query. Without it the one state worth sharing before you commit to it
@@ -2110,6 +2143,8 @@ async function restoreDraftRoute(skinId: number) {
           z: d.charm?.z ?? null,
           seed: d.charm?.seed ?? null,
         }) as (Attach & { z?: number | null; seed?: number | null }) | null,
+        style: d.style,
+        stage: d.stage,
       };
       craftBaseline = "";
     });
@@ -2145,7 +2180,14 @@ function openEdit(inst: InventoryItem) {
     // vanish the moment you pressed Edit on an item that inspects fine in view
     // mode. The link itself never needed it — the backend resolves the defindex
     // from item_id — so it was only ever the button that went missing.
-    skin: { id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null, def: inst.item.def },
+    //
+    // The pet facts for the same reason again: craftPet reads them off this
+    // projection, so leaving them behind gave an owned pet no Style or Stage
+    // controls and offered the egg a name tag.
+    skin: {
+      id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null, def: inst.item.def,
+      hasNameTag: inst.item.hasNameTag, styleCount: inst.item.styleCount, upgradeLevels: inst.item.upgradeLevels, defaultUpgradeLevel: inst.item.defaultUpgradeLevel,
+    },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,
     stattrak: inst.stattrak,
@@ -2155,6 +2197,8 @@ function openEdit(inst: InventoryItem) {
     charm: inst.charm
       ? { id: inst.charm.id, name: inst.charm.name, image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null, inst: inst.charm.inst ?? null }
       : null,
+    style: inst.style ?? null,
+    stage: inst.upgrade_level ?? null,
   };
   // Until something changes, show the render we already have for this item.
   craftBaseline = craftStateJson();
@@ -2315,7 +2359,10 @@ watch(
   },
 );
 function randomSeed() {
-  if (craft.value) craft.value.seed = Math.floor(rand(1, 1001));
+  if (!craft.value) return;
+  // A pet's pattern runs 1..100,000, not a finish's 1..1000.
+  const pet = craftPet.value;
+  craft.value.seed = pet ? Math.floor(rand(pet.seedMin, pet.seedMax + 1)) : Math.floor(rand(1, 1001));
 }
 // Charm patterns run to 100000, an order of magnitude past a weapon's 1000 —
 // they are their own attribute with their own range, not the weapon's reused.
@@ -2327,6 +2374,7 @@ function resetCraft() {
     Object.assign(craft.value, {
       wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "",
       stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null,
+      style: null, stage: null,
     });
 }
 // The craft form as the API wants it. Shared by save and by draft-inspect so
@@ -2350,6 +2398,11 @@ function craftBody() {
     seed: craftHasSeed.value ? c.seed : null,
     stattrak: craftHasStatTrak.value ? c.stattrak : false,
     nametag: craftHasNameTag.value ? c.nametag.trim() || null : null,
+    // Left OFF the body (undefined) for anything but a pet, rather than sent as
+    // null: on these two a null is a value — "back to the default" — and the
+    // update route only leaves a column alone for a key it was never sent.
+    style: craftHasStyle.value ? c.style : undefined,
+    upgrade_level: craftHasStage.value ? c.stage : undefined,
     stickers: c.stickers.map(toSpec),
     patches: c.patches.map(toSpec),
     charm_id: c.charm?.id ?? null,
@@ -2469,6 +2522,8 @@ async function saveCraft() {
               seed: updated.seed,
               stattrak: updated.stattrak,
               nametag: updated.nametag,
+              style: updated.style,
+              upgrade_level: updated.upgrade_level,
             }
           : r,
       );
@@ -3079,6 +3134,8 @@ function draftFromCraft(): Draft | null {
     stickers: c.stickers.map((s) => (s ? { id: s.id, x: s.x, y: s.y, r: s.r, w: s.w } : null)),
     patches: c.patches.map((p) => p?.id ?? null),
     charm: c.charm ? { id: c.charm.id, x: c.charm.x, y: c.charm.y, z: c.charm.z, seed: c.charm.seed } : null,
+    style: c.style,
+    stage: c.stage,
   };
 }
 
@@ -4277,6 +4334,21 @@ async function sendInspect(link: () => Promise<{ inspect: string }>) {
   }
   try {
     const { inspect } = await link();
+    // Past ~300 characters steam:// will not launch the game at all, so the
+    // link builder (cs2-lib-inspect) hands back the bare console command
+    // instead. Navigating to that does nothing — it goes on the clipboard for
+    // the CS2 console, and the toast says so.
+    if (!inspect.startsWith("steam://")) {
+      await navigator.clipboard.writeText(inspect);
+      notify(
+        tr(
+          "inventory.notify.inspect_copied",
+          "Too long for a Steam link — the inspect command is on your clipboard. Paste it into the CS2 console.",
+        ),
+        "success",
+      );
+      return;
+    }
     window.location.href = inspect;
     linkOpening.value = true;
     notifyInspectSent();
@@ -4327,6 +4399,8 @@ async function inspectLoadoutRow(row?: LoadoutEntry) {
     stattrak: row?.stattrak,
     stattrak_count: row?.stattrak_count,
     nametag: row?.nametag,
+    style: row?.style,
+    upgrade_level: row?.upgrade_level,
   });
 }
 async function toggleStatTrak() {
@@ -9107,6 +9181,41 @@ if (MDEBUG) {
                 @input="onNametagInput"
               />
             </label>
+            <!-- A pet's look and life stage, straight under its name: they are
+                 what the chicken IS, the way a finish is what a gun is. Selects,
+                 not sliders — 13 styles is a list you pick from, and stages are
+                 named ("Pullet", "Hen"), not numbered. Each row only exists when
+                 there is a choice: the egg and the chick have no styles and one
+                 stage apiece. -->
+            <div
+              v-if="craftHasStyle || craftHasStage"
+              class="animate-sheet-in flex flex-col gap-2 rounded-md bg-secondary/40 p-2.5"
+              :style="{ '--i': 1 }"
+            >
+              <label v-if="craftHasStyle" class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Style</span>
+                <select
+                  :value="craft.style ?? ''"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  @change="craft!.style = ($event.target as HTMLSelectElement).value === '' ? null : Number(($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="">Stock</option>
+                  <option v-for="n in craftPet!.styleCount" :key="n" :value="n">Style {{ n }}</option>
+                </select>
+              </label>
+              <label v-if="craftHasStage" class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Stage</span>
+                <!-- null and the default stage are the same chicken, so the
+                     select shows the default when nothing is stored. -->
+                <select
+                  :value="craft.stage ?? craftPet!.defaultStage ?? ''"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  @change="craft!.stage = Number(($event.target as HTMLSelectElement).value)"
+                >
+                  <option v-for="lvl in craftPet!.stages" :key="lvl" :value="lvl">{{ PET_STAGE_NAMES[lvl] ?? `Stage ${lvl}` }}</option>
+                </select>
+              </label>
+            </div>
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
               <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${patchSlotCount}, minmax(0, 1fr))` }">
@@ -9343,6 +9452,21 @@ if (MDEBUG) {
                 @preview="previewPattern"
               />
             </div>
+            <!-- A PET's pattern. Neither rail fits: there is no paint to score
+                 and no colour band to aim at — the game reads it as the pattern
+                 of a variation, and nothing we render changes with it. So it is
+                 the plain number it is, with the same die as the float. -->
+            <div v-else-if="craftHasSeed && craftType === 'pet'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+              <div class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                <input
+                  v-model.number="craft.seed"
+                  type="number" :min="craftPet?.seedMin ?? 1" :max="craftPet?.seedMax ?? 100000" step="1"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                />
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+              </div>
+            </div>
             <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
               <div class="flex items-center gap-2">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
@@ -9544,7 +9668,7 @@ if (MDEBUG) {
           <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect in game' }}
         </button>
         <button
-          v-if="ctx && !['agent', 'graffiti', 'musickit', 'collectible'].includes(ctx.pos)"
+          v-if="ctx && !['agent', 'graffiti', 'musickit', 'collectible', 'pet'].includes(ctx.pos)"
           :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent']"
           :disabled="!equippedInstance(ctx.pos)"
           @click="ctxStatTrak"
@@ -9833,7 +9957,7 @@ if (MDEBUG) {
           </button>
         </template>
         <button
-          v-if="itemCtx && !['agent', 'graffiti', 'musickit', 'collectible'].includes(itemCtx.inst.slot ?? '')"
+          v-if="itemCtx && !['agent', 'graffiti', 'musickit', 'collectible', 'pet'].includes(itemCtx.inst.slot ?? '')"
           :class="MENU_ROW"
           @click="itemCtxStatTrak"
         >

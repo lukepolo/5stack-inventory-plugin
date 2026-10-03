@@ -187,7 +187,9 @@ export const supports3d = (item?: { type?: string | null } | null) => !!item?.ty
 // kept them off the screen in the meantime, so it stays type-shaped rather than
 // becoming a `wear != null` test.
 const TYPES_WEAR = new Set(["weapon", "melee", "glove"]);
-const TYPES_SEED = new Set(["weapon", "melee", "glove", "keychain"]);
+// A pet's seed (1..100,000) is real too, but the game reads it as the pattern of
+// a variation rather than a paint seed — see the pet branch of the v5 feed.
+const TYPES_SEED = new Set(["weapon", "melee", "glove", "keychain", "pet"]);
 export const hasWear = (item?: { type?: string | null } | null) => !!item?.type && TYPES_WEAR.has(item.type);
 export const hasSeed = (item?: { type?: string | null } | null) => !!item?.type && TYPES_SEED.has(item.type);
 
@@ -242,6 +244,7 @@ export const rarityRank = (hex?: string | null) =>
  *
  * The union of every editable attribute's types: float and pattern (weapon,
  * melee, glove, and the charm's own pattern), StatTrak (+ music kits), name tag,
+ * a pet's pattern, style and life stage,
  * attachment slots (weapon: stickers + charm; agent: patches), and a sticker's
  * scratch wear. A graffiti has none of them — its Edit button opened a form with
  * nothing in it, so the only verb it has is equip. Same for patches and pins.
@@ -251,7 +254,7 @@ export const rarityRank = (hex?: string | null) =>
  * point — a sticker you own is a thing you can scuff, and until it was here the
  * only way to scratch one was to put it on a gun first.
  */
-const TYPES_EDITABLE = new Set(["weapon", "melee", "glove", "musickit", "agent", "keychain", "sticker"]);
+const TYPES_EDITABLE = new Set(["weapon", "melee", "glove", "musickit", "agent", "keychain", "sticker", "pet"]);
 export const isCustomizable = (item?: { type?: string | null } | null) =>
   !!item?.type && TYPES_EDITABLE.has(item.type);
 

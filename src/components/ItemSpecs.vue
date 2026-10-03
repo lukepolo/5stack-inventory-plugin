@@ -56,6 +56,19 @@ const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : [])
 /** A CHARM's own pattern, as opposed to a weapon's: the seed on a keychain is a
  *  colourway, and the rail renders it as one. */
 const seedIsCharm = computed(() => props.inst?.item?.type === "keychain");
+/** A PET's look and life stage. Style null is the stock look; a stage left
+ *  unset is the pet's own default, which the item says (a hen, for a breed). */
+const PET_STAGE_NAMES: Record<number, string> = { 0: "Egg", 1: "Chick", 2: "Pullet", 3: "Hen" };
+const pet = computed(() => {
+  const i = props.inst;
+  if (i?.item?.type !== "pet") return null;
+  const stage = i.upgrade_level ?? i.item.defaultUpgradeLevel ?? null;
+  return {
+    style: (i.item.styleCount ?? 0) > 0 ? (i.style != null ? `Style ${i.style}` : "Stock") : null,
+    // Only worth a row when the pet could have been something else.
+    stage: (i.item.upgradeLevels?.length ?? 0) > 1 && stage != null ? PET_STAGE_NAMES[stage] ?? `Stage ${stage}` : null,
+  };
+});
 /**
  * The box each reading sits in. The surface is what separates one reading from
  * the next — it stays, over a map environment as much as on a card.
@@ -70,6 +83,19 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
     <div v-if="inst.nametag" :class="[box, 'flex items-center gap-2']" :style="still ? {} : { '--i': 0 }">
       <span :class="label">{{ tr('inventory.specs.nametag', 'Name tag') }}</span>
       <span class="min-w-0 flex-1 truncate text-f13 italic">“{{ inst.nametag }}”</span>
+    </div>
+
+    <!-- A pet's look and stage, where a gun has its stickers: what this one
+         chicken is, as opposed to every chicken of its breed. -->
+    <div v-if="pet?.style || pet?.stage" :class="[box, 'flex flex-col gap-1.5']" :style="still ? {} : { '--i': 1 }">
+      <div v-if="pet.style" class="flex items-center gap-2">
+        <span :class="label">{{ tr('inventory.specs.style', 'Style') }}</span>
+        <span class="text-f13">{{ pet.style }}</span>
+      </div>
+      <div v-if="pet.stage" class="flex items-center gap-2">
+        <span :class="label">{{ tr('inventory.specs.stage', 'Stage') }}</span>
+        <span class="text-f13">{{ pet.stage }}</span>
+      </div>
     </div>
 
     <div v-if="attachments.length" :class="box" :style="still ? {} : { '--i': 1 }">

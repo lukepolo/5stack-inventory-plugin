@@ -85,6 +85,7 @@ const SECTIONS: Section[] = [
   { key: "musickit", label: "Music Kits", kind: "slot", slot: "musickit" },
   { key: "graffiti", label: "Graffiti", kind: "slot", slot: "graffiti" },
   { key: "collectible", label: "Pins & Medals", kind: "slot", slot: "collectible" },
+  { key: "pet", label: "Pets", kind: "slot", slot: "pet" },
   { key: "sticker", label: "Stickers", kind: "attach", attach: "sticker" },
   { key: "charm", label: "Charms", kind: "attach", attach: "charm" },
   { key: "patch", label: "Patches", kind: "attach", attach: "patch" },
@@ -122,7 +123,7 @@ const RAIL_GROUPS: { label: string; keys: string[] }[] = [
   // it cuts across both halves below it, and it is the one entry here that
   // browses by where something CAME FROM rather than by what it is.
   { label: "Browse", keys: ["collection"] },
-  { label: "Gear", keys: ["weapon", "knife", "gloves", "agent", "musickit", "graffiti", "collectible"] },
+  { label: "Gear", keys: ["weapon", "knife", "gloves", "agent", "musickit", "graffiti", "collectible", "pet"] },
   { label: "Attachments", keys: ["sticker", "charm", "patch"] },
 ];
 // A group whose every entry dropped out goes with them — an amber heading over

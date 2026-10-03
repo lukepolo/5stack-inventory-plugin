@@ -7,6 +7,7 @@
       "crafted": "Crafted — it's in your inventory.",
       "copy_created": "Editable copy created in your inventory.",
       "inspect_sent": "Sent to your game client — CS2 will open the inspect view.",
+      "inspect_copied": "Too long for a Steam link — the inspect command is on your clipboard. Paste it into the CS2 console.",
       "loadout_copied": "Copied {summary} into your inventory and equipped them on your own loadout.",
       "loadout_copy_empty": "Nothing to copy — that loadout is empty.",
       "synced": "Synced with Steam — {summary}.",
@@ -197,6 +198,8 @@
       "nametag": "Name tag",
       "applied": "Applied",
       "pattern": "Pattern",
+      "style": "Style",
+      "stage": "Stage",
       "wear": "Wear",
       "scratched": "scratched",
       "kills": "kills"

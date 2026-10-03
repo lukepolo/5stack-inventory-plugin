@@ -50,12 +50,22 @@ function check(label: string, ok: boolean, detail = "") {
 // are the same promise made at the two ends of the app.
 const SYNCED_TYPES = [
   "weapon", "melee", "glove", "agent",
-  "musickit", "graffiti", "collectible",
+  "musickit", "graffiti", "collectible", "pet",
   "sticker", "patch", "keychain",
 ] as const;
 // Resolve, but deliberately do NOT enter an inventory: this app does not model
 // unopened containers or the tools that alter items.
 const SKIPPED_TYPES = ["case", "key", "tool", "utility", "stub"] as const;
+// Skipped items whose Steam name is ALSO the exact name of a synced item, so a
+// name-only import cannot keep them apart. Each is a decision, not a leak:
+//
+//   Tool | Chicken Egg — Steam drops the "Tool | " prefix, which leaves
+//   "Chicken Egg", the egg-stage PET's name verbatim. A synced one imports as
+//   that pet: the closest thing this app models to what the tool hatches into.
+//
+// Keyed by catalog name -> the synced item it resolves to. Anything else a
+// skipped item resolves into is still a failure.
+const STEAM_NAME_COLLISIONS = new Map([["Tool | Chicken Egg", "Chicken Egg"]]);
 
 // ---- 2. real market_hash_names, typed out by hand ----------------------------
 // Hand-written on purpose. The sweep below generates names from the same rules
@@ -126,13 +136,14 @@ function steamNameOf(item: { name: string; type: string }): string {
 }
 
 console.log("\nWhole-catalog sweep");
-const stats = new Map<string, { total: number; unresolved: string[]; unownable: string[] }>();
+const stats = new Map<string, { total: number; unresolved: string[]; unownable: string[]; collided: number }>();
 for (const item of catalogSummary()) {
-  const bucket = stats.get(item.type) ?? { total: 0, unresolved: [], unownable: [] };
+  const bucket = stats.get(item.type) ?? { total: 0, unresolved: [], unownable: [], collided: 0 };
   bucket.total++;
   const { itemId } = parseSteamMarketName(steamNameOf(item));
   if (itemId == null) bucket.unresolved.push(item.name);
   else if (!isOwnable(itemId)) bucket.unownable.push(item.name);
+  else if (itemId !== item.id && STEAM_NAME_COLLISIONS.get(item.name) === getItem(itemId)?.name) bucket.collided++;
   stats.set(item.type, bucket);
 }
 
@@ -155,8 +166,12 @@ for (const type of SYNCED_TYPES) {
 for (const type of SKIPPED_TYPES) {
   const b = stats.get(type);
   if (!b) continue;
-  const entering = b.total - b.unresolved.length - b.unownable.length;
-  check(`${type}: stays out of inventories`, entering === 0, `${entering} of ${b.total} would import`);
+  const entering = b.total - b.unresolved.length - b.unownable.length - b.collided;
+  check(
+    `${type}: stays out of inventories`,
+    entering === 0,
+    `${entering} of ${b.total} would import` + (b.collided ? ` (${b.collided} known name collision, see above)` : ""),
+  );
 }
 
 // A type the catalog grew that this file has never heard of. Not a failure —
