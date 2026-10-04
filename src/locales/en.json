@@ -81,9 +81,6 @@
       "mute": "Mute",
       "unmute": "Unmute"
     },
-    "graffiti": {
-      "how_to_spray": "Your equipped graffiti won't show in the in-game spray wheel — that only lists your Steam inventory. In a match, press E facing a wall or type !spray in chat."
-    },
     "viewer": {
       "hint_place": "Drag a sticker or the charm across the model to place it, and shift-drag a sticker to turn it.",
       "hint_place_touch": "Drag a sticker or the charm across the model to place it, and twist two fingers on a sticker to turn it.",

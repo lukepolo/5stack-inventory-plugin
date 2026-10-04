@@ -5264,13 +5264,7 @@ function invsimBlock(url: string, key: string): string {
     // vanilla and nothing re-evaluates them until the next spawn, so skins
     // only show up after the player's first death.
     "invsim_require_inventory 1",
-    // Graffiti. CS2 draws the spray wheel client-side from the player's REAL
-    // Steam inventory, and nothing a server sends can add to it — so the
-    // equipped spray never appears there. The changer only re-skins a vanilla
-    // spray the player already owns; spray-on-use (E at a wall, plus `!spray`)
-    // is what lets everyone else use the one they equipped here at all.
     "invsim_spraychanger_enabled 1",
-    "invsim_spray_on_use 1",
     "",
   ].join("\n");
 }
@@ -5316,7 +5310,6 @@ const BLOCK_CVARS = new Set([
   "invsim_ws_immediately",
   "invsim_require_inventory",
   "invsim_spraychanger_enabled",
-  "invsim_spray_on_use",
 ]);
 
 // Only the block this plugin wrote: the marker line, and the cvars that block
@@ -5334,18 +5327,6 @@ function stripInvsim(cfg: string): string {
     })
     .join("\n")
     .trim();
-}
-
-// Every line of `block` present in `cfg`, compared trimmed and line by line
-// rather than as one substring, so a panel that re-saves the file with other
-// line endings or whitespace doesn't read as out of date.
-function carriesBlock(cfg: string, block: string): boolean {
-  const have = new Set(cfg.split("\n").map((line) => line.trim()));
-  return block
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .every((line) => have.has(line));
 }
 
 // Spliced in at the top rather than written over the whole file: Global and the
@@ -6420,12 +6401,7 @@ app.get("/api/admin/game-config", async (request, reply) => {
   // Whether the resolved target already carries our block. Without this the UI
   // cannot know a rotated key still needs pushing.
   let configured = false;
-  // And whether that block is the one we would write today. The marker
-  // survives every cvar added since it was written, so a server configured
-  // before spray-on-use reads as configured while missing the line that makes
-  // graffiti work — this is what tells the admin to press re-apply.
-  let upToDate = false;
-  if (target && key && url) {
+  if (target) {
     try {
       const current =
         target === "plugin"
@@ -6434,7 +6410,6 @@ app.get("/api/admin/game-config", async (request, reply) => {
             ? (await readTypeCfgs(cookie, ["Global"])).Global
             : (await readTypeCfgs(cookie, LEGACY_CFG_TYPES)).Competitive;
       configured = Boolean(current?.includes(CFG_MARKER));
-      upToDate = configured && carriesBlock(current as string, invsimBlock(url, key));
     } catch (error) {
       app.log.error({ err: error }, "[invsim-cfg] unable to read current cfg");
     }
@@ -6448,7 +6423,6 @@ app.get("/api/admin/game-config", async (request, reply) => {
     plugin,
     legacy,
     configured,
-    upToDate,
     // Nothing to migrate to on a panel with neither home, so the UI must not
     // offer to "move" the block out of the only place it can live.
     canMigrate: target !== "types",
