@@ -25,6 +25,29 @@ const duration = ref(0);
  *  Kept per URL so switching kits clears it without a separate reset call. */
 const failedSrc = ref<string | null>(null);
 
+/**
+ * Preview volume, 0..1, shared by every player and remembered per browser.
+ *
+ * It used to be whatever the element defaulted to — full scale — and kits are
+ * mastered to be heard over a match, so the first preview was painfully loud.
+ * A quarter is a level you can turn up from rather than one you dive for.
+ */
+const VOLUME_KEY = "inventory.music.volume";
+const DEFAULT_VOLUME = 0.25;
+const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+function storedVolume(): number {
+  try {
+    const raw = localStorage.getItem(VOLUME_KEY);
+    const v = raw == null ? NaN : Number(raw);
+    return Number.isFinite(v) ? clamp01(v) : DEFAULT_VOLUME;
+  } catch {
+    return DEFAULT_VOLUME;
+  }
+}
+const volume = ref(storedVolume());
+/** The level a mute toggles back to. */
+let unmuted = volume.value || DEFAULT_VOLUME;
+
 let el: HTMLAudioElement | null = null;
 /**
  * Whoever asked for the current track.
@@ -43,6 +66,7 @@ function element(): HTMLAudioElement {
   // preview costs the seconds it plays; "auto" would defeat that by pulling all
   // 3.5MB the moment a track is selected.
   audio.preload = "metadata";
+  audio.volume = volume.value;
   // Deliberately NOT crossOrigin: nothing here reads the samples, and setting it
   // would impose a CORS preflight requirement on an asset host that has no
   // reason to satisfy one.
@@ -220,6 +244,20 @@ function seek(url: string, fraction: number): void {
   time.value = at;
 }
 
+function setVolume(v: number): void {
+  volume.value = clamp01(v);
+  if (volume.value > 0) unmuted = volume.value;
+  if (el) el.volume = volume.value;
+  try {
+    localStorage.setItem(VOLUME_KEY, String(volume.value));
+  } catch {
+    /* private mode — the level still holds for this session */
+  }
+}
+function toggleMute(): void {
+  setVolume(volume.value > 0 ? 0 : unmuted);
+}
+
 /** Give up playback if this owner still holds it (component teardown). */
 function release(claim: symbol): void {
   if (owner !== claim) return;
@@ -236,6 +274,9 @@ export const musicPreview = {
   toggle,
   seek,
   release,
+  volume,
+  setVolume,
+  toggleMute,
   durationOf,
   measure,
   unmeasure,

@@ -22,6 +22,13 @@ const src = computed(() =>
   props.inst && art ? art.renderSrc(props.inst) : (props.image ?? undefined),
 );
 
+// A failed image is hidden, and that inline style belongs to the ELEMENT, not
+// to the URL that failed — Vue keeps the same <img> when `src` changes. So a
+// cell whose catalog path 404'd stayed invisible after it was handed working
+// art (a visitor's pet, swapped to its catalog card). Whatever loads is shown.
+function onLoad(e: Event) {
+  (e.target as HTMLImageElement).style.visibility = "";
+}
 function onError(e: Event) {
   if (props.inst && art) {
     art.onRenderError(e, props.inst);
@@ -36,5 +43,5 @@ function onError(e: Event) {
   <!-- decoding="async": this is the art in every card of every long grid, so a
        fast scroll decodes dozens at once. Synchronous decode does that on the
        main thread, inside the scroll frames. -->
-  <img v-if="src" :src="src" alt="" loading="lazy" decoding="async" @error="onError" />
+  <img v-if="src" :src="src" alt="" loading="lazy" decoding="async" @load="onLoad" @error="onError" />
 </template>

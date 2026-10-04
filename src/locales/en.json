@@ -76,7 +76,10 @@
       "play": "Play preview",
       "pause": "Pause preview",
       "seek": "Seek preview",
-      "failed": "Preview unavailable"
+      "failed": "Preview unavailable",
+      "volume": "Preview volume",
+      "mute": "Mute",
+      "unmute": "Unmute"
     },
     "viewer": {
       "hint_place": "Drag a sticker or the charm across the model to place it, and shift-drag a sticker to turn it.",

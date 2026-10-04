@@ -55,8 +55,11 @@ const props = withDefaults(
      * a gun's artwork sits), with the handle always shown.
      */
     centered?: boolean;
+    /** Reading, not choosing: the bars without a handle — the specs panel's
+     *  view of a pet someone already made. `table` is never asked for. */
+    readonly?: boolean;
   }>(),
-  { centered: false },
+  { centered: false, readonly: false },
 );
 const emit = defineEmits<{ seek: [number] }>();
 
@@ -121,7 +124,7 @@ function key(e: KeyboardEvent, k: string) {
   <div class="flex flex-col">
     <div v-for="t in traits" :key="t.key" class="flex items-center gap-2.5">
       <span class="w-14 flex-none truncate text-f9 uppercase tracking-cs1 text-muted-foreground/80">{{ t.label }}</span>
-      <span class="tb-bar" :class="{ 'is-dragging': drag?.key === t.key, 'is-position': !centered }">
+      <span class="tb-bar" :class="{ 'is-dragging': drag?.key === t.key, 'is-position': !centered }" :title="readonly ? `${t.label}: ${t.display}` : undefined">
         <span class="tb-rail">
           <span
             v-if="centered"
@@ -132,6 +135,7 @@ function key(e: KeyboardEvent, k: string) {
         </span>
         <span v-if="drag?.key === t.key" class="tb-landed" :style="{ left: `${t.value * 100}%` }" />
         <span
+          v-if="!readonly"
           class="tb-knob"
           role="slider"
           tabindex="0"
