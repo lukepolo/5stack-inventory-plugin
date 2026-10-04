@@ -8,6 +8,11 @@
 // Plain-string contexts (tooltips, toasts, the 3D title bar) can't stack, so
 // they use itemName() from itemVisuals instead, which folds the phase into
 // "Doppler (Ruby)".
+//
+// A NAMED PET reads the way CS2 shows a named item: the name, in quotes, is the
+// name, and what it is moves up to the eyebrow — "Catalana" over “Clucky”. A pet
+// is its name in a way a gun is not, so this is the pets' alone (callers pass
+// `nametag` only for them).
 import { computed } from "vue";
 import { stripName } from "../itemVisuals";
 
@@ -19,20 +24,26 @@ const props = defineProps<{
   fallback?: string;
   nameClass?: string;
   phaseClass?: string;
+  /** A pet's name tag. When set it is the main line, and the item's own name
+   *  becomes the eyebrow. */
+  nametag?: string | null;
 }>();
 
-const name = computed(() =>
+const itemName = computed(() =>
   props.item?.name ? (props.strip ? stripName(props.item.name) : props.item.name) : "",
 );
+const named = computed(() => props.nametag?.trim() || "");
+const name = computed(() => (named.value ? `“${named.value}”` : itemName.value));
+const eyebrow = computed(() => (named.value ? itemName.value : props.item?.altName ?? ""));
 </script>
 
 <template>
   <span class="block min-w-0">
     <span
-      v-if="item?.altName"
+      v-if="eyebrow"
       class="block truncate leading-tight"
       :class="phaseClass ?? 'text-f9 text-muted-foreground'"
-      >{{ item.altName }}</span
+      >{{ eyebrow }}</span
     >
     <span
       class="block truncate leading-tight"

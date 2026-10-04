@@ -236,7 +236,7 @@ const audioSrc = computed(() => props.inst.item?.audio ?? null);
           {{ weaponName(inst.item) || inst.slot }}
         </div>
         <div class="flex items-center gap-1.5">
-          <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
+          <ItemName :item="inst.item" :strip="stripWeaponName" :nametag="inst.item?.type === 'pet' ? inst.nametag : null" class="min-w-0 flex-1" />
           <ItemBadges :inst="inst" :max="4" />
         </div>
         <!-- Inline, not stacked: the stacked variant spends a second line on
@@ -312,7 +312,7 @@ const audioSrc = computed(() => props.inst.item?.audio ?? null);
          both cases: against a plain name it is exact, and against a name with a
          phase line above it (Doppler) the cluster centres on the pair. -->
     <div class="relative z-[2] flex items-center gap-1.5">
-      <ItemName :item="inst.item" :strip="stripWeaponName" class="min-w-0 flex-1" />
+      <ItemName :item="inst.item" :strip="stripWeaponName" :nametag="inst.item?.type === 'pet' ? inst.nametag : null" class="min-w-0 flex-1" />
       <!-- ST™ and the chips are ONE centred group: apart, the badge floated
            against a row whose height is set by the tallest chip. -->
       <ItemBadges :inst="inst" :max="6" class="ml-auto" />

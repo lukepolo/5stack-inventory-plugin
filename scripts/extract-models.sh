@@ -239,6 +239,12 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v32 (2026-10-03): PETS (new step pet-models -> models/models/chicken/,
+# models/pets/, models/pet-styles.json), and the cs2-lib 9.4.0 -> 9.5.0 bump the
+# v31 note asks for. The econ schema has a flat icon for ONE of the five pets
+# (the egg); the chick and the three breeds have no image_inventory at all, so
+# their model is the only art there is. Styles are material groups, recovered
+# from the vmdl DATA block because the glTF export writes only the default one.
 # v31 (2026-09-27): no pipeline change. cs2-lib 9.0.0 -> 9.4.0 renamed the
 # hash suffix on 2,481 icons and every paint material, and added 112 patch
 # materials, so a mount extracted against the old names 404s its art. Bump this
@@ -270,7 +276,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=31
+EXTRACT_VERSION=32
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -369,7 +375,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
+STEPS=(decompile-models rename-models pet-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -448,6 +454,10 @@ step() { # step "Name" — closes the previous step and opens this one
 #   ONLY_STEPS=charm-anchors  ~5s    where charms hang
 #   ONLY_STEPS=sticker-markup ~1s    sticker slots
 #   ONLY_STEPS=music-audio    ~1-2m  the 101 music kit previews (~350MB)
+#   ONLY_STEPS=pet-models,model-textures   the five pets + every style's maps
+#                                          (model-textures is what turns the
+#                                          GLBs' PNGs into webp; it touches no
+#                                          GLB that already references webp)
 #
 # Only reach for the paint chain when a NEW TEXTURE has to be extracted; params
 # alone never need it. Two things make scoped runs safe, and both had to be
@@ -458,7 +468,7 @@ step() { # step "Name" — closes the previous step and opens this one
 #   · a scoped run does NOT stamp extract-version.json, so the mount stays
 #     honestly stale and a full run still happens later.
 #
-# The seven model steps are individually selectable, and so is music-audio (it
+# The eight model steps are individually selectable, and so is music-audio (it
 # reads the econ schema and the archive and nothing else). econ-icons,
 # paint-chain and sticker-art are one interleaved flow with no seam between them,
 # so naming any of the three runs all three.
@@ -871,6 +881,416 @@ echo "--- Mapped $count weapons, $charms charms, $gloves gloves, $agents agents 
 
 fi
 
+# ---- 3a1. Pets ----------------------------------------------------------------
+if step_if "pet-models"; then
+# THE ROUND-START CHICKEN (cs2-lib 9.5.0, item def 4681 "pet"). Five of them, and
+# the econ schema has a flat icon for exactly ONE: `econ/pets/chicken_egg`. Def
+# 4681 carries no image_inventory at all, and `pet_definitions` gives each pet
+# only a pedestal_display_model, which the game renders live:
+#
+#   "2" { name chicken_chick_01   pedestal_display_model models/chicken/chick.vmdl }
+#   "3" { name chicken_catalana_01 pedestal_display_model models/chicken/chicken.vmdl }
+#
+# cs2-lib still names an icon for every pet (chicken_chick_01_<hash>.webp), and
+# for four of the five nothing in pak01 matches it. The model is the only art
+# there is, so this step is what gives those pets any picture at all.
+#
+# The models keep their ARCHIVE PATH, exactly like agents: cs2-lib's modelKey is
+# already `models/chicken/chick`, so /models/models/chicken/chick.glb resolves
+# through modelUrlFor with no mapping table. Read from the schema rather than
+# listed here, so a new breed arrives with the next run.
+#
+# A STYLE IS A MATERIAL GROUP. The game sets m_materialGroup to the style number
+# as a string, and each breed names its groups "default", "1".."N" with N equal
+# to cs2-lib's styleCount (13 / 9 / 12 on this build). VRF's glTF export writes
+# only the default group, so the others come from the vmdl's DATA block
+# (m_materialGroups), each group's vmat DATA (m_textureParams), and the textures
+# decoded into models/pets/ -> models/pet-styles.json.
+#
+# The vmat records are kept close to raw — every texture param by its own name,
+# the F_* features, the float/vector params, and the DYNAMIC params as their
+# bytecode hex. Those last are how the pet seed reaches the shader: the breeds
+# drive g_fHueShift / g_fSaturation / g_vDetailTexCoordOffset from
+# `$ChickenHue`, `$ChickenSaturation`, `$ChickenUVOffset` and friends (the chick
+# from `$chick_hue`…). How the game derives those attributes from the seed is in
+# libclient.so (ChickenPoseGenerator), not in any data file — so they are
+# recorded for the day that mapping is known, rather than decoded for nothing.
+echo ""
+echo "--- Extracting pets…"
+PET_RAW="$WORK/raw_pets"
+CLI="$CLI" VPK="$VPK" DEST="$DEST" PET_RAW="$PET_RAW" ITEMS_GAME="$ITEMS_GAME" python3 - <<'PYEOF'
+import json, os, re, shutil, struct, subprocess, sys
+
+CLI, VPK, DEST, RAW = (os.environ[k] for k in ("CLI", "VPK", "DEST", "PET_RAW"))
+ITEMS_GAME = os.environ.get("ITEMS_GAME", "")
+PETS_DIR = os.path.join(DEST, "pets")
+
+def progress(done, total, state="running"):
+    pf = os.environ.get("PROGRESS_FILE")
+    if not pf:
+        return
+    try:
+        with open(pf) as fh:
+            doc = json.load(fh)
+        for s in doc.get("steps", []):
+            if s["name"] == "pet-models":
+                s["state"], s["done"], s["total"] = state, done, total
+        with open(pf, "w") as fh:
+            json.dump(doc, fh)
+    except Exception:
+        pass
+
+def cli(*args):
+    return subprocess.run([CLI, "-i", VPK, *args], capture_output=True, text=True, errors="replace")
+
+# ---- which models: the schema's pet_definitions ------------------------------
+KV = re.compile(r'^\s*"([^"]+)"\s+"([^"]*)"\s*$')
+INDEX = re.compile(r'^"(\d+)"$')
+
+def pet_definitions(path):
+    out, lines = {}, open(path, encoding="utf8", errors="replace").read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() != '"pet_definitions"':
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != "{":
+            j += 1
+        depth, j, cur = 1, j + 1, None
+        while j < len(lines) and depth > 0:
+            s = lines[j].strip()
+            if s == "{":
+                depth += 1
+            elif s == "}":
+                depth -= 1
+                if depth == 1:
+                    cur = None
+            elif depth == 1 and INDEX.match(s):
+                cur = out.setdefault(INDEX.match(s).group(1), {})
+            elif depth == 2 and cur is not None and KV.match(lines[j]):
+                k, v = KV.match(lines[j]).groups()
+                cur[k] = v
+            j += 1
+        i = j
+    return out
+
+defs = pet_definitions(ITEMS_GAME) if ITEMS_GAME and os.path.exists(ITEMS_GAME) else {}
+models = []
+for _idx, rec in sorted(defs.items(), key=lambda kv: int(kv[0])):
+    m = rec.get("pedestal_display_model", "")
+    if m.endswith(".vmdl") and m[: -len(".vmdl")] not in models:
+        models.append(m[: -len(".vmdl")])
+if not models:
+    print("!! No pet_definitions in items_game.txt — no pets extracted. Either the schema "
+          "read failed or this CS2 build predates pets.")
+    sys.exit(0)
+print(f"---   {len(models)} pets: {', '.join(os.path.basename(m) for m in models)}")
+
+shutil.rmtree(RAW, ignore_errors=True)
+os.makedirs(RAW)
+os.makedirs(PETS_DIR, exist_ok=True)
+
+def glb_json(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:4] != b"glTF":
+        return None
+    clen, ctype = struct.unpack_from("<II", data, 12)
+    return json.loads(data[20: 20 + clen]) if ctype == 0x4E4F534A else None
+
+# ---- the meshes ---------------------------------------------------------------
+# Same flags as the weapon decompile, and for the same reason: without
+# --gltf_export_animations there is no skeleton. Every chicken ships one-frame
+# POSE clips — `ref` plus ten `chicken_<part>_min/_max` pairs (hips, legs, neck,
+# head, comb front/back, wattle, tail, wing size/width) on one shared 117-joint
+# rig — which are the body proportions a seed varies between.
+placed = 0
+for n, m in enumerate(models, 1):
+    progress(n - 1, len(models))
+    cli("-o", RAW, "-d", "-f", m + ".vmdl_c", "--gltf_export_format", "glb",
+        "--gltf_export_materials", "--gltf_textures_adapt", "--gltf_export_animations")
+    src = os.path.join(RAW, m + ".glb")
+    doc = glb_json(src) if os.path.exists(src) else None
+    if doc is None:
+        print(f"!! {m}: no GLB came out of the decompile")
+        continue
+    out = os.path.join(DEST, m + ".glb")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    shutil.copyfile(src, out)
+    placed += 1
+    # Flat, next to every other model texture: loadGltf resolves a subdirectory
+    # GLB's siblings from /models/, which is what agents already rely on. Only
+    # what this GLB names — the decompile also writes the *_physics hull and its
+    # placeholder textures, which nothing should ever load. A texture already
+    # converted by an earlier run is left alone; model-textures sees the .webp
+    # and repoints the GLB without needing the PNG.
+    for img in doc.get("images", []) or []:
+        uri = img.get("uri") or ""
+        if not uri.endswith(".png"):
+            continue
+        tgt = os.path.join(DEST, uri)
+        if os.path.exists(tgt) or os.path.exists(tgt[:-4] + ".webp"):
+            continue
+        for root, _dirs, files in os.walk(RAW):
+            if uri in files:
+                shutil.copyfile(os.path.join(root, uri), tgt)
+                break
+
+# ---- styles: material groups -> vmats -> textures -----------------------------
+def top_level(block, key):
+    """The text of one top-level KV3 key (one tab deep) up to the next one."""
+    m = re.search(r"\n\t%s = (.*?)(?=\n\t[A-Za-z_]\w* = |\Z)" % key, block, re.S)
+    return m.group(1) if m else ""
+
+# ---- the seed: chicken_metadata ------------------------------------------------
+# HOW A PET'S SEED BECOMES ITS LOOK lives in the vmdl, as `chicken_metadata` in
+# the KV3 document embedded in m_modelInfo.m_keyValueText — none of it is in the
+# binary. Recovered by disassembling libclient.so (BuildChickenMatParams,
+# CChickenPoseGenerator), and the client reproduces it in petPattern.ts:
+#
+#   matparams   [{name: "$ChickenHue", value: 1}, …] — `value` INDEXES ten
+#               floats drawn from CUniformRandomStream(seed); the float is what
+#               the material's `$Chicken*` render attribute is set to.
+#   procedural_geometry_poses.characteristics
+#               name -> sequence_min / sequence_max: the one-frame delta poses
+#               (`chicken_hips_min` …) a body-proportion weight blends between.
+#   procedural_geometry_poses.presets.{adult,adolescent}
+#               the ORDERED draw list {name, min, max} for a second stream on
+#               the same seed — order matters, it is the order of the draws.
+#
+# Kept close to the source shape; a parse failure drops the pattern, never the
+# pet.
+KV3_TOK = re.compile(r'\s*(?:(//[^\n]*)|(\w+:"(?:[^"\\]|\\.)*")|("(?:[^"\\]|\\.)*")|([{}\[\]=,])|([^\s{}\[\]=,"]+))')
+
+def kv3_parse(text):
+    """Enough KV3 text for a vmdl's key-value document. VRF writes array
+    elements with TRAILING commas (`},`) — see the charm parser's trap."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    toks = []
+    for t in KV3_TOK.finditer(text):
+        if t.group(1):
+            continue
+        tok = t.group(2) or t.group(3) or t.group(4) or t.group(5)
+        if tok:
+            toks.append(tok)
+    pos = 0
+
+    def val():
+        nonlocal pos
+        t = toks[pos]
+        pos += 1
+        if t == "{":
+            obj = {}
+            while toks[pos] != "}":
+                key = toks[pos].strip('"')
+                pos += 1
+                if toks[pos] == "=":
+                    pos += 1
+                obj[key] = val()
+                if toks[pos] == ",":
+                    pos += 1
+            pos += 1
+            return obj
+        if t == "[":
+            arr = []
+            while toks[pos] != "]":
+                arr.append(val())
+                if toks[pos] == ",":
+                    pos += 1
+            pos += 1
+            return arr
+        if t.startswith('"'):
+            return t[1:-1]
+        if t in ("null", "true", "false"):
+            return {"null": None, "true": True, "false": False}[t]
+        try:
+            return int(t)
+        except ValueError:
+            try:
+                return float(t)
+            except ValueError:
+                return t
+
+    return val()
+
+def chicken_metadata(dump, model):
+    kvt = re.search(r'm_keyValueText = """\n(.*?)"""', dump, re.S)
+    if not kvt:
+        return None
+    try:
+        meta = kv3_parse(kvt.group(1)).get("chicken_metadata")
+    except Exception as e:  # a pattern we cannot read is a pet that renders stock
+        print(f"!! {model}: chicken_metadata did not parse ({e}) — no pattern for it")
+        return None
+    if not isinstance(meta, dict):
+        return None
+    out = {"matparams": {p["name"]: p["value"] for p in meta.get("matparams") or [] if "name" in p}}
+    poses = meta.get("procedural_geometry_poses") or {}
+    if poses:
+        out["characteristics"] = {c["name"]: [c.get("sequence_min"), c.get("sequence_max")]
+                                  for c in poses.get("characteristics") or [] if "name" in c}
+        out["presets"] = {stage: [[p["name"], p.get("min", 0), p.get("max", 1)] for p in lst]
+                          for stage, lst in (poses.get("presets") or {}).items()}
+    return out
+
+groups_by_model = {}
+meta_by_model = {}
+for m in models:
+    dump = cli("-f", m + ".vmdl_c", "-b", "DATA").stdout
+    meta_by_model[m] = chicken_metadata(dump, m)
+    groups = {}
+    for name, body in re.findall(r'm_name = "([^"]+)"\s*m_materials =\s*\[(.*?)\]',
+                                 top_level(dump, "m_materialGroups"), re.S):
+        groups[name] = re.findall(r'resource:"([^"]+\.vmat)"', body)
+    if not groups:
+        # No alternate looks (the egg, the chick). The default group is then
+        # whatever the model references, in the order it lists them — the same
+        # materials the GLB carries, recorded so the seed params are not lost.
+        refs = re.findall(r"^\s*[0-9A-F]{16}\s+(\S+\.vmat)\s*$", dump, re.M)
+        if refs:
+            groups["default"] = refs
+    groups_by_model[m] = groups
+
+vmats = sorted({v for g in groups_by_model.values() for mats in g.values() for v in mats})
+FEATURES_DROP = {"F_DO_NOT_CAST_SHADOWS"}
+
+def parse_vmat(block):
+    rec = {"shader": (re.search(r'm_shaderName = "([^"]+?)(?:\.vfx)?"', block) or [None, None])[1]}
+    rec["features"] = sorted(
+        k for k, v in re.findall(r'm_name = "(F_\w+)"\s*m_nValue = (-?\d+)', top_level(block, "m_intParams"))
+        if v != "0" and k not in FEATURES_DROP)
+    rec["textures"] = dict(re.findall(r'm_name = "(g_t\w+)"\s*m_pValue = resource:"([^"]+)"',
+                                      top_level(block, "m_textureParams")))
+    rec["floats"] = {k: float(v) for k, v in re.findall(
+        r'm_name = "(\w+)"\s*m_flValue = (-?[\d.]+(?:e-?\d+)?)', top_level(block, "m_floatParams"))}
+    rec["vectors"] = {k: [float(x) for x in v.split(",")] for k, v in re.findall(
+        r'm_name = "(\w+)"\s*m_value = \[ ([^\]]+) \]', top_level(block, "m_vectorParams"))}
+    # `m_value =\s*#\[` — VRF prints a short blob inline and WRAPS a long one onto
+    # its own line, so a same-line pattern silently drops exactly the complex
+    # expressions (the trap that hid 45 charms; see charm-shading.json).
+    rec["dynamic"] = {k: " ".join(v.split()) for k, v in re.findall(
+        r'm_name = "(\w+)"\s*m_value =\s*#\[([0-9A-Fa-f\s]+)\]', top_level(block, "m_dynamicParams"))}
+    rec["attributes"] = re.findall(r'"(\$\w+)"', top_level(block, "m_renderAttributesUsed"))
+    return rec
+
+materials, dumped = {}, set()
+for d in sorted({os.path.dirname(v) for v in vmats}):
+    dump = cli("-f", d + "/", "-e", "vmat_c", "-b", "DATA").stdout
+    for block in re.split(r"\n(?=\[\d+/\d+\] )", dump):
+        named = re.search(r'm_materialName = "([^"]+)"', block)
+        if named and named.group(1) in vmats:
+            materials[named.group(1)] = parse_vmat(block)
+missing = [v for v in vmats if v not in materials]
+if missing:
+    print(f"!! {len(missing)} pet material(s) not found in the archive: {', '.join(missing[:5])}")
+
+# Every texture any of them binds. A COLOUR map ships an alpha channel that is
+# zero across opaque styles (VRF's own GLB export drops it), and a zero-alpha
+# texel is exactly what a browser's premultiplied decode throws the RGB of. So
+# alpha goes, UNLESS the material alpha-tests (the chick's fur cards do) or the
+# same file is bound somewhere else as data.
+uses = {}
+for rec in materials.values():
+    keep_alpha = bool({"F_ALPHA_TEST", "F_TRANSLUCENT"} & set(rec["features"]))
+    for param, tex in rec["textures"].items():
+        uses.setdefault(tex, set()).add("color" if param == "g_tColor" and not keep_alpha else "data")
+
+have_cwebp = shutil.which("cwebp") is not None
+if not have_cwebp:
+    print("!!  `cwebp` not found — pet style textures stay PNG (see model-textures for why "
+          "there is no ImageMagick fallback).", file=sys.stderr)
+TEX_RAW = os.path.join(RAW, "tex")
+by_dir = {}
+for tex in uses:
+    by_dir.setdefault(os.path.dirname(tex), []).append(tex)
+for d, texs in sorted(by_dir.items()):
+    # A whole folder is one archive pass; a stray default from materials/default/
+    # is not worth decoding that folder for.
+    if len(texs) >= 4:
+        cli("-o", TEX_RAW, "-d", "-f", d + "/", "-e", "vtex_c")
+    else:
+        for t in texs:
+            cli("-o", TEX_RAW, "-d", "-f", t + "_c")
+
+out_name, failed = {}, []
+total = len(models) + len(uses)
+for n, tex in enumerate(sorted(uses), 1):
+    progress(len(models) + n, total)
+    stem = os.path.basename(tex)[: -len(".vtex")] if tex.endswith(".vtex") else os.path.basename(tex)
+    src = os.path.join(TEX_RAW, tex[: -len(".vtex")] + ".png") if tex.endswith(".vtex") else None
+    if not src or not os.path.exists(src):
+        failed.append(tex)
+        continue
+    if not have_cwebp:
+        rel = f"pets/{stem}.png"
+        shutil.copyfile(src, os.path.join(DEST, rel))
+        out_name[tex] = rel
+        continue
+    rel = f"pets/{stem}.webp"
+    dst = os.path.join(DEST, rel)
+    if not os.path.exists(dst):
+        # -exact for the same reason as model-textures: these are data, and
+        # libwebp may otherwise rewrite the RGB under transparent texels.
+        args = ["cwebp", "-exact", "-lossless", "-q", "100"]
+        if uses[tex] == {"color"}:
+            args.append("-noalpha")
+        try:
+            subprocess.run(args + [src, "-o", dst + ".tmp"], check=True, capture_output=True)
+            os.replace(dst + ".tmp", dst)
+        except Exception:
+            failed.append(tex)
+            continue
+    out_name[tex] = rel
+if failed:
+    print(f"!! {len(failed)} pet texture(s) did not decode (not PNG, or not in the archive): "
+          f"{', '.join(os.path.basename(t) for t in failed[:6])}")
+
+# The SWATCH: each colour map's four dominant colours, so the craft panel can
+# show a coat without downloading a 1024² texture per style. ImageMagick's
+# quantiser is plenty for a 30px circle and ships in every image we run in.
+HIST = re.compile(r"^\s*(\d+):.*?(#[0-9A-Fa-f]{6})", re.M)
+def palette(rel):
+    if not rel or not shutil.which("convert"):
+        return []
+    out = subprocess.run(["convert", os.path.join(DEST, rel), "-alpha", "off", "-resize", "96x96", "+dither",
+                          "-colors", "4", "-format", "%c", "histogram:info:-"],
+                         capture_output=True, text=True).stdout
+    found = [(int(n), c.lower()) for n, c in HIST.findall(out)]
+    total = sum(n for n, _ in found) or 1
+    return [{"c": c, "w": round(n / total, 3)} for n, c in sorted(found, reverse=True)]
+
+stem_of = lambda v: os.path.basename(v)[: -len(".vmat")]
+for rec in materials.values():
+    rec["palette"] = palette(out_name.get(rec["textures"].get("g_tColor")))
+doc = {
+    "models": {m: {"groups": {g: [stem_of(v) for v in mats] for g, mats in groups.items()},
+                   **({"seed": meta_by_model[m]} if meta_by_model.get(m) else {})}
+               for m, groups in groups_by_model.items()},
+    "materials": {stem_of(v): {**rec, "textures": {p: out_name.get(t) for p, t in rec["textures"].items()}}
+                  for v, rec in materials.items()},
+}
+with open(os.path.join(DEST, "pet-styles.json.tmp"), "w") as fh:
+    json.dump(doc, fh, indent=1, sort_keys=True)
+os.replace(os.path.join(DEST, "pet-styles.json.tmp"), os.path.join(DEST, "pet-styles.json"))
+
+styles = {os.path.basename(m): len([g for g in groups if g != "default"]) for m, groups in groups_by_model.items()}
+print(f"---   placed {placed}/{len(models)} pet models; styles {styles}; "
+      f"{len(materials)} materials, {len(out_name)}/{len(uses)} textures -> models/pets/; "
+      f"seed tables for {sum(1 for v in meta_by_model.values() if v)}")
+progress(total, total)
+PYEOF
+
+# The pets' own animation clips — idle, tricks, the inventory showcases. Not
+# fatal: a pet without them still renders, at bind. See the script's header.
+if node "$(dirname "$0")/extract-pet-anims.mjs" --cli "$CLI" --vpk "$VPK" --out "$DEST/pets/anims" 2>&1 | tail -5; then
+  :
+else
+  echo "!! Pet clip extraction failed — pets will stand still on this instance."
+fi
+
+fi
+
 # ---- 3a2. Model textures -> lossless webp -------------------------------------
 if step_if "model-textures"; then
 # The glTF exporter writes PNG. Lossless WebP is byte-identical after decode and
@@ -895,8 +1315,9 @@ dest = os.environ["DEST"]
 # are simply left alone, which costs transfer but never pixels.
 have_cwebp = shutil.which("cwebp") is not None
 if not have_cwebp:
-    print("!!  `cwebp` not found — leaving model textures as PNG (~30% larger "
-          "transfers). Install the `webp` package for the real output. NOT "
+    print("!!  `cwebp` not found — new model textures stay PNG (~30% larger "
+          "transfers; any .webp already on the mount is still reused). Install "
+          "the `webp` package for the real output. NOT "
           "falling back to ImageMagick: its WebP writer discards colour under "
           "zero alpha, which corrupts masks and ramp-lookup patterns.",
           file=sys.stderr)
@@ -1046,7 +1467,12 @@ def convert(uri):
 todo = sorted(wanted)
 progress("model-textures", 0, len(todo))
 done = set()
-if have_cwebp and todo:
+# Run even WITHOUT cwebp: convert() still answers "already done" for every
+# texture whose .webp an earlier run left on the mount, and only declines the
+# genuinely new ones. Gating the whole pass on cwebp meant a run in an image
+# without it (the node:24 hot-swap pod) re-copied every weapon's PNGs and left
+# all 1,229 references on PNG beside a full set of identical .webp files.
+if todo:
     with ThreadPoolExecutor(max_workers=pool_size()) as pool:
         for i, res in enumerate(pool.map(convert, todo), 1):
             if res:

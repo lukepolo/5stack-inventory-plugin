@@ -99,6 +99,10 @@ export function resolveViewerModelSync(item: ResolvableItem): ViewerTarget | nul
       return item?.model ? { model: item.model, kind: "glove" } : null;
     case "agent":
       return item?.model ? { model: item.model, kind: "agent" } : null;
+    // Same shape as an agent: cs2-lib's modelKey is the archive path
+    // ("models/chicken/chick") and the extraction mirrors it on the mount.
+    case "pet":
+      return item?.model ? { model: item.model, kind: "pet" } : null;
     case "keychain":
       return item?.image ? undefined : null;
     // Neither has a mesh in the game — a sticker is composited into the

@@ -23,6 +23,9 @@ import { BAKE_ENVIRONMENT, viewerEnvironment } from "./viewerEnvironments";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
 import { tickCharmLiquid } from "./charmLiquid";
+import { correctPetMaterials, dressPetStyle, petSeedTable, tunePetShading } from "./petMaterial";
+import { easePetPose, PetPoseLayer, petPoseDeltas, type PetBoneDelta } from "./petPattern";
+import { DEFAULT_PET_CLIP, loadPetClip, petLoopAfter } from "./petAnim";
 import {
   buildCharmSim,
   charmMotion,
@@ -2188,6 +2191,34 @@ export interface ViewerHandle {
    */
   setCharmSeed: (seed: number) => void;
   /**
+   * Re-dress a pet in another style without remounting — `kind: "pet"` only;
+   * a no-op on anything else. null is the stock look. A style is a few texture
+   * swaps, and a remount would throw the camera away for them.
+   */
+  setPetStyle: (style: number | null) => Promise<void>;
+  /**
+   * Re-apply a pet's SEED (coat grade + body proportions) and life stage
+   * without remounting — `kind: "pet"` only. See petPattern.ts.
+   */
+  setPetPattern: (seed: number, stage: number | null) => Promise<void>;
+  /**
+   * Switch a pet to another clip without remounting — `kind: "pet"` only.
+   * Cross-fades from the current one. Resolves false when the clip is not on
+   * the mount (or this is not a pet), leaving the current one playing. The
+   * framing stays the mount's: re-framing per clip would jump the camera.
+   */
+  setPetClip: (name: string, opts?: { once?: boolean }) => Promise<boolean>;
+  /**
+   * WANDER: let the pet pick its own clips — `kind: "pet"` only. Each clip plays
+   * once and, when it finishes, another is drawn at random from `pool` (never
+   * the same one twice running), the way the bird potters about in game.
+   * `onClip` hears each pick so the UI can follow. null stops it and leaves the
+   * current clip looping.
+   */
+  setPetWander: (pool: string[] | null, onClip?: (name: string) => void) => void;
+  /** How far through the playing pet clip, 0..1 — null when nothing plays. */
+  petClipProgress: () => number | null;
+  /**
    * Re-paint at a new wear/pattern without rebuilding — what makes a live
    * pattern slider possible on a weapon, and a live wear slider possible on a
    * glove (whose own compositor has no pattern input, so a seed change there
@@ -2506,7 +2537,7 @@ export interface NameplateProbe {
  * and wrong for an arm or a character, so the assumptions live in one table
  * instead of a dozen inline conditions.
  */
-export type ViewerKind = "weapon" | "glove" | "agent" | "charm" | "sticker" | "patch";
+export type ViewerKind = "weapon" | "glove" | "agent" | "charm" | "sticker" | "patch" | "pet";
 
 interface Presentation {
   /** Pose clips to try IN ORDER. Empty = never pose (the model ships posed). */
@@ -2715,6 +2746,24 @@ const PRESENTATION: Record<ViewerKind, Presentation> = {
     attachments: false,
     frame: "flat",
   },
+  pet: {
+    // EMPTY, the agent answer: left at bind and skinned at draw time. The four
+    // birds share one 117-joint rig whose clips are all ONE-FRAME poses — `ref`
+    // plus ten `chicken_<part>_min/_max` pairs (hips, legs, neck, head, comb
+    // front/back, wattle, tail, wing size/width). Those pairs are the body
+    // proportions a pet's seed varies between, so picking any one of them here
+    // would give every pet the same extreme. The egg has no clips at all.
+    poseClips: [],
+    inspectClips: [],
+    dualLayout: false,
+    bodyPrune: false,
+    cullViewmodel: false,
+    restArms: false,
+    cullHolster: false,
+    weaponPaint: false,
+    attachments: false,
+    frame: "upright",
+  },
 };
 
 /**
@@ -2884,6 +2933,24 @@ export interface ViewerOpts {
    * one mount is the kind of thing that drifts.
    */
   charmSpec?: { material: string | null; shading: Record<string, CharmShading> } | null;
+  /**
+   * A pet's style — `kind: "pet"` only. The model's material group of that
+   * name; null is the stock "default" group, which is what the GLB carries
+   * already. See petMaterial.ts.
+   */
+  petStyle?: number | null;
+  /**
+   * Which clip a pet plays — `kind: "pet"` only, never on a `still` viewer.
+   * `world/chick_idle01` style names, as petAnim.ts lists them; defaults to
+   * DEFAULT_PET_CLIP.
+   */
+  petClip?: string | null;
+  /**
+   * A pet's life stage (cs2-lib's upgrade level) — `kind: "pet"` only. Picks
+   * the body preset the seed draws from; null is the pet's default (a hen).
+   * The seed itself rides `seed`, as every other kind's pattern does.
+   */
+  petStage?: number | null;
   /**
    * A STANDALONE sticker or patch — `kind: "sticker" | "patch"` only.
    *
@@ -3466,13 +3533,31 @@ async function buildViewer(
    * as it is: a bake takes the branch below and gets the flattened pose it
    * always got.
    */
-  const liveClip =
-    !opts?.still && pres.liveClips?.length
-      ? pres.liveClips.reduce<import("three").AnimationClip | undefined>(
-          (found, re) => found ?? gltf.animations?.find((a) => re.test(a.name)),
-          undefined,
-        )
-      : undefined;
+  //
+  // A pet's clips are not in its GLB at all — they come from the extracted
+  // `.vnmclip`s (see petAnim.ts) — so that kind fetches one instead. ALWAYS the
+  // idle, whatever `petClip` asks for: the framing below is measured over the
+  // mount clip, and a trick throws the bird ~1.3m (trick07's `root` travels 50
+  // units), which framed one flying out of the top of the stage. The requested
+  // clip takes over once the mount is done — see the end of buildViewer.
+  const liveClip = opts?.still
+    ? undefined
+    : kind === "pet"
+      ? ((await loadPetClip(THREE, object, DEFAULT_PET_CLIP)) ?? undefined)
+      : pres.liveClips?.length
+        ? pres.liveClips.reduce<import("three").AnimationClip | undefined>(
+            (found, re) => found ?? gltf.animations?.find((a) => re.test(a.name)),
+            undefined,
+          )
+        : undefined;
+  /** The pet clip playing now, so setPetClip can fade out of it. */
+  let petClipNow: import("three").AnimationClip | null = kind === "pet" ? (liveClip ?? null) : null;
+  /** Newest setPetClip wins; and the intro->loop listener it may have left. */
+  let petClipGen = 0;
+  let petClipHandoff: ((e: { action: import("three").AnimationAction }) => void) | null = null;
+  /** setPetWander's pool, and the mixer listener that rolls the next clip. */
+  let petWander: { pool: string[]; onClip?: (name: string) => void } | null = null;
+  let petWanderListener: ((e: { action: import("three").AnimationAction }) => void) | null = null;
   if (liveClip) {
     // Keep the skeleton, skip the bake. The mixer is advanced by the render
     // loop; `still` never reaches here, so nothing offscreen pays for it.
@@ -3913,6 +3998,69 @@ async function buildViewer(
     standaloneCharmMasks = await loadCharmTintMasks(THREE, loadTexture, object, shading);
     tuneCharmShading(THREE, object, shading, opts?.seed ?? 0, standaloneCharmMasks);
   }
+  // A PET'S LOOK, in the order the game builds it: the style picks the
+  // materials, the seed grades them and shapes the body (petPattern.ts). All
+  // three are live — setPetStyle / setPetPattern re-run the relevant half.
+  let petStyleNow = opts?.petStyle ?? null;
+  let petSeedNow = opts?.seed ?? 0;
+  let petStageNow = opts?.petStage ?? null;
+  let petLookGen = 0;
+  const petBones = new Map<string, import("three").Object3D>();
+  let petPose = new Map<string, PetBoneDelta>();
+  /** What is ON SCREEN, chasing `petPose` — see easePetPose. */
+  let petPoseShown = new Map<string, PetBoneDelta>();
+  /** Coat grades easing toward a new pattern's values: material -> target. */
+  const petAdjustTargets = new Map<import("three").Material, import("three").Vector4>();
+  const petLayer = new PetPoseLayer();
+  const petTmp = new THREE.Vector3();
+  // The egg and the chick are one stage each; a breed is a pullet (2) or a hen
+  // (3, its default) and draws its body from that stage's preset.
+  const petStage = () => (/\/egg_pristine$/.test(model) ? 0 : /\/chick$/.test(model) ? 1 : (petStageNow ?? 3));
+  const refreshPetPose = async (snap = false) => {
+    petPose = petPoseDeltas(THREE, gltf.animations ?? [], await petSeedTable(model), petSeedNow, petStage());
+    // With a clip playing, the render loop re-lays the layer around every mixer
+    // update and EASES toward the new deltas (a drag is a run of pattern hops;
+    // chasing them reads as one morph). Without one (a card bake, the egg) it
+    // goes on here, once and exactly — undone first, so a second call replaces
+    // the first rather than stacking on it. The mount snaps: easing in from the
+    // average bird would show every pet growing into itself.
+    if (liveMixer && !snap) return;
+    petPoseShown = new Map([...petPose].map(([k, d]) => [k, { t: d.t.clone(), q: d.q.clone(), s: d.s.clone() }]));
+    if (liveMixer) return;
+    petLayer.undo();
+    petLayer.apply(petBones, petPose, petTmp);
+    object.updateMatrixWorld(true);
+  };
+  /** Re-grade the coat for a new pattern, easing from what is shown now. */
+  const tunePetEased = async (seed: number) => {
+    const before = new Map<import("three").Material, import("three").Vector4>();
+    object.traverse((n) => {
+      const m = (n as import("three").Mesh).material as import("three").Material | undefined;
+      const v = m?.userData?.colorAdjust as import("three").Vector4 | undefined;
+      if (m && v) before.set(m, v.clone());
+    });
+    await tunePetShading(THREE, object, model, petStyleNow, seed);
+    for (const [m, was] of before) {
+      const v = m.userData.colorAdjust as import("three").Vector4 | undefined;
+      if (!v) continue;
+      petAdjustTargets.set(m, v.clone());
+      v.copy(was);
+    }
+  };
+  if (kind === "pet") {
+    object.traverse((n) => {
+      if (!(n as unknown as { isBone?: boolean }).isBone) return;
+      petBones.set(n.name, n);
+    });
+    await correctPetMaterials(THREE, object);
+    // A style the mount does not know keeps the stock coat rather than failing
+    // the mount: it is the look the game shows for an unset style anyway.
+    if (petStyleNow != null && !(await dressPetStyle(THREE, object, model, petStyleNow))) {
+      console.warn(`[viewer3d] no style ${petStyleNow} for ${model} on this mount — showing the stock look`);
+    }
+    await tunePetShading(THREE, object, model, petStyleNow, petSeedNow);
+    await refreshPetPose(true);
+  }
   scene.add(object);
 
   // Apply the equipped skin through the ported CS2 compositor (see
@@ -4306,10 +4454,13 @@ async function buildViewer(
   // multiplier frames an agent nearly edge to edge — it filled about 90% of the
   // pane and read as cropped. 1.75 backs off proportionally to roughly 70%,
   // which leaves the head and boots clear and gives the orbit somewhere to go.
-  // Agents are the only kind on "upright", so this is theirs alone to tune.
+  //
+  // Pets are upright too, but a chicken is about as long as it is tall, and at
+  // 1.75 it filled ~90% of the craft stage with its feet cropped. 2.2 brings it
+  // back to roughly the agents' share.
   const camDir =
     pres.frame === "upright"
-      ? new THREE.Vector3(0.55, 0.12, 1.0).normalize().multiplyScalar(1.75)
+      ? new THREE.Vector3(0.55, 0.12, 1.0).normalize().multiplyScalar(kind === "pet" ? 2.2 : 1.75)
       : flatOn
         ? flatDir()
         : new THREE.Vector3(1.4, 0.35, 1.1);
@@ -4595,7 +4746,33 @@ async function buildViewer(
   // bigger arc than the feet. Lift the pivot toward the chest, where a person
   // actually appears to rotate. Fraction of the box height rather than an
   // absolute, so it holds for the shortest and tallest agents alike.
-  if (pres.frame === "upright") controls.target.y = cbox.min.y + (cbox.max.y - cbox.min.y) * 0.62;
+  //
+  // Not a pet: a chicken's mass sits at its box centre, and lifting the pivot
+  // there only pushed its feet out of the bottom of the frame.
+  if (pres.frame === "upright" && kind !== "pet") {
+    controls.target.y = cbox.min.y + (cbox.max.y - cbox.min.y) * 0.62;
+  }
+
+  // A PET'S CLIPS GO PLACES, and the camera goes with them. Dropping
+  // `root_motion` (petAnim.ts) only removes the locomotion the GAME moves the
+  // entity by; plenty of clips still carry the bird on its own `root` bone —
+  // trick05/07 leap ~40 units up, hop travels 28 forward, retirement01 walks
+  // 430 units off. Freezing that bone would misrepresent every one of them, so
+  // the view follows instead: target and camera shift together (the orbit is
+  // untouched) by a smoothed share of how far `root` is from where it stood at
+  // mount, like an operator keeping the subject in frame.
+  const petRoot = kind === "pet" && liveMixer ? object.getObjectByName("root") ?? null : null;
+  const petRootHome = petRoot?.getWorldPosition(new THREE.Vector3()) ?? null;
+  const petFollowAt = new THREE.Vector3();
+  const petFollowWant = new THREE.Vector3();
+  const followPet = (dt: number) => {
+    if (!petRoot || !petRootHome || dt <= 0) return;
+    petRoot.getWorldPosition(petFollowWant).sub(petRootHome);
+    const step = petFollowWant.sub(petFollowAt).multiplyScalar(1 - Math.exp(-dt * 4));
+    petFollowAt.add(step);
+    controls.target.add(step);
+    camera.position.add(step);
+  };
 
   // THE PIVOT, DRAWN — `?pivotdot=1`. "Rotation feels wrong" is one of the few
   // complaints with no visible cause: the pivot is a point in empty space and
@@ -12481,7 +12658,34 @@ async function buildViewer(
       // Same Motion gate for both. A live skeleton (gloves) and the first-person
       // arms are the same kind of thing — geometry that moves — so one switch
       // stops both.
+      // The seed's body proportions are a layer over the mixer's frame: lifted
+      // off before it writes, laid back on after — see PetPoseLayer for why it
+      // cannot simply be added each frame. Before the follow, so the camera
+      // tracks where the shaped bird actually is.
+      if (liveMixer) petLayer.undo();
       if (liveMixer) liveMixer.update(motionOn ? dt : 0);
+      if (liveMixer && (petPose.size || petPoseShown.size)) {
+        // ~80ms to close most of the gap: quick enough to track a drag, slow
+        // enough that a hop between patterns reads as motion, not a cut.
+        easePetPose(THREE, petPoseShown, petPose, 1 - Math.exp(-dt * 12));
+        petLayer.apply(petBones, petPoseShown, petTmp);
+      }
+      if (petAdjustTargets.size) {
+        const a = 1 - Math.exp(-dt * 12);
+        for (const [m, target] of petAdjustTargets) {
+          const v = m.userData.colorAdjust as import("three").Vector4 | undefined;
+          if (!v) {
+            petAdjustTargets.delete(m);
+            continue;
+          }
+          v.lerp(target, a);
+          if (Math.abs(v.x - target.x) + Math.abs(v.y - target.y) + Math.abs(v.z - target.z) + Math.abs(v.w - target.w) < 1e-4) {
+            v.copy(target);
+            petAdjustTargets.delete(m);
+          }
+        }
+      }
+      followPet(motionOn ? dt : 0);
       // AFTER the mixer, never before: it overwrites every bone it keys, so a
       // constraint applied first is simply thrown away on the same frame.
       twist?.apply();
@@ -12665,6 +12869,102 @@ async function buildViewer(
       // branch costs anything when its side is absent, and an `else` here would
       // be a silent choice about which one wins if it ever were.
       if (charm?.shading) tuneCharmShading(THREE, charm.sprite, charm.shading, seed, charm.masks);
+    },
+    async setPetStyle(style) {
+      if (disposed || kind !== "pet") return;
+      const gen = ++petLookGen;
+      petStyleNow = style;
+      await dressPetStyle(THREE, object, model, style);
+      // A new style is new materials, so the seed's grade goes on again.
+      if (gen === petLookGen && !disposed) await tunePetShading(THREE, object, model, style, petSeedNow);
+    },
+    async setPetPattern(seed, stage) {
+      if (disposed || kind !== "pet") return;
+      const gen = ++petLookGen;
+      petSeedNow = seed;
+      petStageNow = stage;
+      await tunePetEased(seed);
+      if (gen === petLookGen && !disposed) await refreshPetPose();
+    },
+    async setPetClip(name, clipOpts) {
+      if (disposed || kind !== "pet" || !liveMixer) return false;
+      const mixer = liveMixer;
+      const once = !!clipOpts?.once;
+      // An intro with a `_loop` twin (reveal -> reveal_loop, feed -> feed_loop)
+      // plays ONCE and then hands over, which is how the game sequences them;
+      // looping the intro restarts a 22s showcase from its first beat. A clip
+      // played `once` (Wander) wants none of that — it ends, and Wander moves on.
+      const [next, loopName] = await Promise.all([loadPetClip(THREE, object, name), once ? null : petLoopAfter(name)]);
+      if (!next || disposed) return false;
+      const gen = ++petClipGen;
+      if (petClipHandoff) mixer.removeEventListener("finished", petClipHandoff);
+      petClipHandoff = null;
+      const play = (clip: import("three").AnimationClip, once: boolean) => {
+        const from = petClipNow ? mixer.existingAction(petClipNow) : null;
+        const to = mixer.clipAction(clip);
+        to.reset();
+        to.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
+        to.clampWhenFinished = once;
+        to.play();
+        if (from && from !== to) from.crossFadeTo(to, 0.3, false);
+        petClipNow = clip;
+        return to;
+      };
+      const intro = play(next, once || !!loopName);
+      const loop = loopName ? await loadPetClip(THREE, object, loopName) : null;
+      if (loop && gen === petClipGen && !disposed) {
+        const handoff = (e: { action: import("three").AnimationAction }) => {
+          if (e.action !== intro) return;
+          mixer.removeEventListener("finished", handoff);
+          petClipHandoff = null;
+          if (gen === petClipGen && !disposed) play(loop, false);
+        };
+        petClipHandoff = handoff;
+        mixer.addEventListener("finished", handoff);
+      }
+      return true;
+    },
+    setPetWander(pool, onClip) {
+      if (disposed || kind !== "pet" || !liveMixer) return;
+      const mixer = liveMixer;
+      if (petWanderListener) mixer.removeEventListener("finished", petWanderListener);
+      petWanderListener = null;
+      petWander = pool?.length ? { pool, onClip } : null;
+      const current = petClipNow ? mixer.existingAction(petClipNow) : null;
+      if (!petWander) {
+        // Back to looping whatever is on — including a clip Wander had let run
+        // to its end and clamp there.
+        if (current) {
+          current.setLoop(THREE.LoopRepeat, Infinity);
+          current.clampWhenFinished = false;
+          if (!current.isRunning()) current.reset().play();
+        }
+        return;
+      }
+      const w = petWander;
+      const roll = async () => {
+        if (petWander !== w || disposed) return;
+        const choices = w.pool.filter((n) => n !== petClipNow?.name);
+        const pick = choices[Math.floor(Math.random() * choices.length)] ?? w.pool[0];
+        if (pick && (await handle.setPetClip(pick, { once: true })) && petWander === w) w.onClip?.(pick);
+      };
+      petWanderListener = (e) => {
+        if (petWander === w && e.action.getClip() === petClipNow) void roll();
+      };
+      mixer.addEventListener("finished", petWanderListener);
+      // The clip already on finishes its current pass, then Wander takes over.
+      if (current) {
+        current.setLoop(THREE.LoopOnce, 1);
+        current.clampWhenFinished = true;
+      } else {
+        void roll();
+      }
+    },
+    petClipProgress() {
+      if (!liveMixer || !petClipNow) return null;
+      const a = liveMixer.existingAction(petClipNow);
+      const d = petClipNow.duration;
+      return a && d > 0 ? Math.min(1, Math.max(0, a.time / d)) : null;
     },
     charmAlbedoTile(size = 16) {
       if (disposed) return null;
@@ -13416,5 +13716,8 @@ async function buildViewer(
     throwIfAborted(signal);
     renderLoop();
   }
+  // A pet MOUNTS on its idle (see liveClip) and only then moves to the clip it
+  // was asked for, so the camera is the same whichever clip is on.
+  if (kind === "pet" && opts?.petClip && opts.petClip !== DEFAULT_PET_CLIP) void handle.setPetClip(opts.petClip);
   return handle;
 }

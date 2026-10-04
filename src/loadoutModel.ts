@@ -39,10 +39,7 @@ export const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti", "c
 // A slot-level answer is necessarily coarse — it is asked before an occupant is
 // known. The per-ITEM answer (a painted glove has no compositor yet) lives in
 // resolveViewerModel, and the focus/ctx paths below still HEAD-probe on top.
-//
-// pet: cs2-lib names the chicken models, but nothing extracts them yet — the
-// flat econ icon is the whole render until it does.
-export const isNo3d = (s: string) => ["c4", "musickit", "graffiti", "collectible", "pet"].includes(s);
+export const isNo3d = (s: string) => ["c4", "musickit", "graffiti", "collectible"].includes(s);
 // Origin filter — the same control on the Inventory grid and on the loadout
 // sheet's Owned section, so "hide my Steam imports" works the same in both.
 export type OriginFilter = "all" | "steam" | "crafted";

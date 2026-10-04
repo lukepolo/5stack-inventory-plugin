@@ -232,27 +232,39 @@ verification rather than known breakage:
 
 ## Pets: 3D
 
-**Status: deliberately deferred — pets ship as their flat econ icon.**
+**Status: landed 2026-10-03 — models, styles, 109 game clips, the seed's colour
+and body, catalog/owned card art. Open items below.**
 
-The slot, the craft attributes (pattern, style, stage, name tag), the equipped
-v5 `pet` entry and the inspect link all landed with cs2-lib 9.5.0. What did not
-is a 3D form: `isNo3d` lists `pet`, and `viewerModel.ts` has no `pet` case, so
-every surface takes the same flat path a pin or a music kit does.
+### What exists
 
-What a 3D pet needs, from what cs2-lib already says:
+- **Extraction** (`pet-models`, v32): the five `pedestal_display_model`s from
+  `pet_definitions`, mirrored at their archive path; every style's maps under
+  `models/pets/`; `pet-styles.json` (groups, materials with textures/features/
+  float params/dynamic bytecode/palette, and per model `seed` = the vmdl's
+  `chicken_metadata`); and `scripts/extract-pet-anims.mjs` -> `models/pets/anims/`.
+- **Only the egg has a game icon.** Def 4681 has no `image_inventory`; the
+  chick and breeds are rendered live in game. Their craft tiles bake from the
+  model into the CATALOG render store (`/api/render/catalog`, `cat-<id>-v<N>`,
+  first writer wins); owned pets bake cards like weapons (`CARD_BAKE_KINDS`),
+  keyed on coat (`-c`) and stage (`-g`) as well.
+- **The seed** (petPattern.ts) is Valve's, recovered from libclient.so and
+  verified bit-exact: CUniformRandomStream(seed) -> ten floats -> `matparams`
+  -> `$Chicken*` attributes -> each material's dynamic expressions (run by a
+  bytecode VM with real branches) -> the charm colour-adjust shader; a second
+  stream -> `presets.{adult,adolescent}` weights -> min/max DELTA poses laid
+  over the mixer as a reversible layer (PetPoseLayer explains why it has to be).
+- **Viewer**: kind `pet`, live style / clip / pattern switches, camera follows
+  clips that travel; PetControls (coat swatches, stage track, traits, clips).
 
-- **Models.** `modelKey` names them — `models/chicken/egg_pristine`,
-  `models/chicken/chick`, and one per breed (`chicken`, `chicken_silkie`,
-  `chicken_polish`). Nothing in `scripts/extract-models.sh` pulls them yet.
-- **Style is a material group, not a texture swap.** The game plugin sets
-  `m_materialGroup` on the chicken's skeleton to the string token of the style
-  number (`"5"`), so the extraction has to keep every material group of the
-  vmdl, not only the default one. Style null = the default group.
-- **Stage may change the model on a breed.** cs2-lib gives each breed ONE
-  `modelKey`, but a pullet (stage 2) and a hen (stage 3) are different growth
-  stages in game — unverified whether they share a mesh, so check which vmdl a
-  pullet uses before assuming the breed's `modelKey` covers both.
-- **The icons are already handled.** `build-asset-manifest.mjs` takes every
-  cs2-lib `imagePath`, so the next extraction run fetches the `chicken_*` econ
-  icons with no change — a mount extracted before cs2-lib 9.5.0 shows the pet
-  cells blank until then.
+### Open
+
+1. **Detail, UV offset, iridescence.** The seed also drives `g_fDetailHueShift`,
+   `g_vDetailTexCoordOffset` (which face-detail atlas cell) and
+   `$ChickenIridescence`; the face-detail atlas and iridescence masks are
+   extracted, the GLB material does not use them.
+2. **Stage scale and grounding.** In game a pullet is 0.6x, the chick 0.25x
+   (its mesh is hen-sized), and a post-process re-grounds the feet onto the IK
+   targets and corrects the neck pitch (libclient 0x1b71e90). The viewer frames
+   to fit, so scale shows nothing alone; grounding is unimplemented.
+3. **Share cards** for pets still key without coat/stage (`bakedShareRender`).
+4. **`matgrps` freq** (style roll weights) is unused — the Game Coordinator's.

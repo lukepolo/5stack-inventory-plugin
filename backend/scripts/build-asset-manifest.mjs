@@ -58,7 +58,12 @@ const displayedStickerIdOf = (i) => i.displayedStickerId ?? i.stickerId;
 // src/App.vue). Agents and stickers are still out — their icons only stop being
 // true once a patch or a scuff lands, which is a per-item question, not a type
 // one.
-const RENDERED_IN_3D = new Set(["weapon", "melee", "keychain", "glove"]);
+//
+// `pet` is in on the catalog side: four of the five pets have no icon in the
+// game at all (they are rendered live), and their tiles are baked from the
+// model into the shared CATALOG render store (/api/render/catalog) — a stored
+// picture every client gets, not a blank.
+const RENDERED_IN_3D = new Set(["weapon", "melee", "keychain", "glove", "pet"]);
 
 // ---- sticker kit id, the ONLY thing that tells two same-named decals apart ---
 //

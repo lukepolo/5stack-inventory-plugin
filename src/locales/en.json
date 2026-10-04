@@ -5,6 +5,8 @@
       "sign_in_to_save": "Sign in to save this to your inventory.",
       "sign_in_to_inspect": "Sign in to open this in game.",
       "crafted": "Crafted — it's in your inventory.",
+      "crafted_equipped": "Crafted and equipped.",
+      "crafted_not_equipped": "Crafted — it's in your inventory. Nothing on this side can hold it, so it isn't equipped.",
       "copy_created": "Editable copy created in your inventory.",
       "inspect_sent": "Sent to your game client — CS2 will open the inspect view.",
       "inspect_copied": "Too long for a Steam link — the inspect command is on your clipboard. Paste it into the CS2 console.",
