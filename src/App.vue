@@ -1535,16 +1535,41 @@ function equippedInstance(pos: string): InventoryItem | undefined {
   return instanceById(rowFor(pos)?.item_instance_id);
 }
 
-/** Equip `inst` at `pos`. Resolves whether it is now there. */
-async function equipInstanceAt(inst: InventoryItem, pos: string): Promise<boolean> {
-  const cur = rowFor(pos);
+/**
+ * The slot `inst` takes on side `t`, when `pos` is where it goes on the side
+ * on screen. The same slot, unless `t` already holds this weapon in another
+ * one: the backend allows one of each weapon per side and refuses the equip
+ * ("already in another slot"), so equipping both sides at `pos` failed on the
+ * side you couldn't see whenever the two loadouts were laid out differently.
+ */
+function slotOnTeam(inst: InventoryItem, pos: string, t: Team): string {
+  const model = inst.item?.model;
+  if (t === team.value || isSpecial(pos) || !model) return pos;
+  for (const g of POSITION_GROUPS) {
+    for (const p of g.positions) {
+      if (occupantModel(p, t) === model) return p;
+    }
+  }
+  return pos;
+}
+
+/**
+ * Equip `inst` at `pos` on `teams` — this side unless told otherwise, and
+ * always both for a shared slot. Resolves whether it is now there.
+ */
+async function equipInstanceAt(inst: InventoryItem, pos: string, teams?: Team[]): Promise<boolean> {
+  const sides = (isShared(pos) ? (["CT", "T"] as Team[]) : (teams ?? [team.value])).map((t) => ({
+    team: t,
+    slot: slotOnTeam(inst, pos, t),
+  }));
   try {
     // Clicking the already-equipped skin is a no-op: equipping is never a
     // toggle, so a stray second click can't silently strip the slot. Removing
-    // a skin is the explicit Unequip action.
-    if (cur && String(cur.item_instance_id) === String(inst.id)) return true;
-    const teams: Team[] = isShared(pos) ? ["CT", "T"] : [team.value];
-    await Promise.all(teams.map((t) => equip({ team: t, slot: pos, item_instance_id: inst.id })));
+    // a skin is the explicit Unequip action. Per side, so both teams on an
+    // item that is already on CT writes only T.
+    const todo = sides.filter((s) => String(rowFor(s.slot, s.team)?.item_instance_id) !== String(inst.id));
+    if (!todo.length) return true;
+    await Promise.all(todo.map((s) => equip({ team: s.team, slot: s.slot, item_instance_id: inst.id })));
     await refreshAll();
     pulseSlot(pos);
     // Replacing lands you on the new gun's Owned skins, ready to re-skin it.
@@ -2536,6 +2561,8 @@ async function confirmCraft(andEquip = false) {
 async function saveCraft(andEquip = false) {
   if (!craft.value || craftBusy.value) return;
   craftBusy.value = true;
+  // Before anything awaits: the side picker belongs to the modal on screen now.
+  const sides = equipTeams.value;
   try {
     const body = craftBody();
     if (editingId.value != null) {
@@ -2585,9 +2612,9 @@ async function saveCraft(andEquip = false) {
       // "doesn't fit that slot" and the craft was lost. Here the craft is saved
       // first and unconditionally; equipping can only fail on its own.
       let equipped = false;
-      if (andEquip && canEquipInstance(inst)) {
+      if (andEquip && inst.slot) {
         const pos = positionForInstance(inst);
-        if (pos) equipped = await equipInstanceAt(inst, pos);
+        if (pos) equipped = await equipInstanceAt(inst, pos, sides);
       }
       notify(
         equipped
@@ -4705,13 +4732,7 @@ async function ctxEquipTeams(teams: Team[]) {
     if (inst) fail(new Error("No loadout slot fits that item."));
     return;
   }
-  try {
-    await Promise.all(teams.map((t) => equip({ team: t, slot: pos, item_instance_id: inst.id })));
-    await refreshAll();
-    pulseSlot(pos);
-  } catch (e) {
-    fail(e);
-  }
+  await equipInstanceAt(inst, pos, teams);
 }
 async function itemCtxStatTrak() {
   const inst = itemCtx.value?.inst;
@@ -6108,12 +6129,6 @@ watch(
   },
   { immediate: true },
 );
-function canEquipInstance(i: InventoryItem): boolean {
-  if (!i.slot) return false;
-  if (isShared(i.slot)) return true;
-  const teams = i.item?.teams;
-  return !teams || teams.length === 0 || teams.includes(team.value);
-}
 // Where an inventory item would go: the position its weapon already occupies,
 // else the first eligible position in its category group.
 function positionForInstance(i: InventoryItem): string | null {
@@ -6134,14 +6149,6 @@ function positionForInstance(i: InventoryItem): string | null {
     return p;
   }
   return null;
-}
-async function equipFromInventory(i: InventoryItem) {
-  const pos = positionForInstance(i);
-  if (!pos) {
-    fail(new Error("No loadout slot fits that item."));
-    return;
-  }
-  await equipInstanceAt(i, pos);
 }
 
 // ---- opening an item --------------------------------------------------------
@@ -6166,28 +6173,91 @@ function openDetail(i: InventoryItem) {
 /**
  * Can a NEW craft of this item go straight into a slot? Decides whether the
  * commit button leads with Craft & Equip. The type has to have a slot at all
- * (a sticker, charm or patch is applied to things, not equipped), and the side
- * you are on has to be able to use it — the slot itself is only known once the
+ * (a sticker, charm or patch is applied to things, not equipped) — WHICH side
+ * it goes on is the side picker's, and the slot itself is only known once the
  * backend has made the instance, which is why saveCraft re-asks then.
  */
 const EQUIPPABLE_TYPES = new Set(["weapon", "melee", "glove", "agent", "musickit", "graffiti", "collectible", "pet"]);
 const craftCanEquip = computed(() => {
-  const s = craft.value?.skin as { type?: string | null; teams?: string[] | null } | undefined;
-  if (!s || editingId.value != null || !EQUIPPABLE_TYPES.has(s.type ?? "weapon")) return false;
-  return !s.teams?.length || s.teams.includes(team.value);
+  const s = craft.value?.skin;
+  return !!s && editingId.value == null && EQUIPPABLE_TYPES.has(s.type ?? "weapon");
 });
 const craftCommitMenu = ref(false);
 const craftEquipTarget = computed(() => {
   const i = craftInst.value;
-  if (!i || !viewOnly.value || !canEquipInstance(i)) return null;
+  if (!i?.slot || !viewOnly.value) return null;
   const pos = positionForInstance(i);
   return pos ? { pos } : null;
 });
+
+// ---- which side an equip goes on ---------------------------------------------
+// The footer's Equip used to mean "on the side you happen to be looking at",
+// and said nothing about it — so there was no way to put a knife on both teams
+// short of equipping it twice with a team switch in between. The button still
+// just says Equip; the picker beside it says where, and only offers what the
+// item can do: an AK lists T alone (CT is there, greyed, so the reason shows),
+// and Both appears only when both sides can hold it.
+const TEAM_DOT: Record<Team, string> = { CT: "#7ea6ff", T: "#f2c14e" };
+type EquipSide = Team | "both";
+/** Shared slots — zeus, C4, kits, graffiti, pins, pets — are one loadout for
+ *  both sides already, so there is nothing to pick. A new craft has no slot
+ *  yet, so its type answers instead. */
+function sharedCraftType(s: Skin): boolean {
+  return ["musickit", "graffiti", "collectible", "pet"].includes(s.type ?? "") || ["taser", "c4"].includes(s.model ?? "");
+}
+const equipSideOptions = computed(() => {
+  let teams: readonly string[] | null | undefined;
+  if (viewOnly.value) {
+    const i = craftInst.value;
+    if (!i?.slot || isShared(i.slot)) return null;
+    teams = i.item?.teams;
+  } else {
+    const s = craft.value?.skin;
+    if (!s || !craftCanEquip.value || sharedCraftType(s)) return null;
+    // A catalog FINISH carries no teams (only agents do); which side can hold a
+    // gun is its weapon's, so an M4 skin asks the M4. Read as "none" it offered
+    // Both, and T for a weapon T cannot use.
+    teams = s.teams?.length ? s.teams : weaponByModel.value.get(s.model ?? "")?.teams;
+  }
+  const can = (t: Team) => !teams?.length || teams.includes(t);
+  const opts: { value: EquipSide; label: string; color?: string; colors?: string[]; disabled?: boolean }[] = (
+    ["CT", "T"] as Team[]
+  ).map((t) => ({ value: t, label: t, color: TEAM_DOT[t], disabled: !can(t) }));
+  if (can("CT") && can("T")) {
+    opts.push({ value: "both", label: tr("inventory.equip.both_teams", "Both teams"), colors: [TEAM_DOT.CT, TEAM_DOT.T] });
+  }
+  return opts;
+});
+// Keyed to the item it was made for, so opening the next item starts over from
+// the default instead of inheriting a choice made about something else.
+const equipSidePick = ref<{ key: string; side: EquipSide } | null>(null);
+const equipSideKey = computed(() => (viewOnly.value ? `i${craftInst.value?.id}` : `s${craft.value?.skin.id}`));
+const equipSide = computed<EquipSide>(() => {
+  const opts = equipSideOptions.value ?? [];
+  const ok = (v: EquipSide) => opts.some((o) => o.value === v && !o.disabled);
+  const pick = equipSidePick.value;
+  if (pick && pick.key === equipSideKey.value && ok(pick.side)) return pick.side;
+  // Both wherever both can hold it — what most people want, and asked for.
+  if (ok("both")) return "both";
+  if (ok(team.value)) return team.value;
+  return opts.find((o) => !o.disabled)?.value ?? team.value;
+});
+// No picker means a shared slot, which is both sides whatever is asked.
+const equipTeams = computed<Team[]>(() =>
+  !equipSideOptions.value || equipSide.value === "both" ? ["CT", "T"] : [equipSide.value],
+);
+function pickEquipSide(v: string) {
+  equipSidePick.value = { key: equipSideKey.value, side: v as EquipSide };
+}
+
 async function craftViewEquip() {
   const i = craftInst.value;
-  if (!i) return;
+  const target = craftEquipTarget.value;
+  // Read before closeCraft — the picker belongs to the modal it clears.
+  const teams = equipTeams.value;
+  if (!i || !target) return;
   closeCraft();
-  await equipFromInventory(i);
+  await equipInstanceAt(i, target.pos, teams);
 }
 
 // ---- focus view -------------------------------------------------------------
@@ -9290,12 +9360,15 @@ if (MDEBUG) {
            work: five sticker wells, a charm, wear and pattern, all aimed at a
            model you are dragging things onto, and every pixel the card spent on
            being a layer came out of that model. So edit takes the whole
-           viewport and drops the rounding, the border and the inset with it. -->
+           viewport and drops the rounding, the border and the inset with it.
+           The card's caps only bind on a big monitor (a laptop hits the vw/vh
+           first). They were 1320x940, which left a 1440p screen with a model
+           in half of it; 1800x1240 keeps the same ~1.45:1 card, just larger. -->
       <div
         class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
         :class="isCompact || !viewOnly
           ? 'h-full w-full'
-          : 'h-[min(92vh,940px)] w-[min(96vw,1320px)] rounded-lg border border-border'"
+          : 'h-[min(92vh,1240px)] w-[min(96vw,1800px)] rounded-lg border border-border'"
       >
         <div class="flex items-center justify-between border-b border-border" :class="isCompact ? 'gap-2 px-3 py-2' : 'px-4 py-2.5'">
           <!-- Provenance and where it's equipped belong to the item's IDENTITY,
@@ -9922,16 +9995,26 @@ if (MDEBUG) {
             <Copy v-if="isReadOnly(craftInst)" class="h-3.5 w-3.5" /><Pencil v-else class="h-3.5 w-3.5" />
             {{ isReadOnly(craftInst) ? 'Craft' : 'Edit' }}
           </button>
+          <!-- Where the equip goes. Right next to the button it steers, so the
+               button can stay "Equip" — see equipSideOptions. -->
+          <FilterDropdown
+            v-if="viewOnly && canEdit && equipSideOptions"
+            :model-value="equipSide"
+            :options="equipSideOptions"
+            dots
+            up
+            tall
+            @update:model-value="pickEquipSide"
+          />
           <button
             v-if="viewOnly && canEdit"
             class="flex h-9 items-center gap-1.5 rounded-md border border-transparent px-4 text-f11 font-bold uppercase tracking-wider text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 1px 3px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.22)"
             :disabled="!craftEquipTarget"
-            :title="craftEquipTarget ? 'Equip on ' + team : 'Not usable by ' + team"
+            :title="craftEquipTarget ? 'Equip on ' + equipTeams.join(' + ') : 'This item is applied to things, not equipped'"
             @click="craftViewEquip"
           >
-            <template v-if="craftEquipTarget">Equip</template>
-            <template v-else>Not usable by {{ team }}</template>
+            Equip
           </button>
           <!-- Signed out the editor stays fully live — only the commit is off.
                Disabled-with-a-reason rather than hidden, so it's clear up front
@@ -9953,6 +10036,15 @@ if (MDEBUG) {
                awkward half of crafting — with plain Craft one click away on the
                caret. Items that cannot be equipped from here (attachments, or
                off-side) just say Craft; editing says Save. -->
+          <FilterDropdown
+            v-if="!viewOnly && craftCanEquip && equipSideOptions"
+            :model-value="equipSide"
+            :options="equipSideOptions"
+            dots
+            up
+            tall
+            @update:model-value="pickEquipSide"
+          />
           <div
             v-if="!viewOnly"
             class="relative flex h-9 rounded-md"

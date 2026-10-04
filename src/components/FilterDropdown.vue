@@ -6,13 +6,30 @@
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Check, ChevronDown, Search, X } from "lucide-vue-next";
 
+type Option = {
+  value: string;
+  label: string;
+  color?: string | null;
+  /** Several colours in one dot, split side by side — "both teams" is CT's
+   *  blue and T's gold, not a third colour. Dot only: the label stays untinted. */
+  colors?: string[];
+  disabled?: boolean;
+};
 const props = defineProps<{
   modelValue: string;
-  options: { value: string; label: string; color?: string | null; disabled?: boolean }[];
+  options: Option[];
   /** Static prefix on the closed button, e.g. "Sort" -> "Sort · Name". */
   prefix?: string;
   /** Rarity mode: color dots on the rows and the closed button. */
   dots?: boolean;
+  /** Open above the button — for a footer, where below is off the card. */
+  up?: boolean;
+  /** One of the item modal's FOOTER buttons rather than a toolbar control, and
+   *  built to that row's box (see App.vue): h-9, px-4, semibold, tracking-wider.
+   *  The edge is a step brighter too — at the toolbar's border-border, next to
+   *  the solid amber commit, the box was the same 36px but its corners vanished
+   *  into the card and it read as visibly shorter. */
+  tall?: boolean;
 }>();
 const emit = defineEmits<{ (e: "update:modelValue", v: string): void }>();
 
@@ -20,6 +37,17 @@ const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>
 
 const open = ref(false);
 const current = computed(() => props.options.find((o) => o.value === props.modelValue));
+function dotStyle(o: Option | undefined): Record<string, string> {
+  const cs = o?.colors?.length ? o.colors : o?.color ? [o.color] : [];
+  if (!cs.length) return { border: "1px solid hsl(var(--border))" };
+  if (cs.length === 1) return { background: cs[0], boxShadow: `0 0 6px ${cs[0]}` };
+  // Hard stops, one slice per colour, and each slice glowing out of its own side.
+  const step = 100 / cs.length;
+  return {
+    background: `linear-gradient(90deg, ${cs.map((c, i) => `${c} ${i * step}% ${(i + 1) * step}%`).join(", ")})`,
+    boxShadow: cs.map((c, i) => `${i === 0 ? -2 : i === cs.length - 1 ? 2 : 0}px 0 6px ${c}`).join(", "),
+  };
+}
 function pick(v: string) {
   emit("update:modelValue", v);
   open.value = false;
@@ -79,25 +107,25 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
 <template>
   <div class="relative">
     <button
-      class="flex h-8 items-center gap-2 rounded-md border border-border bg-background px-2.5 text-f11 uppercase tracking-wide transition-colors hover:text-foreground"
-      :class="(dots && modelValue) || open ? 'text-foreground' : 'text-muted-foreground'"
+      class="flex items-center gap-2 rounded-md border text-f11 uppercase transition-colors hover:text-foreground"
+      :class="[
+        (dots && modelValue) || open ? 'text-foreground' : 'text-muted-foreground',
+        tall
+          ? 'h-9 border-muted-foreground/40 bg-muted/40 px-4 font-semibold tracking-wider hover:border-muted-foreground/70'
+          : 'h-8 border-border bg-background px-2.5 tracking-wide',
+      ]"
       :style="open ? { borderColor: 'var(--acc)' } : {}"
       @click="open = !open"
     >
-      <span
-        v-if="dots"
-        class="h-2 w-2 flex-none rounded-full"
-        :style="current?.color
-          ? { background: current.color, boxShadow: `0 0 6px ${current.color}` }
-          : { border: '1px solid hsl(var(--border))' }"
-      ></span>
+      <span v-if="dots" class="h-2 w-2 flex-none rounded-full" :style="dotStyle(current)"></span>
       <span class="truncate">{{ prefix ? prefix + ' · ' : '' }}{{ current?.label ?? '—' }}</span>
       <ChevronDown class="h-3 w-3 flex-none opacity-60 transition-transform" :class="open && 'rotate-180'" />
     </button>
     <div v-if="open" class="fixed inset-0 z-[90]" @click="open = false"></div>
     <div
       v-if="open"
-      class="absolute left-0 top-full z-[91] mt-1 flex max-h-[min(60vh,26rem)] min-w-full origin-top-left animate-menu-in flex-col rounded-md border border-border bg-card shadow-2xl"
+      class="absolute left-0 z-[91] flex max-h-[min(60vh,26rem)] min-w-full animate-menu-in flex-col rounded-md border border-border bg-card shadow-2xl"
+      :class="up ? 'bottom-full mb-1 origin-bottom-left' : 'top-full mt-1 origin-top-left'"
     >
       <!-- Sticky rather than scrolling away with the rows: the whole point is to
            still be reachable 60 collections down. -->
@@ -139,11 +167,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
         :disabled="o.disabled"
         @click="pick(o.value)"
       >
-        <span
-          v-if="dots"
-          class="h-2 w-2 flex-none rounded-full"
-          :style="o.color ? { background: o.color, boxShadow: `0 0 6px ${o.color}` } : { border: '1px solid hsl(var(--border))' }"
-        ></span>
+        <span v-if="dots" class="h-2 w-2 flex-none rounded-full" :style="dotStyle(o)"></span>
         <span :style="o.color ? { color: o.color } : {}">{{ o.label }}</span>
         <Check v-if="modelValue === o.value" class="ml-auto h-3.5 w-3.5 flex-none pl-1" />
       </button>

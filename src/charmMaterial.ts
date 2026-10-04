@@ -459,6 +459,14 @@ vec3 csCharmAdjust( vec3 linear ) {
  * per tick of a pattern drag, and a mask does not change with the pattern.
  */
 
+/**
+ * The patch each tuned material was built OVER, with its program key — see
+ * tuneCharmShading. Keyed by identity: a mesh can arrive holding a material
+ * that some other mesh already tuned, and taking that one's onBeforeCompile
+ * as the prior would inject the adjust twice (a compile error, so no charm).
+ */
+const tunedPrior = new WeakMap<ThreeNS.Material, { patch: ThreeNS.Material["onBeforeCompile"]; key: string }>();
+
 export function tuneCharmShading(
   THREE: Three,
   model: ThreeNS.Object3D,
@@ -550,7 +558,16 @@ export function tuneCharmShading(
     owned.userData.lqMetal = lqMetal ?? whiteTexture(THREE);
     owned.userData.lqMetalBound = !!lqMetal;
     if (v.liquid) setCharmLiquidUniforms(THREE, owned, v.liquid);
-    owned.onBeforeCompile = (shader) => {
+    // Material.clone does not carry onBeforeCompile, so a patch the material
+    // already had is lost under ours unless it is run first by hand. The pet
+    // chick's fur was: its no-flip (petMaterial.ts) went, and every fur card
+    // facing away from the camera lit as if it faced into the body — the
+    // blotches across the wing. Its key joins ours too, or three would hand a
+    // patched and an unpatched material the same compiled program.
+    const prior = tunedPrior.get(mat) ?? { patch: mat.onBeforeCompile, key: mat.customProgramCacheKey() };
+    tunedPrior.set(owned, prior);
+    owned.onBeforeCompile = (shader, renderer) => {
+      prior.patch.call(owned, shader, renderer);
       shader.uniforms.uRoughAdjust = { value: owned.userData.roughAdjust };
       shader.uniforms.uColorAdjust = { value: owned.userData.colorAdjust };
       shader.uniforms.uCharmMask = { value: owned.userData.charmMask };
@@ -579,6 +596,7 @@ export function tuneCharmShading(
       // csCharmMask(), which GLSL requires to be declared first.
       if (v.liquid) patchCharmLiquidShader(shader, owned);
     };
+    owned.customProgramCacheKey = () => `${prior.key}|${owned.onBeforeCompile.toString()}`;
     owned.needsUpdate = true;
   });
 }

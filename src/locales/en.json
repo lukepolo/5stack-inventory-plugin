@@ -152,6 +152,9 @@
       "applied_to": "Applied to {name}",
       "steam_synced": "Synced from your Steam inventory (read-only)"
     },
+    "equip": {
+      "both_teams": "Both teams"
+    },
     "actions": {
       "focus": "Focus",
       "view3d": "View in 3D",
