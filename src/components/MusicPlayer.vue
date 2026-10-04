@@ -19,7 +19,7 @@
 // too, cached per URL — that one element can only answer for the one track it
 // holds, and this control has to state a length it has never played.
 import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { Pause, Play } from "lucide-vue-next";
+import { Pause, Play, Volume1, Volume2, VolumeX } from "lucide-vue-next";
 import { formatDuration, musicPreview } from "../musicPreview";
 
 const props = withDefaults(
@@ -141,6 +141,30 @@ function onScrubMove(e: PointerEvent) {
 }
 function onScrubUp(e: PointerEvent) {
   scrubbing = false;
+  (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+}
+
+// Volume — one level for every player (musicPreview), so the compact rows and
+// the loadout's overlay glyph, which have no room for a control, follow
+// whatever was set on a full one. Same pointer-driven span as the scrub, for
+// the same reason: this renders inside <button>s.
+const volume = computed(() => musicPreview.volume.value);
+const volumeIcon = computed(() => (volume.value === 0 ? VolumeX : volume.value < 0.5 ? Volume1 : Volume2));
+let adjusting = false;
+function volumeFrom(e: PointerEvent) {
+  const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  if (box.width > 0) musicPreview.setVolume((e.clientX - box.left) / box.width);
+}
+function onVolumeDown(e: PointerEvent) {
+  adjusting = true;
+  (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+  volumeFrom(e);
+}
+function onVolumeMove(e: PointerEvent) {
+  if (adjusting) volumeFrom(e);
+}
+function onVolumeUp(e: PointerEvent) {
+  adjusting = false;
   (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
 }
 </script>
@@ -283,5 +307,32 @@ function onScrubUp(e: PointerEvent) {
            visibly off-centre on every track whose header never landed. -->
       <span v-if="clock" class="flex-none font-mono text-f9 tabular-nums text-muted-foreground">{{ clock }}</span>
     </template>
+    <span v-if="!compact" class="flex flex-none items-center gap-1">
+      <span
+        role="button"
+        tabindex="-1"
+        :aria-pressed="volume === 0"
+        :title="volume === 0 ? tr('inventory.music.unmute', 'Unmute') : tr('inventory.music.mute', 'Mute')"
+        class="grid h-5 w-5 cursor-pointer place-items-center text-muted-foreground transition-colors hover:text-[color:var(--acc)]"
+        @click.stop="musicPreview.toggleMute()"
+      >
+        <component :is="volumeIcon" class="h-3.5 w-3.5" />
+      </span>
+      <span
+        role="slider"
+        aria-orientation="horizontal"
+        :aria-label="tr('inventory.music.volume', 'Preview volume')"
+        :aria-valuemin="0"
+        :aria-valuemax="100"
+        :aria-valuenow="Math.round(volume * 100)"
+        class="relative h-1 w-12 cursor-pointer rounded-full bg-border"
+        @pointerdown.stop="onVolumeDown"
+        @pointermove="onVolumeMove"
+        @pointerup="onVolumeUp"
+        @pointercancel="onVolumeUp"
+      >
+        <span class="absolute inset-y-0 left-0 rounded-full bg-muted-foreground" :style="{ width: `${volume * 100}%` }"></span>
+      </span>
+    </span>
   </span>
 </template>

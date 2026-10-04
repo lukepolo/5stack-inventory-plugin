@@ -211,6 +211,9 @@ const loadout = ref<LoadoutEntry[]>([]);
 const inventory = ref<InventoryItem[]>([]);
 const loading = ref(true);
 const error = ref(""); // fatal (initial load) error — shows a retry screen
+/** Pictures for items the game shipped none of, by catalog id — see
+ *  bakeCatalogArt. Up here because cell art reads it. */
+const catalogArt = ref<Record<number, string>>({});
 // Viewer mode: ?player=<steam64> shows that player's loadout read-only. The
 // query is host-owned now, so a back/forward between two shared links reloads
 // into the right player instead of stranding the old one on screen.
@@ -460,7 +463,8 @@ function specialDefault(slot: string): CatalogItem | null {
   return null;
 }
 function specialImage(slot: string): string | undefined {
-  return rowFor(slot)?.item?.image ?? specialDefault(slot)?.image ?? undefined;
+  const item = rowFor(slot)?.item;
+  return (item && catalogArt.value[item.id]) ?? item?.image ?? specialDefault(slot)?.image ?? undefined;
 }
 /**
  * The track this slot would play — the equipped kit, else the stock one.
@@ -503,7 +507,7 @@ function slotTitle(slot: string, name: string): string {
 }
 function cellImage(pos: string): string | undefined {
   const row = rowFor(pos);
-  return row?.item?.image ?? occupantWeapon(pos)?.image ?? undefined;
+  return (row?.item && catalogArt.value[row.item.id]) ?? row?.item?.image ?? occupantWeapon(pos)?.image ?? undefined;
 }
 // pg bigints serialize as STRINGS — every instance-id comparison must be
 // string-normalized or lookups silently miss (loadout tiles then fall back
@@ -748,6 +752,19 @@ function selectPos(pos: string) {
   // never fires it — and after minimising the picker, that re-tap is the
   // gesture people reach for to bring it back.
   if (isCompact.value && view.value === "grid") sheetSnap.value = "full";
+}
+
+/**
+ * A VISITOR's click on a loadout cell: open it.
+ *
+ * On your own loadout a click selects, and the picker sheet rising under the
+ * grid is the response. A visitor has no picker, so the same click changed one
+ * highlight and nothing else — on the screen whose whole point is looking at
+ * someone's skins. Focus is the look: 3D, the readings, Inspect, Share, Copy.
+ */
+function openSlot(pos: string) {
+  selectPos(pos);
+  if (view.value !== "focus") go("/focus");
 }
 
 // ---- rarity facets (rarity is a hex color from cs2-lib) ---------------------
@@ -4049,7 +4066,6 @@ const advancedPlacement = ref(false);
  * the upload is refused and that is fine. The gloves stay session-scoped until
  * they join CATALOG_RENDER_TYPES on both sides.
  */
-const catalogArt = ref<Record<number, string>>({});
 const catalogArtTried = new Set<number>();
 /** Must match CATALOG_RENDER_TYPES in backend/src/main.ts — the server refuses
  *  the rest. */
@@ -4089,6 +4105,35 @@ function onCatalogArtError(e: Event, skin: { id: number; model?: string | null; 
   (e.target as HTMLImageElement).style.visibility = "hidden";
   void bakeCatalogArt(skin);
 }
+/**
+ * A VISITOR's gear for items the game shipped no picture of.
+ *
+ * Your own pet cell shows its baked instance card. Someone else's has no card
+ * to show — the public loadout withholds the instance — so it fell back to the
+ * catalog image, which for four of the five pets is a path cs2-lib invents and
+ * Valve never shipped: a 404, hidden, and the cell read as an empty "PET" slot
+ * on a loadout that had one equipped. Resolved before it is drawn rather than
+ * on the <img>'s error, because these cells render through components that
+ * hide a failed image and have no way to ask for a better one.
+ */
+const reachable = (url: string) =>
+  fetch(url, { method: "HEAD" }).then((r) => r.ok, () => false);
+async function ensureCatalogArt(item: CatalogItem) {
+  if (catalogArt.value[item.id] || catalogStoredTried.has(item.id)) return;
+  catalogStoredTried.add(item.id);
+  if (item.image && (await reachable(item.image))) return;
+  const stored = catalogRenderUrl(item.id);
+  if (await reachable(stored)) catalogArt.value = { ...catalogArt.value, [item.id]: stored };
+  else void bakeCatalogArt(item);
+}
+watch(
+  () => (viewerId.value ? loadout.value : []),
+  (rows) => {
+    for (const r of rows) {
+      if (r.item?.type && CATALOG_RENDER_TYPES.has(r.item.type)) void ensureCatalogArt(r.item);
+    }
+  },
+);
 /** Undo the hide above once a replacement actually loads — the <img> is the
  *  same element, so the inline style would otherwise outlive the 404 and keep
  *  the baked picture invisible. */
@@ -7258,6 +7303,64 @@ const publicLoadoutLink = computed<ShareLink | null>(() => {
 });
 
 /**
+ * A loadout ROW as a craft draft — the same item, to make your own.
+ *
+ * A visitor's rows carry their own attachments (LoadoutEntry.stickers et al.:
+ * the public endpoint enriches them because the visitor holds no inventory to
+ * read them from); your own rows carry none, so read the instance instead.
+ */
+function draftFromRow(row: LoadoutEntry): Draft {
+  const src = instanceById(row.item_instance_id) ?? row;
+  return {
+    wear: src.wear ?? DEFAULT_WEAR,
+    seed: src.seed ?? 1,
+    stattrak: !!src.stattrak,
+    nametag: src.nametag ?? "",
+    stickers: (src.stickers ?? []).map((a) => (a ? { id: a.id, x: a.x, y: a.y, r: a.r, w: a.w } : null)),
+    patches: (src.patches ?? []).map((a) => a?.id ?? null),
+    charm: src.charm ? { id: src.charm.id, x: src.charm.x, y: src.charm.y, z: src.charm.z, seed: src.charm.seed } : null,
+    style: src.style ?? null,
+    stage: src.upgrade_level ?? null,
+  };
+}
+const rowDraftQuery = (row: LoadoutEntry) => encodeDraft(draftFromRow(row), DEFAULT_WEAR);
+/**
+ * What a VISITOR can share about the item they are looking at. Item links
+ * (instanceShareLinks) name rows in the viewer's OWN inventory and mean nothing
+ * here, which is why focus offered no Share at all on someone else's loadout.
+ * Two that do travel: this slot on their loadout, and the item itself as a
+ * draft — the recipient can craft it.
+ */
+const visitorShareLinks = computed<ShareLink[]>(() => {
+  const row = focusRow.value;
+  if (!viewerId.value || !row?.item || !isSkinned(row)) return [];
+  const q: Record<string, string> = { player: viewerId.value, slot: selected.value };
+  if (team.value !== DEFAULT_TEAM) q.team = team.value;
+  return [
+    { key: "visit:item", label: "This item on their loadout", href: router.href("/focus", q), hint: "Anyone on this site can open this" },
+    {
+      key: "visit:craft",
+      label: "Craft this",
+      href: router.href(`/craft/${row.item.id}`, rowDraftQuery(row)),
+      hint: "Opens the editor with the same wear, pattern, stickers and charm",
+    },
+  ];
+});
+/**
+ * Copy the item in focus: the editor, filled in with it, on YOUR side of the
+ * app — Craft & Equip from there puts it in your inventory and your loadout.
+ * Leaves viewer mode on the way, because nothing can be saved while it is on:
+ * goApp lands on the plugin's own page without the ?player= that holds it.
+ */
+function copyFocusedItem() {
+  const row = focusRow.value;
+  if (!row?.item) return;
+  const path = `/craft/${row.item.id}`;
+  const q = rowDraftQuery(row);
+  if (!router.goApp(path, q)) router.go(path, { query: q });
+}
+
+/**
  * A self-contained link to the craft currently in the editor: the DRAFT route
  * with the whole state packed into the query.
  *
@@ -7593,8 +7696,12 @@ if (MDEBUG) {
        the breadcrumb and wants the breathing room.
        Separate from the sizing div below so `mx-auto` there still centres the
        app inside its max width on wide monitors — negative margins would
-       cancel the auto. -->
-  <div class="-mx-1 -mb-1 flex min-w-0 flex-1 flex-col bg-background sm:-mx-4 sm:-mb-4">
+       cancel the auto.
+       NOT when embedded: a profile tab sits in a column that clips sideways
+       (overflow-x-hidden) with no padding of ours to bleed over, so the margin
+       pushed our left 16px out of view — the focus rail lost its padding and
+       the first 6px of every cell and label. -->
+  <div class="flex min-w-0 flex-1 flex-col bg-background" :class="!embedMode && '-mx-1 -mb-1 sm:-mx-4 sm:-mb-4'">
   <div
     ref="appRootEl"
     class="mx-auto flex w-full max-w-[1560px] flex-col overflow-hidden text-foreground"
@@ -8168,7 +8275,7 @@ if (MDEBUG) {
           :drop-style="dropStyle"
           :reorder-style="reorderStyle"
           :pulse-pos="pulsePos"
-          :select-pos="selectPos"
+          :select-pos="viewerId ? openSlot : selectPos"
           :open-ctx="openCtx"
           :on-slot-drag-over="onSlotDragOver"
           :on-slot-drop="onSlotDrop"
@@ -8250,6 +8357,21 @@ if (MDEBUG) {
                   :note="ITEM_LINK_NOTE"
                   :btn-class="FOCUS_STAGE"
                 />
+                <!-- Someone else's item: their link and a craftable copy,
+                     instead of item links that would name YOUR inventory. -->
+                <ShareMenu
+                  v-else-if="visitorShareLinks.length"
+                  :links="visitorShareLinks"
+                  :btn-class="FOCUS_STAGE"
+                />
+                <button
+                  v-if="viewerId && !viewingSelf && isSkinned(focusRow)"
+                  :class="[FOCUS_STAGE, 'tac-action border-border text-muted-foreground']"
+                  title="Craft a copy into your inventory — same wear, pattern, stickers and charm"
+                  @click="copyFocusedItem"
+                >
+                  <Copy class="h-3.5 w-3.5" /> Copy
+                </button>
               </template>
             <!-- THE STAGE, the same component the item modal mounts. See
                  ItemStage: the backdrop, the 2D/3D switch, the held toggle, the
@@ -8293,7 +8415,7 @@ if (MDEBUG) {
                   <div :key="selected" class="grid h-full w-full min-h-0 place-items-center">
                     <ItemArt
                       :inst="isSpecial(selected) ? null : cellInstance(selected)"
-                      :image="isSpecial(selected) ? focusRow?.item?.image : cellImage(selected)"
+                      :image="isSpecial(selected) ? specialImage(selected) : cellImage(selected)"
                       :class="cn('w-[min(64%,520px)] object-contain animate-float motion-reduce:animate-none', !isSkinned(focusRow) && 'opacity-50')"
                       style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
                     />
