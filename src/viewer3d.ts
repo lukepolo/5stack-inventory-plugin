@@ -3882,6 +3882,7 @@ async function buildViewer(
     albedo: import("three").Texture;
     rm: import("three").Texture;
     normal: import("three").Texture;
+    incomplete: boolean;
     dispose: () => void;
   };
   /**
@@ -3943,6 +3944,10 @@ async function buildViewer(
         if (run) right = await run(opts?.wear ?? 0);
       }
       const left = right;
+      // A glove composited around a texture that never arrived is not the real
+      // glove — and without this a card bake stored it for good (the tint-ID
+      // maps a CS2 update made unreadable: every such glove baked flat cyan).
+      paintWasIncomplete = !!right?.incomplete;
       if (right && left) {
         const first = right;
         // Reads gloveCtx rather than closing over `first`: a re-composite
@@ -6314,6 +6319,7 @@ async function buildViewer(
     const prev = ctx.current;
     ctx.current = next;
     prev.dispose();
+    paintWasIncomplete = next.incomplete;
     return true;
   }
 

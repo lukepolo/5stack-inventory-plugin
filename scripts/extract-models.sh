@@ -4595,6 +4595,63 @@ print(f"---   {len(paint_todo)} paint textures + {len(sticker_todo)} sticker tex
 BATCH = 150
 converted = 0
 
+# ---- texture formats VRF cannot decode yet ----------------------------------
+# A CS2 update (build 2000924, 2026-10) re-encoded every glove TINT-ID map, and
+# the 1x1 materials/default texture, as VTEX format 33, which no VRF knows —
+# not 19.2, not master: "Unhandled image type for variable 'Format': 33". The
+# batch writes nothing for them, and a glove with no tint map composites as its
+# bare gradient: Sport Gloves | Ultra Violent came out flat cyan, and so did
+# every glove of the tint-ID generation.
+#
+# Format 33 is one 8-bit channel, row-major, LZ4 per mip like the rest — byte
+# for byte the layout of I8 (format 3), which VRF does decode. So the raw file
+# is pulled, its format byte rewritten, and the loose copy decoded. Checked on
+# glove_sport_neoprene_tintid: the PNG's R=G=B are exactly the decompressed
+# bytes. Only formats PROVEN identical belong in this table.
+SAME_LAYOUT_AS = {33: 3}  # R8 -> I8
+
+
+def vtex_format_offset(buf):
+    """Where the VTEX format byte sits in a compiled texture, or None."""
+    table = 8 + int.from_bytes(buf[8:12], "little")
+    for i in range(int.from_bytes(buf[12:16], "little")):
+        p = table + i * 12
+        if buf[p:p + 4] == b"DATA":
+            return p + 4 + int.from_bytes(buf[p + 4:p + 8], "little") + 26
+    return None
+
+
+def recover_unsupported(paths):
+    """Decode what the batch could not, into the same place it would have."""
+    work = raw + ".recover"
+    shutil.rmtree(work, ignore_errors=True)
+    subprocess.run([cli, "-i", vpk, "-o", work, "-f", ",".join(paths)], capture_output=True)
+    done = []
+    for t in paths:
+        try:
+            buf = bytearray(open(os.path.join(work, t), "rb").read())
+            at = vtex_format_offset(buf)
+            fmt = buf[at] if at is not None else None
+        except (OSError, IndexError):
+            continue
+        if fmt not in SAME_LAYOUT_AS:
+            continue
+        buf[at] = SAME_LAYOUT_AS[fmt]
+        patched = os.path.join(work, "patched", os.path.basename(t))
+        os.makedirs(os.path.dirname(patched), exist_ok=True)
+        with open(patched, "wb") as fh:
+            fh.write(buf)
+        # A loose file with an explicit .png output is written exactly there.
+        out = os.path.join(raw, re.sub(r"\.vtex_c$", "", t) + ".png")
+        subprocess.run([cli, "-i", patched, "-o", out, "-d"], capture_output=True)
+        if os.path.exists(out):
+            done.append(t)
+    shutil.rmtree(work, ignore_errors=True)
+    if done:
+        print(f"---   recovered {len(done)} texture(s) in a format VRF cannot read: "
+              f"{', '.join(os.path.basename(t) for t in done)}", flush=True)
+    return done
+
 
 def extract_textures(todo, step, close=False):
   """Pull and convert one phase's textures, reporting under `step`.
@@ -4622,6 +4679,10 @@ def extract_textures(todo, step, close=False):
 
     with ThreadPoolExecutor(max_workers=len(slices)) as pool:
         list(pool.map(grab, slices))
+    unwritten = [t for t in batch
+                 if not glob.glob(glob.escape(os.path.join(raw, re.sub(r"\.vtex_c$", "", t))) + ".*")]
+    if unwritten:
+        recover_unsupported(unwritten)
     jobs = []
     for t in batch:
         # The CLI picks the container from the texture FORMAT, so 8-bit maps

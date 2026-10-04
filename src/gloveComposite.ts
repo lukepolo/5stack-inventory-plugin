@@ -653,6 +653,10 @@ export interface GloveComposite {
    *  these is how you tell "the composite maths is wrong" from "its inputs
    *  were" — they are the boundary between the two. */
   debug: { detail: ThreeNS.Texture; grunge: ThreeNS.Texture; detailNormal: ThreeNS.Texture; damageNormal: ThreeNS.Texture };
+  /** A texture this finish NAMES failed to load, so this is not the real glove
+   *  — the same flag a weapon composite carries, and what stops a card bake
+   *  storing it. */
+  incomplete: boolean;
   dispose: () => void;
 }
 
@@ -715,6 +719,7 @@ export async function compositeGlove(
   const mask = loaded.get("g_tLayerMask");
   const surface = loaded.get("g_tSurface");
   if (!mask || !surface) return null;
+  const incomplete = names.some((n) => !!def.tex[n] && !loaded.get(n));
 
   const scene = new THREE.Scene();
   const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -883,6 +888,7 @@ export async function compositeGlove(
     rm,
     normal,
     debug: { detail, grunge, detailNormal, damageNormal },
+    incomplete,
     dispose: () => {
       targets.forEach((t) => t.dispose());
       blank.dispose();

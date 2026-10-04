@@ -532,7 +532,13 @@ function serveAssetDir(routePrefix: string, dir: string) {
     // that goes out `immutable` is a 404 the browser and Cloudflare keep for a
     // year against a URL whose content now exists, so the skin stays white long
     // after the mount is correct — the exact trap /images had to be fixed for
-    // once already. Errors carry no Cache-Control and revalidate every time.
+    // once already.
+    //
+    // And a miss says `no-store` OUT LOUD. Sending no Cache-Control at all was
+    // meant to mean "revalidate every time", but Cloudflare stamps its default
+    // browser TTL (max-age=14400) on any response without one, 404s included:
+    // the glove tint maps restored after a CS2 format change stayed missing in
+    // browsers for four hours, every 22-finish glove still flat cyan.
     const versioned = (request.query as { v?: string } | undefined)?.v != null;
     const selfVersioning = type !== "application/json" && !type.startsWith("audio/");
     const cacheControl = selfVersioning || versioned ? "public, max-age=31536000, immutable" : "no-cache";
@@ -556,7 +562,7 @@ function serveAssetDir(routePrefix: string, dir: string) {
       reply.header("Cache-Control", cacheControl);
       return reply.type(type).send(buf);
     } catch {
-      return reply.status(404).send({ error: "not extracted" });
+      return reply.status(404).header("Cache-Control", "no-store").send({ error: "not extracted" });
     }
   });
 }

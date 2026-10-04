@@ -737,6 +737,10 @@ export interface GloveModernComposite {
   /** The eight resolve targets, for tools/shadertest's flat-map view — the
    *  boundary between "the composite maths is wrong" and "its inputs were". */
   debug: Record<string, ThreeNS.Texture>;
+  /** A texture this finish NAMES failed to load — see GloveComposite. A missing
+   *  g_tTintId is exactly this: the glove still composites, as its bare
+   *  untinted gradient. */
+  incomplete: boolean;
   dispose: () => void;
 }
 
@@ -792,6 +796,7 @@ export async function compositeGloveModern(
   );
   const layerId = loaded.get("g_tLayerId");
   if (!layerId) return null;
+  const incomplete = names.some((n) => !!def.tex[n] && !loaded.get(n));
 
   const scene = new THREE.Scene();
   const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -949,6 +954,7 @@ export async function compositeGloveModern(
     rm: out[1],
     normal: out[2],
     debug: resolved,
+    incomplete,
     dispose: () => targets.forEach((t) => t.dispose()),
   };
 }
