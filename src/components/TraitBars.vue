@@ -20,6 +20,13 @@
 // away from the cursor mid-drag, which reads as the drag slipping off the
 // slider. No tooltip while dragging either — it covered the bar being dragged.
 //
+// THE DRAG STAYS ON THE SLIDER. Wander off it — up into the next row, out
+// into the 3D view — and the drag ends where it last was on the bar, as if
+// released. A captured drag used to follow the pointer anywhere on screen, so
+// the pattern kept reshuffling after the person had moved on, and with a
+// trackpad's drag-lock it never let go at all. A move that arrives with no
+// button down (a release we never heard) ends it too.
+//
 // Anchored to the traits at the START of the drag, so the others do not wander
 // further with every step; one search per frame however fast the pointer
 // reports; ← → nudge a focused bar through the same search.
@@ -64,29 +71,42 @@ function seek(key: string, target: number, base: Record<string, number>) {
   if (seed !== props.seed) emit("seek", seed);
 }
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
-/** The pointer along the dot's bar, 0..1 (unclamped — the grab offset comes off first). */
-function at(e: PointerEvent) {
-  const r = ((e.currentTarget as HTMLElement).parentElement as HTMLElement).getBoundingClientRect();
-  return (e.clientX - r.left) / Math.max(1, r.width);
-}
+/** The bar a dot's event belongs to. */
+const barRect = (e: PointerEvent) => ((e.currentTarget as HTMLElement).parentElement as HTMLElement).getBoundingClientRect();
+/**
+ * How far past the bar the pointer may go before the drag lets go, in px.
+ * Sideways there is room to overshoot an end and pin it at 0 or 100; up and
+ * down barely any, so the next row is already "off". Fingers drift, so touch
+ * gets more of both.
+ */
+const STRAY = { mouse: { x: 16, y: 6 }, touch: { x: 32, y: 24 } };
+
 function down(e: PointerEvent, t: TraitRow) {
   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  const r = barRect(e);
   // No search yet: taking hold of the dot is not a request to move it.
-  drag.value = { key: t.key, target: t.value, grab: at(e) - t.value, base: valuesNow() };
+  drag.value = { key: t.key, target: t.value, grab: (e.clientX - r.left) / Math.max(1, r.width) - t.value, base: valuesNow() };
 }
 function move(e: PointerEvent) {
   const d = drag.value;
   if (!d) return;
-  d.target = clamp01(at(e) - d.grab);
+  if (e.buttons === 0) return end(e);
+  const r = barRect(e);
+  const stray = e.pointerType === "touch" ? STRAY.touch : STRAY.mouse;
+  if (e.clientX < r.left - stray.x || e.clientX > r.right + stray.x || e.clientY < r.top - stray.y || e.clientY > r.bottom + stray.y) {
+    return end(e);
+  }
+  d.target = clamp01((e.clientX - r.left) / Math.max(1, r.width) - d.grab);
   if (frame) return;
   frame = requestAnimationFrame(() => {
     frame = 0;
     if (drag.value) seek(drag.value.key, drag.value.target, drag.value.base);
   });
 }
-function up() {
-  // A search still waiting on its frame is the LAST place the pointer was —
-  // run it now, or a quick flick and release lands on the one before.
+/** Release, cancel, a lost capture, or the pointer leaving the slider. */
+function end(e: PointerEvent) {
+  // A search still waiting on its frame is the LAST place the pointer was on
+  // the bar — run it now, or a quick flick and release lands on the one before.
   if (frame) {
     cancelAnimationFrame(frame);
     frame = 0;
@@ -94,6 +114,10 @@ function up() {
     if (d) seek(d.key, d.target, d.base);
   }
   drag.value = null;
+  // Hand the pointer back, so whatever it is over now hovers normally for the
+  // rest of the press instead of every move still landing on this dot.
+  const el = e.currentTarget as HTMLElement | null;
+  if (el?.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
 }
 function key(e: KeyboardEvent, k: string) {
   if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -130,8 +154,9 @@ function key(e: KeyboardEvent, k: string) {
           :style="{ left: `${(drag?.key === t.key ? drag.target : t.value) * 100}%` }"
           @pointerdown.prevent="down($event, t)"
           @pointermove="move"
-          @pointerup="up"
-          @pointercancel="up"
+          @pointerup="end"
+          @pointercancel="end"
+          @lostpointercapture="end"
           @keydown="key($event, t.key)"
         />
       </span>
