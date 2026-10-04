@@ -85,6 +85,18 @@ const audioLength = computed(() => {
   return seconds > 0 ? formatDuration(seconds) : "";
 });
 
+/**
+ * The small rail tile's caption: the slot's name, unless a pet has a name of
+ * its own. Those tiles have no name line, so a pet tagged “Yoke” sat captioned
+ * "PET" — the one word on the cell that wasn't about it. Same rule as the
+ * ItemName below (pets only, quoted), and read off `badges` too so a visitor,
+ * who gets the loadout row and no instance, sees the name as well.
+ */
+const caption = computed(() => {
+  const tag = props.item?.type === "pet" ? (props.inst ?? props.badges)?.nametag?.trim() : "";
+  return tag ? `“${tag}”` : props.label;
+});
+
 const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
 
 defineEmits<{
@@ -211,7 +223,7 @@ defineEmits<{
       v-if="compact"
       class="relative z-[2] w-full truncate text-center text-f8 uppercase tracking-cs1 text-muted-foreground/70"
     >
-      {{ label
+      {{ caption
       }}<span v-if="audioLength" class="font-mono tabular-nums text-muted-foreground/45">
         · {{ audioLength }}</span>
     </div>
