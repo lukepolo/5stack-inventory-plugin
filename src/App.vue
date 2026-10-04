@@ -9276,12 +9276,15 @@ if (MDEBUG) {
            work: five sticker wells, a charm, wear and pattern, all aimed at a
            model you are dragging things onto, and every pixel the card spent on
            being a layer came out of that model. So edit takes the whole
-           viewport and drops the rounding, the border and the inset with it. -->
+           viewport and drops the rounding, the border and the inset with it.
+           The card's caps only bind on a big monitor (a laptop hits the vw/vh
+           first). They were 1320x940, which left a 1440p screen with a model
+           in half of it; 1800x1240 keeps the same ~1.45:1 card, just larger. -->
       <div
         class="relative flex flex-col overflow-hidden bg-card shadow-2xl animate-pop-in"
         :class="isCompact || !viewOnly
           ? 'h-full w-full'
-          : 'h-[min(92vh,940px)] w-[min(96vw,1320px)] rounded-lg border border-border'"
+          : 'h-[min(92vh,1240px)] w-[min(96vw,1800px)] rounded-lg border border-border'"
       >
         <div class="flex items-center justify-between border-b border-border" :class="isCompact ? 'gap-2 px-3 py-2' : 'px-4 py-2.5'">
           <!-- Provenance and where it's equipped belong to the item's IDENTITY,
