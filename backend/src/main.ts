@@ -251,7 +251,15 @@ app.addContentTypeParser("application/octet-stream", { parseAs: "buffer" }, (_re
 // Key is derived SERVER-SIDE from the caller's own instance row — a client
 // can never write another user's render slot (or an arbitrary path).
 export function renderKeyForRow(
-  row: { id: number | string; wear: number | string | null; seed: number | string | null; stattrak: boolean | null },
+  row: {
+    id: number | string;
+    wear: number | string | null;
+    seed: number | string | null;
+    stattrak: boolean | null;
+    /** Pets only — see the suffix note below. */
+    style?: number | string | null;
+    upgrade_level?: number | string | null;
+  },
   version: number,
 ) {
   // The version suffix is the EXTRACTION PIPELINE version — EXTRACT_VERSION in
@@ -277,7 +285,12 @@ export function renderKeyForRow(
   // kills and 4000, and keying on the count would re-bake every card on every
   // kill. Must match renderKeyFor in src/api.ts.
   const st = row.stattrak ? "-st" : "";
-  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}-v${version}.png`;
+  // A PET's coat and life stage change its card as much as a seed does, so they
+  // key it too — as suffixes present only when SET, which leaves every other
+  // item's filename (and so every card already on the mount) exactly as it was.
+  const pet =
+    (row.style != null ? `-c${Number(row.style)}` : "") + (row.upgrade_level != null ? `-g${Number(row.upgrade_level)}` : "");
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}${pet}-v${version}.png`;
 }
 
 /** The version cards are keyed on right now: what the mount says it is, or 0
@@ -305,7 +318,8 @@ async function pruneRenders(): Promise<number> {
   const suffix = `-v${current}.png`;
   let removed = 0;
   for (const name of await fs.readdir(RENDERS_DIR).catch(() => [])) {
-    if (!name.startsWith("inst-") || !name.endsWith(".png") || name.endsWith(suffix)) continue;
+    // `cat-` is the catalog store (see /api/render/catalog), same versioning.
+    if (!/^(inst|cat)-/.test(name) || !name.endsWith(".png") || name.endsWith(suffix)) continue;
     await fs.rm(path.join(RENDERS_DIR, name), { force: true }).catch(() => {});
     removed++;
   }
@@ -327,7 +341,7 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
     // stattrak is part of the render key (the card draws the module), so it has
     // to be selected here — without it the stored name loses the -st marker
     // that the client's read URL carries, and every ST card 404s.
-    `SELECT id, wear, seed, stattrak FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    `SELECT id, wear, seed, stattrak, style, upgrade_level FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
     [Number(request.params.id), identity.steamId],
   );
   if (!rows[0]) {
@@ -338,6 +352,58 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
     await fs.writeFile(path.join(RENDERS_DIR, renderKeyForRow(rows[0], await renderVersion())), body);
     return { ok: true };
   } catch {
+    return reply.status(500).send({ error: "render store unavailable" });
+  }
+});
+
+// CATALOG renders — a card for an ITEM rather than an owned instance.
+//
+// For the items the game ships no picture of at all. Four of the five pets
+// have no `image_inventory` (CS2 renders them live from their model), so a
+// catalog tile for the chick or a breed had nothing to show and no instance to
+// bake for. The vanilla-glove-icons note asked for exactly this store; pets are
+// its first customer and those eight gloves can be its next by joining the set.
+//
+// SHARED art — every visitor's tile — so it is guarded harder than an
+// instance card, which only its owner ever sees:
+//  - ADMINISTRATORS ONLY may write it. An instance upload is scoped to the
+//    caller's own row; a catalog one is not scoped to anybody, so letting any
+//    signed-in player write it would let one of them choose the picture
+//    everyone sees. Everyone else still gets a tile — their client bakes it for
+//    the session (bakeCatalogArt) and simply doesn't publish it.
+//  - Only these types, and FIRST WRITER WINS: a stored card is never replaced
+//    by an upload, only by the version sweep after an extraction.
+//  - The PNG's own header must describe a plausible card, not just start with
+//    the magic bytes.
+const CATALOG_RENDER_TYPES = new Set(["pet"]);
+export const catalogRenderKey = (itemId: number, version: number) => `cat-${itemId}-v${version}.png`;
+/** IHDR sanity: the signature, an IHDR chunk first, and card-sized dimensions. */
+function plausibleCardPng(buf: Buffer): boolean {
+  if (buf.length < 33 || !buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
+  if (buf.readUInt32BE(8) !== 13 || buf.subarray(12, 16).toString("latin1") !== "IHDR") return false;
+  const w = buf.readUInt32BE(16);
+  const h = buf.readUInt32BE(20);
+  return w >= 16 && h >= 16 && w <= 4096 && h <= 4096;
+}
+app.post<{ Params: { id: string } }>("/api/render/catalog/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
+  const denied = await requireAdmin(request);
+  if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const id = Number(request.params.id);
+  const item = Number.isInteger(id) ? getItem(id) : null;
+  if (!item || !CATALOG_RENDER_TYPES.has(item.type as string)) {
+    return reply.status(400).send({ error: "not an item that takes a catalog render" });
+  }
+  const body = request.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length > 3_000_000 || !plausibleCardPng(body)) {
+    return reply.status(400).send({ error: "bad render" });
+  }
+  try {
+    await fs.mkdir(RENDERS_DIR, { recursive: true });
+    // `wx`: fails if it exists, which is the first-writer-wins rule above.
+    await fs.writeFile(path.join(RENDERS_DIR, catalogRenderKey(id, await renderVersion())), body, { flag: "wx" });
+    return { ok: true };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") return { ok: true, existing: true };
     return reply.status(500).send({ error: "render store unavailable" });
   }
 });
@@ -510,6 +576,13 @@ for (const route of ["/api/renders/:key", "/renders/:key"]) {
     reply.header("Cache-Control", "public, max-age=3600");
     return reply.type("image/png").send(buf);
   } catch {
+    // A MISS must never be cached. `.png` is an extension Cloudflare caches by
+    // default, 404s included, so a card asked for a moment before its first
+    // upload stayed "missing" at the edge for minutes after the file existed —
+    // measured: cf-cache-status HIT on the 404 with the PNG already on disk.
+    // A render is MADE on a miss, so the miss is the one answer that must not
+    // outlive the request.
+    reply.header("Cache-Control", "no-store");
     return reply.status(404).send({ error: "not found" });
   }
   });

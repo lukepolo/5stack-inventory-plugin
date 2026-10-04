@@ -69,6 +69,8 @@ import {
   MAX_PATCHES,
   NAMETAG_MAX_LENGTH,
   uploadRender,
+  uploadCatalogRender,
+  catalogRenderUrl,
   renderUrlFor,
   type GameConfigState,
 } from "./api";
@@ -111,6 +113,9 @@ import SortDirection from "./components/SortDirection.vue";
 import PatternRail from "./components/PatternRail.vue";
 import PriceTag from "./components/PriceTag.vue";
 import ItemSpecs from "./components/ItemSpecs.vue";
+import PetControls from "./components/PetControls.vue";
+import TraitBars, { type TraitRow } from "./components/TraitBars.vue";
+import { DEFAULT_PET_CLIP, loadPetClipIndex, petWanderPool } from "./petAnim";
 import ItemBadges from "./components/ItemBadges.vue";
 import PatternScoreRail from "./components/PatternScoreRail.vue";
 import { SCAN_READ_SIZE } from "./patternScan";
@@ -153,7 +158,8 @@ import { useAttachmentPicker, type PickerRow } from "./composables/useAttachment
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
 import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { stackByDesign, TINT_SUFFIX } from "./decks";
-import { loadPaintDef, seedMovesPattern } from "./paintComposite";
+import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
+import { formatGunTrait, gunPlacement, gunPlacementTable, gunPlacementTraits } from "./gunPattern";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync } from "./modelAvailability";
@@ -1512,21 +1518,24 @@ function equippedInstance(pos: string): InventoryItem | undefined {
   return instanceById(rowFor(pos)?.item_instance_id);
 }
 
-async function equipInstanceAt(inst: InventoryItem, pos: string) {
+/** Equip `inst` at `pos`. Resolves whether it is now there. */
+async function equipInstanceAt(inst: InventoryItem, pos: string): Promise<boolean> {
   const cur = rowFor(pos);
   try {
     // Clicking the already-equipped skin is a no-op: equipping is never a
     // toggle, so a stray second click can't silently strip the slot. Removing
     // a skin is the explicit Unequip action.
-    if (cur && String(cur.item_instance_id) === String(inst.id)) return;
+    if (cur && String(cur.item_instance_id) === String(inst.id)) return true;
     const teams: Team[] = isShared(pos) ? ["CT", "T"] : [team.value];
     await Promise.all(teams.map((t) => equip({ team: t, slot: pos, item_instance_id: inst.id })));
     await refreshAll();
     pulseSlot(pos);
     // Replacing lands you on the new gun's Owned skins, ready to re-skin it.
     if (sheetMode.value === "replace") sheetMode.value = "owned";
+    return true;
   } catch (e) {
     fail(e);
+    return false;
   }
 }
 // Free equip of a vanilla default weapon into a position (replace mode / reset).
@@ -1834,7 +1843,6 @@ const craftHasStyle = computed(() => (craftPet.value?.styleCount ?? 0) > 0);
 /** A breed can be a pullet or a hen. The egg and the chick are one stage each,
  *  so there is nothing to choose and no control. */
 const craftHasStage = computed(() => (craftPet.value?.stages.length ?? 0) > 1);
-const PET_STAGE_NAMES: Record<number, string> = { 0: "Egg", 1: "Chick", 2: "Pullet", 3: "Hen" };
 /**
  * Can this finish's pattern move its artwork at all?
  *
@@ -1845,6 +1853,23 @@ const PET_STAGE_NAMES: Record<number, string> = { 0: "Egg", 1: "Chick", 2: "Pull
  * otherwise sit and press the die expecting something to happen.
  */
 const patternMoves = ref<boolean | null>(null);
+/** The open finish's paint definition, once loaded — what the placement bars
+ *  read their envelopes from. Set by the same watcher as patternMoves. */
+const craftPaintDef = shallowRef<PaintDef | null>(null);
+/**
+ * A GUN's pattern as the three things it moves — where the artwork sits (see
+ * gunPattern.ts). Dragging one finds the real pattern nearest that placement,
+ * the same way a pet's traits do. Empty when no pattern moves this finish.
+ */
+const gunTraits = computed<TraitRow[]>(() => {
+  const def = craftPaintDef.value;
+  const c = craft.value;
+  if (!def || !c || patternMoves.value !== true) return [];
+  const at = gunPlacement(def, Number(c.seed ?? 1));
+  return gunPlacementTraits(def).map((t) => ({ key: t.key, label: t.label, value: at[t.key], display: formatGunTrait(t, at[t.key]) }));
+});
+/** A gun's patterns are 1..1000 (randomizeCraft draws the same range). */
+const gunTable = () => (craftPaintDef.value ? gunPlacementTable(craftPaintDef.value, 1, 1000) : null);
 /**
  * A sticker's scratch wear, on the sticker's OWN page.
  *
@@ -1965,6 +1990,7 @@ watch(
   () => [craft.value?.skin.paintMaterial ?? null, craftTarget.value?.kind ?? null, craft.value?.skin.type ?? null] as const,
   async ([pm, kind, type]) => {
     patternMoves.value = null;
+    craftPaintDef.value = null;
     // A GLOVE carries a pattern and is rendered by a different compositor —
     // gloveComposite, which never reads the seed. Asking the weapon paint def
     // about it would answer a question about a shader that is not the one
@@ -1998,6 +2024,7 @@ watch(
       return;
     }
     patternMoves.value = def ? seedMovesPattern(def) : null;
+    craftPaintDef.value = def ?? null;
   },
   { immediate: true },
 );
@@ -2466,7 +2493,7 @@ function craftTakesFrom(): { name: string; from: string }[] {
   check(c.charm);
   return out;
 }
-async function confirmCraft() {
+async function confirmCraft(andEquip = false) {
   if (!craft.value || craftBusy.value) return;
   // Belt-and-braces behind the disabled button: the editor is reachable signed
   // out (and via a shared /craft/<id> draft link), so the commit re-checks
@@ -2483,13 +2510,13 @@ async function confirmCraft() {
       confirmLabel: "Move",
       tone: "neutral",
       // Cleared before re-entering, or this would ask again forever.
-      onConfirm: () => void saveCraft(),
+      onConfirm: () => void saveCraft(andEquip),
     };
     return;
   }
-  await saveCraft();
+  await saveCraft(andEquip);
 }
-async function saveCraft() {
+async function saveCraft(andEquip = false) {
   if (!craft.value || craftBusy.value) return;
   craftBusy.value = true;
   try {
@@ -2533,17 +2560,29 @@ async function saveCraft() {
         if (ok) bakeStamp.value = { ...bakeStamp.value, [inst.id]: Date.now() };
       });
       inventory.value = [inst, ...inventory.value];
-      // A new craft lands in the INVENTORY, never straight into a slot.
-      // Auto-equipping used to target whichever slot the UI happened to be on,
-      // which is fine when you started from that slot and wrong every other
-      // time: opening a shared craft link left `selected` pointing at an
-      // unrelated slot, so saving failed with "doesn't fit that slot" and the
-      // craft was lost. Equipping is one click from the inventory; a failed
-      // save is not recoverable.
+      // CRAFT & EQUIP (the default button) equips AFTER the craft has landed,
+      // and only where the ITEM says it goes — positionForInstance, the same
+      // answer the inventory's Equip gives. It must never be "whatever slot the
+      // UI is on": that is what an earlier auto-equip did, and opening a shared
+      // craft link left `selected` on an unrelated slot, so the save failed with
+      // "doesn't fit that slot" and the craft was lost. Here the craft is saved
+      // first and unconditionally; equipping can only fail on its own.
+      let equipped = false;
+      if (andEquip && canEquipInstance(inst)) {
+        const pos = positionForInstance(inst);
+        if (pos) equipped = await equipInstanceAt(inst, pos);
+      }
       notify(
-        duplicating.value
-          ? tr("inventory.notify.copy_created", "Editable copy created in your inventory.")
-          : tr("inventory.notify.crafted", "Crafted — it's in your inventory."),
+        equipped
+          ? tr("inventory.notify.crafted_equipped", "Crafted and equipped.")
+          : andEquip
+            ? tr(
+                "inventory.notify.crafted_not_equipped",
+                "Crafted — it's in your inventory. Nothing on this side can hold it, so it isn't equipped.",
+              )
+            : duplicating.value
+              ? tr("inventory.notify.copy_created", "Editable copy created in your inventory.")
+              : tr("inventory.notify.crafted", "Crafted — it's in your inventory."),
         "success",
       );
       sheetMode.value = "owned";
@@ -2649,7 +2688,10 @@ const renderServes = (url: string) =>
  * build-asset-manifest.mjs, which encodes the same decision for the extractor's
  * missing-icon report.
  */
-const CARD_BAKE_KINDS = new Set<ViewerKind>(["weapon", "charm", "glove"]);
+// PETS ARE IN on the strongest version of the test: for four of the five the
+// game ships no icon at all, and none of them can show a coat, a stage or the
+// body a pattern draws. Coat and stage are in the render key (renderKeyFor).
+const CARD_BAKE_KINDS = new Set<ViewerKind>(["weapon", "charm", "glove", "pet"]);
 async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
   if (renderedIds.has(inst.id)) return false;
   // Resolved, not read off `item.model`. A charm names no model of its own —
@@ -2704,6 +2746,10 @@ async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
         // A charm's `seed` is its own PATTERN and the standalone viewer grades
         // its material by it; on a weapon the same field is the float pattern.
         seed: inst.seed != null ? Number(inst.seed) : null,
+        // A pet's coat and stage; its pattern rides `seed` above. All three are
+        // in the render key, so changing any of them re-bakes the card.
+        petStyle: target.kind === "pet" ? (inst.style ?? null) : null,
+        petStage: target.kind === "pet" ? (inst.upgrade_level ?? null) : null,
         // NOT the live `gloveArms` toggle, and that is the point: a card is
         // keyed on id+wear+seed+stattrak, so anything else it renders from has
         // to be a constant. Reading a UI switch here would bake two different
@@ -3244,6 +3290,40 @@ function craftCharmPlacement(): CharmPlacement | null {
   return c?.image ? { image: c.image, x: c.x ?? null, y: c.y ?? null, z: c.z ?? null, seed: c.seed ?? null } : null;
 }
 /**
+ * The craft screen's title. A NAMED PET is titled by its name, the way CS2 shows
+ * a named item — “Clucky” over "Pet Chicken · Catalana"; everything else keeps
+ * weapon over finish.
+ */
+const craftIdentityName = computed(() => {
+  const c = craft.value;
+  if (!c) return { weapon: "", finish: "" };
+  const name = c.skin.name;
+  const base = name.includes(" | ") ? name.split(" | ")[0] : name;
+  const tag = craftType.value === "pet" ? c.nametag?.trim() : "";
+  if (tag) return { weapon: `“${tag}”`, finish: name.includes(" | ") ? `${base} · ${stripName(name)}` : name };
+  return { weapon: craftWeaponLabel.value ?? base, finish: stripName(name) };
+});
+/**
+ * What the pet on the stage is doing — a VIEWING choice, never saved with the
+ * pet and never sent to the game. Kept across items on purpose: someone
+ * comparing coats wants every bird doing the same thing.
+ */
+const petClip = ref<string>(DEFAULT_PET_CLIP);
+/**
+ * WANDER — the pet choosing its own clips (see setPetWander). Holds the pool it
+ * picks from while on, null while off; a viewing choice like petClip, kept
+ * across items and re-armed on every remount.
+ *
+ * ON BY DEFAULT: a pet on the stage pottering about is the pet as the game shows
+ * it. It stays the default until the person turns it off or picks a clip by
+ * hand (`petWanderTouched`), and from then on their choice holds.
+ */
+const petWander = ref<string[] | null>(null);
+let petWanderTouched = false;
+/** The clip Wander last chose — so its echo through petClip is not mistaken for
+ *  a manual pick and replayed as a loop. */
+let petWanderPick: string | null = null;
+/**
  * Everything about the craft state that decides how the item LOOKS, as the
  * viewer wants it.
  *
@@ -3299,6 +3379,9 @@ async function craftVisualOpts(target: ViewerTarget) {
     // order — there is no geometry and nothing to place.
     patches: target.kind === "agent" ? (c?.patches ?? []).map((p) => p?.image ?? null) : undefined,
     charm: isWeapon ? craftCharmPlacement() : null,
+    petStyle: target.kind === "pet" ? (c?.style ?? null) : null,
+    petClip: target.kind === "pet" ? petClip.value : null,
+    petStage: target.kind === "pet" ? (c?.stage ?? null) : null,
   };
 }
 async function mountModalViewer() {
@@ -3383,6 +3466,10 @@ async function mountModalViewer() {
       // for the watcher below to talk to. Reconcile here so a mode change can't
       // be lost in the gap — no-ops when it already matches.
       handle.setInteractive(!viewOnly.value);
+      // A remount starts the pet on its idle; Wander, if it was on, carries on —
+      // and is switched on here the first time, unless it has been turned off.
+      if (target.kind === "pet" && petWander.value) armPetWander();
+      else if (target.kind === "pet" && !petWanderTouched) void defaultPetWander(target.model);
     },
   );
 }
@@ -3579,6 +3666,13 @@ function repaint(proxy: boolean) {
     handle.setCharmSeed(craft.value.seed ?? 0);
     return;
   }
+  // Nor is a PET's: its seed grades the coat and shapes the body (petPattern.ts),
+  // both of which the live viewer re-applies in place.
+  if (craftTarget.value?.kind === "pet") {
+    clearTimeout(retexRebuild);
+    void handle.setPetPattern(craft.value.seed ?? 0, craft.value.stage ?? null);
+    return;
+  }
   void handle.setPaintVariant(craft.value.wear ?? 0, craft.value.seed ?? 0, proxy).then((ok) => {
     if (ok || !modal3d.value || modalViewer.current() !== handle) return;
     if (retexRebuilt === handle) return;
@@ -3616,6 +3710,57 @@ watch(
   (text) => {
     if (!modalViewer.current() || !craft.value) return;
     modalViewer.current()!.setNameTag(text ?? null);
+  },
+);
+watch(petClip, (name) => {
+  if (name === petWanderPick) return; // Wander already playing it
+  void modalViewer.current()?.setPetClip(name);
+});
+function armPetWander() {
+  modalViewer.current()?.setPetWander(petWander.value, (name) => {
+    petWanderPick = name;
+    petClip.value = name;
+  });
+}
+watch(petWander, armPetWander);
+async function defaultPetWander(model: string) {
+  const pool = petWanderPool(await loadPetClipIndex(), model);
+  if (!petWanderTouched && !petWander.value && pool.length) petWander.value = pool;
+}
+/** Wander switched by hand — on or off, the default no longer applies. */
+function setPetWanderByHand(pool: string[] | null) {
+  petWanderTouched = true;
+  petWander.value = pool;
+}
+/** A clip picked by hand ends Wander: the choice was the person's. */
+function pickPetClip(name: string) {
+  petWanderTouched = true;
+  petWander.value = null;
+  petWanderPick = null;
+  petClip.value = name;
+}
+/** The stepper's bar reads this per frame. */
+const petClipProgress = () => modalViewer.current()?.petClipProgress() ?? null;
+/** Hovering a coat swatch shows it without committing; undefined puts the
+ *  chosen one back. */
+// Life stage → the body preset the seed draws from (pullet vs hen).
+watch(
+  () => craft.value?.stage,
+  (stage) => {
+    if (!modalViewer.current() || !craft.value || craftTarget.value?.kind !== "pet") return;
+    void modalViewer.current()!.setPetPattern(craft.value.seed ?? 0, stage ?? null);
+  },
+);
+function previewPetStyle(style: number | null | undefined) {
+  void modalViewer.current()?.setPetStyle(style === undefined ? (craft.value?.style ?? null) : style);
+}
+// Pet style → re-dress the live pet. Same reasoning again: a style is a few
+// texture swaps, and a remount would reset the camera for them.
+watch(
+  () => craft.value?.style,
+  (style) => {
+    if (!modalViewer.current() || !craft.value) return;
+    void modalViewer.current()!.setPetStyle(style ?? null);
   },
 );
 // Numeric edits / picker changes → live decal + charm updates. The viewer
@@ -3699,7 +3844,7 @@ let craftPreviewToken = 0;
 let craftBaseline = "";
 const craftStateJson = () =>
   craft.value
-    ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm, craft.value.stattrak])
+    ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm, craft.value.stattrak, craft.value.style, craft.value.stage])
     : "";
 /**
  * The still's image didn't load — a stored card bake that was never made (or a
@@ -3756,6 +3901,10 @@ function craftPreviewNeeded(target: ViewerTarget): boolean {
   switch (target.kind) {
     case "charm":
     case "glove":
+      return true;
+    // Four of the five pets have no icon in the game at all (see TODO.md, Pets),
+    // and the egg's cannot show a coat or a stage.
+    case "pet":
       return true;
     case "sticker":
       return (c.wear ?? 0) > 0;
@@ -3890,15 +4039,25 @@ const advancedPlacement = ref(false);
  * card's own 404 rather than up front — this costs a GL context, and the only
  * items that need it are the handful that ask.
  *
- * Session-scoped on purpose. The server-side render store is keyed per owned
- * INSTANCE (`inst-<id>-…`) and these are catalog rows with no instance, so
- * persisting them needs a second store — worth doing if this ever covers more
- * than a few items, overkill for eight.
+ * PETS are the second case, and the one that made a stored copy worth having:
+ * four of the five (the chick and the three breeds) have no image_inventory at
+ * all — the game renders them live. Their bakes go to the backend's CATALOG
+ * render store (`cat-<id>-…`, /api/render/catalog): an ADMINISTRATOR's bake is
+ * published for everybody (the store is shared art, so the backend takes writes
+ * from admins only), and a later visitor's 404 on the icon tries that stored
+ * copy before spending a GL context. Anyone else's bake stays in their session —
+ * the upload is refused and that is fine. The gloves stay session-scoped until
+ * they join CATALOG_RENDER_TYPES on both sides.
  */
 const catalogArt = ref<Record<number, string>>({});
 const catalogArtTried = new Set<number>();
+/** Must match CATALOG_RENDER_TYPES in backend/src/main.ts — the server refuses
+ *  the rest. */
+const CATALOG_RENDER_TYPES = new Set(["pet"]);
+/** Ids whose STORED catalog render has already been tried this session. */
+const catalogStoredTried = new Set<number>();
 async function bakeCatalogArt(skin: { id: number; name?: string; model?: string | null; type?: string | null; paintMaterial?: string | null }) {
-  if (!skin?.id || catalogArtTried.has(skin.id) || catalogArt.value[skin.id]) return;
+  if (!skin?.id || catalogArtTried.has(skin.id)) return;
   catalogArtTried.add(skin.id);
   const target = await resolveViewerModel(skin);
   if (!target || !(await hasModel(target.model))) return;
@@ -3912,14 +4071,29 @@ async function bakeCatalogArt(skin: { id: number; name?: string; model?: string 
       undefined,
       true,
     );
-    if (blob && blob !== INCOMPLETE) catalogArt.value = { ...catalogArt.value, [skin.id]: URL.createObjectURL(blob) };
+    if (blob && blob !== INCOMPLETE) {
+      catalogArt.value = { ...catalogArt.value, [skin.id]: URL.createObjectURL(blob) };
+      if (skin.type && CATALOG_RENDER_TYPES.has(skin.type)) void uploadCatalogRender(skin.id, blob);
+    }
   } catch {
     /* a missing picture is not worth an error surface — the card stays blank */
   }
 }
 function onCatalogArtError(e: Event, skin: { id: number; model?: string | null; type?: string | null }) {
+  // The icon 404'd: a stored catalog render first, if this type has a store.
+  if (skin.type && CATALOG_RENDER_TYPES.has(skin.type) && !catalogStoredTried.has(skin.id)) {
+    catalogStoredTried.add(skin.id);
+    catalogArt.value = { ...catalogArt.value, [skin.id]: catalogRenderUrl(skin.id) };
+    return;
+  }
   (e.target as HTMLImageElement).style.visibility = "hidden";
   void bakeCatalogArt(skin);
+}
+/** Undo the hide above once a replacement actually loads — the <img> is the
+ *  same element, so the inline style would otherwise outlive the 404 and keep
+ *  the baked picture invisible. */
+function onCatalogArtLoad(e: Event) {
+  (e.target as HTMLImageElement).style.visibility = "";
 }
 onBeforeUnmount(() => Object.values(catalogArt.value).forEach((u) => URL.revokeObjectURL(u)));
 
@@ -5939,6 +6113,20 @@ function openDetail(i: InventoryItem) {
 // weapon a few pixels away, and spelling out "AK-47 · Rifles" inside the button
 // made it the widest thing in the footer without answering a question anyone
 // had. `pos` is still the destination the equip actually uses.
+/**
+ * Can a NEW craft of this item go straight into a slot? Decides whether the
+ * commit button leads with Craft & Equip. The type has to have a slot at all
+ * (a sticker, charm or patch is applied to things, not equipped), and the side
+ * you are on has to be able to use it — the slot itself is only known once the
+ * backend has made the instance, which is why saveCraft re-asks then.
+ */
+const EQUIPPABLE_TYPES = new Set(["weapon", "melee", "glove", "agent", "musickit", "graffiti", "collectible", "pet"]);
+const craftCanEquip = computed(() => {
+  const s = craft.value?.skin as { type?: string | null; teams?: string[] | null } | undefined;
+  if (!s || editingId.value != null || !EQUIPPABLE_TYPES.has(s.type ?? "weapon")) return false;
+  return !s.teams?.length || s.teams.includes(team.value);
+});
+const craftCommitMenu = ref(false);
 const craftEquipTarget = computed(() => {
   const i = craftInst.value;
   if (!i || !viewOnly.value || !canEquipInstance(i)) return null;
@@ -8790,6 +8978,7 @@ if (MDEBUG) {
                       class="max-h-full max-w-full object-contain transition-transform duration-200 ease-out group-hover:scale-105"
                       :class="sheetKey === 'agent' && ART_FADE_B"
                       @error="onCatalogArtError($event, st.card)"
+                      @load="onCatalogArtLoad"
                     />
                   </div>
                   <ItemName :item="st.card" strip class="relative z-[2]" />
@@ -8997,7 +9186,7 @@ if (MDEBUG) {
           <!-- THE SAME SCREEN THE FOCUS VIEW IS. Identity, actions, stage,
                footer — in that order, decided by ItemScreen rather than here,
                which is the only way two surfaces stay one surface. -->
-          <ItemScreen class="min-w-[220px]" :held="craftHeld && modal3d" @panel-width="(w) => (craftPanelW = w)" :identity="{ weapon: craftWeaponLabel ?? (craft.skin.name.includes(' | ') ? craft.skin.name.split(' | ')[0] : craft.skin.name), finish: stripName(craft.skin.name), price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
+          <ItemScreen class="min-w-[220px]" :held="craftHeld && modal3d" @panel-width="(w) => (craftPanelW = w)" :identity="{ ...craftIdentityName, price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
             <template #actions>
             <!-- Settings, then which picture, then what you can do with the
                  item — broadest question first. Both screens carry the same
@@ -9181,41 +9370,29 @@ if (MDEBUG) {
                 @input="onNametagInput"
               />
             </label>
-            <!-- A pet's look and life stage, straight under its name: they are
-                 what the chicken IS, the way a finish is what a gun is. Selects,
-                 not sliders — 13 styles is a list you pick from, and stages are
-                 named ("Pullet", "Hen"), not numbered. Each row only exists when
-                 there is a choice: the egg and the chick have no styles and one
-                 stage apiece. -->
-            <div
-              v-if="craftHasStyle || craftHasStage"
-              class="animate-sheet-in flex flex-col gap-2 rounded-md bg-secondary/40 p-2.5"
+            <!-- A pet's coat, life stage and animation, straight under its
+                 name: they are what the chicken IS, the way a finish is what a
+                 gun is. See PetControls for why each is shaped the way it is. -->
+            <PetControls
+              v-if="craftType === 'pet' && craftTarget && (craftHasStyle || craftHasStage || modal3d)"
+              class="animate-sheet-in"
               :style="{ '--i': 1 }"
-            >
-              <label v-if="craftHasStyle" class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Style</span>
-                <select
-                  :value="craft.style ?? ''"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                  @change="craft!.style = ($event.target as HTMLSelectElement).value === '' ? null : Number(($event.target as HTMLSelectElement).value)"
-                >
-                  <option value="">Stock</option>
-                  <option v-for="n in craftPet!.styleCount" :key="n" :value="n">Style {{ n }}</option>
-                </select>
-              </label>
-              <label v-if="craftHasStage" class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Stage</span>
-                <!-- null and the default stage are the same chicken, so the
-                     select shows the default when nothing is stored. -->
-                <select
-                  :value="craft.stage ?? craftPet!.defaultStage ?? ''"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                  @change="craft!.stage = Number(($event.target as HTMLSelectElement).value)"
-                >
-                  <option v-for="lvl in craftPet!.stages" :key="lvl" :value="lvl">{{ PET_STAGE_NAMES[lvl] ?? `Stage ${lvl}` }}</option>
-                </select>
-              </label>
-            </div>
+              :model="craftTarget.model"
+              :coat="craft.style"
+              :stages="craftPet?.stages ?? []"
+              :stage="craft.stage"
+              :default-stage="craftPet?.defaultStage ?? null"
+              :clip="modal3d ? petClip : null"
+              :seed="Number(craft.seed ?? 0)"
+              @update:coat="craft!.style = $event"
+              @update:stage="craft!.stage = $event"
+              :wander="petWander != null"
+              :progress="petClipProgress"
+              @update:clip="pickPetClip"
+              @wander="setPetWanderByHand"
+              @update:seed="(s) => (craft!.seed = s)"
+              @preview-style="previewPetStyle"
+            />
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
               <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${patchSlotCount}, minmax(0, 1fr))` }">
@@ -9442,6 +9619,16 @@ if (MDEBUG) {
                  still round-trips through save and share — there is just no
                  longer a control for a number with nothing to show for it. -->
             <div v-else-if="craftHasSeed && patternMoves === true" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+              <!-- PLACEMENT: the pattern as where the artwork sits, draggable —
+                   the gun's half of what a pet's Traits do. Above the rail it
+                   drives, as a pet's sit above its Pattern field. -->
+              <div v-if="gunTraits.length" class="mb-3">
+                <div class="mb-1 flex items-baseline gap-2">
+                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Placement</span>
+                  <span class="ml-auto text-f10 text-muted-foreground/70">drag to place</span>
+                </div>
+                <TraitBars :traits="gunTraits" :table="gunTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
+              </div>
               <PatternScoreRail
                 :model-value="craft.seed"
                 :paint-material="craft.skin.paintMaterial"
@@ -9453,9 +9640,10 @@ if (MDEBUG) {
               />
             </div>
             <!-- A PET's pattern. Neither rail fits: there is no paint to score
-                 and no colour band to aim at — the game reads it as the pattern
-                 of a variation, and nothing we render changes with it. So it is
-                 the plain number it is, with the same die as the float. -->
+                 and no colour band to aim at, and neighbouring numbers are
+                 unrelated birds. The Traits bars above are how to CHOOSE one;
+                 this is the plain number they land on, with the same die as the
+                 float. -->
             <div v-else-if="craftHasSeed && craftType === 'pet'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
               <div class="flex items-center gap-2">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
@@ -9587,16 +9775,51 @@ if (MDEBUG) {
           >
             <Copy class="h-3.5 w-3.5" /> Copy
           </button>
-          <button
+          <!-- THE COMMIT. A new craft leads with Craft & Equip — making a thing
+               and then hunting for it in the inventory to put it on is the
+               awkward half of crafting — with plain Craft one click away on the
+               caret. Items that cannot be equipped from here (attachments, or
+               off-side) just say Craft; editing says Save. -->
+          <div
             v-if="!viewOnly"
-            class="flex h-9 items-center gap-1.5 rounded-md border border-transparent px-4 text-f11 font-bold uppercase tracking-wider text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+            class="relative flex h-9 rounded-md"
             style="background: linear-gradient(135deg, var(--tac-amber-cta-from, #f9b04a), var(--tac-amber-cta-to, #d97f16)); box-shadow: 0 1px 3px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.22)"
-            :disabled="craftBusy || !signedIn"
-            :title="signedIn ? undefined : 'Sign in to save this to your inventory'"
-            @click="confirmCraft"
+            @focusout="(e) => !(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node) && (craftCommitMenu = false)"
+            @keydown.escape.stop="craftCommitMenu = false"
           >
-            <Loader2 v-if="craftBusy" class="h-3.5 w-3.5 animate-spin" /> {{ editingId != null ? "Save" : "Craft" }}
-          </button>
+            <button
+              class="flex items-center gap-1.5 rounded-md px-4 text-f11 font-bold uppercase tracking-wider text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+              :class="craftCanEquip && 'rounded-r-none'"
+              :disabled="craftBusy || !signedIn"
+              :title="signedIn ? (craftCanEquip ? 'Craft it and put it on — Craft only is on the arrow' : undefined) : 'Sign in to save this to your inventory'"
+              @click="confirmCraft(craftCanEquip)"
+            >
+              <Loader2 v-if="craftBusy" class="h-3.5 w-3.5 animate-spin" />
+              {{ editingId != null ? "Save" : craftCanEquip ? "Craft & Equip" : "Craft" }}
+            </button>
+            <button
+              v-if="craftCanEquip"
+              class="grid w-8 place-items-center rounded-r-md border-l border-black/20 text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="craftBusy || !signedIn"
+              aria-label="More ways to craft"
+              :aria-expanded="craftCommitMenu"
+              @click="craftCommitMenu = !craftCommitMenu"
+            >
+              <ChevronDown class="h-3.5 w-3.5 transition-transform" :class="craftCommitMenu && 'rotate-180'" />
+            </button>
+            <div
+              v-if="craftCommitMenu"
+              class="absolute bottom-full right-0 mb-1.5 min-w-full overflow-hidden rounded-md border border-border bg-card shadow-2xl animate-menu-in"
+            >
+              <button
+                class="flex w-full items-center gap-2 whitespace-nowrap px-3 py-2 text-left text-f11 font-semibold uppercase tracking-wider text-foreground transition-colors hover:bg-muted"
+                @click="craftCommitMenu = false; confirmCraft(false)"
+              >
+                <Hammer class="h-3.5 w-3.5 text-muted-foreground" /> Craft only
+                <span class="ml-auto pl-3 text-f10 font-normal normal-case tracking-normal text-muted-foreground">to inventory</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>

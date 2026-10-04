@@ -18,6 +18,7 @@ import PatternRail from "./PatternRail.vue";
 import WearBar from "./WearBar.vue";
 import { attachmentsOf, hasScratch, hasWear, wearTier } from "../itemVisuals";
 import type { AttachSource } from "../api";
+import { PET_STAGE_NAMES } from "../pets";
 
 const props = withDefaults(
   defineProps<{
@@ -58,7 +59,6 @@ const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : [])
 const seedIsCharm = computed(() => props.inst?.item?.type === "keychain");
 /** A PET's look and life stage. Style null is the stock look; a stage left
  *  unset is the pet's own default, which the item says (a hen, for a breed). */
-const PET_STAGE_NAMES: Record<number, string> = { 0: "Egg", 1: "Chick", 2: "Pullet", 3: "Hen" };
 const pet = computed(() => {
   const i = props.inst;
   if (i?.item?.type !== "pet") return null;

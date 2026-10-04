@@ -99,25 +99,18 @@ export default defineConfig({
     // reka-ui / lucide are bundled into this remote now (only Vue comes from
     // the panel), so their size is expected.
     chunkSizeWarningLimit: 900,
-    // In-cluster dev watch (DEV_WATCH=1, set by `yarn dev:ui`). Two hard-won rules:
-    //  - usePolling: inotify events in the codepier-synced container go silently
-    //    blind after a while (`--watch` then never rebuilds again even though the
-    //    sync delivered the file). Polling can't go blind.
-    //  - emptyOutDir:false: watch rebuilds otherwise wipe dist/ first, so every
-    //    rebuild has a window where remoteEntry.js/chunks 404 through the ingress,
-    //    and clients holding the previous remoteEntry lose their hashed chunks.
-    //    Overwrite in place instead; stale hashed chunks accumulating is harmless
-    //    (the initial clean `vite build` at dev startup still empties it).
-    ...(process.env.DEV_WATCH
-      ? {
-          emptyOutDir: false,
-          watch: {
-            buildDelay: 300,
-            exclude: ["**/node_modules/**", "**/dist/**"],
-            watcher: { usePolling: true, pollInterval: 500 },
-          },
-        }
-      : {}),
+    // In-cluster dev rebuilds (DEV_WATCH=1, set by scripts/dev-watch.mjs, which
+    // `yarn dev:ui` starts). NOT vite's --watch: under rolldown a watch rebuild
+    // drops the federation expose chunk and ships a remoteEntry with its
+    // placeholder unfilled — see that script. It polls (inotify in the
+    // codepier-synced container goes blind) and runs a full build per change.
+    //
+    // emptyOutDir:false: a build that wipes dist/ first has a window where
+    // remoteEntry.js/chunks 404 through the ingress, and clients holding the
+    // previous remoteEntry lose their hashed chunks. Overwrite in place instead;
+    // stale hashed chunks accumulating is harmless (the initial clean
+    // `vite build` at dev startup still empties it).
+    ...(process.env.DEV_WATCH ? { emptyOutDir: false } : {}),
   },
   // `vite preview` serves the built remoteEntry.js. cors:true sends
   // Access-Control-Allow-Origin:* so the panel can import it cross-origin.

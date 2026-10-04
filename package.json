@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "dev": "npm install && vite build && (DEV_WATCH=1 vite build &) && node scripts/serve.mjs",
+    "dev": "npm install && vite build && (node scripts/dev-watch.mjs &) && node scripts/serve.mjs",
     "dev:ui": "npm run dev",
     "dev:api": "cd backend && npm install && node --watch --experimental-strip-types src/server.ts",
     "build": "vite build",

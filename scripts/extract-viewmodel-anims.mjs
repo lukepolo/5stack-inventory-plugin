@@ -30,7 +30,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { readClip } from "../tools/nmclip.mjs";
+import { compactTrack as compact, readClip } from "../tools/nmclip.mjs";
 
 const arg = (name, dflt) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -150,43 +150,6 @@ function folderFor(stem, clips) {
   const guess = `${fam}/${fam}_${stem.replace(/^knife_/, "")}`;
   if (clips.some((c) => c.startsWith(`animation/anims/viewmodel/${guess}/`))) return guess;
   return DEFAULT_FOLDER[fam];
-}
-
-/**
- * Collapse a track that never changes to a single key.
- *
- * Most bones in an inspect only ROTATE — the skeleton's proportions do not
- * change, so every position track is 100+ identical keys. Storing them is the
- * difference between a clip that is hundreds of kilobytes and one that is tens.
- */
-function compact(t, epsilon) {
-  if (!t) return undefined;
-  const { times, values } = t;
-  if (!times.length || !values.length) return undefined;
-  // VALUES ARE TUPLES, not a flat run of numbers: the DMX reader hands back one
-  // `[x,y,z,w]` (or `[x,y,z]`) per key. Treating them as flat made every
-  // comparison `array - number`, i.e. NaN, which is never greater than epsilon —
-  // so every track "never moved" and a 138-key inspect collapsed to a single
-  // pose. It extracted cleanly and produced a 3KB file that animated nothing.
-  const first = values[0];
-  const width = first.length;
-  let moves = false;
-  for (let i = 1; i < values.length && !moves; i++) {
-    for (let k = 0; k < width; k++) {
-      if (Math.abs(values[i][k] - first[k]) > epsilon) {
-        moves = true;
-        break;
-      }
-    }
-  }
-  const round = (v) => Math.round(v * 1e4) / 1e4;
-  if (!moves) return { v: first.map(round) };
-  return {
-    t: Array.from(times, (x) => Math.round(x * 1e4) / 1e4),
-    // Flattened on the way OUT — one array of numbers is a third the JSON of
-    // nested pairs, and the consumer wants a flat buffer anyway.
-    v: values.flatMap((tuple) => tuple.map(round)),
-  };
 }
 
 /**

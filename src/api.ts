@@ -418,14 +418,44 @@ export const fetchCatalog = () => request<Catalog>("/catalog");
 // stattrak is REQUIRED, not optional: an omitted flag silently builds a key
 // that disagrees with the one the writer used, and the card 404s forever.
 let renderVersion = 0;
-export const renderKeyFor = (i: { id: number; wear: number | null; seed: number | null; stattrak: boolean | null }) =>
-  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}${i.stattrak ? "-st" : ""}-v${renderVersion}.png`;
+type RenderKeyed = {
+  id: number;
+  wear: number | null;
+  seed: number | null;
+  stattrak: boolean | null;
+  /** Pets only: coat and life stage, suffixed only when set — must match
+   *  renderKeyForRow. */
+  style?: number | null;
+  upgrade_level?: number | null;
+};
+export const renderKeyFor = (i: RenderKeyed) =>
+  `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}${i.stattrak ? "-st" : ""}` +
+  `${i.style != null ? `-c${i.style}` : ""}${i.upgrade_level != null ? `-g${i.upgrade_level}` : ""}-v${renderVersion}.png`;
 // Served via /api (canonical): that ingress path provably reaches the backend
 // pod that stores the files — immune to stale nginx images, CDN-cached 404s,
 // and hostPath node mismatches. Plain <img> tags send session cookies, so the
 // forward-auth gate passes for signed-in users.
-export const renderUrlFor = (i: { id: number; wear: number | null; seed: number | null; stattrak: boolean | null }) =>
+export const renderUrlFor = (i: RenderKeyed) =>
   `${API_ORIGIN}/api/renders/${renderKeyFor(i)}`;
+/**
+ * A catalog ITEM's stored card — for the items the game ships no icon of (see
+ * /api/render/catalog in the backend). Same store and versioning as an
+ * instance's card; must match catalogRenderKey there.
+ */
+export const catalogRenderUrl = (itemId: number) => `${API_ORIGIN}/api/renders/cat-${itemId}-v${renderVersion}.png`;
+export async function uploadCatalogRender(itemId: number, blob: Blob): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/api/render/catalog/${itemId}`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: blob,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
 export async function uploadRender(instanceId: number, blob: Blob): Promise<{ ok: boolean; error?: string }> {
   try {
     const res = await fetch(`${API_BASE}/api/render/${instanceId}`, {
