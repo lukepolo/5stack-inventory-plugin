@@ -20,12 +20,13 @@
 // away from the cursor mid-drag, which reads as the drag slipping off the
 // slider. No tooltip while dragging either — it covered the bar being dragged.
 //
-// THE DRAG STAYS ON THE SLIDER. Wander off it — up into the next row, out
-// into the 3D view — and the drag ends where it last was on the bar, as if
-// released. A captured drag used to follow the pointer anywhere on screen, so
-// the pattern kept reshuffling after the person had moved on, and with a
-// trackpad's drag-lock it never let go at all. A move that arrives with no
-// button down (a release we never heard) ends it too.
+// THE DRAG HOLDS UNTIL RELEASE, wherever the pointer goes — like any slider,
+// only the pointer's left-right counts once the dot is taken, and past either
+// end it pins at 0 or 100. Ending the drag when the pointer strayed off the
+// bar (the version before) was miserable on a 22px row: a hand dragging
+// sideways drifts a few px up or down, and the dot let go mid-drag. What that
+// version was guarding against is still covered: a move that arrives with no
+// button down (a release we never heard) ends it, and so does a lost capture.
 //
 // Anchored to the traits at the START of the drag, so the others do not wander
 // further with every step; one search per frame however fast the pointer
@@ -73,13 +74,6 @@ function seek(key: string, target: number, base: Record<string, number>) {
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 /** The bar a dot's event belongs to. */
 const barRect = (e: PointerEvent) => ((e.currentTarget as HTMLElement).parentElement as HTMLElement).getBoundingClientRect();
-/**
- * How far past the bar the pointer may go before the drag lets go, in px.
- * Sideways there is room to overshoot an end and pin it at 0 or 100; up and
- * down barely any, so the next row is already "off". Fingers drift, so touch
- * gets more of both.
- */
-const STRAY = { mouse: { x: 16, y: 6 }, touch: { x: 32, y: 24 } };
 
 function down(e: PointerEvent, t: TraitRow) {
   (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -92,10 +86,6 @@ function move(e: PointerEvent) {
   if (!d) return;
   if (e.buttons === 0) return end(e);
   const r = barRect(e);
-  const stray = e.pointerType === "touch" ? STRAY.touch : STRAY.mouse;
-  if (e.clientX < r.left - stray.x || e.clientX > r.right + stray.x || e.clientY < r.top - stray.y || e.clientY > r.bottom + stray.y) {
-    return end(e);
-  }
   d.target = clamp01((e.clientX - r.left) / Math.max(1, r.width) - d.grab);
   if (frame) return;
   frame = requestAnimationFrame(() => {
@@ -103,10 +93,10 @@ function move(e: PointerEvent) {
     if (drag.value) seek(drag.value.key, drag.value.target, drag.value.base);
   });
 }
-/** Release, cancel, a lost capture, or the pointer leaving the slider. */
+/** Release, cancel, or a lost capture. */
 function end(e: PointerEvent) {
-  // A search still waiting on its frame is the LAST place the pointer was on
-  // the bar — run it now, or a quick flick and release lands on the one before.
+  // A search still waiting on its frame is the LAST place the pointer was —
+  // run it now, or a quick flick and release lands on the one before.
   if (frame) {
     cancelAnimationFrame(frame);
     frame = 0;
@@ -114,8 +104,8 @@ function end(e: PointerEvent) {
     if (d) seek(d.key, d.target, d.base);
   }
   drag.value = null;
-  // Hand the pointer back, so whatever it is over now hovers normally for the
-  // rest of the press instead of every move still landing on this dot.
+  // Hand the pointer back — a no-op after a release, but an end we called
+  // ourselves (no button down) must not leave the dot holding it.
   const el = e.currentTarget as HTMLElement | null;
   if (el?.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
 }
