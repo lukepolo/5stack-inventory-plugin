@@ -218,7 +218,7 @@ defineEmits<{
 
     <div v-else-if="showName || showWear" class="relative z-[2] flex items-end justify-between gap-2">
       <span v-if="showName" class="flex min-w-0 flex-1 items-center gap-1.5">
-        <ItemName :item="item" :strip="strip" :fallback="fallback" :nametag="item?.type === 'pet' ? inst?.nametag : null" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
+        <ItemName :item="item" :strip="strip" :fallback="fallback" :nametag="item?.type === 'pet' ? (inst ?? badges)?.nametag : null" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
         <!-- StatTrak and what's applied. The loadout showed neither until this
              component existed; the inventory grid has shown both all along. -->
         <ItemBadges v-if="showBadges" :inst="badges ?? inst" :max="3" compact />

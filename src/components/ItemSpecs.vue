@@ -13,12 +13,15 @@
  * Order matches the EDIT form's boxes deliberately: switching between editing
  * and viewing must not reshuffle the panel under the cursor.
  */
-import { computed, inject } from "vue";
+import { computed, inject, ref, watch } from "vue";
 import PatternRail from "./PatternRail.vue";
+import TraitBars, { type TraitRow } from "./TraitBars.vue";
 import WearBar from "./WearBar.vue";
 import { attachmentsOf, hasScratch, hasWear, wearTier } from "../itemVisuals";
 import type { AttachSource } from "../api";
-import { PET_STAGE_NAMES } from "../pets";
+import { PET_STAGE_NAMES, PET_TRAIT_NAMES, petPresetKey } from "../pets";
+import { petSeedTable, petStyleOptions, type PetStyleOption } from "../petMaterial";
+import { petPoseWeights, type PetSeedTable } from "../petPattern";
 
 const props = withDefaults(
   defineProps<{
@@ -59,15 +62,48 @@ const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : [])
 const seedIsCharm = computed(() => props.inst?.item?.type === "keychain");
 /** A PET's look and life stage. Style null is the stock look; a stage left
  *  unset is the pet's own default, which the item says (a hen, for a breed). */
+const petModel = computed(() => (props.inst?.item?.type === "pet" ? props.inst.item.model ?? null : null));
+const petStage = computed(() => props.inst?.upgrade_level ?? props.inst?.item?.defaultUpgradeLevel ?? null);
+/** The model's coats and seed generator, from pet-styles.json (fetched once). */
+const petData = ref<{ options: PetStyleOption[]; seed: PetSeedTable | null } | null>(null);
+watch(
+  petModel,
+  async (model) => {
+    petData.value = null;
+    if (!model) return;
+    const [options, seed] = await Promise.all([petStyleOptions(model), petSeedTable(model)]);
+    if (petModel.value === model) petData.value = { options, seed };
+  },
+  { immediate: true },
+);
 const pet = computed(() => {
   const i = props.inst;
   if (i?.item?.type !== "pet") return null;
-  const stage = i.upgrade_level ?? i.item.defaultUpgradeLevel ?? null;
+  const stage = petStage.value;
+  // The coat by NAME — the material's, as the editor's swatches say it — with
+  // the bare number only until the names have loaded.
+  const coat = petData.value?.options.find((o) => o.style === (i.style ?? null))?.name;
   return {
-    style: (i.item.styleCount ?? 0) > 0 ? (i.style != null ? `Style ${i.style}` : "Stock") : null,
+    style: (i.item.styleCount ?? 0) > 0 ? coat ?? (i.style != null ? `Style ${i.style}` : "Stock") : null,
     // Only worth a row when the pet could have been something else.
     stage: (i.item.upgradeLevels?.length ?? 0) > 1 && stage != null ? PET_STAGE_NAMES[stage] ?? `Stage ${stage}` : null,
   };
+});
+/**
+ * What a pet's pattern DOES: the body it draws, the same bars the editor drags
+ * (TraitBars, read-only) from the same draws the 3D bird is shaped by. "#48213"
+ * alone is a coordinate nobody can read; this is the bird. None for the chick,
+ * whose generator is off in game.
+ */
+const petTraits = computed<TraitRow[]>(() => {
+  const seed = props.inst?.seed;
+  const key = petPresetKey(petStage.value);
+  const preset = key ? petData.value?.seed?.presets?.[key] : null;
+  if (!pet.value || !preset || !seed) return [];
+  const w = petPoseWeights(seed, preset);
+  return Object.entries(PET_TRAIT_NAMES)
+    .filter(([k]) => w[k] !== undefined)
+    .map(([k, label]) => ({ key: k, label, value: w[k], display: String(Math.round(w[k] * 100)) }));
 });
 /**
  * The box each reading sits in. The surface is what separates one reading from
@@ -140,6 +176,15 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
         :albedo="charmAlbedo"
         :loading="charmLoading"
       />
+      <template v-else-if="petTraits.length">
+        <div class="flex min-w-0 flex-1 flex-col gap-1.5">
+          <div class="flex items-center gap-2">
+            <span :class="label">{{ tr('inventory.specs.pattern', 'Pattern') }}</span>
+            <span class="font-mono text-f13">#{{ inst.seed }}</span>
+          </div>
+          <TraitBars :traits="petTraits" :table="() => null" :seed="inst.seed" centered readonly />
+        </div>
+      </template>
       <template v-else>
         <span :class="label">{{ tr('inventory.specs.pattern', 'Pattern') }}</span>
         <span class="font-mono text-f13">#{{ inst.seed }}</span>

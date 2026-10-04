@@ -3307,18 +3307,23 @@ function craftCharmPlacement(): CharmPlacement | null {
   return c?.image ? { image: c.image, x: c.x ?? null, y: c.y ?? null, z: c.z ?? null, seed: c.seed ?? null } : null;
 }
 /**
- * The craft screen's title. A NAMED PET is titled by its name, the way CS2 shows
- * a named item — “Clucky” over "Pet Chicken · Catalana"; everything else keeps
- * weapon over finish.
+ * A NAMED PET's title: its name, the way CS2 shows a named item — “Clucky” over
+ * "Pet Chicken · Catalana". Null for anything else, which keeps weapon over
+ * finish. Shared by the craft screen and focus so a name reads the same on both.
  */
+function namedPetTitle(name: string, type: string | null | undefined, tag: string | null | undefined) {
+  const t = type === "pet" ? tag?.trim() : "";
+  if (!t) return null;
+  const base = name.includes(" | ") ? name.split(" | ")[0] : name;
+  return { weapon: `“${t}”`, finish: name.includes(" | ") ? `${base} · ${stripName(name)}` : name };
+}
+/** The craft screen's title — see namedPetTitle. */
 const craftIdentityName = computed(() => {
   const c = craft.value;
   if (!c) return { weapon: "", finish: "" };
   const name = c.skin.name;
   const base = name.includes(" | ") ? name.split(" | ")[0] : name;
-  const tag = craftType.value === "pet" ? c.nametag?.trim() : "";
-  if (tag) return { weapon: `“${tag}”`, finish: name.includes(" | ") ? `${base} · ${stripName(name)}` : name };
-  return { weapon: craftWeaponLabel.value ?? base, finish: stripName(name) };
+  return namedPetTitle(name, craftType.value, c.nametag) ?? { weapon: craftWeaponLabel.value ?? base, finish: stripName(name) };
 });
 /**
  * What the pet on the stage is doing — a VIEWING choice, never saved with the
@@ -6671,6 +6676,33 @@ const focusInstance = computed(() => {
 const focusAttachments = computed<AttachSource | null>(
   () => focusInstance.value ?? focusRow.value ?? null,
 );
+// A pet's look moving under a mounted focus stage — CT and T can hold the same
+// breed in different coats, and a team switch keeps the model (no remount), so
+// the stage would go on showing the other side's bird. Same live setters the
+// craft modal drives.
+watch(
+  () => (focusTarget.value?.kind === "pet" ? focusAttachments.value : null),
+  (pet, was) => {
+    const v = focusViewer.current();
+    if (!pet || !v || !was) return;
+    if ((pet.style ?? null) !== (was.style ?? null)) void v.setPetStyle(pet.style ?? null);
+    if (pet.seed !== was.seed || (pet.upgrade_level ?? null) !== (was.upgrade_level ?? null)) {
+      void v.setPetPattern(pet.seed ?? 0, pet.upgrade_level ?? null);
+    }
+  },
+);
+/** Focus's title: a named pet by its name (namedPetTitle — the instance's tag,
+ *  or a visitor's row's), else the slot's weapon over the finish. */
+const focusIdentityName = computed(() => {
+  const row = focusRow.value;
+  const item = isSkinned(row) ? row?.item ?? null : null;
+  return (
+    (item && namedPetTitle(item.name, item.type, focusAttachments.value?.nametag)) ?? {
+      weapon: sheetWeaponName.value,
+      finish: item ? stripName(item.name) : "— default finish —",
+    }
+  );
+});
 /**
  * What the panel PRINTS about the focused item: the badge row beside the name,
  * and the spec column under the stage controls.
@@ -6843,6 +6875,11 @@ async function mount3d() {
       legacyPaint: focusLegacyPaint.value,
       wear: focusRow.value?.wear ?? focusInstance.value?.wear,
       seed: focusRow.value?.seed ?? focusInstance.value?.seed,
+      // A pet's coat and life stage. Focus passed neither, so every pet here —
+      // yours or a visitor's — stood in its stock coat at the default stage
+      // while the cell and the specs described a different bird.
+      petStyle: focusTarget.value?.kind === "pet" ? (focusAttachments.value?.style ?? null) : null,
+      petStage: focusTarget.value?.kind === "pet" ? (focusAttachments.value?.upgrade_level ?? null) : null,
       ...(isWeapon ? await stickerGeom(key) : {}),
       ...(isWeapon ? instPlacements(focusAttachments.value) : {}),
       // See the craft modal for why patches are their own option rather than
@@ -8313,7 +8350,7 @@ if (MDEBUG) {
                  under it are ordered by ItemScreen rather than by this file —
                  the item modal mounts the same one, so the two cannot drift
                  into looking like different screens again. -->
-            <ItemScreen :held="fpvOn && focus3d" @panel-width="(w) => (focusPanelW = w)" :identity="{ slotLabel: focusSlotLabel, weapon: sheetWeaponName, finish: isSkinned(focusRow) ? stripName(focusRow!.item!.name) : '— default finish —', price: focusPrice }">
+            <ItemScreen :held="fpvOn && focus3d" @panel-width="(w) => (focusPanelW = w)" :identity="{ slotLabel: focusSlotLabel, ...focusIdentityName, price: focusPrice }">
               <template #actions>
                 <!-- The same three controls the modal carries, in the same
                      order. Focus had no settings cog at all for a while, which

@@ -28,7 +28,7 @@ import { groupPetClips, loadPetClipIndex, petWanderPool, type PetClipGroup, type
 import { petSeedTable, petStyleOptions, type PetStyleOption } from "../petMaterial";
 import { petPoseWeights, petTraitTable, type PetSeedTable } from "../petPattern";
 import TraitBars, { type TraitRow } from "./TraitBars.vue";
-import { PET_STAGE_NAMES } from "../pets";
+import { PET_STAGE_NAMES, PET_TRAIT_NAMES, petPresetKey } from "../pets";
 
 const props = defineProps<{
   /** The pet's model key, e.g. `models/chicken/chicken`. */
@@ -113,26 +113,15 @@ const canStage = computed(() => props.stages.length > 1);
  * 0.5 is the average bird; a bar runs from the middle toward the min or max
  * pose. Only the grown breeds vary: the chick's generator is off in game.
  */
-const TRAIT_NAMES: Record<string, string> = {
-  fatness: "Body",
-  tail: "Tail",
-  legs: "Legs",
-  wing_size: "Wings",
-  wing_width: "Span",
-  neck: "Neck",
-  head: "Head",
-  comb_front: "Comb",
-  wattle: "Wattle",
-};
 const preset = computed(() => {
-  const stage = stageNow.value ?? 3;
-  return seedTable.value?.presets?.[stage === 2 ? "adolescent" : stage === 3 ? "adult" : ""] ?? null;
+  const key = petPresetKey(stageNow.value);
+  return key ? seedTable.value?.presets?.[key] ?? null : null;
 });
 const weights = computed(() => (preset.value && props.seed ? petPoseWeights(props.seed, preset.value) : null));
 const traits = computed<TraitRow[]>(() => {
   const w = weights.value;
   if (!w) return [];
-  return Object.entries(TRAIT_NAMES)
+  return Object.entries(PET_TRAIT_NAMES)
     .filter(([k]) => w[k] !== undefined)
     .map(([k, label]) => ({ key: k, label, value: w[k], display: String(Math.round(w[k] * 100)) }));
 });
