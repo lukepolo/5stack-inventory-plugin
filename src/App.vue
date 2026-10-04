@@ -6,7 +6,7 @@ import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
-  Layers,
+  Layers, Info,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -8716,6 +8716,20 @@ if (MDEBUG) {
         </div>
         </div>
         <!-- /measured minimised height -->
+
+        <!-- Graffiti only. CS2 fills the spray wheel client-side from the
+             player's real Steam inventory and no server can add to it, so the
+             spray equipped here is never listed there — which reads as broken
+             unless something says how it IS used. Below the measured peek on
+             purpose: the minimised sheet stays the height it always was. -->
+        <div
+          v-if="sheetKey === 'graffiti'"
+          class="flex flex-none items-start gap-2 border-b border-border text-f11 text-muted-foreground"
+          :class="isCompact ? 'px-3 py-1.5' : 'px-6 py-2'"
+        >
+          <Info class="mt-px h-3.5 w-3.5 flex-none" />
+          <span>{{ tr("inventory.graffiti.how_to_spray", "Your equipped graffiti won't show in the in-game spray wheel — that only lists your Steam inventory. In a match, press E facing a wall or type !spray in chat.") }}</span>
+        </div>
 
         <!-- Compact-only tally. A phone can't show a scrollbar, and the picker
              is a short scroller inside a sheet inside a page — so how many
