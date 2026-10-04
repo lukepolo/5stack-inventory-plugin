@@ -253,6 +253,7 @@ invsim_ws_enabled 1
 invsim_ws_immediately 1
 invsim_require_inventory 1
 invsim_spraychanger_enabled 1
+invsim_spray_on_use 1
 ```
 
 Where it lands depends on the panel, best first:
@@ -274,7 +275,7 @@ place instead of three.
 | POST   | `/api/increment-item-stattrak`   | `apiKey` in body   |
 | POST   | `/api/sign-in`                   | `apiKey` in body   |
 
-Three things about this protocol are counter-intuitive and have each cost a
+Four things about this protocol are counter-intuitive and have each cost a
 debugging session:
 
 - **`invsim_ws_*` is not WebSockets.** `ws` means *weapon skin* — the `!ws` chat
@@ -289,6 +290,17 @@ debugging session:
   after their first death. This convar defers activation until the fetch lands.
   The trade-off is that a slow or unreachable backend now hangs players at
   connect instead of spawning them skinless.
+- **The equipped graffiti never appears in the in-game spray wheel.** CS2
+  fills that wheel client-side from the player's *real* Steam inventory, and
+  nothing a server sends can add to it. The plugin applies the equipped spray
+  in two other ways: `invsim_spraychanger_enabled` re-skins a vanilla spray as
+  it lands (so it only helps a player who owns a real graffiti to spray in the
+  first place), and `invsim_spray_on_use` sprays it when the player presses
+  **E** facing a wall — the only way in for everyone else, alongside the
+  `!spray` chat command (`sw_spray` / `css_spray` in the console, bindable).
+  The admin console flags a server still carrying a block from before
+  `invsim_spray_on_use` was added, and the graffiti picker says all of this to
+  the player.
 - **`invsim_apikey` is never an HTTP header**, and the equipped `GET` sends no
   credential at all — it is a bare `GetAsync`. That endpoint must stay publicly
   readable by SteamID64. Putting the ingress' 5stack forward-auth in front of

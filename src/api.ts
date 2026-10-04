@@ -1416,6 +1416,10 @@ export interface GameConfigState {
   // Whether the resolved target already carries our block -- the only way to
   // know a rotated key still needs pushing once the legacy block is gone.
   configured: boolean;
+  // Whether that block is the one the backend would write today. False when it
+  // predates a cvar added since (spray-on-use) or an un-pushed key rotation.
+  // Optional: a backend too old to send it never says the block is stale.
+  upToDate?: boolean;
   // False on a panel with neither a plugin config nor a Global config: the type
   // configs are the only home, so there is nothing to migrate away to.
   canMigrate: boolean;

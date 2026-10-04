@@ -164,6 +164,12 @@ const configuredSomewhere = computed(
   () => gameConfig.value?.configured === true,
 );
 
+// Carries a block, but an older one than the backend writes now. Only an
+// explicit `false` counts — a backend that predates the flag sends nothing.
+const configStale = computed(
+  () => configuredSomewhere.value && gameConfig.value?.upToDate === false,
+);
+
 // The plugin is installed but cannot make its calls until the operator turns
 // Valve's server guidelines off for it, which is theirs to decide -- it risks
 // every GSLT on their Steam account -- so this points at the switch.
@@ -223,6 +229,7 @@ const invsimSnippet = computed(
       "invsim_ws_immediately 1",
       "invsim_require_inventory 1",
       "invsim_spraychanger_enabled 1",
+      "invsim_spray_on_use 1",
     ].join("\n"),
 );
 
@@ -1105,6 +1112,15 @@ const BTN_DANGER =
                   >
                     Open the plugin directory
                   </a>
+                </div>
+
+                <div
+                  v-if="configStale"
+                  class="rounded-md border border-[hsl(var(--tac-amber)/0.4)] bg-[hsl(var(--tac-amber)/0.08)] px-3 py-2.5 text-sm"
+                >
+                  Your servers carry an older copy of these cvars. Re-apply to pick up the
+                  missing lines &mdash; without <code class="font-mono text-xs">invsim_spray_on_use</code>,
+                  players with no graffiti of their own in Steam can't spray the one they equipped.
                 </div>
 
                 <p class="text-xs text-muted-foreground">
