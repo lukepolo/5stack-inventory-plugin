@@ -12,6 +12,7 @@ import { pool } from "./db.ts";
 // Shared with scripts/serve.mjs — see the module header for why it is .mjs.
 import { parseByteRange } from "./byteRange.mjs";
 import { getIdentity } from "./identity.ts";
+import { isAllowedOrigin, originPolicyFromEnv, refuseCrossSite, requestHost } from "./originGuard.ts";
 import {
   GAME_PLUGIN_SLUG,
   deleteTypeCfg,
@@ -115,6 +116,24 @@ const app = Fastify({
   logController: new LogController({
     disableRequestLogging: !process.env.LOG_REQUESTS,
   }),
+});
+
+// CSRF: an unsafe method from an origin that is not the panel (or this host)
+// never reaches a route — see originGuard.ts. Registered before every route, so
+// none can be declared ahead of it. CORS (in start()) uses the same policy.
+const originPolicy = originPolicyFromEnv();
+const refusedOrigins = new Set<string>();
+app.addHook("onRequest", async (request, reply) => {
+  const refused = refuseCrossSite(originPolicy, request.method, request.headers);
+  if (!refused) return;
+  // Once per origin: a panel on a domain this cannot infer shows up here first,
+  // and the log line is how an operator finds out to name it.
+  const origin = String(request.headers.origin ?? "");
+  if (!refusedOrigins.has(origin) && refusedOrigins.size < 100) {
+    refusedOrigins.add(origin);
+    app.log.warn(`[csrf] refused ${request.method} ${request.url}: ${refused} (host ${requestHost(request.headers) || "?"}). If this is your panel, set WEB_DOMAIN or EXTRA_CORS_ORIGINS.`);
+  }
+  return reply.status(403).send({ error: "cross-site request refused" });
 });
 
 // Self-provision the inventory schema on boot (idempotent) so a fresh deploy
@@ -6745,16 +6764,21 @@ app.get("/healthz", async () => ({ ok: true }));
 const port = Number(process.env.PORT ?? 3000);
 
 async function start() {
-  // CORS handled in the app (like the 5stack api's enableCors) — reflects the
-  // requesting origin and allows credentials, so the panel (any origin/site) can
-  // call the API without any ingress config.
+  // CORS handled in the app (like the 5stack api's enableCors), with the same
+  // policy as the CSRF hook above: the panel (and this host) get their origin
+  // echoed WITH credentials; every other origin gets a bare `*`, which a browser
+  // never pairs with a cookie — public reads still work, a session never leaks.
+  // A delegator rather than an origin function, because the policy needs the
+  // request's own host and the origin function is only handed the Origin.
   const cors = (await import("@fastify/cors")).default;
   // Methods spelled out: @fastify/cors 11 narrowed the default to GET/HEAD/POST,
   // which fails the preflight for every PUT, PATCH and DELETE route here.
+  const methods = ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE"];
   await app.register(cors, {
-    origin: true,
-    credentials: true,
-    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE"],
+    delegator: (request, callback) => {
+      const trusted = isAllowedOrigin(originPolicy, request.headers.origin, requestHost(request.headers));
+      callback(null, trusted ? { origin: true, credentials: true, methods } : { origin: "*", credentials: false, methods });
+    },
   });
   await applySchema();
   await dropImpossibleScalars();

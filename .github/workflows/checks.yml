@@ -116,6 +116,12 @@ jobs:
       - name: Every sort mode is reachable
         run: npm run check:sorts
 
+      # The CSRF guard fails silently in BOTH directions: too loose and any page
+      # can act as a signed-in player; too tight and every craft from the real
+      # panel is a 403 the browser reports as an anonymous CORS error.
+      - name: Only the panel can act as a player
+        run: npm run check:origin
+
   # NOT in the job above: tools/charmsim-check.ts needs a directory of
   # *.phys.json from the extracted CS2 assets, which no clean runner has. Run it
   # by hand against a mount with `npm run check:charmsim -- <dir>`. Splitting it
