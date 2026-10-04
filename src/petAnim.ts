@@ -148,6 +148,38 @@ function loadRaw(name: string): Promise<RawPetClip | null> {
 }
 
 /**
+ * Put the rig's Z-up -> Y-up axis swap where the clips expect it: on
+ * `root_motion`, not on `root`.
+ *
+ * Every bird ships the same swap, (0.5, 0.5, 0.5, 0.5), but VRF hangs it on a
+ * different bone per model. chicken.glb has it on `root_motion` with `root`
+ * plain at (0, 7.2, -2.01); chick.glb has `root_motion` plain and the swap on
+ * `root` at (-2.01, 0, 7.2). Same world bind, so a still render cannot tell.
+ * The clips are written for the first layout and their `root_motion` track is
+ * dropped, so on the chick a clip's plain `root` wiped the swap and the bird
+ * played lying on its side.
+ *
+ * Moved up rather than baked into the clips: every child of `root_motion` (the
+ * IK targets, attachWorld) is re-expressed so nothing moves in the world, and
+ * the skin's inverse binds stay valid. A rig already in the clip layout, and
+ * the single-bone egg, are left alone.
+ */
+export function normalizePetRig(rig: import("three").Object3D) {
+  const motion = rig.getObjectByName("root_motion");
+  const root = motion?.getObjectByName("root");
+  if (!motion || !root || root.parent !== motion) return;
+  const swap = root.quaternion.clone();
+  if (swap.w > 1 - 1e-6) return;
+  const undo = swap.clone().invert();
+  for (const child of motion.children) {
+    child.position.applyQuaternion(undo);
+    child.quaternion.premultiply(undo);
+  }
+  motion.quaternion.multiply(swap);
+  rig.updateMatrixWorld(true);
+}
+
+/**
  * A pet clip ready to play on `rig`, or null when there is nothing to play —
  * the clip is not on the mount, or the rig is not the chicken skeleton (the
  * egg is a single bone, and every clip would bind to nothing on it).

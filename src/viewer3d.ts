@@ -25,7 +25,7 @@ import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } f
 import { tickCharmLiquid } from "./charmLiquid";
 import { correctPetMaterials, dressPetStyle, petSeedTable, tunePetShading } from "./petMaterial";
 import { easePetPose, PetPoseLayer, petPoseDeltas, type PetBoneDelta } from "./petPattern";
-import { DEFAULT_PET_CLIP, loadPetClip, petLoopAfter } from "./petAnim";
+import { DEFAULT_PET_CLIP, loadPetClip, normalizePetRig, petLoopAfter } from "./petAnim";
 import {
   buildCharmSim,
   charmMotion,
@@ -3540,6 +3540,7 @@ async function buildViewer(
   // mount clip, and a trick throws the bird ~1.3m (trick07's `root` travels 50
   // units), which framed one flying out of the top of the stage. The requested
   // clip takes over once the mount is done — see the end of buildViewer.
+  if (kind === "pet") normalizePetRig(object);
   const liveClip = opts?.still
     ? undefined
     : kind === "pet"
