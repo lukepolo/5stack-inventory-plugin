@@ -1,7 +1,13 @@
 # Builds the Module Federation remote (remoteEntry.js + assets) and serves it as
 # static files. @5stack/ui must be resolvable at install time (published to your
 # registry, or vendored / yarn-linked for local builds).
-FROM node:24-alpine AS build
+#
+# The build stage runs on the runner's own arch ($BUILDPLATFORM), not the target
+# one: dist/ is plain JS/CSS, identical for amd64 and arm64. Building it under
+# QEMU arm64 emulation intermittently crashed vite's native bundler with
+# "qemu: uncaught target signal 4 (Illegal instruction)". Now it builds once,
+# natively, and the arm64 image only runs the COPYs below.
+FROM --platform=$BUILDPLATFORM node:24-alpine AS build
 WORKDIR /app
 COPY package.json ./
 RUN npm install
