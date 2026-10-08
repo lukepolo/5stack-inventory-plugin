@@ -11,7 +11,7 @@ description: |
   in the pod" failures, native-module/platform errors right after an install, or when resolving a
   .local hostname or port to a service.
 metadata:
-  version: 2.0.36
+  version: 2.0.47
 ---
 
 # CodePier
@@ -23,6 +23,44 @@ Mutagen keeps the local tree and the container's tree in sync.
 **The consequence that matters: the editor is local, the runtime is Linux in a cluster, and the two
 filesystems are continuously mirrored into each other.** Almost every mistake in a CodePier project
 comes from forgetting one of those three facts.
+
+**If a `codepier` command is refused before it even runs** — "blocked by the classifier", or a
+permission prompt in a session that cannot answer one — the project is missing the allow rule, not
+the tool. `codepier skills install` writes it into `.claude/settings.json` alongside this skill; add
+it by hand if it is absent:
+
+```json
+{ "permissions": { "allow": ["Bash(codepier:*)"] } }
+```
+
+## 0. Which cluster: `~/.kube/codepier`, or ask.
+
+**`~/.kube/codepier` is the kubeconfig for this tool. If it exists, use it.** If it does not, ask
+the user which kubeconfig and context to use — and wait for the answer.
+
+**Never fall back to the ambient default** — `kubectl config current-context`, `$KUBECONFIG`, or
+`~/.kube/config`. A machine that works on several clusters keeps a file per cluster under
+`~/.kube/`, and the ambient default is frequently production. A read-only `get` against the wrong
+cluster is still the wrong cluster, and `codepier up` scales a workload to zero.
+
+Pass it explicitly on every invocation, so nothing depends on ambient state:
+
+```bash
+codepier --config ~/.kube/codepier exec -- true
+kubectl --kubeconfig ~/.kube/codepier get deploy -n <ns>
+```
+
+**Confirm before reaching for `kubectl` at all.** `~/.kube/codepier` settles _which_ cluster, not
+_whether_ you may poke at it directly. `codepier exec` / `tail` / `sync-status` are the tool's own
+surface and need no extra ceremony, but plain `kubectl` is a wider blade: ask the user before your
+first `kubectl` in a session, say what you intend to read, and keep it read-only. Anything that
+mutates cluster state — `scale`, `delete`, `apply`, `patch`, `rollout` — is out of bounds regardless
+of the answer (see Never, below).
+
+Resolve this once per session and reuse the answer. If the user names a cluster in passing ("use
+5stackgg"), that is the answer — keep passing it explicitly. If any command fails with an auth or
+permission error, re-confirm the target before retrying; never silently fall through to another
+context.
 
 ## 1. Establish the session first
 
@@ -43,9 +81,45 @@ Then confirm a swap is actually live:
 codepier exec -- true
 ```
 
-**If that fails, stop and tell the user to run `codepier up`.** Do not run `up` or `down` yourself.
-`up` scales the real workload to zero, is interactive, and will disconnect a teammate who already
-has a swap on that workload. Starting and stopping the session is the user's decision.
+**If that fails, the workload has no swap.** Starting one is the user's decision, not yours: `up`
+scales the real workload to zero and will disconnect a teammate who already has a swap on it. Ask,
+and wait for an answer.
+
+Once the user has said yes, `--command` is how you run one — it needs no TTY, tears the swap down
+afterwards, and exits with the command's own status, so a script or agent can branch on it:
+
+```bash
+codepier up --namespace <ns> --command 'rm -rf node_modules && yarn install'
+```
+
+It waits for the initial sync before running, and flushes changes back before tearing down — so
+whatever the command wrote in the container is on disk locally when the process exits. Bare
+`codepier up` opens an interactive shell instead and will crash outright without a TTY.
+
+**Never pass `--deployment` to `up`** — `codepier.yaml` already names the workload. Pass
+`--namespace` only when `namespaces` is an array, which means the namespace was chosen at `up` time.
+
+### Tearing a swap down
+
+`--command` tears its own swap down on exit, so you normally never run `down`. You need it when a
+session died without cleaning up — a killed process, a dropped connection — which leaves the swap in
+place and the **real workload scaled to zero**. Check with `codepier down` before walking away from a
+session that ended badly.
+
+Bare `codepier down` prompts you to pick from a list, so it hangs forever without a TTY. Always say
+which one:
+
+```bash
+codepier down --deployment <workload> --namespace <ns>   # exactly one — prefer this
+codepier down --all                                      # every swap in the cluster
+```
+
+`--deployment` takes the **original** workload name (the one in `codepier.yaml`), not the
+`-hot-swap` object. A single match needs no `--all`: naming it is the choice. With no terminal and
+several matches it refuses and lists them rather than hanging.
+
+`down` restores the replica count `up` recorded on the swap. Swaps created by an older CLI carry no
+such annotation and come back at 1 replica — check the count afterwards if the workload ran more.
 
 ## 2. Two filesystems, one tree
 
@@ -122,18 +196,36 @@ codepier tail
 ```
 
 It streams until the user's shell exits, so **run it in the background and read the output**, or it
-will block. The mirror is stripped of ANSI codes and capped at the most recent 2MB, and the file
+will block. Its output is plain text when it isn't going to a terminal, so the backgrounded output
+reads clean; the mirror file itself keeps colour codes, so read it through `tail` rather than
+opening the file. The mirror is capped at the most recent 2MB, and the file
 exists only while a session is live — no file means no shell, and with no session `tail` falls back
-to the container's own (near-empty) logs. **Empty output still does not mean the app is down**: it
+to the container's own (near-empty) logs. A mirror left behind by a killed shell is detected by the
+PID in the `.pid` file beside it and removed the next time `tail` runs. **Empty output still does not mean the app is down**: it
 can equally mean the user has no shell open. Check for the session file before concluding anything,
 and ask the user if it isn't there.
+
+Only the swapped container's shell is mirrored. Another container in the pod — a sidecar, or the
+workload's real container next to a `supplemental` swap — has real logs of its own, and
+`codepier tail --container <name>` reads them straight from the pod instead of the mirror
+(`--container-logs` does the same for the swapped container).
+
+When `tail` shows nothing or the wrong thing, rerun it with `-v`: it prints to stderr which stream it
+picked (session mirror or pod), the pod and container it resolved, the log request's HTTP status,
+and every stream drop and reconnect.
 
 `forward:` lists `local:remote` port forwards. Don't assume a port is reachable on localhost unless
 it's there or covered by a `proxy` entry.
 
 ## 7. Never
 
-- Run `codepier up` or `codepier down` — ask the user.
+- Use the ambient kubeconfig/context. Ask which cluster, and pass `--config` / `--context`
+  explicitly every time — the default is often production.
+- Start or stop a session without asking. Once the user agrees, run it headless with
+  `codepier up --command '<cmd>'`; bare `up` needs a TTY it will not have, and bare `down` will sit
+  on a prompt — pass `--deployment`/`--namespace`, or `--all`.
+- Walk away from a session that died mid-run without checking `codepier down`. A stranded swap
+  leaves the real workload at zero replicas.
 - `kubectl scale`, `kubectl delete`, or otherwise mutate the workload; the swap owns its lifecycle
   and a stray change strands the real workload at 0 replicas.
 - Edit files inside the pod.

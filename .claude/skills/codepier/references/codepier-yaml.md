@@ -128,13 +128,47 @@ cache:
 
 ### `forward`
 
-`local:remote` port forwards from the machine into the pod.
+Ports to make reachable from the machine. Two forms, for two different things.
+
+A `local:remote` **string** forwards into the pod `codepier up` swapped. Only meaningful
+while a swap is running.
 
 ```yaml
 forward:
   - "3000:3000"
   - "9229:9229" # debugger
 ```
+
+An **object** forwards a cluster service to a local port, served by `codepier forward`. No
+swap, no proxy, no certificate.
+
+```yaml
+forward:
+  - service: postgres
+    port: 5432
+    localPort: 50444 # keeps clear of a local postgres
+  - service: redis
+    port: 6379
+    localPort: 50637
+  - service: typesense
+    port: 8108
+  - service: kafka
+    port: 9092
+    namespace: shared # a datastore in another namespace
+```
+
+- `service` — service name, as `kubectl get svc` lists it.
+- `port` — the port on the service.
+- `localPort` — the port to bind here. Defaults to `port`. Worth moving for anything that
+  also runs locally: a forwarded cluster postgres on 5432 is indistinguishable from a local
+  one, and "why is my data wrong" is a bad afternoon.
+- `namespace` — override for this entry; defaults to the first `namespaces` value.
+
+**Use this and not `proxy` for anything that is not HTTP.** The proxy terminates TLS and
+routes on a Host header; postgres opens a socket and speaks its own binary protocol with no
+hostname anywhere in it, so there is nothing to route on. Databases, caches, search indexes
+and brokers belong here. Both forms can appear in one list — each command takes the entries
+it can use and ignores the rest.
 
 ### `proxy`
 
@@ -182,16 +216,17 @@ proxyPort: 8443
 
 ## Commands
 
-| Command                  | Purpose                                                              |
-| ------------------------ | -------------------------------------------------------------------- |
-| `codepier up`            | Start the hot swap. Interactive. **User runs this, not the agent.**  |
-| `codepier down`          | Restore the original workload. **User runs this.**                   |
-| `codepier exec -- <cmd>` | Run one command in the swapped pod. Non-interactive, real exit code. |
-| `codepier ssh`           | Interactive shell in the pod. Not usable by an agent.                |
-| `codepier tail`          | Stream pod logs (a swapped container has none of its own).           |
-| `codepier proxy`         | Start the HTTPS reverse proxy.                                       |
-| `codepier sync-status`   | Mutagen sync state — useful when a file edit doesn't seem to land.   |
-| `codepier clean`         | Remove orphaned sync directories from cluster nodes.                 |
+| Command                  | Purpose                                                                |
+| ------------------------ | ---------------------------------------------------------------------- |
+| `codepier up`            | Start the hot swap. Interactive. **User runs this, not the agent.**    |
+| `codepier down`          | Restore the original workload. **User runs this.**                     |
+| `codepier exec -- <cmd>` | Run one command in the swapped pod. Non-interactive, real exit code.   |
+| `codepier ssh`           | Interactive shell in the pod. Not usable by an agent.                  |
+| `codepier tail`          | Stream pod logs (a swapped container has none of its own).             |
+| `codepier proxy`         | Start the HTTPS reverse proxy.                                         |
+| `codepier forward`       | Forward cluster services to local ports (databases, caches, non-HTTP). |
+| `codepier sync-status`   | Mutagen sync state — useful when a file edit doesn't seem to land.     |
+| `codepier clean`         | Remove orphaned sync directories from cluster nodes.                   |
 
 Global flags accepted by any command: `--config <kubeconfig>`, `--context`, `--namespace`,
 `--deployment`, `--container`, `--pod`, `--node`.
