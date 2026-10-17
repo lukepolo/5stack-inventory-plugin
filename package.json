@@ -10,7 +10,7 @@
     "dev:api": "cd backend && npm install && node --watch --experimental-strip-types src/server.ts",
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
-    "check": "npm run typecheck && npm run check:slots && npm run check:inspect && npm run check:stattrak && npm run check:steam-sync && npm run check:prices && npm run check:sfc && npm run check:schema && npm run check:i18n && npm run check:sorts && npm run check:origin && npm run check:auto-extract && npm run check:guidelines",
+    "check": "npm run typecheck && npm run check:slots && npm run check:inspect && npm run check:stattrak && npm run check:steam-sync && npm run check:prices && npm run check:sfc && npm run check:schema && npm run check:i18n && npm run check:sorts && npm run check:origin && npm run check:auto-extract && npm run check:guidelines && npm run check:extract-state",
     "check:slots": "node --experimental-strip-types tools/slot-whitelist-check.ts",
     "check:inspect": "node --experimental-strip-types tools/inspect-roundtrip.ts",
     "check:stattrak": "node --experimental-strip-types tools/stattrak-digits.ts",
@@ -21,6 +21,7 @@
     "check:i18n": "node --experimental-strip-types tools/i18n-check.ts",
     "check:sorts": "esbuild tools/sort-modes-check.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/sort-modes-check.mjs && node node_modules/.cache/sort-modes-check.mjs",
     "check:origin": "node --experimental-strip-types tools/origin-guard-check.ts",
+    "check:extract-state": "node --experimental-strip-types tools/extract-state-check.ts",
     "check:auto-extract": "node --experimental-strip-types tools/auto-extract-check.ts",
     "check:guidelines": "node --experimental-strip-types tools/guidelines-check.ts",
     "check:charmsim": "esbuild tools/charmsim-check.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/charmsim-check.mjs && node node_modules/.cache/charmsim-check.mjs"

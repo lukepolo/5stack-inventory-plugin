@@ -14,6 +14,7 @@ import { parseByteRange } from "./byteRange.mjs";
 import { getIdentity } from "./identity.ts";
 import { isAllowedOrigin, originPolicyFromEnv, refuseCrossSite, requestHost } from "./originGuard.ts";
 import { autoExtractor, installProblem } from "./autoExtract.ts";
+import { readSavedExtractState, IDLE_STATE, type ExtractState } from "./extractState.ts";
 import {
   GAME_PLUGIN_SLUG,
   deleteTypeCfg,
@@ -5786,40 +5787,13 @@ async function writeExtractJobsFile(jobs: number): Promise<void> {
   }
 }
 
-type ExtractState = {
-  state: "idle" | "running" | "succeeded" | "failed" | "interrupted";
-  startedAt: string | null;
-  finishedAt: string | null;
-  exitCode: number | null;
-  error: string | null;
-  log: string;
-};
-const IDLE_STATE: ExtractState = {
-  state: "idle",
-  startedAt: null,
-  finishedAt: null,
-  exitCode: null,
-  error: null,
-  log: "",
-};
-
-// Only one run at a time, and only this process can be running it — a child
-// dies with its parent, so "running in the file" + "no child here" means a
-// restart killed it (reported as `interrupted`, not a phantom `running`).
+// A run can outlive the API process, so consult the existing PID lock before
+// reporting an interruption. The admin status route uses that same lock.
 let extractChild: ChildProcess | null = null;
 let extractLog: string[] = [];
 
 async function readExtractState(): Promise<ExtractState> {
-  try {
-    const raw = await fs.readFile(EXTRACT_STATE_FILE, "utf8");
-    const parsed = { ...IDLE_STATE, ...(JSON.parse(raw) as Partial<ExtractState>) };
-    if (parsed.state === "running" && !extractChild) {
-      return { ...parsed, state: "interrupted", error: "The backend restarted while extraction was running." };
-    }
-    return parsed;
-  } catch {
-    return IDLE_STATE; // never run, or the mount was wiped
-  }
+  return readSavedExtractState(EXTRACT_STATE_FILE, extractChild != null, liveExtractionPid);
 }
 
 // ---- Pipeline version: is what's on the mount what this build expects? ------
