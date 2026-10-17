@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import { extractWorkerLimit } from "./extractWorkers.ts";
+import { machineMemoryMb } from "./machineMemory.ts";
 import path from "node:path";
 import Fastify, { LogController } from "fastify";
 // Type-only, so node's type stripping erases it — "pg" is CJS and has no such
@@ -5805,27 +5806,6 @@ function extractCores(): number {
   return extractWorkerLimit(os.cpus().length || 1, process.env.INVENTORY_EXTRACT_MAX_JOBS);
 }
 
-/** Node memory, for the panel's "N workers ≈ X GB of Y GB" warning. Reads
- *  /proc/meminfo first: under a cgroup os.freemem() reports the HOST's free
- *  pages, and MemAvailable is the number that actually predicts an OOM. */
-async function machineMemoryMb(): Promise<{ totalMb: number | null; availableMb: number | null }> {
-  try {
-    const meminfo = await fs.readFile("/proc/meminfo", "utf8");
-    const field = (name: string) => {
-      const m = new RegExp(`^${name}:\\s+(\\d+) kB`, "m").exec(meminfo);
-      return m ? Math.round(Number(m[1]) / 1024) : null;
-    };
-    const totalMb = field("MemTotal");
-    const availableMb = field("MemAvailable");
-    if (totalMb) return { totalMb, availableMb };
-  } catch {
-    // Not Linux — fall through to the os module.
-  }
-  const totalMb = Math.round(os.totalmem() / 1024 / 1024);
-  const freeMb = Math.round(os.freemem() / 1024 / 1024);
-  return { totalMb: totalMb || null, availableMb: freeMb || null };
-}
-
 async function readExtractJobs(): Promise<number> {
   const { rows } = await pool.query<{ value: string }>(
     `SELECT value FROM inventory.settings WHERE key = 'extract_jobs'`,
@@ -6304,7 +6284,7 @@ app.get("/api/admin/extract-models", async (request, reply) => {
  *  the setting, what the box has, and what a worker costs at each end of the
  *  measured range. */
 async function extractWorkerInfo() {
-  const { totalMb, availableMb } = await machineMemoryMb();
+  const { totalMb, availableMb, scope } = await machineMemoryMb();
   return {
     jobs: await readExtractJobs(),
     cores: extractCores(),
@@ -6313,6 +6293,7 @@ async function extractWorkerInfo() {
     panelReserveMb: PANEL_RESERVE_MB,
     memTotalMb: totalMb,
     memAvailableMb: availableMb,
+    memoryScope: scope,
   };
 }
 

@@ -136,6 +136,9 @@ jobs:
       - name: API and extraction script enforce the configured worker ceiling
         run: npm run check:extract-workers
 
+      - name: Extraction memory guidance respects container limits
+        run: npm run check:machine-memory
+
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 

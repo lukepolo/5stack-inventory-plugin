@@ -1862,7 +1862,7 @@ const BTN_DANGER =
                         <span class="mx-1 text-muted-foreground/50">·</span>
                         <span class="font-mono"
                           >{{ memPlan.availableGb != null ? fmtGb(memPlan.availableGb) : "?" }} free of
-                          {{ fmtGb(memPlan.totalGb) }}</span
+                          {{ fmtGb(memPlan.totalGb) }}<template v-if="workers?.memoryScope === 'container'"> container limit</template></span
                         ></template
                       >
                     </p>
