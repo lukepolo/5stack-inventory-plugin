@@ -1385,54 +1385,51 @@ for root, _dirs, files in os.walk(dest):
             glbs.append(os.path.join(root, f))
 
 def read_glb(path):
-    """(header_version, json_dict, bin_chunk_bytes) or None."""
+    """Read only the JSON chunk; mesh buffers stay on disk."""
     with open(path, "rb") as fh:
-        data = fh.read()
-    if len(data) < 20 or data[:4] != b"glTF":
-        return None
-    ver = struct.unpack_from("<I", data, 4)[0]
-    off, doc, binc = 12, None, b""
-    while off + 8 <= len(data):
-        clen, ctype = struct.unpack_from("<II", data, off)
-        chunk = data[off + 8: off + 8 + clen]
-        if ctype == 0x4E4F534A:
-            doc = json.loads(chunk.decode("utf-8"))
-        elif ctype == 0x004E4942:
-            binc = chunk
-        off += 8 + clen
-    return None if doc is None else (ver, doc, binc)
+        header = fh.read(20)
+        if len(header) < 20 or header[:4] != b"glTF":
+            return None
+        ver, total, size, kind = struct.unpack_from("<IIII", header, 4)
+        if kind != 0x4E4F534A or total != os.fstat(fh.fileno()).st_size or size > total - 20:
+            raise ValueError(f"Invalid GLB header: {path}")
+        return ver, json.loads(fh.read(size).decode("utf-8"))
 
-def write_glb(path, ver, doc, binc):
-    """Rebuild the container. Chunk payloads are 4-byte aligned by spec — JSON
-    pads with spaces, BIN with zeros — and every length in the header has to
-    agree or the loader rejects the file outright."""
+def write_glb(path, ver, doc):
+    """Replace JSON atomically and stream all following chunks unchanged."""
     js = json.dumps(doc, separators=(",", ":")).encode("utf-8")
     js += b" " * (-len(js) % 4)
-    out = bytearray()
-    out += b"glTF" + struct.pack("<I", ver) + struct.pack("<I", 0)  # length patched below
-    out += struct.pack("<II", len(js), 0x4E4F534A) + js
-    if binc:
-        pad = binc + b"\x00" * (-len(binc) % 4)
-        out += struct.pack("<II", len(pad), 0x004E4942) + pad
-    struct.pack_into("<I", out, 8, len(out))
     tmp = path + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(bytes(out))
-    os.replace(tmp, path)
+    try:
+        with open(path, "rb") as src, open(tmp, "wb") as out:
+            header = src.read(20)
+            old_size = struct.unpack_from("<I", header, 12)[0]
+            total = os.fstat(src.fileno()).st_size + len(js) - old_size
+            out.write(b"glTF" + struct.pack("<IIII", ver, total, len(js), 0x4E4F534A))
+            out.write(js)
+            src.seek(20 + old_size)
+            shutil.copyfileobj(src, out, length=1024 * 1024)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
-# Collect every PNG the models actually reference. Anything unreferenced is left
-# alone — converting it would spend minutes on bytes nothing fetches.
-parsed = {}
+# Keep only texture names between passes. Retaining every model's parsed JSON
+# and BIN chunk can exceed the worker's entire memory budget before conversion
+# starts. Reopen one model at a time when updating its image references below.
 wanted = set()
 for g in glbs:
     got = read_glb(g)
     if not got:
         continue
-    parsed[g] = got
     for img in got[1].get("images", []) or []:
         uri = img.get("uri")
         if uri and uri.lower().endswith(".png"):
             wanted.add(uri)
+    del got
 
 # Same trap the paint staging hits: skipping what already exists is the right
 # resume behaviour right up until the ENCODING changes, at which point every
@@ -1503,7 +1500,11 @@ if todo:
 # PNG and its URI, so a partial pass degrades to "some are still PNG" rather
 # than to a model referencing a file that was never written.
 rewritten = 0
-for g, (ver, doc, binc) in parsed.items():
+for g in glbs:
+    got = read_glb(g)
+    if not got:
+        continue
+    ver, doc = got
     changed = False
     for img in doc.get("images", []) or []:
         uri = img.get("uri")
@@ -1513,8 +1514,9 @@ for g, (ver, doc, binc) in parsed.items():
                 img["mimeType"] = "image/webp"
             changed = True
     if changed:
-        write_glb(g, ver, doc, binc)
+        write_glb(g, ver, doc)
         rewritten += 1
+    del got, doc
 
 # Only now are the PNGs safe to drop: every .glb that named one points at the
 # .webp. Done last so an interrupted run leaves both forms on disk (harmless)

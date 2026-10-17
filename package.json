@@ -1,7 +1,7 @@
 {
   "name": "5stack-inventory-plugin",
   "version": "0.1.0",
-  "description": "CS2 inventory simulator — a 5stack Custom Pages micro-frontend. Rendered natively inside the 5stack panel via Module Federation; reuses 5stack Steam auth.",
+  "description": "CS2 inventory simulator \u2014 a 5stack Custom Pages micro-frontend. Rendered natively inside the 5stack panel via Module Federation; reuses 5stack Steam auth.",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
     "dev:api": "cd backend && npm install && node --watch --experimental-strip-types src/server.ts",
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
-    "check": "npm run typecheck && npm run check:slots && npm run check:inspect && npm run check:stattrak && npm run check:steam-sync && npm run check:prices && npm run check:sfc && npm run check:schema && npm run check:i18n && npm run check:sorts && npm run check:origin && npm run check:auto-extract && npm run check:guidelines",
+    "check": "npm run typecheck && npm run check:slots && npm run check:inspect && npm run check:stattrak && npm run check:steam-sync && npm run check:prices && npm run check:sfc && npm run check:schema && npm run check:i18n && npm run check:sorts && npm run check:origin && npm run check:auto-extract && npm run check:guidelines && npm run check:model-textures",
     "check:slots": "node --experimental-strip-types tools/slot-whitelist-check.ts",
     "check:inspect": "node --experimental-strip-types tools/inspect-roundtrip.ts",
     "check:stattrak": "node --experimental-strip-types tools/stattrak-digits.ts",
@@ -23,7 +23,8 @@
     "check:origin": "node --experimental-strip-types tools/origin-guard-check.ts",
     "check:auto-extract": "node --experimental-strip-types tools/auto-extract-check.ts",
     "check:guidelines": "node --experimental-strip-types tools/guidelines-check.ts",
-    "check:charmsim": "esbuild tools/charmsim-check.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/charmsim-check.mjs && node node_modules/.cache/charmsim-check.mjs"
+    "check:charmsim": "esbuild tools/charmsim-check.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/charmsim-check.mjs && node node_modules/.cache/charmsim-check.mjs",
+    "check:model-textures": "python3 tools/model-texture-check.py"
   },
   "dependencies": {
     "@5stack/ui": "^0.2.0",
