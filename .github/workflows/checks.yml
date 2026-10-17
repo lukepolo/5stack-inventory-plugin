@@ -139,6 +139,9 @@ jobs:
       - name: Extraction memory guidance respects container limits
         run: npm run check:machine-memory
 
+      - name: Model textures fit a bounded worker memory budget
+        run: npm run check:model-textures
+
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 
