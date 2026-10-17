@@ -127,6 +127,9 @@ jobs:
       - name: A stale mount extracts itself once CS2 is installed
         run: npm run check:auto-extract
 
+      - name: A live extraction survives an API process restart
+        run: npm run check:extract-state
+
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 
