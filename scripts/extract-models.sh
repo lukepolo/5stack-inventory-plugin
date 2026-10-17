@@ -630,7 +630,8 @@ else
   # Each shard touches a marker on completion, which is both the progress count
   # the panel reads and how the scheduler below knows what is still in flight.
   SHARD_DONE="$SHARDS/.done"
-  mkdir -p "$SHARD_DONE"
+  SHARD_FAILED="$SHARDS/.failed"
+  mkdir -p "$SHARD_DONE" "$SHARD_FAILED"
   # FILTER, do not silence. As one pass this step emitted ~26k lines, almost all
   # of it the documented VCS-71 shader noise plus a four-line vpk preamble per
   # shard. Dumping it all buried everything; dumping none of it also threw away
@@ -640,12 +641,24 @@ else
   shard_one() {
     local dir="$1" tag
     tag="${dir//\//_}"
+    # grep returns 1 when every line was expected noise. That is harmless;
+    # a nonzero decompiler exit is not. Preserve the pipeline statuses before
+    # another command overwrites PIPESTATUS, and let the pool report failure.
+    local -a status
+    set +e
     "$CLI" -i "$VPK" -o "$SHARDS/$tag" -d -f "$dir" -e "vmdl_c" \
       --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
       --gltf_export_animations 2>&1 |
       grep -vE "$SHARD_NOISE" |
-      sed "s|^|    [$(basename "$dir")] |" || true
-    : >"$SHARD_DONE/$tag"
+      sed "s|^|    [$(basename "$dir")] |"
+    status=("${PIPESTATUS[@]}")
+    set -e
+    if (( status[0] != 0 || status[1] > 1 || status[2] != 0 )); then
+      printf '%s %s %s\n' "${status[@]}" >"$SHARD_FAILED/$tag"
+      echo "!! Decompile failed for $dir (pipeline exits: ${status[*]})" >&2
+    else
+      : >"$SHARD_DONE/$tag"
+    fi
   }
   # A dynamic pool rather than `xargs -P N`: xargs fixes its width at launch,
   # and the whole point of the knob is that an operator who starts at one worker
@@ -659,6 +672,14 @@ else
   while :; do
     done_n=$(find "$SHARD_DONE" -type f 2>/dev/null | wc -l | tr -d "[:space:]")
     prog "decompile-models" running "$done_n" "$shard_total"
+    failed_n=$(find "$SHARD_FAILED" -type f 2>/dev/null | wc -l | tr -d "[:space:]")
+    if (( failed_n > 0 )); then
+      # Launch nothing else. Let only this pool's in-flight shards finish,
+      # then fail before merging partial models or writing a success stamp.
+      wait
+      echo "!! $failed_n model decompile shard(s) failed; scratch retained at $SHARDS" >&2
+      exit 1
+    fi
     if (( done_n >= shard_total )); then break; fi
     prev=$want
     want=$(read_jobs)
