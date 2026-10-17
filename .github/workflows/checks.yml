@@ -67,6 +67,9 @@ jobs:
         run: npm ci
         working-directory: backend
 
+      - name: Model decompile failures stop before merge and stamping
+        run: npm run check:extract-shards
+
       - name: Typecheck
         run: npm run typecheck
 
