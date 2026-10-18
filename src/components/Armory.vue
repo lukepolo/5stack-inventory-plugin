@@ -41,6 +41,7 @@ import {
 } from "../sortModes";
 import { useSortControl } from "../composables/useSortControl";
 import ItemName from "./ItemName.vue";
+import MusicPlayer from "./MusicPlayer.vue";
 import InfiniteSentinel from "./InfiniteSentinel.vue";
 import CatalogFilters, { type FacetAxis, type FacetOption } from "./CatalogFilters.vue";
 
@@ -971,6 +972,12 @@ const count = computed(() =>
                   v-else
                   class="relative z-[2] w-full truncate text-center text-f9 uppercase tracking-cs1 text-muted-foreground"
                 >{{ t.name }}</span>
+                <MusicPlayer
+                  v-if="t.skin?.audio"
+                  :src="t.skin.audio"
+                  compact
+                  class="relative z-[2] mt-1 w-full"
+                />
               </button>
             </div>
 
