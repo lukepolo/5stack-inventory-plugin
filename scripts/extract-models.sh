@@ -316,7 +316,10 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=37
+# v38: require a readable econ schema before producing schema-dependent assets.
+# A single archive match can be written as the output file itself unless the
+# destination directory already exists, leaving pets, gloves and music empty.
+EXTRACT_VERSION=38
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -473,14 +476,20 @@ prog_init() {
 }
 prog_init
 
-step() { # step "Name" — closes the previous step and opens this one
+finish_step() {
   local now; now=$(date +%s)
   if [[ -n "${STEP_NAME:-}" ]]; then
     local d=$(( now - STEP_START ))
     STEP_TIMES+=("$STEP_NAME=$d")
     echo "--- [${STEP_NAME}] took $(fmt_dur "$d")"
     prog "$STEP_NAME" done "" "" "$d"
+    STEP_NAME=""
   fi
+}
+
+step() { # step "Name" — closes the previous step and opens this one
+  finish_step
+  local now; now=$(date +%s)
   STEP_NAME="$1"
   STEP_START=$now
   prog "$1" running
@@ -836,8 +845,15 @@ export MODEL_KEY_JSON
 echo ""
 echo "--- Reading the econ schema…"
 rm -rf "$WORK/raw_items"
-"$CLI" -i "$VPK" -o "$WORK/raw_items" -d -f "scripts/items/items_game.txt" >/dev/null 2>&1 || true
-ITEMS_GAME="$(find "$WORK/raw_items" -name items_game.txt | head -1)"
+# Pre-create the directory: some CLI releases treat a single matching file as
+# the output itself when the destination does not exist.
+mkdir -p "$WORK/raw_items"
+"$CLI" -i "$VPK" -o "$WORK/raw_items/" -d -f "scripts/items/items_game.txt" >/dev/null
+ITEMS_GAME="$WORK/raw_items/scripts/items/items_game.txt"
+if [[ ! -s "$ITEMS_GAME" ]]; then
+  echo "!! Econ schema missing or empty after extraction: $ITEMS_GAME" >&2
+  exit 1
+fi
 
 # ---- Glove model key -> mesh -------------------------------------------------
 # 10 cs2-lib keys against 12 meshes, and NOT guessable: `t_gloves` is
@@ -5637,3 +5653,7 @@ else
   echo "      tar -xzf /tmp/cs2-models-glb.tar.gz -C 5stack-inventory-plugin/public/models/"
   echo "    then restart dev:ui (vite's watch doesn't rebuild on public/ changes)."
 fi
+
+# There is no next step to close stamp. Only finish it after the final output
+# operation succeeds, so a failed stamp or bundle cannot report completion.
+finish_step

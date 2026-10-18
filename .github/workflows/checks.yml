@@ -142,6 +142,9 @@ jobs:
       - name: Model textures fit a bounded worker memory budget
         run: npm run check:model-textures
 
+      - name: Schema extraction and final progress complete honestly
+        run: npm run check:extract-completion
+
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 
