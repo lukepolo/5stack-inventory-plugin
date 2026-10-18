@@ -1,7 +1,7 @@
 # Floating-point paint inputs
 
-Source2Viewer exports floating-point position maps as OpenEXR. They include
-signed coordinates outside 0..1, so the paint stage preserves their bytes and
+Source2Viewer exports floating-point position maps as OpenEXR. These are numeric
+inputs whose precision must survive extraction, so the stage preserves their bytes and
 writes `.exr` material references. Ordinary images still use the existing
 `cwebp -exact -lossless` path.
 
@@ -23,6 +23,11 @@ the version stamp. Scoped development runs must not stamp completion.
 `npm run check:paint-inputs` exercises the actual extraction functions, texture
 loaders, and fallback route. It checks float byte preservation, cache migration,
 hardlink safety, failure handling, row order, sampler state, and HTTP responses.
+
+The three previously missing overrides in the tested archive are 1024-square
+EXRs with values in 0..1. They remain floating-point data: normalization or an
+8-bit conversion is unnecessary and would change their precision. Synthetic
+loader fixtures also exercise negative values and values above one.
 
 Format references: [OpenEXR file layout](https://openexr.com/en/latest/OpenEXRFileLayout.html)
 and [Three.js EXRLoader](https://threejs.org/docs/pages/EXRLoader.html).

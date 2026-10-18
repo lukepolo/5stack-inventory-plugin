@@ -5188,9 +5188,9 @@ def extract_textures(todo, step, close=False):
         tmp = dst + ".tmp"
         try:
             if is_exr(src):
-                # Position maps contain signed floating-point coordinates.
-                # Preserve bytes exactly; cwebp cannot decode EXR, and an
-                # 8-bit intermediary would lose the values the shader samples.
+                # Preserve floating-point data exactly; cwebp cannot decode
+                # EXR, and an 8-bit intermediary would lose precision or clamp
+                # values outside its range.
                 shutil.copyfile(src, tmp)
             elif not have_cwebp:
                 # Copy the PNG bytes under the .webp name. Ugly, but it is what
