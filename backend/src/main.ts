@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import os from "node:os";
+import { extractWorkerLimit } from "./extractWorkers.ts";
 import path from "node:path";
 import Fastify, { LogController } from "fastify";
 // Type-only, so node's type stripping erases it — "pg" is CJS and has no such
@@ -5801,7 +5802,7 @@ const PANEL_RESERVE_MB = 3072;
 const EXTRACT_JOBS_DEFAULT = 1;
 
 function extractCores(): number {
-  return Math.max(1, os.cpus().length || 1);
+  return extractWorkerLimit(os.cpus().length || 1, process.env.INVENTORY_EXTRACT_MAX_JOBS);
 }
 
 /** Node memory, for the panel's "N workers ≈ X GB of Y GB" warning. Reads

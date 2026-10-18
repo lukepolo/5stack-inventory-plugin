@@ -372,12 +372,22 @@ DECOMPILE_WORKER_MB=1400   # measured peak RSS of one decompile shard
 EXTRACT_WORKER_MB=120      # …and of one texture extract/convert worker
 JOBS_FILE="${EXTRACT_JOBS_FILE:-${OUT_DIR:-$WORK}/extract-jobs}"
 CORES=$(nproc 2>/dev/null || echo 4)
-read_jobs() { # the panel's number, else the env, else 1 — clamped to the cores
+# Keep this grammar aligned with backend/src/extractWorkers.ts. This caps the
+# heavy decompile workers; the smaller texture pools retain their own limits.
+MAX_JOBS=$CORES
+if [[ -n "${INVENTORY_EXTRACT_MAX_JOBS:-}" ]]; then
+  if [[ "$INVENTORY_EXTRACT_MAX_JOBS" =~ ^[1-9][0-9]{0,8}$ ]]; then
+    if (( INVENTORY_EXTRACT_MAX_JOBS < MAX_JOBS )); then MAX_JOBS=$INVENTORY_EXTRACT_MAX_JOBS; fi
+  else
+    MAX_JOBS=1
+  fi
+fi
+read_jobs() { # the panel's number, else the env, else 1 — clamped to the deployment ceiling
   local n=""
   if [[ -r "$JOBS_FILE" ]]; then read -r n < "$JOBS_FILE" || true; fi
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then n="${EXTRACT_JOBS:-1}"; fi
   if [[ ! "$n" =~ ^[0-9]+$ ]]; then n=1; fi
-  if (( n > CORES )); then n=$CORES; fi
+  if (( n > MAX_JOBS )); then n=$MAX_JOBS; fi
   if (( n < 1 )); then n=1; fi
   printf '%s' "$n"
 }

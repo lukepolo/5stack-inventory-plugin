@@ -133,6 +133,9 @@ jobs:
       - name: A live extraction survives an API process restart
         run: npm run check:extract-state
 
+      - name: API and extraction script enforce the configured worker ceiling
+        run: npm run check:extract-workers
+
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 
