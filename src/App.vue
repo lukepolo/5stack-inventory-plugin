@@ -4452,6 +4452,12 @@ watch(
 function onCatalogArtLoad(e: Event) {
   (e.target as HTMLImageElement).style.visibility = "";
 }
+// Armory pets and their hero share the same stored-card/model fallback as
+// the catalogue picker, including one bake attempt per item per session.
+provide("catalogArt", {
+  src: (item: Skin) => catalogArt.value[item.id] ?? item.image ?? undefined,
+  onError: onCatalogArtError,
+});
 onBeforeUnmount(() => Object.values(catalogArt.value).forEach((u) => URL.revokeObjectURL(u)));
 
 // ---- Attachment 3D preview --------------------------------------------------

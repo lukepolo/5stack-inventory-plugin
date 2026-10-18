@@ -4,13 +4,15 @@
 // the bake doesn't exist yet the catalog art shows immediately and a bake is
 // queued in the background (App provides the canonical helpers — no view
 // gets to invent its own fallback chain, that's how the tiles drifted apart).
-// Un-crafted items (or none) just show catalog art.
+// Catalogue items share App's stored-card/model fallback where available.
 import { computed, inject } from "vue";
-import type { InventoryItem } from "../api";
+import type { InventoryItem, Skin } from "../api";
 
 const props = defineProps<{
   inst?: InventoryItem | null;
   image?: string | null;
+  /** Catalogue items can use App's shared stored-card/model fallback. */
+  catalog?: Skin | null;
 }>();
 
 const art = inject<{
@@ -18,9 +20,16 @@ const art = inject<{
   onRenderError: (e: Event, i: InventoryItem) => void;
 } | null>("itemArt", null);
 
-const src = computed(() =>
-  props.inst && art ? art.renderSrc(props.inst) : (props.image ?? undefined),
-);
+const catalogArt = inject<{
+  src: (item: Skin) => string | undefined;
+  onError: (e: Event, item: Skin) => void;
+} | null>("catalogArt", null);
+
+const src = computed(() => {
+  if (props.inst && art) return art.renderSrc(props.inst);
+  if (props.catalog && catalogArt) return catalogArt.src(props.catalog);
+  return props.image ?? undefined;
+});
 
 // A failed image is hidden, and that inline style belongs to the ELEMENT, not
 // to the URL that failed — Vue keeps the same <img> when `src` changes. So a
@@ -32,6 +41,8 @@ function onLoad(e: Event) {
 function onError(e: Event) {
   if (props.inst && art) {
     art.onRenderError(e, props.inst);
+  } else if (props.catalog && catalogArt) {
+    catalogArt.onError(e, props.catalog);
   } else {
     // Catalog art 404 — blank beats a broken-image glyph.
     (e.target as HTMLImageElement).style.visibility = "hidden";
