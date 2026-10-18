@@ -509,6 +509,7 @@ const ASSET_TYPES: Record<string, string> = {
   ".webp": "image/webp",
   ".png": "image/png",
   ".glb": "model/gltf-binary",
+  ".exr": "application/octet-stream",
   // Music kit menu themes. Both containers, because the extractor probes what
   // Source2Viewer actually wrote rather than assuming mp3 — the format follows
   // the codec inside the .vsnd_c.

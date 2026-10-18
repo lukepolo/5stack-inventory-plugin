@@ -319,6 +319,8 @@ set -euo pipefail
 # v38: require a readable econ schema before producing schema-dependent assets.
 # A single archive match can be written as the output file itself unless the
 # destination directory already exists, leaving pets, gloves and music empty.
+# Also preserve floating-point paint/position textures as EXR and reference
+# their real format. Passing them to cwebp silently left missing paint inputs.
 EXTRACT_VERSION=38
 
 # Default is the node's CS2 dedicated-server install — the same tree the
@@ -4740,7 +4742,12 @@ for entry in manifest:
         unresolved.append(entry["out"])
 
 
+texture_names = {}
+
+
 def out_name(path, kind):
+    if kind == "vtex" and path in texture_names:
+        return texture_names[path]
     if path in wanted_name:
         return wanted_name[path]
     stem = os.path.basename(path)
@@ -5011,8 +5018,39 @@ def convert(node):
 # textures still present, or the new one with textures already written. The
 # worst a reader sees is a material that hasn't been refreshed yet, which is a
 # correct older skin rather than a broken new one.
+def is_exr(file):
+    try:
+        with open(file, "rb") as fh:
+            return fh.read(4) == b"\x76\x2f\x31\x01"
+    except OSError:
+        return False
+
+
+def restore_float_texture_names(textures, tex_dir):
+    # Reuse real EXRs on later runs. Older installations without cwebp may
+    # instead contain EXR bytes under .webp; copy them under the honest name.
+    # Never rename or overwrite a hardlinked live file in place.
+    for path in textures:
+        original = out_name(path, "vtex")
+        name = os.path.splitext(original)[0] + ".exr"
+        target = os.path.join(tex_dir, name)
+        legacy = os.path.join(tex_dir, original)
+        if is_exr(target):
+            texture_names[path] = name
+        elif is_exr(legacy):
+            tmp = target + ".tmp"
+            try:
+                shutil.copyfile(legacy, tmp)
+                os.replace(tmp, target)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            texture_names[path] = name
+
+
 have_cwebp = shutil.which("cwebp") is not None
 tex_dir = os.path.join(dest, "textures")
+restore_float_texture_names(textures, tex_dir)
 missing = [t for t in sorted(textures) if not os.path.exists(os.path.join(tex_dir, out_name(t, "vtex")))]
 # Two phases, two progress rows, two times: paint textures under "paint-chain"
 # and sticker art under "sticker-art". Sticker art is thousands of files on a
@@ -5134,10 +5172,13 @@ def extract_textures(todo, step, close=False):
         if src is None:
             failed.append(f"{t} (no image written)")
             continue
-        jobs.append((src, os.path.join(tex_dir, out_name(t, "vtex"))))
+        name = out_name(t, "vtex")
+        if is_exr(src):
+            name = os.path.splitext(name)[0] + ".exr"
+        jobs.append((t, src, os.path.join(tex_dir, name)))
 
     def to_webp(job):
-        src, dst = job
+        _, src, dst = job
         # Write to a temp and rename. Staging is seeded with HARDLINKS to the
         # live copy, so writing a texture in place would mutate the file being
         # served right now. Today the skip-existing filter above means we never
@@ -5146,7 +5187,12 @@ def extract_textures(todo, step, close=False):
         # catch a half-written image.
         tmp = dst + ".tmp"
         try:
-            if not have_cwebp:
+            if is_exr(src):
+                # Position maps contain signed floating-point coordinates.
+                # Preserve bytes exactly; cwebp cannot decode EXR, and an
+                # 8-bit intermediary would lose the values the shader samples.
+                shutil.copyfile(src, tmp)
+            elif not have_cwebp:
                 # Copy the PNG bytes under the .webp name. Ugly, but it is what
                 # this line did for its whole life before v10 and it renders
                 # CORRECTLY — browsers sniff the content. Never fall back to
@@ -5196,10 +5242,13 @@ def extract_textures(todo, step, close=False):
             return False
 
     with ThreadPoolExecutor(max_workers=pool_size(CORES)) as pool:
-        for ok, (_, dst) in zip(pool.map(to_webp, jobs), jobs):
+        for ok, (path, _, dst) in zip(pool.map(to_webp, jobs), jobs):
             if ok:
+                texture_names[path] = os.path.basename(dst)
                 converted += 1
             else:
+                if dst.endswith(".exr"):
+                    raise RuntimeError(f"Failed to preserve float texture: {path}")
                 failed.append(f"{os.path.basename(dst)} (convert failed)")
     print(f"---   {step} {converted}/{len(todo)}", flush=True)
     progress(step, converted, len(todo))

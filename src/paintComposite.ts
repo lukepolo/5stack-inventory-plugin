@@ -1825,8 +1825,13 @@ export async function evictPaintTextures(keep: (url: string) => boolean) {
  *  so a vertical flip hands each texel some other island's position and the
  *  artwork lands nowhere near where it belongs. Deagle | Blaze put its gold band
  *  across the middle of the slide instead of the muzzle. */
-function loadExr(THREE: THREE, url: string): Promise<import("three").Texture | null> {
-  const key = `${url}|exr`;
+function loadExr(
+  THREE: THREE,
+  url: string,
+  opts: { srgb: boolean; wrap: boolean; addr?: [number, number] } = { srgb: false, wrap: false },
+): Promise<import("three").Texture | null> {
+  const akey = opts.addr ? `a${opts.addr[0]}_${opts.addr[1]}` : "";
+  const key = `${url}|exr|${opts.srgb ? "s" : "l"}|${opts.wrap ? "w" : "c"}${akey}`;
   let cached = texCache.get(key);
   if (!cached) {
     cached = import("three/examples/jsm/loaders/EXRLoader.js")
@@ -1847,8 +1852,13 @@ function loadExr(THREE: THREE, url: string): Promise<import("three").Texture | n
             data[bot + i] = s;
           }
         }
-        t.colorSpace = THREE.NoColorSpace; // position data, never colour
-        t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+        t.colorSpace = opts.srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+        if (opts.addr) {
+          t.wrapS = wrapForAddr(THREE, opts.addr[0]);
+          t.wrapT = wrapForAddr(THREE, opts.addr[1]);
+        } else {
+          t.wrapS = t.wrapT = opts.wrap ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+        }
         t.minFilter = t.magFilter = THREE.LinearFilter;
         t.generateMipmaps = false;
         t.flipY = false;
@@ -1877,6 +1887,9 @@ function loadTex(
   url: string,
   opts: { srgb: boolean; wrap: boolean; addr?: [number, number] },
 ): Promise<import("three").Texture | null> {
+  // Runtime position overrides are not named g_tPosition, so Valve's generic
+  // sampler path reaches this loader too. Dispatch by the extracted format.
+  if (/\.exr(?:[?#]|$)/i.test(url)) return loadExr(THREE, url, opts);
   // Address mode is part of the key: paints share pattern textures and disagree.
   const akey = opts.addr ? `a${opts.addr[0]}_${opts.addr[1]}` : "";
   const key = `${url}|${opts.srgb ? "s" : "l"}|${opts.wrap ? "w" : "c"}${akey}`;

@@ -145,6 +145,9 @@ jobs:
       - name: Schema extraction and final progress complete honestly
         run: npm run check:extract-completion
 
+      - name: Float paint inputs keep their data and remain loadable
+        run: npm run check:paint-inputs
+
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 
