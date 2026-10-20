@@ -19,7 +19,7 @@ import { buildArms, buildTwistSolver, weaponSeat, type ArmsRig, type Hand, type 
 import { buildPropClip, buildViewmodelClip, loadViewmodelClip, viewmodelAssetUrl, type ClipAction, type ClipCue } from "./viewmodelClip";
 import { buildMuzzleFlash, type MuzzleFlash } from "./muzzleFlash";
 import { CHOICES, FLAGS, NUMBERS, choicesVersion, choiceValue, flagValue, flagsVersion, numberValue, numbersVersion, setChoice, setFlag, setNumber } from "./devFlags";
-import { BAKE_ENVIRONMENT, viewerEnvironment } from "./viewerEnvironments";
+import { BAKE_ENVIRONMENT, viewerEnvironment, type ViewerEnvironment } from "./viewerEnvironments";
 import { compositePaint, dropCompositeCache, loadPaintDef, loadWeaponInputs, paintTextureUrl } from "./paintComposite";
 import { type CharmShading, dressCharm, loadCharmTintMasks, tuneCharmShading } from "./charmMaterial";
 import { tickCharmLiquid } from "./charmLiquid";
@@ -257,8 +257,82 @@ export { hasModel, hasModelSync, modelUrlFor } from "./modelAvailability";
 interface SharedGL {
   renderer: import("three").WebGLRenderer;
   env: import("three").Texture;
+  /** The daylight rig's sky and backdrop — built on first use, see getDaylight. */
+  daylight?: { env: import("three").Texture; plate: import("three").Texture };
 }
 let sharedGL: SharedGL | null = null;
+/** The calibrated tone-mapping exposure — see getSharedGL. */
+const BASE_EXPOSURE = 0.75;
+
+/**
+ * The DAYLIGHT rig's sky (to light by) and haze (to stand behind), generated.
+ *
+ * CS2 inspects an item in front of the main menu's map scene: an overcast sky,
+ * a bright pale horizon and warm ground. Measured off in-game screenshots the
+ * backdrop sits around rgb(127-149, 135-156, 139-159) — a desaturated blue-grey —
+ * and the light it gives is NEUTRAL: Blackbook's white print reads (221,217,208).
+ * Nothing shipped matches that (venice_sunset is a warm sunset; RoomEnvironment
+ * is a flat box with nothing for metal to mirror), and the game's own vanity
+ * panoramas are not on every mount, so both are painted here: a vertical
+ * gradient with a soft bright patch where an overcast sun would be, prefiltered
+ * once per context like the HDRI.
+ */
+function getDaylight(THREE: ThreeBundle["THREE"], renderer: import("three").WebGLRenderer) {
+  const gl = sharedGL;
+  if (gl?.daylight && gl.renderer === renderer) return gl.daylight;
+  const paint = (w: number, h: number, stops: [number, string][], glow?: { x: number; y: number; r: number; a: number }) => {
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext("2d")!;
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    for (const [at, col] of stops) g.addColorStop(at, col);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+    if (glow) {
+      const rg = ctx.createRadialGradient(glow.x * w, glow.y * h, 0, glow.x * w, glow.y * h, glow.r * w);
+      rg.addColorStop(0, `rgba(255,255,250,${glow.a})`);
+      rg.addColorStop(1, "rgba(255,255,250,0)");
+      ctx.fillStyle = rg;
+      ctx.fillRect(0, 0, w, h);
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  };
+  // Equirect: top row is the zenith, the middle row the horizon.
+  const sky = paint(
+    512,
+    256,
+    [
+      [0, "#97a8b9"],
+      [0.32, "#bcc7d0"],
+      [0.49, "#e6e8e7"],
+      [0.52, "#b3ada2"],
+      [1, "#6a655d"],
+    ],
+    { x: 0.62, y: 0.3, r: 0.16, a: 0.85 },
+  );
+  sky.mapping = THREE.EquirectangularReflectionMapping;
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const env = pmrem.fromEquirectangular(sky).texture;
+  pmrem.dispose();
+  sky.dispose();
+  // The haze behind the item: what the menu scene reads as once it is out of
+  // focus — sky at the top, the bright horizon a little above centre, warm
+  // ground below.
+  // Authored ~12% under the target: it is drawn through the daylight rig's
+  // 1.25 exposure, and measured on screen it then lands on the game's haze.
+  const plate = paint(1024, 576, [
+    [0, "#70797f"],
+    [0.42, "#959ca0"],
+    [0.6, "#929390"],
+    [1, "#6f6b64"],
+  ]);
+  const daylight = { env, plate };
+  if (gl && gl.renderer === renderer) gl.daylight = daylight;
+  return daylight;
+}
 function loadSceneEnvironment(
   THREE: ThreeBundle["THREE"],
   renderer: import("three").WebGLRenderer,
@@ -343,8 +417,9 @@ function getSharedGL(
   // 0.75 is csgoskins' default (`env.toneMappingExposure || 0.75`); their
   // per-scenery overrides run 0.65-1.2. It matters more than it looks with bloom
   // on: the bright-pass threshold is absolute, so exposure decides how much of
-  // the frame is "bright".
-  renderer.toneMappingExposure = 0.75;
+  // the frame is "bright". A rig may override it — drawFrame applies each
+  // viewer's own before every frame (ViewerEnvironment.exposure).
+  renderer.toneMappingExposure = BASE_EXPOSURE;
   // Image-based studio lighting carries the shading (composited metal/rough
   // maps need real reflections); directionals only shape highlights.
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -3314,6 +3389,11 @@ async function buildViewer(
   // where nothing changed — the poll runs every frame and the answer is the same
   // one all but a handful of times in a session.
   let rigKey = rig.key;
+  // The daylight rig lights by its own painted sky (getDaylight), and sets its
+  // own exposure — read by drawFrame, since the renderer is shared and every
+  // other viewer on the page has a say in it too.
+  if (rig.daylight) scene.environment = getDaylight(THREE, renderer).env;
+  let exposureNow = rig.exposure ?? BASE_EXPOSURE;
   scene.environmentIntensity = L.env;
   // Theirs too: the HDRI is a real place, so which way it faces decides where the
   // sun and the bright sky sit in every reflection. 3.8 rad is what csgoskins use.
@@ -3364,6 +3444,13 @@ async function buildViewer(
   const spot = new THREE.SpotLight(0xffb3b3, L.spot, 0, 0.8, 0.3, 0);
   scene.add(spot);
   scene.add(spot.target);
+  /** A rig's lamp colours over the calibrated ones above. */
+  const colourLamps = (r: ViewerEnvironment) => {
+    key.color.setHex(r.colors?.key ?? 0xffccb3);
+    rim.color.setHex(r.colors?.rim ?? 0xdde6ff);
+    spot.color.setHex(r.colors?.spot ?? 0xffb3b3);
+  };
+  colourLamps(rig);
   // Context allocation + the PMREM prefilter of RoomEnvironment. Both are per
   // mount today and neither depends on the item, so this stage is pure overhead.
   mt.mark("ctx");
@@ -12014,6 +12101,9 @@ async function buildViewer(
       });
     }
   }
+  // The daylight haze stands behind live viewers only — a card is transparent
+  // over the grid's own background, whatever lit it.
+  if (rig.daylight && !opts?.still) setBackdrop(getDaylight(THREE, renderer).plate, true);
 
   function setEnvironment(name: string) {
     if (opts?.still) return;
@@ -12043,6 +12133,10 @@ async function buildViewer(
           setBackdrop(plate, true);
         });
       }
+    } else if (next.daylight) {
+      const day = getDaylight(THREE, renderer);
+      scene.environment = day.env;
+      setBackdrop(day.plate, true);
     } else {
       scene.environment = envTex;
       setBackdrop(null, false);
@@ -12053,6 +12147,8 @@ async function buildViewer(
     key.intensity = lit.key;
     rim.intensity = lit.rim;
     spot.intensity = lit.spot;
+    colourLamps(next);
+    exposureNow = next.exposure ?? BASE_EXPOSURE;
     // BOTH the live rotation and the rest pose the motion restores to. Writing
     // only the first would hold for one frame and then be undone by the next
     // clearInspect, which is the animated viewer quietly reverting to the old
@@ -12666,6 +12762,9 @@ async function buildViewer(
 
   const drawFrame = () => {
     renderer.setSize(cssW, cssH, false);
+    // Per frame, because the renderer is shared: the last viewer to draw would
+    // otherwise decide every other viewer's exposure.
+    renderer.toneMappingExposure = exposureNow;
     // Only the pane's shape. The backdrop's DIRECTION is deliberately fixed —
     // see setBackdrop.
     if (backdrop?.visible) {

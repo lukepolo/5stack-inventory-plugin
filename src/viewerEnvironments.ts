@@ -57,6 +57,25 @@ export interface ViewerEnvironment {
    * resolution, from the camera CS2 itself frames a weapon with in that scene.
    */
   plate?: string;
+  /** Tone-mapping exposure. Absent = the renderer's calibrated 0.75. */
+  exposure?: number;
+  /**
+   * Lamp colours, 0xRRGGBB. Absent = the csgoskins-calibrated set: a peach key,
+   * a cool rim and a pink overhead spot (see the rig in viewer3d.ts).
+   */
+  colors?: { key?: number; rim?: number; spot?: number };
+  /**
+   * DAYLIGHT, generated rather than shipped — the look of CS2's own inspect.
+   *
+   * The game shows an item in front of the main menu's map scene: overcast,
+   * neutral daylight with a pale blue-grey haze behind. The studio rigs all
+   * reflect venice_sunset, whose warm sky plus the peach and pink lamps casts
+   * whites pink and blacks maroon — measured on Blackbook against an in-game
+   * screenshot, the white print came out hue 332 where the game's is neutral.
+   * With this set the item is lit by a procedural overcast sky instead, and a
+   * matching haze is drawn behind it in live viewers (never on a card bake).
+   */
+  daylight?: boolean;
 }
 
 /**
@@ -131,14 +150,24 @@ const mapEnvironment = ({ map, label, hint }: (typeof MAP_SCENES)[number]): View
 export const BAKE_ENVIRONMENT = "studio";
 
 /**
- * What a LIVE viewer opens under when the user has not picked. Showcase: the
- * brighter rig with the harder overhead spot, because most people open the 3D
- * view to look at a skin rather than to grade it. Judging a finish is what
- * Studio is for, and it is one click away.
+ * What a LIVE viewer opens under when the user has not picked. CS2: neutral
+ * daylight with the main-menu haze behind, because most people open the 3D view
+ * to see a skin the way the game shows it. Judging a finish under a studio rig
+ * is one click away.
  */
-export const DEFAULT_ENVIRONMENT = "showcase";
+export const DEFAULT_ENVIRONMENT = "cs2";
 
 export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
+  {
+    key: "cs2",
+    label: "CS2",
+    hint: "Bright, neutral daylight with the main-menu haze behind — how the game's own inspect shows an item.",
+    lighting: { env: 2.1, key: 0.8, rim: 0.35, ambient: 0.28, spot: 0.35 },
+    envRotation: 0,
+    exposure: 1.25,
+    colors: { key: 0xfff5ec, rim: 0xe8eeff, spot: 0xffffff },
+    daylight: true,
+  },
   {
     key: "studio",
     label: "Studio",
