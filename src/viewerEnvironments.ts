@@ -1,3 +1,7 @@
+import ancientNight from "./assets/backdrops/ancient-night.jpg?url";
+import italyAlley from "./assets/backdrops/italy-alley.jpg?url";
+import italyStreet from "./assets/backdrops/italy-street.jpg?url";
+
 // Named lighting rigs for the 3D viewer.
 //
 // A skin does not look like one thing. A fade reads differently in a bright
@@ -76,7 +80,20 @@ export interface ViewerEnvironment {
    * matching haze is drawn behind it in live viewers (never on a card bake).
    */
   daylight?: boolean;
+  /**
+   * A PHOTOGRAPH of a CS2 scene to stand the item in — a screenshot taken in
+   * game, shipped with the bundle (src/assets/backdrops). It is drawn behind the
+   * model in live viewers, blurred like the game's own out-of-focus backdrop,
+   * and it also LIGHTS the item: the reflections are built from the same image
+   * (getBackdropEnv), so a knife in a night jungle mirrors blue night rather
+   * than the studio's sunset. `blur` is the mip level the backdrop is drawn at.
+   */
+  backdrop?: { image: string; blur?: number };
 }
+
+/** A bundled backdrop's URL, made absolute against this bundle — a bare
+ *  "/assets/x.jpg" would otherwise resolve against the PANEL's host. */
+const bundled = (url: string) => new URL(url, import.meta.url).href;
 
 /**
  * CS2's OWN VANITY SCENES, as environments.
@@ -157,17 +174,80 @@ export const BAKE_ENVIRONMENT = "studio";
  */
 export const DEFAULT_ENVIRONMENT = "cs2";
 
+/** The CS2 rig's lamps, exposure and colours — shared by its scene variants. */
+const CS2_LIGHT = {
+  lighting: { env: 2.1, key: 0.8, rim: 0.35, ambient: 0.28, spot: 0.35 },
+  envRotation: 0,
+  exposure: 1.25,
+  colors: { key: 0xfff5ec, rim: 0xe8eeff, spot: 0xffffff },
+};
+
+/**
+ * CS2 SCENES: the CS2 rig standing in a real map instead of the painted haze.
+ *
+ * Each is a screenshot taken in game with the HUD off (the FPS counter and build
+ * line cropped away), drawn behind the item and turned into its reflections —
+ * see ViewerEnvironment.backdrop. The lamps start as the CS2 rig's; `tune`
+ * overrides them per scene, closed against in-game inspects in that scene.
+ */
+const cs2Scene = (
+  key: string,
+  label: string,
+  hint: string,
+  image: string,
+  tune: Partial<Pick<ViewerEnvironment, "exposure" | "colors">> & { lighting?: Partial<ViewerEnvironment["lighting"]> } = {},
+): ViewerEnvironment => ({
+  key,
+  label,
+  hint,
+  ...CS2_LIGHT,
+  lighting: { ...CS2_LIGHT.lighting, ...tune.lighting },
+  exposure: tune.exposure ?? CS2_LIGHT.exposure,
+  colors: { ...CS2_LIGHT.colors, ...tune.colors },
+  backdrop: { image: bundled(image), blur: 2.2 },
+});
+
 export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
   {
     key: "cs2",
     label: "CS2",
     hint: "Bright, neutral daylight with the main-menu haze behind — how the game's own inspect shows an item.",
-    lighting: { env: 2.1, key: 0.8, rim: 0.35, ambient: 0.28, spot: 0.35 },
-    envRotation: 0,
-    exposure: 1.25,
-    colors: { key: 0xfff5ec, rim: 0xe8eeff, spot: 0xffffff },
+    ...CS2_LIGHT,
     daylight: true,
   },
+  cs2Scene(
+    "cs2-ancient-night",
+    "Ancient (night)",
+    "Moonlit jungle ruins — cool, dim and blue, with a warm lamp glow off to one side.",
+    ancientNight,
+    // Moonlight: the lamps go cool and the darks lift a little — in game the
+    // white print reads blue-grey here and black leather as slate, not black.
+    {
+      lighting: { env: 2.4, ambient: 0.32 },
+      exposure: 1.2,
+      colors: { key: 0xc9d8ff, rim: 0xb8c8ff, spot: 0xdbe4ff },
+    },
+  ),
+  cs2Scene(
+    "cs2-italy",
+    "Italy",
+    "A sunlit street under a soft pink-grey sky — warm, bright and even.",
+    italyStreet,
+    // A bright street: in game even black leather reads warm grey-brown here.
+    {
+      lighting: { env: 2.7, key: 1.0, ambient: 0.34 },
+      exposure: 1.4,
+      colors: { key: 0xffe9d6 },
+    },
+  ),
+  cs2Scene(
+    "cs2-italy-alley",
+    "Italy (alley)",
+    "A shaded archway and stairs — soft indirect light, green plaster and warm stone.",
+    italyAlley,
+    // Shade: softer than the street — less sun, more bounce.
+    { lighting: { env: 2.5, key: 0.6, ambient: 0.32 }, exposure: 1.35 },
+  ),
   {
     key: "studio",
     label: "Studio",

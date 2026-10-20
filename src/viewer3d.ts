@@ -259,6 +259,8 @@ interface SharedGL {
   env: import("three").Texture;
   /** The daylight rig's sky and backdrop — built on first use, see getDaylight. */
   daylight?: { env: import("three").Texture; plate: import("three").Texture };
+  /** Reflections built from a backdrop photograph, by its URL — see getBackdropEnv. */
+  backdropEnvs?: Map<string, import("three").Texture>;
 }
 let sharedGL: SharedGL | null = null;
 /** The calibrated tone-mapping exposure — see getSharedGL. */
@@ -333,6 +335,48 @@ function getDaylight(THREE: ThreeBundle["THREE"], renderer: import("three").WebG
   if (gl && gl.renderer === renderer) gl.daylight = daylight;
   return daylight;
 }
+
+/**
+ * Reflections from a backdrop PHOTOGRAPH, so a scene lights what stands in it.
+ *
+ * A screenshot is a ~90 degree window, not a panorama, so it is unwrapped the
+ * cheap way: stretched over the sphere top to bottom (its sky overhead, its
+ * ground underfoot) and laid twice around it, the second copy mirrored so the
+ * seam meets itself. Prefiltered, that reads as "this place": its colour, its
+ * bright side, its dark ground. Glossy metal mirrors a smeared copy of the
+ * scene rather than the true room behind the camera — which nothing short of a
+ * real panorama could give, and a blurred backdrop never contradicts.
+ */
+function getBackdropEnv(
+  THREE: ThreeBundle["THREE"],
+  renderer: import("three").WebGLRenderer,
+  url: string,
+  plate: import("three").Texture,
+): import("three").Texture {
+  const gl = sharedGL;
+  const cached = gl?.renderer === renderer ? gl.backdropEnvs?.get(url) : undefined;
+  if (cached) return cached;
+  const img = plate.image as CanvasImageSource;
+  const c = document.createElement("canvas");
+  c.width = 1024;
+  c.height = 512;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(img, 0, 0, 512, 512);
+  ctx.save();
+  ctx.translate(1024, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(img, 0, 0, 512, 512);
+  ctx.restore();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const env = pmrem.fromEquirectangular(tex).texture;
+  pmrem.dispose();
+  tex.dispose();
+  if (gl && gl.renderer === renderer) (gl.backdropEnvs ??= new Map()).set(url, env);
+  return env;
+}
 function loadSceneEnvironment(
   THREE: ThreeBundle["THREE"],
   renderer: import("three").WebGLRenderer,
@@ -373,7 +417,9 @@ function loadPlate(THREE: ThreeBundle["THREE"], url: string): Promise<import("th
   if (hit) return hit;
   const p = new Promise<import("three").Texture | null>((resolve) => {
     new THREE.TextureLoader().load(
-      withAssetVersion(`${getAssetOrigin()}${url}`),
+      // An absolute URL is a backdrop shipped with the bundle (see
+      // ViewerEnvironment.backdrop), not a file on the models mount.
+      /^https?:\/\//.test(url) ? url : withAssetVersion(`${getAssetOrigin()}${url}`),
       (tex) => {
         tex.colorSpace = THREE.SRGBColorSpace;
         // The backdrop asks for a blurred mip level rather than shipping a
@@ -3395,6 +3441,12 @@ async function buildViewer(
   // own exposure — read by drawFrame, since the renderer is shared and every
   // other viewer on the page has a say in it too.
   if (rig.daylight) scene.environment = getDaylight(THREE, renderer).env;
+  // A photographed scene is AWAITED here, before anything draws: otherwise the
+  // first frames reflect the studio sunset and swap to the scene a beat later,
+  // and a card baked under such a rig could catch the wrong one. One small image
+  // shipped with the bundle, cached after the first viewer.
+  const mountPhoto = rig.backdrop ? await loadPlate(THREE, rig.backdrop.image) : null;
+  if (mountPhoto && rig.backdrop) scene.environment = getBackdropEnv(THREE, renderer, rig.backdrop.image, mountPhoto);
   let exposureNow = rig.exposure ?? BASE_EXPOSURE;
   scene.environmentIntensity = L.env;
   // Theirs too: the HDRI is a real place, so which way it faces decides where the
@@ -11976,7 +12028,7 @@ async function buildViewer(
    */
   let backdrop: import("three").Mesh | null = null;
   const backdropDir = new THREE.Matrix3();
-  function setBackdrop(tex: import("three").Texture | null, isPlate: boolean) {
+  function setBackdrop(tex: import("three").Texture | null, isPlate: boolean, blur?: number) {
     if (!tex) {
       if (backdrop) backdrop.visible = false;
       return;
@@ -12073,7 +12125,7 @@ async function buildViewer(
     if (isPlate && img?.width && img?.height) u.uPlateAspect.value = img.width / img.height;
     // A plate is already a photograph of a room at a distance; the panorama
     // slice is not, and needs more help.
-    u.uBlur.value = isPlate ? 1.1 : 2.6;
+    u.uBlur.value = blur ?? (isPlate ? 1.1 : 2.6);
     backdrop.visible = true;
   }
 
@@ -12106,6 +12158,24 @@ async function buildViewer(
   // The daylight haze stands behind live viewers only — a card is transparent
   // over the grid's own background, whatever lit it.
   if (rig.daylight && !opts?.still) setBackdrop(getDaylight(THREE, renderer).plate, true);
+  /**
+   * A PHOTOGRAPHED scene: fetched (it ships with the bundle, so it is one cached
+   * request), then made both the reflections and — live only — the backdrop.
+   * Re-checked on arrival like the map rigs, so a fast switch away never lands
+   * the old scene on the new preset.
+   */
+  function applyPhotoBackdrop(r: ViewerEnvironment) {
+    const b = r.backdrop;
+    if (!b) return;
+    void loadPlate(THREE, b.image).then((plate) => {
+      if (disposed || rigKey !== r.key || !plate) return;
+      scene.environment = getBackdropEnv(THREE, renderer, b.image, plate);
+      if (!opts?.still) setBackdrop(plate, true, b.blur);
+    });
+  }
+  // The mount already has the photograph (awaited above); only a live viewer
+  // stands it behind the item.
+  if (mountPhoto && rig.backdrop && !opts?.still) setBackdrop(mountPhoto, true, rig.backdrop.blur);
 
   function setEnvironment(name: string) {
     if (opts?.still) return;
@@ -12135,6 +12205,11 @@ async function buildViewer(
           setBackdrop(plate, true);
         });
       }
+    } else if (next.backdrop) {
+      // The studio sky until the photograph lands, then the scene's own.
+      scene.environment = envTex;
+      setBackdrop(null, false);
+      applyPhotoBackdrop(next);
     } else if (next.daylight) {
       const day = getDaylight(THREE, renderer);
       scene.environment = day.env;
