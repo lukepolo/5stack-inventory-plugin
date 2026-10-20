@@ -156,7 +156,7 @@ import { useDebouncedSearch } from "./composables/useDebouncedSearch";
 import { useInventoryView } from "./composables/useInventoryView";
 import { useAttachmentPicker, type PickerRow } from "./composables/useAttachmentPicker";
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
-import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
+import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, weaponName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { stackByDesign, TINT_SUFFIX } from "./decks";
 import { MAX_STATTRAK } from "./stattrakModule";
 import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
@@ -724,7 +724,7 @@ async function loadSkins(key: string) {
     if (sheetKey.value !== key) return; // a newer selection won
     // After, never with: the picker must paint as soon as the catalog lands.
     void loadStockPrices(key);
-    sheetSkins.value = key === "c4" ? c4Craftables(data) : data.skins;
+    sheetSkins.value = key === "c4" ? c4Craftables(data) : byModel(data.skins);
     sheetFacets.value = { groups: data.groups, tints: data.tints };
     sheetGroup.value = sheetDefaultGroup.value;
   } catch (e) {
@@ -748,6 +748,16 @@ function c4Craftables(data: { base: Skin | null; skins: Skin[] }): Skin[] {
   return [
     { ...data.base, type: "weapon", model: "c4", hasWear: false, hasSeed: false, hasStatTrak: false, hasNameTag: true },
   ];
+}
+/**
+ * Knives and gloves stack under their MODEL, the way graffiti stack under their
+ * artwork: 578 knife finishes as one flat grid is twenty knives to scroll
+ * through, not a choice. The model's id is the deck key, so the drill-in, the
+ * back strip and the filters all work unchanged. Only those two catalogs carry
+ * `baseId`; a backend from before it renders flat, as it always did.
+ */
+function byModel(skins: Skin[]): Skin[] {
+  return skins.map((s) => (s.baseId != null ? { ...s, design: s.baseId } : s));
 }
 // One place to clear the catalog-shaped filters, because there are four of them
 // and four reset points — a filter left set on a list it no longer applies to
@@ -1125,21 +1135,36 @@ const craftList = computed(() =>
   ),
 );
 
-/** Craft grid stacks, plus the name a deck shows: the face's, minus the
- *  "(Colour)" that only distinguishes it from its own siblings. */
+/** Craft grid stacks, plus what a deck's card shows. A colour deck is its face
+ *  minus the "(Colour)" that only distinguishes it from its own siblings. A knife
+ *  or glove deck is the MODEL — its name and its stock icon, under the model's
+ *  own id so no finish's baked art lands on it — and `model` marks it, because
+ *  its price would be one finish's and says nothing about the deck. */
 const craftStacks = computed(() =>
-  stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id, tintColors.value).map((st) => ({
-    ...st,
-    card: st.variants.length > 1 ? { ...st.face, name: st.face.name.replace(TINT_SUFFIX, "") } : st.face,
-  })),
+  stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id, tintColors.value).map((st) => {
+    const f = st.face;
+    const model = st.variants.length > 1 && f.baseId != null;
+    return {
+      ...st,
+      model,
+      card: model
+        ? { ...f, id: f.baseId!, name: f.baseName ?? f.name, altName: null, image: f.baseImage ?? f.image }
+        : st.variants.length > 1
+          ? { ...f, name: f.name.replace(TINT_SUFFIX, "") }
+          : f,
+    };
+  }),
 );
+/** Knife and glove craft cards carry the model label an owned card has — a
+ *  finish name alone ("Fade") does not say which of twenty knives it is. */
+const craftLabels = computed(() => sheetKey.value === "knife" || sheetKey.value === "gloves");
 
 /** The design being drilled into, for the back chip's label. */
-const sheetDesignName = computed(() =>
-  sheetDesign.value == null
-    ? ""
-    : stripName(sheetSkins.value.find((s) => s.design === sheetDesign.value)?.name ?? "").replace(TINT_SUFFIX, ""),
-);
+const sheetDesignName = computed(() => {
+  if (sheetDesign.value == null) return "";
+  const s = sheetSkins.value.find((s) => s.design === sheetDesign.value);
+  return s?.baseName ?? stripName(s?.name ?? "").replace(TINT_SUFFIX, "");
+});
 
 // Both sheet lists scroll rather than truncate. The reset key is every filter
 // that narrows them plus the slot itself — switching weapons is a new list.
@@ -4219,13 +4244,15 @@ const advancedPlacement = ref(false);
  * published for everybody (the store is shared art, so the backend takes writes
  * from admins only), and a later visitor's 404 on the icon tries that stored
  * copy before spending a GL context. Anyone else's bake stays in their session —
- * the upload is refused and that is fine. The gloves stay session-scoped until
- * they join CATALOG_RENDER_TYPES on both sides.
+ * the upload is refused and that is fine. The gloves joined once the craft
+ * sheet started wearing those eight as the face of each glove model's deck —
+ * eight bakes on every visit to the gloves sheet, for every visitor, was the
+ * cost the store exists to pay once.
  */
 const catalogArtTried = new Set<number>();
 /** Must match CATALOG_RENDER_TYPES in backend/src/main.ts — the server refuses
  *  the rest. */
-const CATALOG_RENDER_TYPES = new Set(["pet"]);
+const CATALOG_RENDER_TYPES = new Set(["pet", "glove"]);
 /** Ids whose STORED catalog render has already been tried this session. */
 const catalogStoredTried = new Set<number>();
 async function bakeCatalogArt(skin: { id: number; name?: string; model?: string | null; type?: string | null; paintMaterial?: string | null }) {
@@ -9138,7 +9165,7 @@ if (MDEBUG) {
           <span class="min-w-0 truncate text-f11 uppercase tracking-cs2 text-foreground">{{ sheetDesignName }}</span>
           <span class="flex-none text-f9 uppercase tracking-cs1 text-muted-foreground">
             <span class="font-mono text-foreground">{{ sheetResultCount }}</span>
-            {{ sheetResultCount === 1 ? 'color' : 'colors' }}
+            {{ craftLabels ? (sheetResultCount === 1 ? 'finish' : 'finishes') : sheetResultCount === 1 ? 'color' : 'colors' }}
           </span>
         </div>
 
@@ -9302,7 +9329,7 @@ if (MDEBUG) {
                     v-if="st.variants.length > 1"
                     class="absolute right-1.5 top-1.5 z-[3] flex items-center gap-0.5 rounded bg-black/50 px-1 py-0.5 font-mono text-f8 text-[color:var(--acc)]"
                   >
-                    <Palette class="h-2.5 w-2.5" /> {{ st.variants.length }}
+                    <component :is="st.model ? Layers : Palette" class="h-2.5 w-2.5" /> {{ st.variants.length }}
                   </span>
                   <span
                     v-else
@@ -9316,8 +9343,24 @@ if (MDEBUG) {
                        bottom), but the POSITION is what people have learned, and
                        a price that moves between two grids of the same shape is
                        a price you have to hunt for. -->
+                  <!-- Knives and gloves add the owned card's model label above it,
+                       and the price hangs under the label there instead. A model
+                       deck has no price of its own, and labels its kind. -->
+                  <span v-if="craftLabels" class="relative z-[2] block min-w-0 pr-8">
+                    <span class="block truncate text-f9 uppercase tracking-cs1 text-muted-foreground/70">
+                      {{ st.model ? sheetWeaponName : weaponName(st.card) }}
+                    </span>
+                    <PriceTag
+                      v-if="pricesOn && !st.model"
+                      class="absolute left-0 top-full z-[3]"
+                      size="xs"
+                      :value="stockPriceOf(st.card.id)?.value"
+                      :missing="!stockPriceOf(st.card.id)"
+                      :title="stockPriceTip(st.card.id)"
+                    />
+                  </span>
                   <PriceTag
-                    v-if="pricesOn"
+                    v-else-if="pricesOn"
                     class="absolute left-2.5 top-2 z-[3]"
                     size="xs"
                     :value="stockPriceOf(st.card.id)?.value"

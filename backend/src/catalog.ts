@@ -101,6 +101,15 @@ export interface CatalogSkin {
   collection?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
+  /**
+   * KNIVES and GLOVES only: the bare model every finish of the kind is painted
+   * onto — "Butterfly Knife", "Bloodhound Gloves". The craft sheet folds the
+   * finishes under it, wearing the model's own icon, which for gloves is not an
+   * item on the list (see getGloves) and so has to be named here.
+   */
+  baseId?: number;
+  baseName?: string;
+  baseImage?: string | null;
   /** Colourway id, for the items that come in more than one. */
   tint?: number;
   /** That colourway's name ("Cash Green"). */
@@ -345,8 +354,34 @@ export function getAgents() {
     }));
 }
 
+/**
+ * modelKey -> the bare model of that kind, as the `base*` facts of a listing.
+ *
+ * Every knife and glove finish shares its modelKey with exactly one item that
+ * has no paint index — the model itself — so this is a lookup, not a guess.
+ */
+function baseFacts(type: "melee" | "glove") {
+  const bases = new Map(
+    items.filter((i) => i.type === type && !i.variantIndex && !i.isDefault).map((b) => [b.modelKey, b]),
+  );
+  return (i: (typeof items)[number]): Pick<CatalogSkin, "baseId" | "baseName" | "baseImage"> => {
+    const b = bases.get(i.modelKey);
+    return b ? { baseId: b.id, baseName: b.name.replace(/^★\s*/, ""), baseImage: img(b.imagePath) } : {};
+  };
+}
+
+/**
+ * Knife finishes, plus the vanilla knives — "★ Butterfly Knife" with no finish
+ * is a real item, and it sits in its own model's group.
+ *
+ * The stock T and CT knives are not offered: like the stock gloves they are the
+ * slot's default (getDefaults reads them), not something to craft.
+ */
 export function getKnives(): CatalogSkin[] {
-  return items.filter((i) => i.type === "melee").map(paintedListing);
+  const base = baseFacts("melee");
+  return items
+    .filter((i) => i.type === "melee" && !i.isDefault)
+    .map((i) => ({ ...paintedListing(i), ...base(i) }));
 }
 
 // ---- Music kit audio --------------------------------------------------------
@@ -904,7 +939,10 @@ export function getItemsByIds(ids: number[]): (CatalogSkin & {
  * still resolves, since nothing here touches getItem.
  */
 export function getGloves(): CatalogSkin[] {
-  return items.filter((i) => i.type === "glove" && !!i.variantIndex).map(paintedListing);
+  const base = baseFacts("glove");
+  return items
+    .filter((i) => i.type === "glove" && !!i.variantIndex)
+    .map((i) => ({ ...paintedListing(i), ...base(i) }));
 }
 
 /**

@@ -126,10 +126,12 @@ export function attachmentsOf(i: AttachSource) {
 
 // "★ Butterfly Knife | Marble Fade" -> "Butterfly Knife". The catalog `model`
 // is a raw slug (knife_butterfly) — correct as a key, unreadable as a label,
-// which is what tile headers were showing.
+// which is what tile headers were showing. A name with no finish ("Bloodhound
+// Gloves", a vanilla "★ Karambit") IS the model's name, so it comes before the
+// slug: the slug only labels an item with no name at all.
 export function weaponName(item?: { name?: string | null; model?: string | null } | null): string {
   const full = item?.name ?? "";
-  const head = full.includes(" | ") ? full.split(" | ")[0] : "";
+  const head = full.includes(" | ") ? full.split(" | ")[0] : full;
   return (head || item?.model || "").replace(/^★\s*/, "").trim();
 }
 

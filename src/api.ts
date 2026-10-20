@@ -95,6 +95,11 @@ export interface Skin {
   collection?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
+  /** KNIVES and GLOVES only: the bare model the finish is painted onto
+   *  ("Butterfly Knife"), with its own icon — what the craft sheet groups under. */
+  baseId?: number;
+  baseName?: string;
+  baseImage?: string | null;
   /** That variant's colourway ("Cash Green"). */
   tintName?: string;
   /** MUSIC KITS only: the kit's menu theme, ready to play. See `CatalogItem`. */

@@ -389,8 +389,10 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
 // For the items the game ships no picture of at all. Four of the five pets
 // have no `image_inventory` (CS2 renders them live from their model), so a
 // catalog tile for the chick or a breed had nothing to show and no instance to
-// bake for. The vanilla-glove-icons note asked for exactly this store; pets are
-// its first customer and those eight gloves can be its next by joining the set.
+// bake for. The vanilla-glove-icons note asked for exactly this store; pets were
+// its first customer and those eight gloves its second — the craft sheet shows
+// them as the face of each glove model. A painted glove has its icon and never
+// reaches the upload: the client bakes only on a 404.
 //
 // SHARED art — every visitor's tile — so it is guarded harder than an
 // instance card, which only its owner ever sees:
@@ -403,7 +405,7 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
 //    by an upload, only by the version sweep after an extraction.
 //  - The PNG's own header must describe a plausible card, not just start with
 //    the magic bytes.
-const CATALOG_RENDER_TYPES = new Set(["pet"]);
+const CATALOG_RENDER_TYPES = new Set(["pet", "glove"]);
 export const catalogRenderKey = (itemId: number, version: number) => `cat-${itemId}-v${version}.png`;
 /** IHDR sanity: the signature, an IHDR chunk first, and card-sized dimensions. */
 function plausibleCardPng(buf: Buffer): boolean {
