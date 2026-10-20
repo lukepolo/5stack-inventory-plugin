@@ -297,6 +297,41 @@ function loadTex(
 }
 
 /**
+ * Draw a weapon decal through its weapon's STICKER MASK.
+ *
+ * csgo_weapon's g_tStickerWepInputs (R = TextureStickerMask, G = cavity), in the
+ * weapon's TEXCOORD_1 space — the space stickers are placed in. The game draws
+ * every sticker through R, so whatever is modelled over the sticker band (the
+ * C4's LCD module, wires and tape) hides the part of a sticker beneath it.
+ * Sampled at `uvBody`, the body UV1 the decal cutter writes per vertex; a
+ * geometry without that attribute must not get this patch.
+ *
+ * Layered over applyStickerSfx rather than folded into it: that patch is skipped
+ * for a plain sticker, and the mask applies to every sticker. Before
+ * alphatest_fragment, which no other patch touches, so it composes with either.
+ */
+export function applyStickerMask(mat: ThreeNS.MeshStandardMaterial, mask: ThreeNS.Texture): void {
+  const prev = mat.onBeforeCompile;
+  const prevKey = mat.customProgramCacheKey.bind(mat);
+  mat.onBeforeCompile = (shader, renderer) => {
+    prev.call(mat, shader, renderer);
+    shader.uniforms.uWepMask = { value: mask };
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute vec2 uvBody;\nvarying vec2 vUvBody;")
+      .replace("#include <uv_vertex>", "#include <uv_vertex>\nvUvBody = uvBody;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", "#include <common>\nuniform sampler2D uWepMask;\nvarying vec2 vUvBody;")
+      .replace(
+        "#include <alphatest_fragment>",
+        "diffuseColor.a *= texture2D( uWepMask, vUvBody ).r;\n#include <alphatest_fragment>",
+      );
+  };
+  // Its own program: a masked decal and an unmasked one must not share one.
+  mat.customProgramCacheKey = () => `${prevKey()}|wepMask`;
+  mat.needsUpdate = true;
+}
+
+/**
  * Patch a sticker decal material with the real alpha, wear and effect shading.
  *
  * Two mechanics carried over from the wear approximation this replaces, both

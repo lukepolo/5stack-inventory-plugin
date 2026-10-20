@@ -29,6 +29,7 @@ import {
 import { buildInspectLink, type CS2BaseInventoryItem } from "./inspect.ts";
 import {
   getStickerMarkup,
+  getStickerMasks,
   slotCount,
   getCharmMarkup,
   charmBounds,
@@ -1753,10 +1754,11 @@ app.get<{ Querystring: { image?: string } }>("/api/catalog/charm-model", async (
 
 app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", async (request) => {
   const model = request.params.model;
-  const [bounds, slots, charmQuads] = await Promise.all([
+  const [bounds, slots, charmQuads, masks] = await Promise.all([
     Promise.resolve(getStickerBounds(model)),
     getStickerMarkup(model),
     getCharmMarkup(model),
+    getStickerMasks(model),
   ]);
   // Charm surfaces ride along with the sticker markup because they come out of
   // the same DATA block, are fetched at the same moment (the viewer mounts a
@@ -1777,6 +1779,9 @@ app.get<{ Params: { model: string } }>("/api/catalog/sticker-bounds/:model", asy
     anchorCount: slotCount(slots),
     anchorCountLegacy: slotCount(slots, "body_legacy"),
     charmQuads,
+    // Where a sticker may SHOW, per body — see getStickerMasks. Bare filenames
+    // under /models; {} on a mount extracted before v34.
+    masks,
     charmBounds: charmBounds(charmQuads),
     charmBoundsLegacy: charmBounds(charmQuads, "body_legacy"),
   };

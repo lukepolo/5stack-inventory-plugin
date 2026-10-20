@@ -239,6 +239,13 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v34 (2026-10-20): STICKER MASKS (new step sticker-masks -> models/
+# <key>.stickermask.{hd,legacy}.webp + sticker-masks.json). csgo_weapon's
+# g_tStickerWepInputs, per body: the game draws stickers through its R channel,
+# so whatever is modelled over the sticker band (the C4's LCD module, wires and
+# tape) hides the part of a sticker beneath it. The viewer drew stickers over all
+# of it. The bump also re-bakes every card, which is what puts the masked
+# stickers into the 2D art.
 # v33 (2026-10-15): KNIVES IN FIRST PERSON (step viewmodel-anims only). Each
 # viewmodel clip now carries `prop` — the weapon's OWN skeleton tracks, decoded
 # from the clip's m_secondaryAnimations by tools/nmclip-data.mjs, because the
@@ -290,7 +297,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=33
+EXTRACT_VERSION=34
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -389,7 +396,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models pet-models model-textures composite-inputs charm-anchors sticker-markup charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
+STEPS=(decompile-models rename-models pet-models model-textures composite-inputs charm-anchors sticker-markup sticker-masks charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -2500,6 +2507,114 @@ if kc_empty:
 if not keychain:
     print("!!! No charm surfaces recovered at all — charm placement keeps the "
           "raycast lift. Check that `KeychainMarkup` is still in the DATA block.")
+PYEOF
+
+fi
+
+# ---- 3d2. Sticker masks -------------------------------------------------------
+if step_if "sticker-masks"; then
+# Where a sticker may SHOW on each weapon body: csgo_weapon's
+# `g_tStickerWepInputs` (csgo_weapon.slang: R = TextureStickerMask, G =
+# TextureStickerCavity, ATI2N), authored in the same TEXCOORD_1 space the
+# sticker anchors are. The game draws stickers through it, so anything modelled
+# on top of the sticker band — the C4's LCD module, wires and tape, a rifle's
+# moving parts — hides the part of a sticker under it. Without it the viewer
+# painted stickers straight over all of that.
+#
+# The weapon GLBs already name it: step 2 keeps each material's vmat params in
+# extras.vmat.TextureParams, so no second pass over the archive's materials is
+# needed — only the textures themselves, decompiled in batches like §3b's.
+# One per BODY (the HD and legacy unwraps differ, and so do their masks), found
+# by the mesh each material is drawn on.
+#
+# Output: <key>.stickermask.hd.webp / .legacy.webp, lossless (cwebp -exact, as
+# model-textures does — the mask is data, and a lossy edge is a sticker cut in
+# the wrong place), and sticker-masks.json { key: { body_hd: file, … } }.
+echo ""
+echo "--- Extracting sticker masks…"
+CLI="$CLI" VPK="$VPK" DEST="$DEST" WORK="$WORK" python3 - <<'PYEOF'
+import json, os, shutil, struct, subprocess
+
+cli, vpk, dest, work = (os.environ[k] for k in ("CLI", "VPK", "DEST", "WORK"))
+raw = os.path.join(work, "raw_stickermask")
+shutil.rmtree(raw, ignore_errors=True)
+os.makedirs(raw, exist_ok=True)
+
+def glb_json(path):
+    with open(path, "rb") as fh:
+        head = fh.read(20)
+        if len(head) < 20 or head[:4] != b"glTF":
+            return None
+        jlen = struct.unpack_from("<I", head, 12)[0]
+        return json.loads(fh.read(jlen))
+
+# key -> { body -> vtex path }
+wanted = {}
+for name in sorted(os.listdir(dest)):
+    if not name.endswith(".glb"):
+        continue
+    try:
+        doc = glb_json(os.path.join(dest, name))
+    except Exception:
+        continue
+    if not doc:
+        continue
+    mats = doc.get("materials") or []
+    mask_of = {}
+    for i, m in enumerate(mats):
+        tp = (((m.get("extras") or {}).get("vmat") or {}).get("TextureParams") or {})
+        v = tp.get("g_tStickerWepInputs")
+        if isinstance(v, str) and v.endswith(".vtex"):
+            mask_of[i] = v
+    if not mask_of:
+        continue
+    bodies = {}
+    for mesh in doc.get("meshes") or []:
+        mname = (mesh.get("name") or "").rsplit(".", 1)[-1]
+        body = "body_legacy" if "legacy" in mname else "body_hd"
+        for prim in mesh.get("primitives") or []:
+            vtex = mask_of.get(prim.get("material"))
+            if vtex:
+                bodies.setdefault(body, vtex)
+    if bodies:
+        wanted[name[: -len(".glb")]] = bodies
+
+paths = sorted({v + "_c" for b in wanted.values() for v in b.values()})
+print(f"--- Sticker masks: {len(paths)} textures across {len(wanted)} models")
+BATCH = 40
+for i in range(0, len(paths), BATCH):
+    subprocess.run([cli, "-i", vpk, "-o", raw, "-d", "-f", ",".join(paths[i:i + BATCH])],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+have_cwebp = shutil.which("cwebp") is not None
+index, missing = {}, []
+for key, bodies in sorted(wanted.items()):
+    for body, vtex in sorted(bodies.items()):
+        stem = os.path.join(raw, vtex[: -len(".vtex")])
+        src = next((stem + e for e in (".png", ".tga", ".tif") if os.path.isfile(stem + e)), None)
+        if not src:
+            missing.append(f"{key}:{body}")
+            continue
+        tag = "legacy" if body == "body_legacy" else "hd"
+        out = f"{key}.stickermask.{tag}." + ("webp" if have_cwebp and src.endswith(".png") else src.rsplit(".", 1)[-1])
+        tgt = os.path.join(dest, out)
+        if out.endswith(".webp"):
+            tmp = tgt + ".tmp.webp"
+            r = subprocess.run(["cwebp", "-exact", "-lossless", "-q", "100", src, "-o", tmp],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            if r.returncode != 0 or not os.path.isfile(tmp):
+                missing.append(f"{key}:{body} (cwebp)")
+                continue
+            os.replace(tmp, tgt)
+        else:
+            shutil.copyfile(src, tgt)
+        index.setdefault(key, {})[body] = out
+
+with open(os.path.join(dest, "sticker-masks.json"), "w") as fh:
+    json.dump(index, fh, indent=1, sort_keys=True)
+print(f"--- Sticker masks written for {len(index)} models")
+if missing:
+    print(f"!!  no decompiled mask for {len(missing)}: {', '.join(missing[:10])}")
 PYEOF
 
 fi

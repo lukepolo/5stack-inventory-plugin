@@ -3473,7 +3473,7 @@ async function stickerGeom(model: string) {
   // needs the sticker anchors: it is the model's own answer to where an
   // attachment goes. Spread into ViewerOpts, so adding it here reaches the live
   // stage, the 2D still and the card bake at once.
-  return { stickerBounds: g.bounds, stickerSlots: g.slots, charmSurfaces: g.charmQuads };
+  return { stickerBounds: g.bounds, stickerSlots: g.slots, stickerMasks: g.masks, charmSurfaces: g.charmQuads };
 }
 // Craft state → viewer placement shapes.
 function craftStickerPlacements(): StickerPlacement[] {

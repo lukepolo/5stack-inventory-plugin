@@ -676,6 +676,9 @@ export interface StickerGeometry {
    *  extracted before v23 — read as "we have no authored answer", not as "this
    *  weapon takes no charm". */
   charmQuads: CharmQuad[];
+  /** Where a sticker may SHOW, per body: the weapon's sticker mask, as a bare
+   *  filename under /models. Empty on a mount extracted before v34. */
+  masks: Partial<Record<"body_hd" | "body_legacy", string>>;
   /** Anchors the HD body declares. 0 when the mount has no markup for the model
    *  — read that as "unknown", not as "this weapon takes no stickers". */
   anchorCount: number;
@@ -693,13 +696,14 @@ export function fetchStickerGeometry(model: string): Promise<StickerGeometry> {
         bounds: r.bounds ?? null,
         slots: r.slots ?? [],
         charmQuads: Array.isArray(r.charmQuads) ? r.charmQuads : [],
+        masks: r.masks && typeof r.masks === "object" ? r.masks : {},
         // Counted server-side from the same slots, so a client that only wants
         // the number does not re-derive it — and a mount whose markup regressed
         // shows up as a zero here rather than as a mispositioned sticker.
         anchorCount: r.anchorCount ?? 0,
         anchorCountLegacy: r.anchorCountLegacy ?? 0,
       }))
-      .catch(() => ({ bounds: null, slots: [], charmQuads: [], anchorCount: 0, anchorCountLegacy: 0 }));
+      .catch(() => ({ bounds: null, slots: [], charmQuads: [], masks: {}, anchorCount: 0, anchorCountLegacy: 0 }));
     stickerGeomCache.set(model, cached);
   }
   return cached;

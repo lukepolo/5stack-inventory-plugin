@@ -510,6 +510,7 @@ const STEP_LABELS: Record<string, string> = {
   "composite-inputs": "Extracting composite inputs",
   "charm-anchors": "Reading charm anchors",
   "sticker-markup": "Reading sticker slots",
+  "sticker-masks": "Extracting sticker masks",
   // Was missing entirely, so this row rendered as the raw kebab id.
   "charm-models": "Reading charm & patch definitions",
   "econ-icons": "Extracting item icons",

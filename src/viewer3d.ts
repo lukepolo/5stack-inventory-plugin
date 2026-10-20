@@ -40,7 +40,7 @@ import {
   wakeCharmSim,
   worldToCharmDir,
 } from "./charmPhysics";
-import { applyStickerSfx, type StickerSfx } from "./stickerShader";
+import { applyStickerMask, applyStickerSfx, type StickerSfx } from "./stickerShader";
 import { compositeGlove, gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { compositeGloveModern, gloveSeedMoves, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
@@ -3158,6 +3158,9 @@ export interface ViewerOpts {
   /** Per-slot UV anchors from the model. Without them placement falls back to
    *  the old silhouette guess, which does NOT match the game. */
   stickerSlots?: StickerSlot[];
+  /** The weapon's sticker mask per body (bare filenames under /models) — where
+   *  a sticker may SHOW. See applyStickerMask. */
+  stickerMasks?: Partial<Record<"body_hd" | "body_legacy", string>>;
   /** The model's own charm surfaces. Without them a charm is seated on whatever
    *  triangle happens to be nearest, which finds A surface rather than one the
    *  game would hang a charm on. See CharmSurface. */
@@ -5454,6 +5457,27 @@ async function buildViewer(
     (lo, sm) => (!lo || sm.index < lo.index ? sm : lo),
     undefined,
   );
+  /**
+   * The weapon's sticker mask for the body on screen, loaded once per mount on
+   * the first decal that wants it. Null when the mount has none (before v34),
+   * which draws stickers whole, as before. Flipped like every glTF texture: the
+   * UV1 the decal samples it at comes straight out of the GLB.
+   */
+  let stickerMaskTex: Promise<import("three").Texture | null> | null = null;
+  const stickerMask = () =>
+    (stickerMaskTex ??= (() => {
+      const file = opts?.stickerMasks?.[bodyVariant as "body_hd" | "body_legacy"];
+      if (!file) return Promise.resolve(null);
+      return new THREE.TextureLoader()
+        .loadAsync(withAssetVersion(`${getAssetOrigin()}/models/${encodeURIComponent(file)}`))
+        .then((t) => {
+          t.flipY = false;
+          t.colorSpace = THREE.NoColorSpace;
+          t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+          return t;
+        })
+        .catch(() => null);
+    })());
   const slotMarkup = (slot: number): { mk: StickerSlot | undefined; shared: boolean } => {
     const exact = anchors.find((sm) => sm.index === slot);
     if (exact) return { mk: exact, shared: false };
@@ -5617,6 +5641,9 @@ async function buildViewer(
     const pos: number[] = [];
     const nor: number[] = [];
     const uvs: number[] = [];
+    // The body's own UV1 under each vertex — what the weapon's sticker mask is
+    // authored in (applyStickerMask). toSticker inverted, so it is exact.
+    const body: number[] = [];
     // A clipped vertex carries everything it needs to be interpolated: sticker
     // coords for the cut, world position and normal for the output.
     type CutVert = { s: number; t: number; p: import("three").Vector3; n: import("three").Vector3 };
@@ -5717,6 +5744,9 @@ async function buildViewer(
             nor.push(tmp.x, tmp.y, tmp.z);
             // The image is authored with V down, as textures are.
             uvs.push(v.s, 1 - v.t);
+            const a = (v.s - 0.5) * sizeUv;
+            const b = (v.t - 0.5) * sizeUv;
+            body.push(cu + a * cos - b * sin, cv + a * sin + b * cos);
           }
         }
       }
@@ -5726,6 +5756,7 @@ async function buildViewer(
     geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pos), 3));
     geom.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(nor), 3));
     geom.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(uvs), 2));
+    geom.setAttribute("uvBody", new THREE.BufferAttribute(new Float32Array(body), 2));
     return geom;
   }
 
@@ -6230,6 +6261,10 @@ async function buildViewer(
       await applyStickerSfx(THREE, mat, (await stickerArtInfo(st.image)).sfx, st.w ?? 0, paintTextureUrl, {
         expandAlpha: tex.userData.stkRealStickerArt === true,
       });
+      // Through the weapon's sticker mask — only on the UV path, the one whose
+      // geometry carries the body UV1 the mask is sampled at.
+      const wepMask = uvCut ? await stickerMask() : null;
+      if (wepMask) applyStickerMask(mat, wepMask);
       mesh = new THREE.Mesh(geom, mat);
       mesh.userData.stickerSlot = st.slot;
       mesh.userData.stickerImage = st.image;

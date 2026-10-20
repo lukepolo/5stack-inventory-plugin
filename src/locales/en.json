@@ -56,6 +56,7 @@
           "composite-inputs": "Extracting composite inputs",
           "charm-anchors": "Reading charm anchors",
           "sticker-markup": "Reading sticker slots",
+          "sticker-masks": "Extracting sticker masks",
           "econ-icons": "Extracting item icons",
           "paint-chain": "Extracting paint chain",
           "sticker-art": "Extracting sticker art",

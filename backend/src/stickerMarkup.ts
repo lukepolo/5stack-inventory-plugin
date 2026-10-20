@@ -143,6 +143,49 @@ export function slotCount(slots: StickerSlot[], mesh = "body_hd"): number {
   return slots.filter((s) => s.mesh === mesh).length;
 }
 
+// ---- Sticker masks ------------------------------------------------------------
+//
+// Where a sticker may SHOW on each body: csgo_weapon's g_tStickerWepInputs
+// (R = mask, G = cavity), in the same TEXCOORD_1 space as the anchors above.
+// The game draws stickers through it, so whatever is modelled over the sticker
+// band — the C4's LCD module, wires and tape — hides the part of a sticker under
+// it. extract-models.sh §3d2 writes one image per body beside the GLBs and
+// indexes them in sticker-masks.json; absent before v34, which reads as "no
+// mask", i.e. stickers drawn whole, as before.
+
+/** Mask file per body, as a bare filename under /models. */
+export type StickerMasks = Partial<Record<"body_hd" | "body_legacy", string>>;
+
+const MASKS_FILE = path.join(MODELS_DIR, "sticker-masks.json");
+let masksCache: { mtimeMs: number; masks: Record<string, StickerMasks> } | null = null;
+/** A filename the extraction could have written, and nothing that could leave
+ *  /models — the value is spliced into a URL. */
+const MASK_FILE_RE = /^[\w.-]+\.stickermask\.(hd|legacy)\.(webp|png|tga)$/;
+
+/** The sticker mask per body for a weapon, or {} when the mount has none.
+ *  Never throws. */
+export async function getStickerMasks(model: string): Promise<StickerMasks> {
+  try {
+    const { mtimeMs } = await stat(MASKS_FILE);
+    if (!masksCache || masksCache.mtimeMs !== mtimeMs) {
+      const doc = JSON.parse(await readFile(MASKS_FILE, "utf8")) as Record<string, Record<string, unknown>>;
+      const masks: Record<string, StickerMasks> = {};
+      for (const [key, bodies] of Object.entries(doc)) {
+        const m: StickerMasks = {};
+        for (const body of ["body_hd", "body_legacy"] as const) {
+          const f = bodies?.[body];
+          if (typeof f === "string" && MASK_FILE_RE.test(f)) m[body] = f;
+        }
+        masks[key] = m;
+      }
+      masksCache = { mtimeMs, masks };
+    }
+    return masksCache.masks[model] ?? {};
+  } catch {
+    return {};
+  }
+}
+
 // ---- Charm placement surfaces (KeychainMarkup) ------------------------------
 //
 // The sticker markup's counterpart for charms, out of the same DATA block and
