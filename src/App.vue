@@ -5,7 +5,7 @@ import { useI18n } from "./composables/useI18n";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Palette, Link2,
   Layers,
 } from "lucide-vue-next";
 import {
@@ -3486,6 +3486,55 @@ function craftStickerPlacements(): StickerPlacement[] {
 function setStickerWear(slot: number, w: number) {
   const st = craft.value?.stickers[slot];
   if (st) st.w = Math.min(1, Math.max(0, w));
+}
+/**
+ * Move a sticker to another slot, swapping with whatever is there.
+ *
+ * Slot order is draw order — the game paints the slots in turn, so where two
+ * stickers overlap the later slot is on top, and the viewer orders its decals
+ * the same way. Reordering used to mean deleting a sticker and adding it again.
+ *
+ * Each keeps its place on the gun. x/y are offsets from the SLOT'S anchor (see
+ * slotMarkup in viewer3d), so they are re-expressed against the new slot's —
+ * picked the way the viewer picks them: this finish's body, the exact anchor or
+ * else the first. Rotation is not anchor-relative and carries over as is; the
+ * size follows the new slot's scale, as it does in game.
+ */
+async function moveSticker(from: number, to: number) {
+  const c = craft.value;
+  const model = craftTarget.value?.model;
+  if (!c || from === to || !c.stickers[from]) return;
+  const geo = model ? await fetchStickerGeometry(model) : null;
+  if (craft.value !== c) return;
+  const body = c.skin.legacyPaint && c.skin.paintMaterial ? "body_legacy" : "body_hd";
+  const mine = (geo?.slots ?? []).filter((s) => s.mesh === body);
+  const anchors = mine.length ? mine : (geo?.slots ?? []);
+  const first = anchors.reduce<(typeof anchors)[number] | undefined>((lo, s) => (!lo || s.index < lo.index ? s : lo), undefined);
+  const anchorOf = (slot: number) => anchors.find((s) => s.index === slot) ?? first;
+  const fit = (v: number, r?: [number, number]) => Math.round((r ? Math.min(r[1], Math.max(r[0], v)) : v) * 1e4) / 1e4;
+  const reanchor = (st: NonNullable<typeof c.stickers[number]>, a: number, b: number) => {
+    const fromA = anchorOf(a);
+    const toA = anchorOf(b);
+    if (!fromA || !toA || fromA === toA) return st;
+    return {
+      ...st,
+      x: fit(fromA.offset[0] + (st.x ?? 0) - toA.offset[0], geo?.bounds?.x),
+      y: fit(fromA.offset[1] + (st.y ?? 0) - toA.offset[1], geo?.bounds?.y),
+    };
+  };
+  const a = c.stickers[from];
+  const b = c.stickers[to];
+  c.stickers[to] = a ? reanchor(a, from, to) : null;
+  c.stickers[from] = b ? reanchor(b, to, from) : null;
+}
+/** The sticker tile being dragged onto another, for the reorder. */
+const stickerDragFrom = ref<number | null>(null);
+const stickerDropOn = ref<number | null>(null);
+function onStickerTileDrop(to: number) {
+  const from = stickerDragFrom.value;
+  stickerDragFrom.value = null;
+  stickerDropOn.value = null;
+  if (from != null) void moveSticker(from, to);
 }
 function craftCharmPlacement(): CharmPlacement | null {
   const c = craft.value?.charm;
@@ -9827,13 +9876,26 @@ if (MDEBUG) {
                 >{{ advancedPlacement ? 'Hide' : 'Advanced' }}</button>
               </div>
               <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
+                <!-- Draggable onto each other: slot order is draw order, so this is
+                     how one overlapping sticker goes over another — see
+                     moveSticker. -->
                 <button
                   v-for="(st, idx) in craft.stickers.slice(0, stickerSlotCount)"
                   :key="idx"
                   class="group/st relative grid h-10 place-items-center rounded border transition-colors"
-                  :class="st ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]'"
-                  :title="st ? st.name + ' (slot ' + (idx + 1) + ')' : 'Add a sticker in slot ' + (idx + 1)"
+                  :class="[
+                    st ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]',
+                    stickerDropOn === idx && stickerDragFrom !== idx && '!border-solid !border-[color:var(--acc)]',
+                    stickerDragFrom === idx && 'opacity-40',
+                  ]"
+                  :title="st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
+                  :draggable="!!st"
                   @click="openPicker('sticker', idx)"
+                  @dragstart="stickerDragFrom = idx; $event.dataTransfer?.setData('text/plain', String(idx))"
+                  @dragover.prevent="stickerDragFrom != null && (stickerDropOn = idx)"
+                  @dragleave="stickerDropOn === idx && (stickerDropOn = null)"
+                  @drop.prevent="onStickerTileDrop(idx)"
+                  @dragend="stickerDragFrom = null; stickerDropOn = null"
                 >
                   <span class="absolute bottom-0 right-0.5 z-[1] font-mono text-f8 text-muted-foreground/40">{{ idx + 1 }}</span>
                   <img v-if="st?.image" :src="st.image" alt="" class="max-h-8 max-w-full object-contain" />
@@ -9876,6 +9938,22 @@ if (MDEBUG) {
                   @input="setStickerWear(idx, ($event.target as HTMLInputElement).valueAsNumber)"
                 />
                 <span class="w-8 flex-none text-right font-mono text-f9 text-muted-foreground">{{ (st?.w ?? 0).toFixed(2) }}</span>
+                <!-- The reorder without a drag, for touch: one slot earlier or
+                     later, which is one step down or up in draw order. -->
+                <span class="flex flex-none items-center">
+                  <button
+                    class="grid h-5 w-4 place-items-center text-muted-foreground transition-colors hover:text-foreground disabled:opacity-25"
+                    :disabled="idx === 0"
+                    :title="'Move to slot ' + idx + ' — drawn under the stickers after it'"
+                    @click="moveSticker(idx, idx - 1)"
+                  ><ChevronLeft class="h-3 w-3" /></button>
+                  <button
+                    class="grid h-5 w-4 place-items-center text-muted-foreground transition-colors hover:text-foreground disabled:opacity-25"
+                    :disabled="idx >= stickerSlotCount - 1"
+                    :title="'Move to slot ' + (idx + 2) + ' — drawn over the stickers before it'"
+                    @click="moveSticker(idx, idx + 1)"
+                  ><ChevronRight class="h-3 w-3" /></button>
+                </span>
               </div>
               <!-- Placement per applied sticker: offsets + rotation flow straight
                    to the game server (equipped v5 x/y/rotation). Dragging in 3D
