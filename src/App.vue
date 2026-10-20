@@ -6403,8 +6403,11 @@ const equipSide = computed<EquipSide>(() => {
   const ok = (v: EquipSide) => opts.some((o) => o.value === v && !o.disabled);
   const pick = equipSidePick.value;
   if (pick && pick.key === equipSideKey.value && ok(pick.side)) return pick.side;
-  // Both wherever both can hold it — what most people want, and asked for.
-  if (ok("both")) return "both";
+  // The side you picked before choosing the item: crafting from the CT
+  // loadout equips on CT. It used to default to Both wherever both sides could
+  // hold the item, which put a CT pick on T as well unless you caught the
+  // dropdown. Both stays one click away; a side that cannot hold the item
+  // (an AK from CT) falls through to the one that can.
   if (ok(team.value)) return team.value;
   return opts.find((o) => !o.disabled)?.value ?? team.value;
 });
