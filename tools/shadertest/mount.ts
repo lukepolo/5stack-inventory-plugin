@@ -12,6 +12,7 @@
 // Query parameters (all optional except model):
 //
 //   model=ak47            model key, as the GLBs are named on the mount
+//   kind=glove            viewer kind for non-weapons (glove, agent, charm…)
 //   pm=/materials/….json  paint material (an item's paintMaterial)
 //   legacy=1              legacy body — only takes effect WITH a legacy paint
 //   wear=0.1 seed=1       float and pattern
@@ -28,6 +29,9 @@
 //                         diffing: the difference bbox IS the feature
 //   size=1400             host width in CSS px (height 9/14 of it)
 //   settle=3000           ms to wait after mount before the first shot
+//   pre=/materials/….json mount the same model with THIS paint first and
+//                         dispose it — for state leaking from one item to the
+//                         next (shared caches, reused shader materials)
 //
 // Viewer debug switches read the same query string, so e.g. &stickerlog=1 logs
 // every sticker build (collect with shoot.mjs --log '\[sticker\]').
@@ -59,6 +63,29 @@ const bounds = images.length
   ? await fetch(`/api/catalog/sticker-bounds/${model}`).then((r) => r.json()).catch(() => ({}))
   : {};
 
+if (q.get("pre")) {
+  const host = document.createElement("div");
+  host.style.cssText = `width:${size}px;height:${Math.round((size * 9) / 14)}px;position:fixed;top:0;left:-9999px`;
+  document.body.appendChild(host);
+  try {
+    const handle = await mountViewer(host, model, {
+      ...(q.get("kind") ? { kind: q.get("kind") } : {}),
+      paintMaterial: q.get("pre"),
+      wear: 0.1,
+      seed: 7,
+      interactive: false,
+      still: true,
+    } as never);
+    await new Promise((r) => setTimeout(r, settle));
+    await handle.snapshot();
+    handle.dispose();
+  } catch (e) {
+    note(`pre-mount failed: ${String(e)}`);
+  } finally {
+    host.remove();
+  }
+}
+
 async function shoot(va: number, plain: boolean) {
   const host = document.createElement("div");
   // On screen for the LIVE path: an off-screen host can be treated as hidden
@@ -67,6 +94,7 @@ async function shoot(va: number, plain: boolean) {
   document.body.appendChild(host);
   try {
     const handle = await mountViewer(host, model, {
+      ...(q.get("kind") ? { kind: q.get("kind") } : {}),
       paintMaterial: q.get("pm"),
       legacyPaint: q.get("legacy") === "1",
       wear: num("wear", 0.05),

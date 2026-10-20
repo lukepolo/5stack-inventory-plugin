@@ -277,6 +277,22 @@ Check, for every texture involved:
   `charmMaterial.ts`). `PINNED_TO_PREVIEW` lists any we deliberately evaluate at
   pattern 1; it's empty now.
 
+### 4.5a The decompile and the game disagree
+
+The decompile is the best source we have, but its variable names can be wrong.
+`g_flTintSaturateSticker0`, read as decompiled, turned every foil sticker grey;
+the game's own icons for five metal stickers (two golds, two foils, one metal
+holo) all matched the opposite reading, so the shader uses `1 - value`. When
+in doubt, check the item's icon on the mount (`/images/<name>.webp`) — it is a
+render the game made.
+
+Placement conventions are the same kind of trap. The Gen2 glove pattern was
+scaled about its centre, which looked reasonable and was wrong by a quarter of
+the artwork; scaling from the origin, as the fabric layers and the weapon
+compositor already did, matched an in-game screenshot of the same pattern
+number exactly. Compare one specific pattern number against the game before
+trusting a transform.
+
 ### 4.6 A card is wrong or stale
 
 Cards are baked once and kept. The viewer reports a failed paint
@@ -324,6 +340,13 @@ Add an extraction step to `scripts/extract-models.sh`:
   as hidden; `mount.html` places live viewers on screen.
 - **Wait for the composite.** Painted items need seconds before the snapshot
   (`settle` in `mount.html`); an early shot shows an unpainted model.
+- **Sticker decals live in the scene, not under the weapon object.** Anything
+  that walks `object` to find them finds nothing; use the `liveMesh` slot map.
+  The live holo animation silently did nothing until this was found by logging
+  how many holo materials it saw.
+- **Scripted clicks are not user gestures.** Audio `play()` is refused in
+  headless Chrome unless it runs with `--autoplay-policy=no-user-gesture-required`
+  (`drive.mjs` passes it); without it every preview reads "Preview unavailable".
 - **`src/viewer3d.ts.tmp.12606.f232a5218f7d` is an upstream file**, committed by
   accident upstream. Leave it alone so merges stay clean.
 - **`BAKE_ENVIRONMENT`** in `src/viewerEnvironments.ts` must stay `"studio"` in

@@ -66,7 +66,7 @@ const json = (res, body) => {
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 };
-const PROXIED = ["/api/", "/images/", "/models/", "/paints/", "/renders/", "/composites/", "/anims/"];
+const PROXIED = ["/api/", "/images/", "/models/", "/paints/", "/renders/", "/composites/", "/anims/", "/music/"];
 
 createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");

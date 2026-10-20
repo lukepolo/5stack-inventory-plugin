@@ -36,6 +36,9 @@ const chrome = spawn(
     "--use-gl=angle",
     "--use-angle=swiftshader",
     "--enable-unsafe-swiftshader",
+    // A scripted click is not a user gesture, so without this every audio
+    // preview's play() is refused and the player reads "Preview unavailable".
+    "--autoplay-policy=no-user-gesture-required",
     `--window-size=${W},${H}`,
     "about:blank",
   ],

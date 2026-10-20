@@ -1,7 +1,7 @@
 # Changelog
 
 Changes in the LCrew fork of `lukepolo/5stack-inventory-plugin`, all made on 2026-10-20.
-The 3D model extraction is now at pipeline version 36; run it once to get every asset listed below.
+The 3D model extraction is now at pipeline version 37; run it once to get every asset listed below.
 
 ## Crafting & Editing
 
@@ -13,6 +13,8 @@ The 3D model extraction is now at pipeline version 36; run it once to get every 
 - **Knives and gloves grouped by model**: the knife and glove Craft tabs open on one card per model, such as Butterfly Knife or Bloodhound Gloves, with a finish count. Finish cards carry the grey model label and the price, like owned cards.
 - **Leaner Replace list**: Replace lists only the base weapons that can take the slot on that side and aren't already in the loadout.
 - **Reorder stickers**: drag sticker tiles onto each other, or use the ‹ › buttons, to change slot order, which decides which sticker is drawn on top. A moved sticker stays where it was on the weapon.
+- **Music kit preview in the editor**: Edit on a music kit plays the full song and, separately, its round-MVP anthem, each with play/pause and seek. One volume control sits above both and shares the level with every other player.
+- **One volume bar per music kit list**: the music kit sheet's Owned and Craft tabs have a single volume control in the toolbar instead of a slider on every card.
 - **Precise sticker dragging**: a sticker picked up in the 3D editor keeps the point where you grabbed it. Small nudges no longer jump the sticker's centre to the pointer.
 
 ### Removed
@@ -34,7 +36,7 @@ The 3D model extraction is now at pipeline version 36; run it once to get every 
 - **CS2 scene presets**: Ancient (night), Italy and Italy (alley) place the item in front of a blurred in-game screenshot of the map. The same image lights the item's reflections.
 - **Knife StatTrak counter**: the kill count is scratched into the blade as in game, at each knife's exact spot from the game's own attachment data. The digits use the game's own cut-out texture and stay sharp however close you zoom.
 - **C4 name tag**: the name label sits over the top of the C4's LCD, on top of any stickers, as in game.
-- **Live holo and lenticular stickers**: holo colours sweep and lenticular stickers change frame as you turn the weapon, and a slow light drift keeps them shimmering when it is still. A moving glint and sheen make foil look shiny; the drift stops with the viewer's Motion switch or the system's reduce-motion setting.
+- **Live holo and lenticular stickers**: in the 3D viewer, holo rainbows cycle and lenticular stickers flip frames strongly as you turn the weapon, and a slow light drift keeps them shimmering when it is still. The effect is deliberately stronger than the game's, with a moving glint and sheen on the foil; the drift stops with the Motion switch or the system's reduce-motion setting.
 - **Sticker masks**: stickers are hidden wherever the game hides them, such as under the C4's LCD module, wires and tape.
 - **Live Gen2 glove patterns**: on the 22 newer glove finishes, the 3D model repaints as you change the pattern. First-person arms wear the equipped glove's pattern too.
 - **Charm detail textures**: charms with a detail layer now show it, such as the pattern-coloured triangle in 8 Ball IGL's window.
@@ -45,6 +47,8 @@ The 3D model extraction is now at pipeline version 36; run it once to get every 
 
 - Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
 - Legacy-body finishes such as AK-47 | Redline dropped the fourth sticker on the handguard.
+- Foil, gold and other metal stickers came out flat grey or the wrong colour; hovering one brought the colour back. They now keep their artwork's colours, and gold stickers turn gold, matching the game's own icons.
+- Newer (Gen2) glove patterns sat in the wrong place: Specialist Gloves | Blackbook #30 showed a different part of the artwork than in game. The pattern is now placed as the game places it, checked against an in-game #30.
 - Knife name tags lay diagonally across the handle (Karambit) or stood on edge (Bayonet). They now lie flat along the handle.
 - Older glove finishes drew no print: Crimson Web had no web, and the DDPAT, kimono, snakeskin, leopard and Fade prints were missing.
 - Eight weapon finishes drew their pattern two to four times too large, including P90 | Death by Kitty, M4A4 | Jungle Tiger and Nova | Tempest.
@@ -73,6 +77,7 @@ The 3D model extraction is now at pipeline version 36; run it once to get every 
 
 - **v34, sticker masks**: each weapon body's sticker mask is extracted, which is what hides stickers under modelled parts.
 - **v35, charm detail textures**: each charm material's detail layer and its placement are recorded, and the texture is extracted.
+- **v37, MVP anthems**: each music kit's round-MVP anthem is extracted beside its menu theme, with its own manifest.
 - **v36, StatTrak art and knife data**: the knife digit texture is extracted with its cut-out channel intact. Every knife's attachment points and bone chain are written out as the source for knife counter and name tag placement.
 - **C4 model**: the extraction publishes the C4 model with its sticker slots and charm surfaces.
 
@@ -81,6 +86,7 @@ The 3D model extraction is now at pipeline version 36; run it once to get every 
 ### Features
 
 - **StatTrak count**: craft and edit accept a StatTrak kill count, capped at six digits. An edit that leaves it out keeps the count the game server maintains.
+- **MVP anthem**: music kits in the catalog and inventory carry an `mvpAudio` URL next to `audio`, once the mount has the anthems.
 - **Base model on listings**: knife and glove catalog listings carry their base model's id, name and image.
 - **Sticker masks endpoint**: the sticker bounds endpoint returns each weapon body's sticker mask.
 - **Bake lighting**: the catalog reports which lighting the server bakes cards under. Charm shading data includes detail textures.
