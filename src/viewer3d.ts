@@ -6503,7 +6503,12 @@ async function buildViewer(
   const HOLO_GLINT_DRIFT = [0.55, 0.3];
   /** Idle light wander in radians (around view Y, view X). Enough to swing a
    *  lenticular a frame either way and run a holo band a good way across. */
-  const HOLO_DRIFT = [0.4, 0.22];
+  const HOLO_DRIFT = [0.35, 0.2];
+  /** How much harder the live view swings the holo/lenticular term than the
+   *  game — see uHoloGain in stickerShader. 6 runs a rainbow holo through a
+   *  full cycle in about a third of a radian of orbit, roughly the three
+   *  cycles across a turn the game shows. */
+  const HOLO_GAIN = 6;
   const holoTmp = {
     eye: new THREE.Vector3(),
     light: new THREE.Vector3(),
@@ -6511,14 +6516,16 @@ async function buildViewer(
     axis: new THREE.Vector3(),
   };
   function stepStickerHolo(now: number) {
+    // The decals live in the SCENE, not under `object` (see buildDecal), so
+    // they are found through the slot map rather than a traversal.
     const lives: StickerHoloLive[] = [];
-    object.traverse((n) => {
-      const live = ((n as import("three").Mesh).material as import("three").Material | undefined)?.userData?.stkHolo as
+    for (const mesh of liveMesh.values()) {
+      const live = (mesh.material as import("three").Material | undefined)?.userData?.stkHolo as
         | StickerHoloLive
         | null
         | undefined;
       if (live) lives.push(live);
-    });
+    }
     if (!lives.length) return;
     camera.updateMatrixWorld();
     const view = camera.matrixWorldInverse;
@@ -6542,6 +6549,7 @@ async function buildViewer(
       live.uHoloGlint.value.copy(glint);
       live.uHoloBias.value = holoBias;
       live.uHoloShine.value = 1;
+      live.uHoloGain.value = HOLO_GAIN;
     }
   }
 

@@ -85,6 +85,7 @@ export interface StickerHoloLive {
   uHoloGlint: { value: ThreeNS.Vector3 };
   uHoloBias: { value: number };
   uHoloShine: { value: number };
+  uHoloGain: { value: number };
 }
 
 export interface StickerSfxOpts {
@@ -132,7 +133,7 @@ uniform sampler2D uScratchTex, uSfxMaskTex, uHoloTex, uGlitterTex, uNormRoughTex
 uniform bool uHasScratch, uHasSfxMask, uHasHolo, uHasGlitter, uHasNormRough;
 uniform bool uPaperBacking, uMetallic, uPreserveRough, uClampSpectrumV;
 uniform vec4 uStkArtUv;
-uniform float uHoloLive, uHoloBias, uHoloShine;
+uniform float uHoloLive, uHoloBias, uHoloShine, uHoloGain;
 uniform vec3 uHoloEye, uHoloLight, uHoloGlint;
 uniform bool uExpandAlpha, uPbrFit, uLegacyTint, uSelfIllum;
 uniform float uWear, uWearScratches, uSfxColorBoost, uGlitterScale, uColorBoost, uTintSaturate;
@@ -436,6 +437,7 @@ export async function applyStickerSfx(
         uHoloGlint: { value: new THREE.Vector3(0, 0, 1) },
         uHoloBias: { value: 0 },
         uHoloShine: { value: 0 },
+        uHoloGain: { value: 1 },
       }
     : null;
   mat.userData.stkHolo = live;
@@ -469,7 +471,17 @@ export async function applyStickerSfx(
       uSfxColorBoost: { value: s.sfxColorBoost },
       uGlitterScale: { value: s.glitterScale },
       uColorBoost: { value: s.colorBoost },
-      uTintSaturate: { value: s.tintSaturate },
+      // INVERTED against the decompile, on the game's own evidence. Read as
+      // written, g_flTintSaturateSticker0 is how far a METAL sticker's art is
+      // replaced by its tint, and nearly every sticker sets it to 1 — so every
+      // foil would be a flat grey and every gold with a white tint white. The
+      // game's own icons say the opposite, five for five: ESL One Cologne 2014
+      // (Gold) (white tint, 1) is gold, OpTic Gaming (Gold) (gold tint, 0.04)
+      // is solid gold not green, Astralis and qikert (Foil) (grey tint, 1) and
+      // MOUZ (Holo) (metal, 1) keep their red. All five match 1 - value. The
+      // grey foil was reported against the viewer, where hovering a foil
+      // sticker (its glow is the raw art) brought the colour back.
+      uTintSaturate: { value: 1 - s.tintSaturate },
       uWearBias: { value: new THREE.Vector2(s.wearBias[0], s.wearBias[1]) },
       uColorTint: { value: new THREE.Vector3(...s.colorTint) },
       uStkArtUv: { value: new THREE.Vector4(...artUv) },
@@ -480,6 +492,7 @@ export async function applyStickerSfx(
         uHoloGlint: { value: new THREE.Vector3(0, 0, 1) },
         uHoloBias: { value: 0 },
         uHoloShine: { value: 0 },
+        uHoloGain: { value: 1 },
       }),
     });
 
@@ -625,8 +638,26 @@ export async function applyStickerSfx(
              // STILL (baked cards): the parallel view and the calibrated
              // constant STK_HOLO_LIGHT, so a card never depends on a light.
              vec3 holoV = uHoloLive > 0.5 ? normalize(uHoloEye + vViewPosition) : stkV;
+             // LIVE is deliberately stronger than the game's term, which moves
+             // as the cosine of the viewing angle and so is flat near head-on:
+             // a lenticular changed a frame or two for a big turn of the
+             // weapon, and a holo cycled its rainbow under once across a
+             // curved part where the game shows it about three times. Live:
+             //   - the sticker's TILT against the view (the unperturbed
+             //     normal's sideways and vertical lean), which changes
+             //     linearly with angle, as a lens does;
+             //   - the curvature/angle term dot(V,N) and the light term;
+             // both scaled by uHoloGain, so turning the weapon sweeps the
+             // frames and a curved sticker cycles the rainbow across itself.
+             // The sticker's own normal-map detail is added unscaled (scaled
+             // it reads as noise). Head-on and at rest it lands where the card
+             // does, 1 + STK_HOLO_LIGHT.
              float shift = uHoloLive > 0.5
-               ? dot(holoV, normal) + dot(holoV, uHoloLight) + uHoloBias
+               ? (1.0 + STK_HOLO_LIGHT)
+                 + uHoloGain * (0.5 * (nonPerturbedNormal.x + 0.5 * nonPerturbedNormal.y)
+                                + (dot(holoV, nonPerturbedNormal) - 1.0)
+                                + dot(holoV, uHoloLight) + uHoloBias - STK_HOLO_LIGHT)
+                 + (dot(holoV, normal) - dot(holoV, nonPerturbedNormal))
                : dot(stkV, normal) + STK_HOLO_LIGHT;
              vec2 suv = vec2(sfxM.y + shift, sfxM.z);
              if (uClampSpectrumV) suv.y = clamp(suv.y, 0.0, 1.0);
@@ -655,7 +686,7 @@ export async function applyStickerSfx(
                // viewer only.
                vec3 hh = normalize(uHoloGlint + holoV);
                float nh = max(dot(normal, hh), 0.0);
-               float glint = pow(nh, 64.0) * 2.2 + pow(nh, 16.0) * 0.25;
+               float glint = pow(nh, 48.0) * 3.0 + pow(nh, 12.0) * 0.4;
                // A glint off a point light only fires at the angles that
                // mirror it, which a sticker held side-on to the viewer rarely
                // meets. Foil also throws a SHEEN: a soft band of light lying
@@ -663,7 +694,7 @@ export async function applyStickerSfx(
                // the same view-and-light term as the colour shift, so the band
                // and the rainbow move together, as one surface.
                float band = fract((stkUv.x + stkUv.y) * 0.7 - shift * 2.5) - 0.5;
-               float sheen = exp(-band * band * 90.0) * 0.55;
+               float sheen = exp(-band * band * 60.0) * 0.6;
                stkEmissive += refit * (glint + sheen) * uHoloShine * sfxM.x;
                roughnessFactor = mix(roughnessFactor, min(roughnessFactor, 0.22), sfxM.x * uHoloShine);
              }
