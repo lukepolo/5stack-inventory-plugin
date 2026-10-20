@@ -239,6 +239,15 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v36 (2026-10-20): STATTRAK ART (new step stattrak-art -> models/stattrak/ +
+# stattrak-art.json + knife-attachments.json). A knife's kill count is
+# scratched into the blade through an alpha test on the digit atlas's ALPHA,
+# and the module's glTF copy of that atlas comes out RGB-only, so the viewer
+# had to rebuild the cut from the normal map. This decodes the atlas pair
+# straight from the archive with alpha intact. It also dumps every knife's
+# attachments and bone chain (parent bone, origin, angles) — the StatTrak
+# anchors for knives were generated without the parent bone's offset, and this
+# is the ground truth to regenerate them from instead of fitting screenshots.
 # v35 (2026-10-20): charm-shading.json gains `detail` — csgo_weapon's
 # F_DETAIL_TEXTURE over the albedo (mode, blend, scale, rotation, authored
 # offset, masked by the tint mask or not), and the detail texture joins the
@@ -303,7 +312,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=35
+EXTRACT_VERSION=36
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -402,7 +411,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models pet-models model-textures composite-inputs charm-anchors sticker-markup sticker-masks charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
+STEPS=(decompile-models rename-models pet-models model-textures composite-inputs charm-anchors sticker-markup sticker-masks stattrak-art charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -2622,6 +2631,218 @@ with open(os.path.join(dest, "sticker-masks.json"), "w") as fh:
 print(f"--- Sticker masks written for {len(index)} models")
 if missing:
     print(f"!!  no decompiled mask for {len(missing)}: {', '.join(missing[:10])}")
+PYEOF
+
+fi
+
+# ---- 3d3. StatTrak art + knife attachments ------------------------------------
+if step_if "stattrak-art"; then
+# Two things the knife's kill count needs that the glTF export loses.
+#
+# 1. THE DIGIT ATLAS WITH ITS ALPHA. stattrak_module_display_knife is
+#    csgo_weapon with F_ALPHA_TEST (reference 0.667): the numerals are
+#    scratched into the blade by cutting the plate down to the colour atlas's
+#    alpha. VRF's glTF writes that atlas RGB-only — flat grey — so the viewer
+#    could only rebuild the cut from the normal map. Decompiling the vtex on its
+#    own keeps the alpha, at the archive's own resolution. The texture names
+#    come from the module GLB's vmat params, so a retouched atlas with a new
+#    content hash is still found.
+#
+# 2. EVERY KNIFE'S ATTACHMENTS AND BONE CHAIN. charm-anchors only keeps models
+#    with a keychain attachment, and knives have none, so their `stattrak` and
+#    `nametag` attachments were never dumped — the StatTrak anchors for knives
+#    were generated without the parent bone's offset and landed half an inch
+#    toward the handle. knife-attachments.json is the ground truth: per vmdl,
+#    each attachment's parent bone / relative origin / relative angles and each
+#    bone's parent / origin / angles, plus the raw text under
+#    attachments/knives/ for re-parsing without another run.
+#
+# Output: stattrak/knife_digits_{color,normal}.webp (lossless, -exact: the
+# alpha IS the data), stattrak-art.json, knife-attachments.json.
+echo ""
+echo "--- Extracting StatTrak art and knife attachments…"
+CLI="$CLI" VPK="$VPK" DEST="$DEST" WORK="$WORK" python3 - <<'PYEOF'
+import json, os, re, shutil, struct, subprocess, zlib
+
+cli, vpk, dest, work = (os.environ[k] for k in ("CLI", "VPK", "DEST", "WORK"))
+raw = os.path.join(work, "raw_stattrak")
+shutil.rmtree(raw, ignore_errors=True)
+os.makedirs(raw, exist_ok=True)
+
+def glb_json(path):
+    with open(path, "rb") as fh:
+        head = fh.read(20)
+        if len(head) < 20 or head[:4] != b"glTF":
+            return None
+        return json.loads(fh.read(struct.unpack_from("<I", head, 12)[0]))
+
+def png_alpha_range(path):
+    """(width, height, min alpha, max alpha) of an 8-bit PNG, or None.
+    Plain zlib — the node has no imaging library. Alpha-less colour types
+    report (w, h, 255, 255)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos, idat, w = 8, [], None
+    while pos + 8 <= len(data):
+        n, kind = struct.unpack_from(">I4s", data, pos)
+        body = data[pos + 8: pos + 8 + n]
+        if kind == b"IHDR":
+            w, h, depth, ctype, _, _, interlace = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat.append(body)
+        pos += 12 + n
+    if w is None:
+        return None
+    if depth != 8 or interlace:
+        return (w, h, None, None)
+    bpp = {6: 4, 4: 2}.get(ctype)
+    if not bpp:
+        return (w, h, 255, 255)
+    rows = zlib.decompress(b"".join(idat))
+    stride = w * bpp
+    prev = bytearray(stride)
+    lo, hi = 255, 0
+    for y in range(h):
+        f = rows[y * (stride + 1)]
+        line = bytearray(rows[y * (stride + 1) + 1: (y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + ((a + b) >> 1)) & 255
+            elif f == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        alpha = line[bpp - 1::bpp]
+        lo, hi = min(lo, min(alpha)), max(hi, max(alpha))
+        prev = line
+    return (w, h, lo, hi)
+
+have_cwebp = shutil.which("cwebp") is not None
+def publish(src, stem):
+    """Lossless, alpha byte-exact; PNG as-is without cwebp."""
+    os.makedirs(os.path.join(dest, "stattrak"), exist_ok=True)
+    if have_cwebp:
+        rel = f"stattrak/{stem}.webp"
+        tgt = os.path.join(dest, rel)
+        tmp = tgt + ".tmp.webp"
+        r = subprocess.run(["cwebp", "-exact", "-lossless", "-q", "100", src, "-o", tmp],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if r.returncode == 0 and os.path.isfile(tmp):
+            os.replace(tmp, tgt)
+            return rel
+    rel = f"stattrak/{stem}.png"
+    shutil.copyfile(src, os.path.join(dest, rel))
+    return rel
+
+# ---- 1. the knife digit atlas -------------------------------------------------
+art = {}
+module = os.path.join(dest, "knives", "stattrak_module_knife.glb")
+doc = glb_json(module) if os.path.isfile(module) else None
+params = {}
+for m in (doc or {}).get("materials") or []:
+    if (m.get("name") or "").startswith("stattrak_module_display"):
+        params = (((m.get("extras") or {}).get("vmat") or {}).get("TextureParams") or {})
+        break
+want = {k: params.get(p) for k, p in (("color", "g_tColor"), ("normal", "g_tNormal"))}
+want = {k: v for k, v in want.items() if isinstance(v, str) and v.endswith(".vtex")}
+if want:
+    subprocess.run([cli, "-i", vpk, "-o", raw, "-d", "-f", ",".join(v + "_c" for v in want.values())],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+for kind, vtex in sorted(want.items()):
+    stem = os.path.join(raw, vtex[: -len(".vtex")])
+    src = stem + ".png" if os.path.isfile(stem + ".png") else None
+    if not src:
+        print(f"!!  StatTrak art: {vtex} did not decompile to PNG")
+        continue
+    info = png_alpha_range(src)
+    if kind == "color":
+        # Only worth shipping if the alpha actually cuts something: an opaque
+        # atlas would turn the viewer's scratches back into a grey plate, and
+        # its fallback (the cut rebuilt from the normals) is the better answer.
+        if not info or info[2] is None or info[2] > 128 or info[3] < 128:
+            print(f"!!  StatTrak art: {vtex} has no usable alpha {info} — not shipped")
+            continue
+    art[kind] = publish(src, f"knife_digits_{kind}")
+    print(f"--- StatTrak art: {kind} {info[0] if info else '?'}x{info[1] if info else '?'}"
+          f" alpha {info[2] if info else '?'}..{info[3] if info else '?'} -> {art[kind]}")
+with open(os.path.join(dest, "stattrak-art.json"), "w") as fh:
+    json.dump({"knife": art} if art else {}, fh, indent=1, sort_keys=True)
+
+# ---- 2. knife attachments + bone chain ----------------------------------------
+att_raw = os.path.join(raw, "vmdl")
+subprocess.run([cli, "-i", vpk, "-o", att_raw, "-d", "-f", "weapons/models/knife/", "-e", "vmdl_c"],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+NAME = re.compile(r'\bname\s*=\s*"([^"]*)"')
+VEC = lambda key: re.compile(key + r'\s*=\s*\[([^\]]*)\]')
+PARENT, R_ORIGIN, R_ANGLES = re.compile(r'parent_bone\s*=\s*"([^"]*)"'), VEC("relative_origin"), VEC("relative_angles")
+B_ORIGIN, B_ANGLES = VEC(r'\borigin'), VEC(r'\bangles')
+def floats(m):
+    try:
+        return [float(v) for v in m.group(1).replace(",", " ").split()][:3] if m else None
+    except ValueError:
+        return None
+def parse(text):
+    atts = {}
+    for block in text.split('_class = "Attachment"')[1:]:
+        block = block[: block.find("_class") if "_class" in block else len(block)]
+        name = NAME.search(block)
+        if not name:
+            continue
+        parent = PARENT.search(block)
+        atts[name.group(1)] = {"parent_bone": parent.group(1) if parent else None,
+                               "origin": floats(R_ORIGIN.search(block)),
+                               "angles": floats(R_ANGLES.search(block))}
+    bones, stack, cur = {}, [], None
+    for line in text.split("\n"):
+        if '_class = "Bone"' in line:
+            cur = {"depth": len(line) - len(line.lstrip("\t")), "name": None, "origin": None}
+            continue
+        if cur is None:
+            continue
+        m = NAME.search(line)
+        if m and cur["name"] is None:
+            cur["name"] = m.group(1)
+            continue
+        m = B_ORIGIN.search(line)
+        if m and cur["origin"] is None:
+            cur["origin"] = floats(m)
+            continue
+        m = B_ANGLES.search(line)
+        if m:  # angles closes the bone record, as in charm-anchors
+            while stack and stack[-1]["depth"] >= cur["depth"]:
+                stack.pop()
+            bones[cur["name"]] = {"parent": stack[-1]["name"] if stack else None,
+                                  "origin": cur["origin"], "angles": floats(m)}
+            stack.append(cur)
+            cur = None
+    return atts, bones
+knives, dumped = {}, 0
+os.makedirs(os.path.join(dest, "attachments", "knives"), exist_ok=True)
+for root, _dirs, files in os.walk(att_raw):
+    for f in sorted(files):
+        if not f.endswith(".vmdl"):
+            continue
+        path = os.path.join(root, f)
+        text = open(path, encoding="utf-8", errors="replace").read()
+        atts, bones = parse(text)
+        if "stattrak" not in atts and "nametag" not in atts:
+            continue
+        stem = f[: -len(".vmdl")]
+        knives[stem] = {"vmdl": os.path.relpath(path, att_raw), "attachments": atts, "bones": bones}
+        shutil.copyfile(path, os.path.join(dest, "attachments", "knives", f))
+        dumped += 1
+with open(os.path.join(dest, "knife-attachments.json"), "w") as fh:
+    json.dump(knives, fh, indent=1, sort_keys=True)
+print(f"--- Knife attachments for {dumped} models"
+      + ("" if dumped else " — NONE: -d emitted no text .vmdl under weapons/models/knife/"))
 PYEOF
 
 fi
