@@ -2363,9 +2363,14 @@ function openEdit(inst: InventoryItem) {
     skin: {
       id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null, def: inst.item.def,
       hasNameTag: inst.item.hasNameTag, styleCount: inst.item.styleCount, upgradeLevels: inst.item.upgradeLevels, defaultUpgradeLevel: inst.item.defaultUpgradeLevel,
-      // The per-item facts the craftHas* gates ask first (craftItemSays), and
-      // the pattern range the glove control is bounded by.
+      // The per-item facts the craftHas* gates ask first (craftItemSays), the
+      // pattern range the glove control is bounded by, and the float range the
+      // Wear slider is. craftWearRange reads THIS projection, never the
+      // instance behind it, so leaving the range out gave every owned item a
+      // 0..1 slider on Edit — a Doppler, which exists only to 0.08, dragged to
+      // 0.9 and then failed to save.
       hasWear: inst.item.hasWear, hasSeed: inst.item.hasSeed, hasStatTrak: inst.item.hasStatTrak, seedMin: inst.item.seedMin, seedMax: inst.item.seedMax,
+      wearMin: inst.item.wearMin, wearMax: inst.item.wearMax,
     },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,

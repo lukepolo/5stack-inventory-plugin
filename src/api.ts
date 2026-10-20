@@ -186,6 +186,9 @@ export interface CatalogItem {
   hasWear?: boolean;
   hasSeed?: boolean;
   hasStatTrak?: boolean;
+  /** The finish's real float range — see `Skin.wearMin`. */
+  wearMin?: number | null;
+  wearMax?: number | null;
   seedMin?: number | null;
   seedMax?: number | null;
   /** PETS only: how many alternate looks the breed has (0 for the egg and the
