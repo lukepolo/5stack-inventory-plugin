@@ -311,7 +311,11 @@ texture was already decoded.
 
 ### 4.6 A card is wrong or stale
 
-Cards are baked once and kept. The viewer reports a failed paint
+Cards are baked once and kept, under a filename made of the instance id, wear,
+pattern, StatTrak flag, pet coat/stage, `card_look` (a fingerprint of the
+stickers and charm, computed by the backend's `cardLook` and sent with every
+inventory row) and the extraction version. Anything the card draws that is not
+in that name will NOT re-bake when it changes. The viewer reports a failed paint
 (`paintFailed`), and the bake returns null and is retried. A frame with under 2%
 lit pixels (`BLANK_BAKE_LIT`) is refused. Anything already stored needs **Clear
 renders**. Card and composite keys include `EXTRACT_VERSION` and

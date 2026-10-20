@@ -288,6 +288,8 @@ export function renderKeyForRow(
     /** Pets only — see the suffix note below. */
     style?: number | string | null;
     upgrade_level?: number | string | null;
+    /** cardLook() of the RESOLVED row — what the card draws on top of the skin. */
+    look?: string | null;
   },
   version: number,
 ) {
@@ -319,7 +321,13 @@ export function renderKeyForRow(
   // item's filename (and so every card already on the mount) exactly as it was.
   const pet =
     (row.style != null ? `-c${Number(row.style)}` : "") + (row.upgrade_level != null ? `-g${Number(row.upgrade_level)}` : "");
-  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}${pet}-v${version}.png`;
+  // Stickers and the charm are drawn on the card too, so an edit that moves,
+  // swaps or scratches one has to land on a new file — keyed only on the four
+  // scalars above, the card stayed the old picture until "Clear renders".
+  // Present only when there is something attached, so a bare item keeps the
+  // filename it always had.
+  const look = row.look ? `-l${row.look}` : "";
+  return `inst-${row.id}-${Number(row.wear ?? 0).toFixed(4)}-${Number(row.seed ?? 0)}${st}${pet}${look}-v${version}.png`;
 }
 
 /** The version cards are keyed on right now: what the mount says it is, or 0
@@ -370,15 +378,20 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
     // stattrak is part of the render key (the card draws the module), so it has
     // to be selected here — without it the stored name loses the -st marker
     // that the client's read URL carries, and every ST card 404s.
-    `SELECT id, wear, seed, stattrak, style, upgrade_level FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    `SELECT id, wear, seed, stattrak, style, upgrade_level, stickers, charm_id, charm_offset
+       FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
     [Number(request.params.id), identity.steamId],
   );
   if (!rows[0]) {
     return reply.status(403).send({ error: "not your item" });
   }
   try {
+    const [resolved] = await withAttachments(identity.steamId, [rows[0]]);
     await fs.mkdir(RENDERS_DIR, { recursive: true });
-    await fs.writeFile(path.join(RENDERS_DIR, renderKeyForRow(rows[0], await renderVersion())), body);
+    await fs.writeFile(
+      path.join(RENDERS_DIR, renderKeyForRow({ ...rows[0], look: cardLook(resolved) }, await renderVersion())),
+      body,
+    );
     return { ok: true };
   } catch {
     return reply.status(500).send({ error: "render store unavailable" });
@@ -708,9 +721,16 @@ interface ShareArt {
  */
 async function bakedShareRender(facts: ShareFacts, version: number): Promise<string | null> {
   if (facts.instanceId == null) return null;
+  // The card's look (stickers, charm) is in its filename too, and the facts do
+  // not carry it — read it off the row with its links resolved, as the upload
+  // path does, so the two derive the same name.
+  const { rows } = await pool.query<{
+    steam_id: string; stickers: unknown[] | null; charm_id: number | null; charm_offset: ItemRow["charm_offset"];
+  }>(`SELECT steam_id, stickers, charm_id, charm_offset FROM inventory.owned_items WHERE id = $1`, [facts.instanceId]);
+  const look = rows[0] ? cardLook((await withAttachments(String(rows[0].steam_id), [rows[0]]))[0]) : "";
   const file = path.join(
     RENDERS_DIR,
-    renderKeyForRow({ id: facts.instanceId, wear: facts.wear, seed: facts.seed, stattrak: facts.stattrak }, version),
+    renderKeyForRow({ id: facts.instanceId, wear: facts.wear, seed: facts.seed, stattrak: facts.stattrak, look }, version),
   );
   return (await fs.stat(file).then((s) => s.isFile(), () => false)) ? file : null;
 }
@@ -2181,6 +2201,30 @@ async function withAttachments<T extends AttachBody>(steamId: string, rows: T[])
   const insts = await instFactsFor(steamId, rows);
   return rows.map((r) => resolveAttachments(r, insts));
 }
+/**
+ * A short fingerprint of what a card draws beyond the skin itself — each
+ * sticker's id, offset, rotation and scratch, and the charm's id, placement and
+ * pattern — for renderKeyForRow. "" when nothing is attached.
+ *
+ * Taken from the RESOLVED row, so a linked sticker's own wear is in it: scratch
+ * that sticker and the weapon's card changes, exactly as its picture does.
+ * Numbers are rounded to 4 places so float noise in the JSON cannot split one
+ * look into two keys. Sent to the client as `card_look` so the read URL and
+ * this write agree by construction.
+ */
+export function cardLook(row: {
+  stickers?: unknown[] | null;
+  charm_id?: number | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+}): string {
+  const n = (v: unknown) => (v == null || v === "" || !Number.isFinite(Number(v)) ? "" : String(Math.round(Number(v) * 1e4) / 1e4));
+  const stickers = normSpecs(row.stickers).map((sp) => (sp ? `${sp.id}:${n(sp.x)}:${n(sp.y)}:${n(sp.r)}:${n(sp.w)}` : "-"));
+  while (stickers.length && stickers[stickers.length - 1] === "-") stickers.pop();
+  const co = row.charm_offset;
+  const charm = row.charm_id ? `${row.charm_id}:${n(co?.x)}:${n(co?.y)}:${n(co?.z)}:${n(co?.seed)}` : "";
+  if (!stickers.length && !charm) return "";
+  return createHash("sha1").update(`${stickers.join(",")}|${charm}`).digest("hex").slice(0, 10);
+}
 function enrichAttachments<T extends { stickers?: unknown[] | null; charm_id?: number | null; charm_offset?: ItemRow["charm_offset"]; patches?: unknown[] | null }>(row: T) {
   const enrich = (spec: AttachSpec) =>
     spec
@@ -2292,6 +2336,7 @@ app.get("/api/inventory", async (request, reply) => {
   // its own after a sync, a craft, or the switch being turned on.
   return resolved.map((row) => ({
     ...enrichAttachments(row),
+    card_look: cardLook(row),
     slot: slotForItem(row.item_id),
     item: getItem(row.item_id),
     equipped: byInstance.get(row.id) ?? [],
@@ -2531,7 +2576,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   );
   return {
     ...enrichInstance(rows[0], []),
-    ...enrichAttachments((await withAttachments(identity.steamId, [rows[0]]))[0]),
+    ...((r) => ({ ...enrichAttachments(r), card_look: cardLook(r) }))((await withAttachments(identity.steamId, [rows[0]]))[0]),
   };
 });
 
@@ -2630,7 +2675,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
     }
     return {
       ...enrichInstance(rows[0], []),
-      ...enrichAttachments((await withAttachments(identity.steamId, [rows[0]]))[0]),
+      ...((r) => ({ ...enrichAttachments(r), card_look: cardLook(r) }))((await withAttachments(identity.steamId, [rows[0]]))[0]),
     };
   },
 );

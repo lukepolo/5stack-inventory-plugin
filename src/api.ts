@@ -266,6 +266,8 @@ export interface InventoryItem {
   wear: number | null;
   seed: number | null;
   stattrak: boolean;
+  /** See RenderKeyed.card_look — the stickers/charm part of the card's key. */
+  card_look?: string | null;
   /** Kills recorded on the module. 0 when the item isn't StatTrak. Drives the
    *  3D digit display only — 2D cards render a blank display on purpose. */
   stattrak_count: number;
@@ -457,10 +459,15 @@ type RenderKeyed = {
    *  renderKeyForRow. */
   style?: number | null;
   upgrade_level?: number | null;
+  /** The server's fingerprint of the stickers and charm a card draws (cardLook
+   *  in the backend), so an edit to them lands on a new card. Empty or absent
+   *  when nothing is attached, and on a backend older than the field. */
+  card_look?: string | null;
 };
 export const renderKeyFor = (i: RenderKeyed) =>
   `inst-${i.id}-${Number(i.wear ?? 0).toFixed(4)}-${Number(i.seed ?? 0)}${i.stattrak ? "-st" : ""}` +
-  `${i.style != null ? `-c${i.style}` : ""}${i.upgrade_level != null ? `-g${i.upgrade_level}` : ""}-v${renderVersion}.png`;
+  `${i.style != null ? `-c${i.style}` : ""}${i.upgrade_level != null ? `-g${i.upgrade_level}` : ""}` +
+  `${i.card_look ? `-l${i.card_look}` : ""}-v${renderVersion}.png`;
 // Served via /api (canonical): that ingress path provably reaches the backend
 // pod that stores the files — immune to stale nginx images, CDN-cached 404s,
 // and hostPath node mismatches. Plain <img> tags send session cookies, so the

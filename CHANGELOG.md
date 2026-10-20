@@ -64,6 +64,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 
 ### Bug Fixes
 
+- Editing an item's stickers or charm now re-renders its card. Card files were named only by wear, pattern and StatTrak, so moving, swapping or scratching a sticker kept the old picture until the cache was cleared.
 - A card whose paint failed to load, or which came out black, is retried instead of stored. This caused a Butterfly Knife | Doppler card to show a plain knife and the Driver Gloves card to be black.
 
 ## Performance
