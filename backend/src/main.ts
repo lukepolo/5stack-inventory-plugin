@@ -258,6 +258,12 @@ app.get("/api/catalog", async () => {
     // same reason assetVersion does: this is the one call that always lands
     // before anything asks for a card.
     renderVersion: await renderVersion(),
+    // Which lighting rig this server's cards are baked under. Unset is the
+    // client's own canonical rig (Studio). It belongs to the SERVER because the
+    // cards live in its RENDERS_DIR: a backend with a store of its own (the dev
+    // copy's) can bake under another rig without a single card in a shared store
+    // ending up lit two different ways.
+    bakeEnvironment: process.env.BAKE_ENVIRONMENT || undefined,
   };
 });
 

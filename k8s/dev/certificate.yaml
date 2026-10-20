@@ -1,0 +1,16 @@
+# Only applied when the live plugin terminates TLS in the cluster (its ingress
+# carries a tls block). Issued by whatever issues the live plugin's certificate.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: inventory-dev-ssl
+  namespace: 5stack
+spec:
+  secretName: inventory-dev-ssl
+  duration: 2160h
+  renewBefore: 240h
+  dnsNames:
+    - __DOMAIN__
+  issuerRef:
+    name: __ISSUER__
+    kind: __ISSUER_KIND__

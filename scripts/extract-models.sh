@@ -700,6 +700,11 @@ declare -A MAP=(
   [weapon_pist_deagle]=deagle
   [weapon_pist_revolver]=revolver
   [weapon_pist_taser]=taser
+  # The C4 is decompiled with every other weapons/models/ dir already; this
+  # entry is what names it c4.glb and feeds MODEL_KEY, so its sticker markup and
+  # charm surfaces are read too. items_game gives the C4 both
+  # weapon_supports_stickers and weapon_supports_keychains.
+  [weapon_c4]=c4
   [weapon_smg_mp9]=mp9
   [weapon_smg_mac10]=mac10
   [weapon_smg_mp7]=mp7

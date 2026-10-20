@@ -137,6 +137,10 @@ export interface Catalog {
    *  the same host that served this API. Non-empty when the operator has opted
    *  into the shared 5stack CDN. */
   assetOrigin?: string;
+  /** The lighting rig this server's cards are baked under (a ViewerEnvironment
+   *  key). Absent = the client's canonical rig. A server only sets it when its
+   *  card store is its own — see the backend's /api/catalog. */
+  bakeEnvironment?: string;
 }
 
 export interface CatalogItem {
@@ -354,7 +358,14 @@ function applyCatalogRuntime(c: Partial<Catalog>) {
   // Empty string is meaningful — "serve from this host" — so only a non-empty
   // value overrides the default.
   if (c.assetOrigin) assetOrigin = c.assetOrigin;
+  if (typeof c.bakeEnvironment === "string" && c.bakeEnvironment) bakeEnvironment = c.bakeEnvironment;
 }
+/**
+ * The rig the SERVER bakes its cards under, when it names one — see
+ * `Catalog.bakeEnvironment`. Null means the client's own canonical rig.
+ */
+let bakeEnvironment: string | null = null;
+export const getBakeEnvironment = () => bakeEnvironment;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}/api${path}`, {

@@ -88,6 +88,7 @@ environment variables, so a normal build is the upstream build:
 | `vite.config.ts` | `base` from `PLUGIN_BASE`, Federation `name` from `PLUGIN_SCOPE` |
 | `src/composables/useBuildCheck.ts` | reads `build-info.json` from an absolute `base` when there is one |
 | `.github/workflows/dev-plugin.yml` | the Pages build and the dev manifest |
+| `.github/workflows/dev-backend.yml`, `k8s/dev/`, `scripts/dev-backend.sh` | the dev backend (below) |
 | `docs/DEV-PLUGIN.md` | this file |
 
 ## Building the dev copy locally
@@ -101,10 +102,71 @@ VITE_INVENTORY_API=https://inventory.fulm.eu \
 npm run build
 ```
 
+## Dev backend (optional)
+
+Backend changes (an editable StatTrak count, the C4's 3D model, cards lit by
+the CS2 rig) need this fork's backend running somewhere. The dev backend runs
+it **beside** the installed one, in the same cluster, without replacing
+anything:
+
+| | Installed plugin | Dev backend |
+| --- | --- | --- |
+| Deployment | `inventory-backend` | `inventory-dev-backend` |
+| Image | upstream `:latest` | `ghcr.io/lcrew/5stack-inventory-plugin-backend:dev`, built by **dev-backend** |
+| Host | `inventory.<panel domain>` | `inventory-dev.<panel domain>` (`/` still served by the installed frontend) |
+| Database | | **shared** — same inventories, same loadouts |
+| Models mount, CS2 install | | **shared** — same node |
+| Card store | `/cs2-models/renders` | `/cs2-models/renders-dev`, baked under the CS2 rig |
+| Model extraction | automatic | by hand only (⚙ settings → 3D Models) |
+
+Sharing the database is what makes it useful: what you equip through the dev
+copy is what the installed backend's feed sends your game servers, so `!ws` in
+game shows it with no server reconfigured. It is safe while the fork's backend
+changes add nothing to the database schema; one that does needs its own
+database instead.
+
+### Install
+
+1. **Image:** the **dev-backend** workflow builds it on every push that touches
+   the backend (or run it from the Actions tab). The first time, make the
+   package public so the cluster can pull it: GitHub profile → **Packages** →
+   **5stack-inventory-plugin-backend** → **Package settings** → **Change
+   visibility** → **Public**.
+2. **Run it**, on the machine the panel runs on (where `kubectl` works):
+
+   ```bash
+   git clone https://github.com/LCrew/5stack-inventory-plugin.git
+   cd 5stack-inventory-plugin
+   ./scripts/dev-backend.sh
+   ```
+
+   It reads everything from the installed plugin (database connection, panel
+   domains, ingress class, TLS) and asks nothing. `DOMAIN=...` overrides the
+   host.
+3. **DNS:** point `inventory-dev.<panel domain>` wherever
+   `inventory.<panel domain>` points (behind a Cloudflare Tunnel, add it as a
+   public hostname for the same service).
+4. **Point the dev copy at it:** repository variable `INVENTORY_API` =
+   `https://inventory-dev.<panel domain>`, then re-run **dev-plugin**. Setting
+   it back to the installed host returns the dev copy to the installed backend.
+
+Updating after a push: `./scripts/dev-backend.sh update` (once the
+**dev-backend** run is green). Removing: `./scripts/dev-backend.sh remove`.
+
+### The C4's 3D model
+
+The extractor now names the C4's model, but the installed backend extracted the
+mount without it. Open the dev copy's **⚙ settings → 3D Models** and press
+**Run extraction** once: it re-runs the whole pipeline from your CS2 install —
+the same job the installed backend runs after a CS2 update, and as long — and
+adds `c4.glb` with its sticker and charm positions. The files land on the shared
+mount, where the installed plugin simply ignores the C4.
+
 ## Taking a change to the installed plugin
 
-The dev copy only ever replaces the frontend. To put your changes on the
-installed plugin, or to change the backend, you need the full install from this
-fork: images built to your own registry and `k8s/base/deployment.yaml` pointed
-at them, then `./plugin.sh https://github.com/LCrew/5stack-inventory-plugin`.
-See [DEVELOPMENT.md](DEVELOPMENT.md#installing-by-hand).
+The dev copy never replaces anything the installed plugin runs. To put your
+changes on the installed plugin itself, either get them merged upstream, or
+install from this fork: images built to your own registry and
+`k8s/base/deployment.yaml` pointed at them, then
+`./plugin.sh https://github.com/LCrew/5stack-inventory-plugin`. See
+[DEVELOPMENT.md](DEVELOPMENT.md#installing-by-hand).

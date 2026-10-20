@@ -428,7 +428,7 @@ export const CHOICES: DevChoice[] = [
   {
     name: "env",
     label: "Lighting",
-    hint: "Which rig the viewer lights an item under. Item CARDS are always baked under Studio, whatever this says — a card is cached against its render key, so a preset baked into one could never be told apart from a bug.",
+    hint: "Which rig the viewer lights an item under. Item CARDS are baked under the server's rig (Studio unless it names another), whatever this says — a card is cached against its render key, so a preset baked into one could never be told apart from a bug.",
     dflt: DEFAULT_ENVIRONMENT,
     options: VIEWER_ENVIRONMENTS.map((e) => ({ value: e.key, label: e.label, hint: e.hint })),
     // Live: a preset is five intensities and an env rotation, and the viewer

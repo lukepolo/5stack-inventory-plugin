@@ -34,13 +34,14 @@ export const isShared = (s: string) => ["zeus", "c4", "musickit", "graffiti", "c
 //
 // Gloves and agents came off this list when their trees joined the extraction
 // (v19). zeus came off too — its GLB has shipped all along, it was only ever
-// here because this list started life as the "special slot" one. c4 stays:
-// nothing extracts it, since it has no MAP entry.
+// here because this list started life as the "special slot" one. c4 came off
+// once the extractor's MAP named weapon_c4; on a mount extracted before that,
+// the HEAD probe below finds no c4.glb and the slot stays flat on its own.
 //
 // A slot-level answer is necessarily coarse — it is asked before an occupant is
 // known. The per-ITEM answer (a painted glove has no compositor yet) lives in
 // resolveViewerModel, and the focus/ctx paths below still HEAD-probe on top.
-export const isNo3d = (s: string) => ["c4", "musickit", "graffiti", "collectible"].includes(s);
+export const isNo3d = (s: string) => ["musickit", "graffiti", "collectible"].includes(s);
 // Origin filter — the same control on the Inventory grid and on the loadout
 // sheet's Owned section, so "hide my Steam imports" works the same in both.
 export type OriginFilter = "all" | "steam" | "crafted";

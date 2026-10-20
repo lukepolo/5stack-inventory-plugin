@@ -14,7 +14,7 @@
 //
 // Skin rendering is a faithful port of CS2's compositing pipeline — see
 // paintComposite.ts for the shader and its provenance.
-import { API_ORIGIN, getAssetOrigin, withAssetVersion } from "./api";
+import { API_ORIGIN, getAssetOrigin, getBakeEnvironment, withAssetVersion } from "./api";
 import { buildArms, buildTwistSolver, weaponSeat, type ArmsRig, type Hand, type TwistSolver } from "./viewerArms";
 import { buildPropClip, buildViewmodelClip, loadViewmodelClip, viewmodelAssetUrl, type ClipAction, type ClipCue } from "./viewmodelClip";
 import { buildMuzzleFlash, type MuzzleFlash } from "./muzzleFlash";
@@ -3383,7 +3383,9 @@ async function buildViewer(
   // five intensities and a rotation, all of them assignable on the lights that
   // are already in the scene, so there was never anything a remount provided
   // except the re-read itself.
-  const rig = viewerEnvironment(opts?.still ? BAKE_ENVIRONMENT : debugChoice("env"));
+  // A bake follows the SERVER's rig when it names one: the cards land in its
+  // store, so it alone decides how they are lit (Catalog.bakeEnvironment).
+  const rig = viewerEnvironment(opts?.still ? (getBakeEnvironment() ?? BAKE_ENVIRONMENT) : debugChoice("env"));
   const L = { ...rig.lighting, ...(opts?.lighting ?? {}) };
   // Which preset those numbers came from, so a live re-light can skip the frames
   // where nothing changed — the poll runs every frame and the answer is the same
