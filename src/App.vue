@@ -1185,16 +1185,19 @@ const sheetResetKey = () =>
 // Both windows count CARDS, not items — a stack is one thing to scroll past.
 const ownedWindow = useRenderWindow(ownedStacks, sheetResetKey);
 const craftWindow = useRenderWindow(craftStacks, sheetResetKey);
-// Sheet: replace mode — every weapon eligible for this position (defaults are
-// free) plus owned skins of those weapons.
+// Sheet: replace mode — the base weapons that can take this position: eligible
+// for it, on this side, and not already somewhere else in the loadout — or in
+// it. That is the whole of the choice. Owned skins of those weapons used to
+// follow them here, which made Replace a second, unfiltered Owned tab; the
+// weapon you swap in is a base weapon, and its skins are on Owned once it is.
+// The one in the slot is left out for the same reason: "Default" on Owned is
+// how you take its skin off, and swapping a weapon for itself is no swap.
 const replaceOptions = computed(() => {
-  if (!isWeaponPos(selected.value)) return { defaults: [] as CatalogWeapon[], owned: [] as InventoryItem[] };
+  if (!isWeaponPos(selected.value)) return { defaults: [] as CatalogWeapon[] };
   const cats = catsForPos(selected.value);
   const used = new Set<string>();
   for (const g of POSITION_GROUPS) {
-    for (const p of g.positions) {
-      if (p !== selected.value) used.add(occupantModel(p));
-    }
+    for (const p of g.positions) used.add(occupantModel(p));
   }
   let eligible = weapons.value.filter(
     (w) => cats.includes(w.category) && w.teams.includes(team.value) && !used.has(w.model),
@@ -1204,11 +1207,7 @@ const replaceOptions = computed(() => {
   } else if (/^p/.test(selected.value)) {
     eligible = eligible.filter((w) => !START_PISTOLS.includes(w.model));
   }
-  const models = new Set(eligible.map((w) => w.model));
-  const owned = inventory.value.filter(
-    (i) => i.item?.model && models.has(i.item.model) && matchesFilters(itemName(i.item), i.item.rarity),
-  );
-  return { defaults: eligible.filter((w) => matchesFilters(w.name)), owned };
+  return { defaults: eligible.filter((w) => matchesFilters(w.name)) };
 });
 
 // ---- mutations --------------------------------------------------------------
@@ -5009,7 +5008,7 @@ const sheetResultCount = computed(() =>
     ? ownedStacks.value.length
     : sheetMode.value === "craft"
       ? craftStacks.value.length
-      : replaceOptions.value.defaults.length + replaceOptions.value.owned.length,
+      : replaceOptions.value.defaults.length,
 );
 function resetSheetFilters() {
   sheetSearch.value = "";
@@ -9421,30 +9420,8 @@ if (MDEBUG) {
                 <div class="mt-0.5 text-f8 uppercase tracking-wider text-muted-foreground/60">Default</div>
               </div>
             </button>
-            <button
-              v-for="(i, idx) in replaceOptions.owned"
-              :key="'own' + i.id"
-              data-role="skin"
-              class="animate-sheet-in relative overflow-hidden rounded-lg border border-border bg-card text-left transition-colors hover:border-[color:var(--acc)]"
-              :class="SHEET_ENTRY"
-              :style="[
-                { '--i': replaceOptions.defaults.length + idx },
-                i.item?.rarity ? (sheetRows ? { borderLeft: `3px solid ${i.item.rarity}` } : { borderBottom: `3px solid ${i.item.rarity}` }) : {},
-              ]"
-              @click="equipInstanceAt(i, selected)"
-              @contextmenu.prevent="openItemCtx(i, $event)"
-            >
-              <span class="pointer-events-none absolute inset-0" :style="glowStyle(i.item?.rarity, 0.22)"></span>
-              <div :class="[SHEET_ART, 'relative z-[2]']">
-                <img :src="i.item?.image ?? undefined" alt="" loading="lazy" decoding="async" class="max-h-full max-w-full object-contain" />
-              </div>
-              <div :class="[SHEET_LABEL, 'relative z-[2] flex items-center gap-1.5']">
-                <span class="truncate text-f13 font-medium">{{ itemName(i.item) }}</span>
-                <span v-if="i.stattrak" class="flex-none font-mono text-f8 text-[hsl(var(--tac-stattrak))]">ST™</span>
-              </div>
-            </button>
             <div
-              v-if="!replaceOptions.defaults.length && !replaceOptions.owned.length"
+              v-if="!replaceOptions.defaults.length"
               class="col-span-full py-8 text-center text-sm text-muted-foreground"
             >
               Every eligible weapon is already in this loadout.
