@@ -152,6 +152,13 @@ export interface PaintDef {
    *  finish's artwork and must beat the weapon's generic extracted mask —
    *  see the pick in compositePaint. 269 of 1479 materials ship one. */
   masksSkinSpecific: boolean;
+  /**
+   * The finish's "Use Custom Material Mask" switch (g_bOverrideDefaultMasks).
+   * It is THE rule the game uses: the vcompmat's own COPY_PROPERTY copies
+   * g_tPaintByNumberMasks over g_tMasks exactly when this is 1, and otherwise
+   * the weapon's own mask stands. See the pick in compositePaint.
+   */
+  overrideDefaultMasks: boolean;
   ao?: string;
   baseColor?: string;
   baseRM?: string;
@@ -654,6 +661,7 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       // g_tMasks first meant those skins coloured against a stand-in mask.
     masks: loose.get("g_tPaintByNumberMasks") ?? t("g_tMasks"),
       masksSkinSpecific: loose.has("g_tPaintByNumberMasks"),
+      overrideDefaultMasks: int("g_bOverrideDefaultMasks", 0) !== 0,
       // Overlay layer: a second artwork pass composited over the paint. ~10% of
       // finishes use it and ~4% have NO pattern at all, so without this they
       // render as flat white. Declarations below are all from the shader's own
@@ -2143,7 +2151,20 @@ export async function compositePaint(
     //   - case hardening alone: Deagle | Heat Treated (style 7) drifted
     //     12.5 -> 13.6 for no established reason.
     // Style 8 + case hardening is exactly the set this is evidenced for.
-    (def.masksSkinSpecific && def.caseHardening && def.style === 8 ? await urlOf(def.masks) : null) ??
+    //
+    // ...and it was a proxy for the game's own rule, which the vcompmat states
+    // outright: a COPY_PROPERTY of g_tPaintByNumberMasks onto g_tMasks, gated on
+    // g_bOverrideDefaultMasks == 1 ("Use Custom Material Mask"). AXIA sets it;
+    // so do LongDog, Autumn Thicket and Heat Treated. Without it AWP | LongDog
+    // took the AWP's generic metal mask, whose high R sent its whole receiver and
+    // stock down Valve's paint-by-number branch — metalness ~0.9, the white paint
+    // remapped to near-black — where the game (and its own icon) shows white,
+    // non-metal paint. The two drifts measured above were against the rig's
+    // statistical floors, not the game. The case-hardening clause stays for any
+    // material that predates the switch.
+    (def.masksSkinSpecific && (def.overrideDefaultMasks || (def.caseHardening && def.style === 8))
+      ? await urlOf(def.masks)
+      : null) ??
       opts.weapon?.masks ??
       (await urlOf(def.masks)),
     opts.weapon?.ao ?? urlOf(def.ao),

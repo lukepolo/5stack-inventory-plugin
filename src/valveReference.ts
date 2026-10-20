@@ -171,7 +171,11 @@ void main() {
 `;
 /** Folded into the composite store's generation so a change here (or a
  *  regenerated combo set) re-bakes every stored composite. Bump on either. */
-export const VALVE_RUNTIME_REV = `vcs72-r4 ${RUNTIME_EPILOGUE}`;
+// "+masks": the fork's g_bOverrideDefaultMasks binding (paintComposite) changes
+// what stored composites contain without touching either shader source, so it
+// has to move the generation itself — and under a name an upstream bump can
+// never collide with.
+export const VALVE_RUNTIME_REV = `vcs72-r4+masks ${RUNTIME_EPILOGUE}`;
 
 // The vertex stage, written by hand: Valve's VS is four affine transforms of
 // the mesh UV (decompiled, csgo_customweapon_vulkan_50_vs.vcs — every combo is
