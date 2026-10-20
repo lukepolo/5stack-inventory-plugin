@@ -1,0 +1,98 @@
+# A side-by-side DEV copy of the plugin, published to GitHub Pages, so UI work
+# can be tried inside the real panel without touching the installed plugin.
+# See docs/DEV-PLUGIN.md for registering it.
+#
+# Frontend only. The bundle comes from Pages, but every /api call and every
+# asset (/images, /models, /paints, ...) goes to the LIVE backend named by the
+# INVENTORY_API repository variable — the plugin runs in the panel's origin
+# either way, so the backend's origin guard treats it exactly like the
+# installed copy. That also means it reads and writes real inventories.
+#
+# What keeps the two copies apart is the manifest rewrite below: its own slug
+# (/apps/inventory-dev) and its own Federation scope, which has to match
+# PLUGIN_SCOPE because scopes are one flat namespace across the panel.
+name: dev-plugin
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+env:
+  PLUGIN_SCOPE: inventory_dev
+  PLUGIN_SLUG: inventory-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      # PLUGIN_BASE is absolute so every URL Vite emits (chunk preloads, the
+      # bundled HDR) points at Pages rather than resolving against the panel.
+      - name: Build
+        run: npm run build
+        env:
+          PLUGIN_BASE: ${{ steps.pages.outputs.base_url }}/
+          VITE_INVENTORY_API: ${{ vars.INVENTORY_API || 'https://inventory.fulm.eu' }}
+
+      # Detect reads this file server-side and fills the registration form from
+      # it. No `install`/`deployments`: this copy is never installed with
+      # ./plugin.sh, and remoteEntry is absolute because the build sits on a
+      # subpath of github.io.
+      - name: Write the dev manifest
+        run: |
+          jq \
+            --arg scope "$PLUGIN_SCOPE" \
+            --arg slug "$PLUGIN_SLUG" \
+            --arg entry "${{ steps.pages.outputs.base_url }}/assets/remoteEntry.js" \
+            '.name = "Inventory (dev)"
+             | .slug = $slug
+             | .scope = $scope
+             | .remoteEntry = $entry
+             | .requiredRole = "administrator"
+             | .profileTabLabel = "Inventory (dev)"
+             | del(.deployments, .install)' \
+            public/5stack-plugin.json > dist/5stack-plugin.json
+          touch dist/.nojekyll
+          cat dist/5stack-plugin.json
+
+      - name: Upload the build
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
