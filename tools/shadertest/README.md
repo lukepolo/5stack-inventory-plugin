@@ -52,6 +52,7 @@ Then open one of:
 | `http://localhost:5199/fpv.html?model=aug` | mounts the REAL viewer in first person, fires, and captures consecutive frames off the visible canvas — for anything that only goes wrong while a weapon is being held |
 | `http://localhost:5199/flash.html` | the muzzle flash alone, plain and through the bloom composer, with each sprite's blend state printed |
 | `http://localhost:5199/?model=famas&pm=/materials/<file>.vcompmat.json&wear=0.4&seed=821` | one skin, full resolved detail as JSON |
+| `http://localhost:5199/mount.html?model=knife_flip&stattrak=1337&va=0,3.1416&plain=1` | the REAL viewer with any item and options from the URL — stickers + offsets, StatTrak, name tag, view angles, timed live shots, a `plain` twin for diffing (parameters in `mount.ts`'s header); collect with `shoot.mjs` |
 
 Vite proxies `/materials`, `/textures`, `/images`, `/models`, `/paints` and
 `/api` at `inventory.5stack.gg` (override with `ASSET_HOST`), so there is **no
@@ -59,6 +60,12 @@ auth, no deploy and no cache** in the loop. Every asset route points at one of
 our own hosts — there is no third-party mirror to borrow from, so the rig
 exercises exactly what production serves. Edit `src/paintComposite.ts`, reload the page, see the
 new GPU output.
+
+Headless, `node tools/shadertest/shoot.mjs '<url>' out/prefix_` saves every
+`#out img` (named by its `data-id`), stops early when the page adds `#done`,
+prints console lines matching `--log <regex>`, and deletes its Chrome profile on
+exit. See [docs/DEBUGGING.md](../../docs/DEBUGGING.md) for the methods built on
+it.
 
 Both pages set `window.__done` when finished and expose results on
 `window.__result` (single) or `window.__results` (batch), so a driver can poll

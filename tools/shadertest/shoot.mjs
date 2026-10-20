@@ -12,15 +12,26 @@
 //   node tools/shadertest/shoot.mjs 'http://localhost:5199/item3d.html?image=/images/kc_db_lighter_d10214d2.webp&seed=1' out/butane
 //   node tools/shadertest/shoot.mjs '…&lqprobe=31' out/probe31 --wait 14000
 //
-// Writes <prefix>0.png, <prefix>1.png … one per <img> the page produced, and
-// prints the page's own #out text plus anything that looked like an error.
+// Writes <prefix>0.png, <prefix>1.png … one per <img> the page produced — or
+// <prefix><id>.png when the <img> carries data-id — and prints the page's own
+// #out text plus anything that looked like an error.
+//
+//   --wait ms      the LONGEST to wait (default 14000). A page that appends an
+//                  element with id="done" when it has finished (mount.html
+//                  does) is collected as soon as it appears.
+//   --log regex    also print every console line matching it — e.g.
+//                  --log '\[sticker\]' with ?stickerlog=1 on the URL.
+//
+// The Chrome profile is a temp directory and is DELETED on exit. It used not
+// to be: a session of a few hundred runs left gigabytes of profiles behind and
+// filled the disk.
 //
 // THE GL FLAGS ARE NOT OPTIONAL. Without --use-angle=swiftshader and
 // --enable-unsafe-swiftshader a headless Chrome has no WebGL context at all;
 // mountViewer then fails or draws nothing and every render comes back blank,
 // which reads exactly like a broken shader.
 import { spawn } from "node:child_process";
-import { writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -42,7 +53,18 @@ const WAIT = Number(flag("wait", 14000));
 const PORT = Number(flag("port", 9333));
 const CHROME = flag("chrome", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
 
+const LOG = flag("log", null);
 const profile = mkdtempSync(join(tmpdir(), "shadertest-cdp-"));
+const cleanup = () => {
+  try {
+    chrome.kill("SIGKILL");
+  } catch {}
+  try {
+    rmSync(profile, { recursive: true, force: true });
+  } catch {}
+};
+process.on("exit", cleanup);
+process.on("SIGINT", () => process.exit(130));
 const chrome = spawn(CHROME, [
   "--headless=new",
   `--remote-debugging-port=${PORT}`,
@@ -87,8 +109,11 @@ ws.onmessage = (e) => {
     pending.get(m.id)(m);
     pending.delete(m.id);
   }
-  if (m.method === "Runtime.consoleAPICalled")
-    logs.push(`[${m.params.type}] ` + m.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
+  if (m.method === "Runtime.consoleAPICalled") {
+    const line = `[${m.params.type}] ` + m.params.args.map((a) => a.value ?? a.description ?? "").join(" ");
+    logs.push(line);
+    if (LOG && new RegExp(LOG).test(line)) console.log(line);
+  }
   if (m.method === "Runtime.exceptionThrown")
     logs.push("[exception] " + (m.params.exceptionDetails?.exception?.description ?? ""));
 };
@@ -104,16 +129,20 @@ const evaluate = async (expression) =>
 await send("Runtime.enable");
 await send("Page.enable");
 await send("Page.navigate", { url });
-await sleep(WAIT);
+for (const t0 = Date.now(); Date.now() - t0 < WAIT; await sleep(500)) {
+  if (await evaluate("!!document.getElementById('done')")) break;
+}
 
 console.log("---- page ----\n" + (await evaluate("document.getElementById('out')?.innerText ?? '(no #out element)'")));
 
-const srcs = JSON.parse((await evaluate("JSON.stringify([...document.querySelectorAll('#out img')].map(i => i.src))")) ?? "[]");
+const srcs = JSON.parse(
+  (await evaluate("JSON.stringify([...document.querySelectorAll('#out img')].map(i => [i.dataset.id ?? null, i.src]))")) ?? "[]",
+);
 mkdirSync(dirname(prefix) || ".", { recursive: true });
 let wrote = 0;
-srcs.forEach((src, i) => {
+srcs.forEach(([id, src], i) => {
   if (!src.startsWith("data:image")) return;
-  const file = `${prefix}${i}.png`;
+  const file = `${prefix}${id ?? i}.png`;
   writeFileSync(file, Buffer.from(src.split(",")[1], "base64"));
   console.log("wrote " + file);
   wrote++;
@@ -133,5 +162,4 @@ const noise = /Clock: This module has been deprecated/;
 const interesting = logs.filter((l) => /error|exception|shader|fail|WARN/i.test(l) && !noise.test(l));
 if (interesting.length) console.log("---- console ----\n" + interesting.join("\n"));
 
-chrome.kill();
 process.exit(wrote ? 0 : 1);

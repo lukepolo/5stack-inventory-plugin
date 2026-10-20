@@ -375,6 +375,22 @@ does the build-watch + serve in one command.
 > Pin `vue`, `reka-ui`, `pinia`, `@5stack/ui` to the **same versions** the panel
 > (`web`) uses, or Federation loads a second copy and reactivity breaks.
 
+## Debugging and test tools
+
+When something renders or sits wrong, see [DEBUGGING.md](DEBUGGING.md): where the
+ground truth lives (model files, attachment dumps, materials, decompiled
+shaders), the tools that render the real viewer headless and diff the results,
+and the method behind each class of fix. For paints and skins specifically, see
+[tools/shadertest/DEBUGGING-SKINS.md](../tools/shadertest/DEBUGGING-SKINS.md).
+
+| Tool | What |
+| --- | --- |
+| `tools/shadertest/mount.html` | the real viewer, any item and options from the URL |
+| `tools/shadertest/shoot.mjs` | headless Chrome: load a rig page, save its images |
+| `tools/standalone/` | the real UI on your machine against a fake inventory, plus a click-through driver |
+| `tools/glb-info.mjs` | bones, meshes, UV ranges and vmat params of a model on the mount |
+| `tools/knife-anchors.mjs` | regenerate knife StatTrak anchors from the game's attachment data |
+
 ## Installing by hand
 
 `./plugin.sh` (see the [README](../README.md)) does all of this for you. The panel

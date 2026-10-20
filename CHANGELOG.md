@@ -1,0 +1,103 @@
+# Changelog
+
+Changes in the LCrew fork of `lukepolo/5stack-inventory-plugin`, all made on 2026-10-20.
+The 3D model extraction is now at pipeline version 36; run it once to get every asset listed below.
+
+## Crafting & Editing
+
+### Features
+
+- **Editable StatTrak kill count**: the craft editor has a Kills field under the StatTrak switch, and the 3D preview shows the number live. Saving an edit sends the count only if you changed it, so kills the game server counts while the editor is open are never overwritten.
+- **Craftable C4**: the C4's Craft tab now offers the plain C4, which takes stickers, a charm and a name tag. Items with no finishes, the C4 included, are no longer offered a float, pattern or StatTrak they can't have.
+- **Glove pattern control**: every painted glove gets the same pattern tools as weapons: type a number, roll the dice, scrub the rail with a live 3D preview, and "Compare with another". Newer (Gen2) finishes whose artwork moves with the pattern also get Placement bars (Shift X, Shift Y, Rotation).
+- **Knives and gloves grouped by model**: the knife and glove Craft tabs open on one card per model, such as Butterfly Knife or Bloodhound Gloves, with a finish count. Finish cards carry the grey model label and the price, like owned cards.
+- **Leaner Replace list**: Replace lists only the base weapons that can take the slot on that side and aren't already in the loadout.
+- **Reorder stickers**: drag sticker tiles onto each other, or use the ‹ › buttons, to change slot order, which decides which sticker is drawn on top. A moved sticker stays where it was on the weapon.
+- **Precise sticker dragging**: a sticker picked up in the 3D editor keeps the point where you grabbed it. Small nudges no longer jump the sticker's centre to the pointer.
+
+### Removed
+
+- The stock T and CT knives are no longer listed as crafts; they remain the knife slot's default.
+- Replace no longer shows a second "Owned" tab of skins.
+
+### Bug Fixes
+
+- Editing or duplicating an owned item keeps its finish's float range. Owned Dopplers could be dragged to 1.00, and the save then failed.
+- Craft & Equip defaults to the team you are crafting from instead of "Both teams".
+- The glove Craft list no longer includes ten gloves nobody can own: the eight bare models and the two stock pairs.
+
+## 3D Viewer & Lighting
+
+### Features
+
+- **CS2 lighting preset (new default)**: neutral daylight and the main menu's blue-grey haze, measured against in-game inspect screenshots. Items no longer come out pink-tinted and dull.
+- **CS2 scene presets**: Ancient (night), Italy and Italy (alley) place the item in front of a blurred in-game screenshot of the map. The same image lights the item's reflections.
+- **Knife StatTrak counter**: the kill count is scratched into the blade as in game, at each knife's exact spot from the game's own attachment data. The digits use the game's own cut-out texture and stay sharp however close you zoom.
+- **C4 name tag**: the name label sits over the top of the C4's LCD, on top of any stickers, as in game.
+- **Live holo and lenticular stickers**: holo colours sweep and lenticular stickers change frame as you turn the weapon, and a slow light drift keeps them shimmering when it is still. A moving glint and sheen make foil look shiny; the drift stops with the viewer's Motion switch or the system's reduce-motion setting.
+- **Sticker masks**: stickers are hidden wherever the game hides them, such as under the C4's LCD module, wires and tape.
+- **Live Gen2 glove patterns**: on the 22 newer glove finishes, the 3D model repaints as you change the pattern. First-person arms wear the equipped glove's pattern too.
+- **Charm detail textures**: charms with a detail layer now show it, such as the pattern-coloured triangle in 8 Ball IGL's window.
+- **Butane Buddy fill level**: the liquid level follows the pattern, from 45% to 80% full and repeating every 1,000 patterns, as the game's material defines it.
+- **C4 in 3D**: the C4 has a 3D model with its sticker slots and charm position.
+
+### Bug Fixes
+
+- Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
+- Legacy-body finishes such as AK-47 | Redline dropped the fourth sticker on the handguard.
+- Knife name tags lay diagonally across the handle (Karambit) or stood on edge (Bayonet). They now lie flat along the handle.
+- Older glove finishes drew no print: Crimson Web had no web, and the DDPAT, kimono, snakeskin, leopard and Fade prints were missing.
+- Eight weapon finishes drew their pattern two to four times too large, including P90 | Death by Kitty, M4A4 | Jungle Tiger and Nova | Tempest.
+- AWP | LongDog's body rendered near-black because finishes with their own material mask ignored it. This also fixes Desert Eagle | Heat Treated's grip colour.
+- 23 community charms, such as Lil' Happy, had their artwork upside down. The 22 Dr. Boom charms were drawn side-on.
+
+## Cards & Asset Cache
+
+### Features
+
+- **Glove model cards**: the eight bare glove models get cards baked from their 3D model, kept in the shared card store.
+
+### Bug Fixes
+
+- A card whose paint failed to load, or which came out black, is retried instead of stored. This caused a Butterfly Knife | Doppler card to show a plain knife and the Driver Gloves card to be black.
+
+## Performance
+
+### Bug Fixes
+
+- Scrubbing glove patterns no longer stutters: each repaint went from 60–100 ms to about 1 ms with identical output.
+
+## Model Extraction
+
+### Features
+
+- **v34, sticker masks**: each weapon body's sticker mask is extracted, which is what hides stickers under modelled parts.
+- **v35, charm detail textures**: each charm material's detail layer and its placement are recorded, and the texture is extracted.
+- **v36, StatTrak art and knife data**: the knife digit texture is extracted with its cut-out channel intact. Every knife's attachment points and bone chain are written out as the source for knife counter and name tag placement.
+- **C4 model**: the extraction publishes the C4 model with its sticker slots and charm surfaces.
+
+## Backend & API
+
+### Features
+
+- **StatTrak count**: craft and edit accept a StatTrak kill count, capped at six digits. An edit that leaves it out keeps the count the game server maintains.
+- **Base model on listings**: knife and glove catalog listings carry their base model's id, name and image.
+- **Sticker masks endpoint**: the sticker bounds endpoint returns each weapon body's sticker mask.
+- **Bake lighting**: the catalog reports which lighting the server bakes cards under. Charm shading data includes detail textures.
+
+## Dev Tooling & Deployment
+
+### Features
+
+- **Dev copy of the plugin**: a separate admin-only "Inventory (dev)" plugin is built and published to GitHub Pages on every push. It runs beside the installed plugin without touching it.
+- **Dev backend**: `inventory-dev.fulm.eu` runs the fork's backend beside the installed one, sharing its database and models but keeping its own card store. It is installed and updated with `scripts/dev-backend.sh`, from an image built on every backend or script change.
+- **Debugging guide**: `docs/DEBUGGING.md` explains where the ground truth lives and how each class of rendering and placement bug was diagnosed. It also covers the tools below.
+- **Test tools**: `mount.html` renders any item with any options from the URL, `tools/standalone` runs the real UI against a fake inventory, and `glb-info`/`knife-anchors` read and apply the game's model data.
+
+### Removed
+
+- The upstream workflow that publishes Docker images is disabled in the fork.
+
+### Bug Fixes
+
+- The headless render runner (`shoot.mjs`) now deletes its temporary Chrome profile and finishes as soon as the page is done. Leftover profiles had grown to several gigabytes.

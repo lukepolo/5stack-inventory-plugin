@@ -1,0 +1,14 @@
+[
+  {
+    "name": "open the inventory",
+    "js": "new Promise(r=>{const t=setInterval(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.innerText.trim().startsWith('INVENTORY')); if(b){clearInterval(t); b.click(); r('ok')}},300)})",
+    "wait": 3000,
+    "shot": "inventory"
+  },
+  {
+    "name": "edit the first item (3D editor)",
+    "js": "new Promise(r=>{const t=setInterval(()=>{const e=document.querySelector('[title=\"Edit item\"]'); if(e){clearInterval(t); e.click(); r('ok')}},300)})",
+    "wait": 35000,
+    "shot": "editor"
+  }
+]

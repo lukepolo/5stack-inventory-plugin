@@ -162,6 +162,17 @@ the same job the installed backend runs after a CS2 update, and as long — and
 adds `c4.glb` with its sticker and charm positions. The files land on the shared
 mount, where the installed plugin simply ignores the C4.
 
+### After an extraction
+
+An extraction rewrites the shared mount; the cards baked before it stay as they
+were. Clear them in the dev copy (**⚙ → Asset Cache → Clear renders**) so they
+re-bake from the new assets, then hard-reload. `models/extract-version.json` on
+the dev backend shows which pipeline version ran, on which CS2 build, and how
+long each step took.
+
+To track down something that looks wrong in the dev copy, see
+[DEBUGGING.md](DEBUGGING.md).
+
 ## Taking a change to the installed plugin
 
 The dev copy never replaces anything the installed plugin runs. To put your
