@@ -513,6 +513,51 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
   };
 }
 
+/**
+ * One live material per pass shader, shared by every glove composite — both
+ * generations.
+ *
+ * Each pass used to make its own material and dispose it after drawing, and
+ * three frees a compiled program the moment no material holds it. So EVERY
+ * composite recompiled all of the glove's shaders: 60-100ms of main thread per
+ * repaint, measured, which is the hitch in the glove animation while scrubbing
+ * patterns (each hovered pattern is a composite). The weapon compositor never
+ * had it — it keeps its one material (quadMat in paintComposite); this is the
+ * same thing, per shader.
+ *
+ * Values are copied INTO the kept uniforms rather than the object swapped: three
+ * binds a program's uniform list to the material's own object when it compiles.
+ * Every caller passes the full set for its shader, so nothing stale survives.
+ */
+const passMats = new Map<string, Map<string, ThreeNS.RawShaderMaterial>>();
+export function passMaterial(
+  THREE: Three,
+  vertexShader: string,
+  fragmentShader: string,
+  uniforms: Record<string, ThreeNS.IUniform>,
+): ThreeNS.RawShaderMaterial {
+  let byFrag = passMats.get(vertexShader);
+  if (!byFrag) passMats.set(vertexShader, (byFrag = new Map()));
+  const kept = byFrag.get(fragmentShader);
+  if (!kept) {
+    const mat = new THREE.RawShaderMaterial({
+      vertexShader,
+      fragmentShader,
+      glslVersion: THREE.GLSL3,
+      depthTest: false,
+      depthWrite: false,
+      uniforms,
+    });
+    byFrag.set(fragmentShader, mat);
+    return mat;
+  }
+  for (const k in uniforms) {
+    if (kept.uniforms[k]) kept.uniforms[k].value = uniforms[k].value;
+    else kept.uniforms[k] = uniforms[k];
+  }
+  return kept;
+}
+
 const VERT = /* glsl */ `
 precision highp float;
 in vec3 position;
@@ -989,7 +1034,6 @@ export async function compositeGloveModern(
     quad.material = mat;
     renderer.setRenderTarget(rt);
     renderer.render(scene, cam);
-    mat.dispose();
   };
 
   const blank = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);
@@ -1013,30 +1057,23 @@ export async function compositeGloveModern(
   for (const fam of FAMILIES) {
     const rt = makeRT();
     const fp = famPlace(fam);
-    const mat = new THREE.RawShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: RESOLVE_FRAG,
-      glslVersion: THREE.GLSL3,
-      depthTest: false,
-      depthWrite: false,
-      uniforms: {
-        uId: { value: layerId },
-        uT1: { value: loaded.get(`${fam}1`) ?? blank },
-        uT2: { value: loaded.get(`${fam}2`) ?? loaded.get(`${fam}1`) ?? blank },
-        uT3: { value: loaded.get(`${fam}3`) ?? loaded.get(`${fam}1`) ?? blank },
-        uT4: { value: loaded.get(`${fam}4`) ?? loaded.get(`${fam}1`) ?? blank },
-        // Damage and grime carry their own per-layer scale; everything else
-        // rides the shared g_vUvScale<n>.
-        uScaleX: {
-          value: fam === "g_tDamage" ? v4("g_fDamageUvScale") : fam === "g_tGrime" ? v4("g_fGrimeUvScale") : v4("uvScaleX"),
-        },
-        uScaleY: {
-          value: fam === "g_tDamage" ? v4("g_fDamageUvScale") : fam === "g_tGrime" ? v4("g_fGrimeUvScale") : v4("uvScaleY"),
-        },
-        uOffX: { value: new THREE.Vector4(fp.offX[0], fp.offX[1], fp.offX[2], fp.offX[3]) },
-        uOffY: { value: new THREE.Vector4(fp.offY[0], fp.offY[1], fp.offY[2], fp.offY[3]) },
-        uRot: { value: new THREE.Vector2(Math.cos(rad(fp.rot)), Math.sin(rad(fp.rot))) },
+    const mat = passMaterial(THREE, VERT, RESOLVE_FRAG, {
+      uId: { value: layerId },
+      uT1: { value: loaded.get(`${fam}1`) ?? blank },
+      uT2: { value: loaded.get(`${fam}2`) ?? loaded.get(`${fam}1`) ?? blank },
+      uT3: { value: loaded.get(`${fam}3`) ?? loaded.get(`${fam}1`) ?? blank },
+      uT4: { value: loaded.get(`${fam}4`) ?? loaded.get(`${fam}1`) ?? blank },
+      // Damage and grime carry their own per-layer scale; everything else
+      // rides the shared g_vUvScale<n>.
+      uScaleX: {
+        value: fam === "g_tDamage" ? v4("g_fDamageUvScale") : fam === "g_tGrime" ? v4("g_fGrimeUvScale") : v4("uvScaleX"),
       },
+      uScaleY: {
+        value: fam === "g_tDamage" ? v4("g_fDamageUvScale") : fam === "g_tGrime" ? v4("g_fGrimeUvScale") : v4("uvScaleY"),
+      },
+      uOffX: { value: new THREE.Vector4(fp.offX[0], fp.offX[1], fp.offX[2], fp.offX[3]) },
+      uOffY: { value: new THREE.Vector4(fp.offY[0], fp.offY[1], fp.offY[2], fp.offY[3]) },
+      uRot: { value: new THREE.Vector2(Math.cos(rad(fp.rot)), Math.sin(rad(fp.rot))) },
     });
     runPass(mat, rt);
     resolved[fam] = rt.texture;
@@ -1110,14 +1147,7 @@ export async function compositeGloveModern(
     const rt = makeRT(mode === 0);
     const u = shadeUniforms();
     u.uMode.value = mode;
-    const mat = new THREE.RawShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: SHADE_FRAG,
-      glslVersion: THREE.GLSL3,
-      depthTest: false,
-      depthWrite: false,
-      uniforms: u,
-    });
+    const mat = passMaterial(THREE, VERT, SHADE_FRAG, u);
     runPass(mat, rt);
     out.push(rt.texture);
   }

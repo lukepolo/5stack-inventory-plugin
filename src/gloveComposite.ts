@@ -74,7 +74,7 @@
  */
 import type * as ThreeNS from "three";
 import { paintFetch, paintTextureUrl, texXform } from "./paintComposite";
-import { gloveRolled, gloveRolls, type GloveRoll } from "./gloveCompositeModern";
+import { gloveRolled, gloveRolls, passMaterial, type GloveRoll } from "./gloveCompositeModern";
 
 type Three = typeof ThreeNS;
 
@@ -790,7 +790,6 @@ export async function compositeGlove(
     quad.material = mat;
     renderer.setRenderTarget(rt);
     renderer.render(scene, cam);
-    mat.dispose();
   };
 
   const xform = (name: string, dflt: number[]) => {
@@ -819,28 +818,21 @@ export async function compositeGlove(
   blank.needsUpdate = true;
   const resolve = (prefix: string, scaled: boolean, grunged = false) => {
     const rt = makeRT(false);
-    const mat = new THREE.RawShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: RESOLVE_FRAG,
-      glslVersion: THREE.GLSL3,
-      depthTest: false,
-      depthWrite: false,
-      uniforms: {
-        uMask: { value: mask },
-        uT1: { value: loaded.get(`${prefix}1`) ?? blank },
-        uT2: { value: loaded.get(`${prefix}2`) ?? loaded.get(`${prefix}1`) ?? blank },
-        uT3: { value: loaded.get(`${prefix}3`) ?? loaded.get(`${prefix}1`) ?? blank },
-        uT4: { value: loaded.get(`${prefix}4`) ?? loaded.get(`${prefix}1`) ?? blank },
-        // One scale for the whole family: the original samples every detail
-        // family at the same g_fDetailScale, blended by the mask. Using layer
-        // 1's is the approximation the resolve split forces — a per-texel scale
-        // cannot be resolved ahead of the blend.
-        uScale: { value: new THREE.Vector2(def.layer.g_fDetailScale[0] || 1, def.layer.g_fDetailScale[0] || 1) },
-        uScaled: { value: scaled },
-        uGrunged: { value: grunged },
-        uGrungeXform0: { value: xform("g_vGrungeTexCoordXform0", [1, 0, 0, 0]) },
-        uGrungeXform1: { value: xform("g_vGrungeTexCoordXform1", [0, 1, 0, 0]) },
-      },
+    const mat = passMaterial(THREE, VERT, RESOLVE_FRAG, {
+      uMask: { value: mask },
+      uT1: { value: loaded.get(`${prefix}1`) ?? blank },
+      uT2: { value: loaded.get(`${prefix}2`) ?? loaded.get(`${prefix}1`) ?? blank },
+      uT3: { value: loaded.get(`${prefix}3`) ?? loaded.get(`${prefix}1`) ?? blank },
+      uT4: { value: loaded.get(`${prefix}4`) ?? loaded.get(`${prefix}1`) ?? blank },
+      // One scale for the whole family: the original samples every detail
+      // family at the same g_fDetailScale, blended by the mask. Using layer
+      // 1's is the approximation the resolve split forces — a per-texel scale
+      // cannot be resolved ahead of the blend.
+      uScale: { value: new THREE.Vector2(def.layer.g_fDetailScale[0] || 1, def.layer.g_fDetailScale[0] || 1) },
+      uScaled: { value: scaled },
+      uGrunged: { value: grunged },
+      uGrungeXform0: { value: xform("g_vGrungeTexCoordXform0", [1, 0, 0, 0]) },
+      uGrungeXform1: { value: xform("g_vGrungeTexCoordXform1", [0, 1, 0, 0]) },
     });
     runPass(mat, rt);
     return rt.texture;
@@ -875,63 +867,56 @@ export async function compositeGlove(
   };
   const shade = (mode: number, srgb: boolean) => {
     const rt = makeRT(srgb);
-    const mat = new THREE.RawShaderMaterial({
-      vertexShader: VERT,
-      fragmentShader: SHADE_FRAG,
-      glslVersion: THREE.GLSL3,
-      depthTest: false,
-      depthWrite: false,
-      uniforms: {
-        uMask: { value: mask },
-        uSurface: { value: surface },
-        uNormal: { value: loaded.get("g_tNormal") ?? blank },
-        uNoise: { value: loaded.get("g_tNoise") ?? blank },
-        uPattern: { value: loaded.get("g_tPattern") ?? blank },
-        uDetail: { value: detail },
-        uGrunge: { value: grunge },
-        uDetailNormal: { value: detailNormal },
-        uDamageNormal: { value: damageNormal },
-        uMode: { value: mode },
-        uWear: { value: opts.wear },
-        uCloth: { value: def.cloth },
-        uCurvaturePower: { value: v4("g_fCurvaturePower") },
-        uCurvatureWearBoost: { value: v4("g_fCurvatureWearBoost") },
-        uDetailBlackPoint: { value: v4("g_fDetailBlackPoint") },
-        uDetailBlackPointComp: { value: v4("g_fDetailBlackPointCompensation") },
-        uDetailRoughContrast: { value: v4("g_fDetailRoughnessContrast") },
-        uDetailRoughBright: { value: v4("g_fDetailRoughnessBrightness") },
-        uDetailMetalness: { value: v4("g_fDetailMetalness") },
-        uDamageBleaching: { value: v4("g_fDamageBleaching") },
-        uDamageBrightness: { value: v4("g_fDamageBrightness") },
-        uDamageSaturation: { value: v4("g_fDamageSaturation") },
-        uDamageMetalness: { value: v4("g_fDamageMetalness") },
-        uGrungeMax: { value: v4("g_fGrungeMax") },
-        uDetailGrunge: { value: v4("g_fDetailGrunge") },
-        uGrimeSaturation: { value: v4("g_fGrimeSaturation") },
-        uGrimeBrightness: { value: v4("g_fGrimeBrightness") },
-        uTint: { value: tints },
-        // 0 would collapse the 9 taps onto one texel — a hard-edged palette.
-        uColorMaskBlur: { value: def.scalar.g_fColorMaskBlur || 1 },
-        uHasPatternFlag: { value: def.pattern && !!loaded.get("g_tPattern") },
-        uPatternMode: { value: def.patternMode },
-        // 1-based in the vmat, like the palette indices beside it; the shader
-        // indexes its 8 accumulated weights from 0. The finishes say 1..8 and
-        // never 0 — four Sport Gloves say 8, past the end of a 0-based array —
-        // and read raw, Crimson Web printed its web over the red strap (slot 2)
-        // instead of the grey back (slot 1) its own palette starts from.
-        uPatternReplaceIndex: { value: Math.min(7, Math.max(0, def.patternReplaceIndex - 1)) },
-        uPatternPaletteIdx: { value: paletteIdx },
-        uPatternMetalness: { value: def.scalar.g_fPatternMetalness },
-        uPatternRoughBright: { value: def.scalar.g_fPatternRoughnessBrightness || 1 },
-        uPaintThickness: { value: def.scalar.g_fPaintThickness },
-        uDetailNormalContrast: { value: v4("g_fDetailNormalContrast") },
-        uPatternRotXform0: { value: patRot0 },
-        uPatternRotXform1: { value: patRot1 },
-        uPatternXform0: { value: patXform0 },
-        uPatternXform1: { value: patXform1 },
-        uDamageLevelsA: { value: dmgLevels(0) },
-        uDamageLevelsB: { value: dmgLevels(2) },
-      },
+    const mat = passMaterial(THREE, VERT, SHADE_FRAG, {
+      uMask: { value: mask },
+      uSurface: { value: surface },
+      uNormal: { value: loaded.get("g_tNormal") ?? blank },
+      uNoise: { value: loaded.get("g_tNoise") ?? blank },
+      uPattern: { value: loaded.get("g_tPattern") ?? blank },
+      uDetail: { value: detail },
+      uGrunge: { value: grunge },
+      uDetailNormal: { value: detailNormal },
+      uDamageNormal: { value: damageNormal },
+      uMode: { value: mode },
+      uWear: { value: opts.wear },
+      uCloth: { value: def.cloth },
+      uCurvaturePower: { value: v4("g_fCurvaturePower") },
+      uCurvatureWearBoost: { value: v4("g_fCurvatureWearBoost") },
+      uDetailBlackPoint: { value: v4("g_fDetailBlackPoint") },
+      uDetailBlackPointComp: { value: v4("g_fDetailBlackPointCompensation") },
+      uDetailRoughContrast: { value: v4("g_fDetailRoughnessContrast") },
+      uDetailRoughBright: { value: v4("g_fDetailRoughnessBrightness") },
+      uDetailMetalness: { value: v4("g_fDetailMetalness") },
+      uDamageBleaching: { value: v4("g_fDamageBleaching") },
+      uDamageBrightness: { value: v4("g_fDamageBrightness") },
+      uDamageSaturation: { value: v4("g_fDamageSaturation") },
+      uDamageMetalness: { value: v4("g_fDamageMetalness") },
+      uGrungeMax: { value: v4("g_fGrungeMax") },
+      uDetailGrunge: { value: v4("g_fDetailGrunge") },
+      uGrimeSaturation: { value: v4("g_fGrimeSaturation") },
+      uGrimeBrightness: { value: v4("g_fGrimeBrightness") },
+      uTint: { value: tints },
+      // 0 would collapse the 9 taps onto one texel — a hard-edged palette.
+      uColorMaskBlur: { value: def.scalar.g_fColorMaskBlur || 1 },
+      uHasPatternFlag: { value: def.pattern && !!loaded.get("g_tPattern") },
+      uPatternMode: { value: def.patternMode },
+      // 1-based in the vmat, like the palette indices beside it; the shader
+      // indexes its 8 accumulated weights from 0. The finishes say 1..8 and
+      // never 0 — four Sport Gloves say 8, past the end of a 0-based array —
+      // and read raw, Crimson Web printed its web over the red strap (slot 2)
+      // instead of the grey back (slot 1) its own palette starts from.
+      uPatternReplaceIndex: { value: Math.min(7, Math.max(0, def.patternReplaceIndex - 1)) },
+      uPatternPaletteIdx: { value: paletteIdx },
+      uPatternMetalness: { value: def.scalar.g_fPatternMetalness },
+      uPatternRoughBright: { value: def.scalar.g_fPatternRoughnessBrightness || 1 },
+      uPaintThickness: { value: def.scalar.g_fPaintThickness },
+      uDetailNormalContrast: { value: v4("g_fDetailNormalContrast") },
+      uPatternRotXform0: { value: patRot0 },
+      uPatternRotXform1: { value: patRot1 },
+      uPatternXform0: { value: patXform0 },
+      uPatternXform1: { value: patXform1 },
+      uDamageLevelsA: { value: dmgLevels(0) },
+      uDamageLevelsB: { value: dmgLevels(2) },
     });
     runPass(mat, rt);
     return rt.texture;
