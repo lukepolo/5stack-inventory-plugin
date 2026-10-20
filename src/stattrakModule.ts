@@ -127,6 +127,72 @@ export function composeDigitAtlas(
   return canvas;
 }
 
+/**
+ * The cut-out for the KNIFE plate: opaque on the scratched digits, clear
+ * everywhere else.
+ *
+ * In game a knife's kill count is scratched into the blade — no plate, the
+ * paint simply missing where the numerals are cut. The material does that with
+ * an alpha test (F_ALPHA_TEST, reference 0.667) on the colour atlas's alpha,
+ * but the extracted atlas comes out flat grey with NO alpha, so taken as-is the
+ * whole 3.9 x 1cm quad draws as a grey sticker on the blade.
+ *
+ * The digit shapes survive in the normal atlas, though: its background is one
+ * flat normal and every stroke bends away from it. So the mask is "differs
+ * from the background normal", grown by a pixel so the groove's flat floor and
+ * its anti-aliased rim stay inside the cut. Built from the column-permuted
+ * atlas, so it follows the count exactly as the engraving does.
+ */
+export function engravingMask(normals: HTMLCanvasElement): HTMLCanvasElement {
+  const { width: w, height: h } = normals;
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  const src = normals.getContext("2d")?.getImageData(0, 0, w, h);
+  const ctx = out.getContext("2d");
+  if (!src || !ctx) return out;
+  const px = src.data;
+  // The background is whatever normal covers most of the atlas — measured
+  // (128, 117, 254), not the textbook (128, 128, 255), so it is read rather
+  // than assumed.
+  const votes = new Map<number, number>();
+  for (let i = 0; i < px.length; i += 4 * 7) {
+    const key = (px[i] << 8) | px[i + 1];
+    votes.set(key, (votes.get(key) ?? 0) + 1);
+  }
+  let bg = 0;
+  let most = -1;
+  for (const [key, n] of votes) if (n > most) [bg, most] = [key, n];
+  const r0 = bg >> 8;
+  const g0 = bg & 0xff;
+  const cut = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    cut[p] = Math.hypot(px[p * 4] - r0, px[p * 4 + 1] - g0) > 10 ? 1 : 0;
+  }
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let on = 0;
+      for (let dy = -1; dy <= 1 && !on; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx >= 0 && xx < w && cut[yy * w + xx]) {
+            on = 1;
+            break;
+          }
+        }
+      }
+      const o = (y * w + x) * 4;
+      img.data[o] = img.data[o + 1] = img.data[o + 2] = on ? 255 : 0;
+      img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return out;
+}
+
 // Typed as plain number[] rather than 3-tuples because these come straight
 // from a JSON import, which widens tuples — asserting the narrower type would
 // be a cast that proves nothing. Length is checked where it's consumed.

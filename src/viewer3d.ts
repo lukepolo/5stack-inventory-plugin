@@ -62,6 +62,7 @@ import NAMETAG_ANCHORS from "./nametagAnchors.json";
 const NAMETAG_GLB = "extra/nametag_module";
 import {
   composeDigitAtlas,
+  engravingMask,
   isDisplayMaterial,
   MODULE_GLB,
   MODULE_GLB_KNIFE,
@@ -1404,6 +1405,11 @@ interface PoseBones {
    *  poseXform: the bone's live matrixWorld carries the glb node transform
    *  while its bind inverse does not. */
   byName: Map<string, import("three").Matrix4>;
+  /** Each bone's own BIND frame in model inches (the inverse of its bind
+   *  inverse). An attachment is authored in its parent bone's axes, so a bone
+   *  that is turned at bind turns the attachment with it — see
+   *  placeAttachedModule. */
+  bind: Map<string, import("three").Matrix4>;
   /** Rotation of the exporter's model→world node matrix (the axis swizzle).
    *  Dividing it out of a bone's pose leaves the rotation the CLIP applied,
    *  which is what an attachment has to share. It measures 0.05-0.09 degrees
@@ -1641,7 +1647,7 @@ function bakePose(
   // Per-bone transforms, for attachments — see PoseBones. Read from the first
   // skinned mesh and NOT cached: it is 16 matrix multiplies on the largest rig,
   // against the per-vertex blend below that the cache actually exists for.
-  const bones: PoseBones = { byName: new Map(), modelQuat: null };
+  const bones: PoseBones = { byName: new Map(), bind: new Map(), modelQuat: null };
   {
     const sm = skinned[0];
     if (sm) {
@@ -1654,6 +1660,7 @@ function bakePose(
             .multiply(sm.bindMatrix)
             .premultiply(sm.bindMatrixInverse),
         );
+        bones.bind.set(bone.name, sm.skeleton.boneInverses[bi].clone().invert());
       });
       // Walk out of the bone chain to the node the exporter parked the swizzle
       // (and the inch->metre scale) on. decompose, not setFromRotationMatrix:
@@ -3348,7 +3355,7 @@ async function buildViewer(
   let poseBoneName: string | null = null;
   // The same motion per BONE, for attachments that hang off something other
   // than the body — see PoseBones.
-  let poseBones: PoseBones = { byName: new Map(), modelQuat: null };
+  let poseBones: PoseBones = { byName: new Map(), bind: new Map(), modelQuat: null };
   // Lay a dual-wield pair out parallel rather than in the icon's tent. Off for
   // card bakes (`still`), which want the game's own item art — see the call to
   // bakePose below. Harmless on a single-weapon rig: bakePose finds no `*_l`
@@ -10258,8 +10265,27 @@ async function buildViewer(
     // comes out centred with center ~= 0). The pose makes the same trip:
     // bind MODEL INCHES -> baked WORLD metres. No `center` correction —
     // object.position applies -center to geometry and module alike.
+    // A bone turned AT BIND turns its attachments with it. `src` adds the
+    // bone's position to the attachment's relative origin but not its rotation,
+    // which is exact for every gun (their bones sit unrotated) and wrong for
+    // the Shadow Daggers, whose `weapon_r` stands at 90 degrees: unrotated, the
+    // plate lands an inch out from the handle instead of an inch up the blade.
+    const bind = bone ? poseBones.bind.get(bone) : undefined;
+    let bindTurn: import("three").Quaternion | null = null;
+    let at = new THREE.Vector3(src[0], src[1], src[2]);
+    if (bind) {
+      const bp = new THREE.Vector3();
+      const bq = new THREE.Quaternion();
+      bind.decompose(bp, bq, new THREE.Vector3());
+      if (Math.abs(bq.w) < 0.9999) {
+        at = at.sub(bp).applyQuaternion(bq).add(bp);
+        // In the module's glb basis, like the attachment's own angles below.
+        const m = poseBones.modelQuat;
+        bindTurn = m ? m.clone().multiply(bq).multiply(m.clone().invert()) : bq;
+      }
+    }
     if (bonePose) {
-      mod.position.set(src[0], src[1], src[2]).applyMatrix4(bonePose);
+      mod.position.copy(at).applyMatrix4(bonePose);
     } else {
       mod.position.set(pos[0], pos[1], pos[2]);
     }
@@ -10280,12 +10306,13 @@ async function buildViewer(
     //
     // Onto that goes the attachment's own tilt, swizzled to match the position
     // (glb x,y,z = model y,z,x). Every GUN anchor is unrotated, so that half is
-    // unconstrained by guns — which is exactly why knives (karambit
-    // [-54.1, 0, -170.4]) do not work yet and stay gated above.
+    // unconstrained by guns; knives (karambit [-54.1, 0, -170.4]) are what
+    // settled it, and they take `sourceAngles`.
     const clipQuat = clipRotation(THREE, bonePose, poseBones.modelQuat) ?? new THREE.Quaternion();
     if (noRotation) mod.quaternion.identity();
     else mod.quaternion
       .copy(clipQuat)
+      .multiply(bindTurn ?? new THREE.Quaternion())
       .multiply(
         new THREE.Quaternion().setFromEuler(
           sourceAngles
@@ -10523,30 +10550,85 @@ async function buildViewer(
     return { glass, worst, at, pushed: push, skipped: want > MAX_PUSH };
   }
 
+  /**
+   * Lift a knife's engraved plate out of the blade where it is buried.
+   *
+   * Placed from the attachment alone, most plates already lie on the blade —
+   * measured 0 to 0.2mm off the surface on 17 of 22 knives. The rest is our
+   * extraction disagreeing with the game by a hair: the Falchion's plate sits
+   * up to 2.1mm INSIDE the blade and the Flip's 1.1mm, which hides most of the
+   * count. A quarter-millimetre engraving has no thickness to spare, so any
+   * burial at all reads as missing digits.
+   *
+   * Sampled across the plate rather than at its centre, because a blade is not
+   * flat, and only ever moved OUT along the plate's own normal. A sample buried
+   * deeper than KNIFE_MAX_LIFT is not the blade but a raised feature the plate
+   * overlaps (the Stiletto's bolster, 7.6mm proud) — lifting the whole plate
+   * clear of it would float the rest off the steel, so it is left out.
+   *
+   * Returns how far the plate moved.
+   */
+  function seatKnifePlate(mod: import("three").Object3D) {
+    let plate: import("three").Mesh | null = null;
+    mod.traverse((c) => {
+      const m = c as import("three").Mesh;
+      if (m.isMesh && isDisplayMaterial((m.material as import("three").Material | undefined)?.name)) plate = m;
+    });
+    const mesh = plate as import("three").Mesh | null;
+    if (!mesh) return 0;
+    const geo = mesh.geometry;
+    geo.computeBoundingBox();
+    const bb = geo.boundingBox!;
+    const size = bb.getSize(new THREE.Vector3()).toArray();
+    const thin = size.indexOf(Math.min(...size));
+    const long = size.indexOf(Math.max(...size));
+    const across = 3 - thin - long;
+    // Facing from the plate's own normals: the thin axis says which line the
+    // normal lies on, not which way the readout faces.
+    const nAttr = geo.getAttribute("normal");
+    const facing = new THREE.Vector3();
+    for (let i = 0; nAttr && i < nAttr.count; i++) facing.add(new THREE.Vector3().fromBufferAttribute(nAttr, i));
+    if (facing.lengthSq() < 1e-12) facing.setComponent(thin, 1);
+    const n = facing.transformDirection(mesh.matrixWorld);
+    const ctr = bb.getCenter(new THREE.Vector3());
+    const PROBE = 0.01;
+    const KNIFE_MAX_LIFT = 0.003;
+    const CLEAR = 0.0001;
+    let worst = -Infinity;
+    // Centre plus four corners inset from the rim — a sample on the very edge
+    // can slide off the blade onto whatever is behind it.
+    for (const [fl, fa] of [[0, 0], [-0.7, -0.6], [0.7, -0.6], [-0.7, 0.6], [0.7, 0.6]]) {
+      const p = ctr.clone();
+      p.setComponent(long, p.getComponent(long) + (fl * size[long]) / 2);
+      p.setComponent(across, p.getComponent(across) + (fa * size[across]) / 2);
+      p.applyMatrix4(mesh.matrixWorld).addScaledVector(n, PROBE);
+      raycaster.set(p, n.clone().negate());
+      raycaster.far = PROBE * 2;
+      const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+      if (!hit) continue;
+      const buried = PROBE - hit.distance;
+      if (buried <= KNIFE_MAX_LIFT) worst = Math.max(worst, buried);
+    }
+    if (worst === -Infinity || worst <= -CLEAR) return 0;
+    const lift = worst + CLEAR;
+    const at = mod.getWorldPosition(new THREE.Vector3()).addScaledVector(n, lift);
+    mod.position.copy(object.worldToLocal(at));
+    return lift;
+  }
+
   const stattrakDisposables: { dispose: () => void }[] = [];
   let stattrakMod: import("three").Object3D | null = null;
   async function mountStatTrak(spec: { count: number | null }) {
     const picked = pickAnchor(STATTRAK_ANCHORS as Record<string, import("./stattrakModule").StatTrakAnchorSet | undefined>, model, !!opts?.legacyPaint);
     if (!picked) return; // no attachment (the C4 has none) — nothing to hang
     const { anchor, knife, bone } = picked;
-    // Knives are SKIPPED — the module is wired for them but its orientation is
-    // unsolved, so enabling it renders a plate stabbed through the blade.
-    //
-    // What already works: the knife asset (stattrak_module_knife) is a flat
-    // engraved plate whose readout is unwrapped with the SAME digit-cell
-    // convention as the gun's (measured: both span u = 1 .. 6.3671875), so the
-    // column permutation carries over untouched. Its digits live in the NORMAL
-    // map (the colour atlas is flat grey) and column 0 is genuinely blank
-    // rather than a dim zero, which digitColumns already handles.
-    //
-    // What does not: the plate ends up perpendicular to the blade. Gun anchors
-    // are all unrotated so they never constrained the Source->three angle
-    // convention; knives rotate hard (karambit [-54.1, 0, -170.4]). A sweep of
-    // 8 axis/order candidates was measured against "plate must be thin along
-    // the knife's thin axis" and NONE produced a coplanar plate (best still
-    // 0.011 thick against a 3.94 x 1.0 x 0cm plate), so the remaining error is
-    // not merely Euler order. See tools/shadertest/stattrak.html.
-    if (knife) return;
+    // Knives take their own module (stattrak_module_knife): a bare plate whose
+    // readout is unwrapped with the SAME digit-cell convention as the gun's
+    // (measured: both span u = 1 .. 6.3671875), so the column permutation
+    // carries over untouched. Its digits live in the NORMAL map (the colour
+    // atlas is flat grey) and column 0 is genuinely blank rather than a dim
+    // zero, which digitColumns already handles. How it is placed, cut out and
+    // seated differs — see sourceAngles, engravingMask and seatKnifePlate.
     let modGltf;
     try {
       // The StatTrak module is a single small prop with one texture set — no
@@ -10598,6 +10680,20 @@ async function buildViewer(
       // map is either absent or already per-digit consistent.
       const engraved = swap(display.normalMap);
       if (engraved) display.normalMap = engraved;
+      // Only the scratches draw — see engravingMask. alphaTest is already the
+      // vmat's 0.667, carried over by the loader from the glTF's MASK mode.
+      if (knife && engraved) {
+        const cut = new THREE.CanvasTexture(engravingMask(engraved.image as HTMLCanvasElement));
+        cut.flipY = engraved.flipY;
+        cut.colorSpace = THREE.NoColorSpace;
+        cut.wrapS = engraved.wrapS;
+        cut.wrapT = engraved.wrapT;
+        cut.repeat.copy(engraved.repeat);
+        cut.offset.copy(engraved.offset);
+        stattrakDisposables.push(cut);
+        display.alphaMap = cut;
+        if (!display.alphaTest) display.alphaTest = 0.667;
+      }
       // Glow follows the DIGITS, not g_tSelfIllumMask. That mask is a 1x1
       // near-white pixel — a constant meaning "all of it may glow", with the
       // actual shape coming from the albedo (the vmat's
@@ -10619,12 +10715,20 @@ async function buildViewer(
     // seating="none" — Valve authors this attachment already seated, with the
     // housing sunk into the receiver and only the readout proud. All this pass
     // has to do afterwards is guarantee the readout actually clears.
-    if (!placeAttachedModule(mod, anchor, bone, false, false, "none")) return;
+    //
+    // Knives compose their angles as a real Source QAngle. Gun anchors are all
+    // unrotated, so they never cared; knife anchors are turned hard (karambit
+    // [-54.1, 0, -170.4]), and under the hand-rolled swizzle every plate stood
+    // perpendicular to its blade. As a QAngle all 22 lie flat on the blade,
+    // front face outward, within 0.2mm of the surface on most.
+    if (!placeAttachedModule(mod, anchor, bone, knife, false, "none")) return;
     object.add(mod);
     stattrakMod = mod;
     object.updateMatrixWorld(true);
-    const clearance = clearReadout(mod);
-    if (clearance?.pushed) object.updateMatrixWorld(true);
+    // The gun pass pushes along the receiver's side axis, which on a knife runs
+    // ALONG the blade — knives seat along the plate's own normal instead.
+    const clearance = knife ? null : clearReadout(mod);
+    if (clearance?.pushed || (knife && seatKnifePlate(mod) > 0)) object.updateMatrixWorld(true);
     // Placement introspection for tools/shadertest/stattrak.html. Off unless
     // the rig sets the flag, so production pays nothing — and measuring these
     // boxes is what finally settled placement after several wrong theories.

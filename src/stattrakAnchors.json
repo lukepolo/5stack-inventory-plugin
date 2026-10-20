@@ -762,6 +762,7 @@
   "knife": true
  },
  "knife_push": {
+  "bone": "weapon_r",
   "hd": {
    "angles": [
     0.464768,
