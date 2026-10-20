@@ -161,6 +161,8 @@ import { stackByDesign, TINT_SUFFIX } from "./decks";
 import { MAX_STATTRAK } from "./stattrakModule";
 import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
 import { formatGunTrait, gunPlacement, gunPlacementTable, gunPlacementTraits } from "./gunPattern";
+import { gloveSeedMoves, loadGloveModernDef, type GloveModernDef } from "./gloveCompositeModern";
+import { glovePlacementAt, glovePlacementTable, glovePlacementTraits } from "./glovePattern";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync } from "./modelAvailability";
@@ -1955,6 +1957,21 @@ const gunTraits = computed<TraitRow[]>(() => {
 });
 /** A gun's patterns are 1..1000 (randomizeCraft draws the same range). */
 const gunTable = () => (craftPaintDef.value ? gunPlacementTable(craftPaintDef.value, 1, 1000) : null);
+/** The open GLOVE's Gen2 def — null for the 73 older finishes, whose pattern
+ *  rolls nothing the data spells out. Set by the same watcher as patternMoves. */
+const craftGloveDef = shallowRef<GloveModernDef | null>(null);
+/** Does this glove's pattern change the 3D preview? */
+const gloveSeedLive = computed(() => !!craftGloveDef.value && gloveSeedMoves(craftGloveDef.value));
+/** The glove's twin of gunTraits: where the pattern puts the artwork. */
+const gloveTraits = computed<TraitRow[]>(() => {
+  const def = craftGloveDef.value;
+  const c = craft.value;
+  if (!def || !c) return [];
+  const at = glovePlacementAt(def, Number(c.seed ?? 1));
+  return glovePlacementTraits(def).map((t) => ({ key: t.key, label: t.label, value: at[t.key], display: formatGunTrait(t, at[t.key]) }));
+});
+const gloveTable = () =>
+  craftGloveDef.value ? glovePlacementTable(craftGloveDef.value, craftGloveSeedRange.value.min, craftGloveSeedRange.value.max) : null;
 /**
  * A sticker's scratch wear, on the sticker's OWN page.
  *
@@ -2090,11 +2107,13 @@ watch(
   async ([pm, kind, type]) => {
     patternMoves.value = null;
     craftPaintDef.value = null;
-    // A GLOVE carries a pattern and is rendered by a different compositor —
-    // gloveComposite, which never reads the seed. Asking the weapon paint def
-    // about it would answer a question about a shader that is not the one
-    // drawing this. The pattern is still a real tradeable attribute, so the
-    // field stays; there is simply no look to browse.
+    craftGloveDef.value = null;
+    // A GLOVE carries a pattern and is rendered by a different compositor.
+    // Asking the weapon paint def about it would answer a question about a
+    // shader that is not the one drawing this, so the weapon rail stays off.
+    // The glove's own answer is its Gen2 def: on those 22 finishes the pattern
+    // rolls the artwork's placement (gloveRolls), and the glove control shows
+    // it live. The other 73 load null and keep the plain field.
     //
     // Asked of the ECONOMY TYPE as well as the viewer kind, because the two
     // become known at different moments and only one of them is synchronous.
@@ -2103,6 +2122,11 @@ watch(
     // by then and settles it without waiting for anything.
     if (kind === "glove" || type === "glove") {
       patternMoves.value = false;
+      if (!pm) return;
+      const gdef = await loadGloveModernDef(pm).catch(() => null);
+      // Same subject check as below, for the same out-of-order reason.
+      if ((craft.value?.skin.paintMaterial ?? null) !== pm) return;
+      craftGloveDef.value = gdef;
       return;
     }
     if (!pm) return;
@@ -6689,11 +6713,12 @@ const fpvArms = computed<string>(() => {
  * Null for the stock pair, which has no finish and is correct unpainted — the
  * default gloves' own textures are the real thing rather than a placeholder.
  */
-const fpvArmsPaint = computed<{ material: string; wear: number | null } | null>(() => {
+const fpvArmsPaint = computed<{ material: string; wear: number | null; seed: number | null } | null>(() => {
   const row = rowFor("gloves");
   const inst = isSkinned(row) ? row?.item ?? null : null;
   const material = inst?.paintMaterial ?? null;
-  return material ? { material, wear: row?.wear ?? null } : null;
+  // The pattern places the artwork on the 22 substrate/surface finishes.
+  return material ? { material, wear: row?.wear ?? null, seed: row?.seed ?? null } : null;
 });
 /**
  * The equipped agent's model, for the first-person sleeve.
@@ -9987,12 +10012,20 @@ if (MDEBUG) {
                 <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
               </div>
             </div>
-            <!-- A GLOVE's pattern. No rail: gloveComposite never reads the seed,
-                 so there is nothing on screen to score or aim at. It is still the
-                 real paint seed the equipped feed hands the game server, so it
-                 gets the plain field-plus-slider the float has, on the neutral
-                 pattern track (an index, not a better-or-worse scale). -->
+            <!-- A GLOVE's pattern: the field-plus-slider the float has, on the
+                 neutral pattern track (an index, not a better-or-worse scale).
+                 On the 22 Gen2 finishes the pattern rolls the artwork's placement,
+                 so they also get the gun's Placement bars and a live 3D preview;
+                 the older 73 roll nothing the data spells out, so their number
+                 still only rides the equipped feed to the game server. -->
             <div v-else-if="craftHasSeed && craftType === 'glove' && craftGloveSeedRange.known" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+              <div v-if="gloveTraits.length" class="mb-3">
+                <div class="mb-1 flex items-baseline gap-2">
+                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Placement</span>
+                  <span class="ml-auto text-f10 text-muted-foreground/70">drag to place</span>
+                </div>
+                <TraitBars :traits="gloveTraits" :table="gloveTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
+              </div>
               <div class="flex items-center gap-2">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
                 <input
@@ -10007,7 +10040,13 @@ if (MDEBUG) {
               </div>
               <div class="mt-1 flex items-center justify-between font-mono text-f9 text-muted-foreground">
                 <span>{{ craftGloveSeedRange.min }}–{{ craftGloveSeedRange.max }}</span>
-                <span>Applies in game · not previewed here</span>
+                <!-- One composite dresses both hands; CS2 rolls its second hand
+                     from a seed derived in game code (see gloveCompositeModern). -->
+                <span
+                  v-if="gloveSeedLive"
+                  title="The 3D view shows where this pattern puts the artwork. In game, your other hand rolls its own placement."
+                >Live in 3D · one hand</span>
+                <span v-else>Applies in game · not previewed here</span>
               </div>
             </div>
             <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">

@@ -42,7 +42,7 @@ import {
 } from "./charmPhysics";
 import { applyStickerSfx, type StickerSfx } from "./stickerShader";
 import { compositeGlove, loadGlovePaintDef } from "./gloveComposite";
-import { compositeGloveModern, loadGloveModernDef } from "./gloveCompositeModern";
+import { compositeGloveModern, gloveSeedMoves, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
 import { hasModel, modelUrlFor } from "./modelAvailability";
 import { INCOMPLETE } from "./viewerSentinel";
@@ -2908,7 +2908,7 @@ export interface FirstPersonSpec {
    * paintable glove is a near-black placeholder meant to be replaced — so a
    * player wearing Sport Gloves would see black hands rather than their gloves.
    */
-  armsPaint?: { material: string; wear?: number | null } | null;
+  armsPaint?: { material: string; wear?: number | null; seed?: number | null } | null;
   /** The equipped AGENT's model, for its first-person sleeve. Absent leaves the
    *  forearms bare, which is right for an agent that has bare arms. */
   sleeve?: string | null;
@@ -3897,12 +3897,15 @@ async function buildViewer(
    * full rebuild — a fresh GLB load, a fresh context and a fresh 2048² composite
    * per pointer move, which is the slideshow the weapon path stopped having.
    *
-   * The SEED is deliberately absent: csgo_customglove never reads it (see the
-   * patternMoves gate in App.vue), so a pattern change on a glove is a no-op
-   * rather than a repaint.
+   * The SEED matters only on the 22 substrate/surface finishes, whose vcompmat
+   * rolls the artwork's placement from it (gloveRolls in gloveCompositeModern).
+   * The other 73 have no roll the data spells out, so on those a pattern change
+   * stays a no-op rather than a repaint — `seeded` says which this is.
    */
   let gloveCtx: {
-    run: (wear: number, size?: number) => Promise<GloveMaps | null>;
+    run: (wear: number, size?: number, seed?: number | null) => Promise<GloveMaps | null>;
+    /** Does a new pattern change the composite? */
+    seeded: boolean;
     /** The materials wearing the composite — the ones to re-point. */
     mats: import("three").MeshStandardMaterial[];
     /** What is on those materials right now, to be freed once replaced. */
@@ -3935,14 +3938,16 @@ async function buildViewer(
       // The re-composite below has to run the same generation this mount
       // resolved to, and re-deciding it per tick would re-fetch both defs and
       // re-run the whole "try 73, fall back to 22" probe on every pointer move.
-      let run: ((wear: number, size?: number) => Promise<GloveMaps | null>) | null = def
+      let run: ((wear: number, size?: number, seed?: number | null) => Promise<GloveMaps | null>) | null = def
         ? (w, s) => compositeGlove(THREE, renderer, def, { wear: w, size: s })
         : null;
+      let seeded = false;
       let right: GloveMaps | null = run ? await run(opts?.wear ?? 0) : null;
       if (!right) {
         const mdef = await loadGloveModernDef(opts.paintMaterial);
-        run = mdef ? (w, s) => compositeGloveModern(THREE, renderer, mdef, { wear: w, size: s }) : null;
-        if (run) right = await run(opts?.wear ?? 0);
+        run = mdef ? (w, s, sd) => compositeGloveModern(THREE, renderer, mdef, { wear: w, size: s, seed: sd }) : null;
+        seeded = !!mdef && gloveSeedMoves(mdef);
+        if (run) right = await run(opts?.wear ?? 0, undefined, opts?.seed ?? null);
       }
       const left = right;
       // A glove composited around a texture that never arrived is not the real
@@ -3979,7 +3984,7 @@ async function buildViewer(
         // Collected AFTER the traverse for the same reason the weapon side's
         // paintedMats is: one list, built once, so a later re-composite has
         // somewhere to point.
-        if (run) gloveCtx = { run, mats: gloveMats, current: first };
+        if (run) gloveCtx = { run, seeded, mats: gloveMats, current: first };
       } else {
         // A paintable glove's BASE mesh is a near-black placeholder meant to be
         // replaced by its finish, so failing to composite does not degrade to
@@ -6282,25 +6287,25 @@ async function buildViewer(
    * SFX pass, no refcounted store, and an owned render target that has to be
    * disposed rather than released.
    *
-   * The SEED is accepted and ignored. csgo_customglove has no pattern input, so
-   * a seed-only change is genuinely already on screen — and answering `true` is
+   * The SEED repaints only a `seeded` glove (see gloveCtx). On the rest a
+   * seed-only change is genuinely already on screen — and answering `true` is
    * what stops the caller falling back to a rebuild that would produce the exact
    * same pixels.
    */
   async function repaintGloveOnce(wear: number, seed: number, proxy: boolean): Promise<boolean> {
     const ctx = gloveCtx;
     if (!ctx) return false;
-    const wearSame = wear === paintWear;
+    const same = wear === paintWear && (!ctx.seeded || seed === paintSeed);
     paintWear = wear;
     paintSeed = seed;
-    // Nothing to redo when the wear held: the seed moved nothing, and a PROXY
-    // request for a float already on screen at full resolution would only spend
-    // seven passes to make it blurrier. The one same-wear case worth running is
-    // the other direction — the settle back up from a drag's proxy.
-    if (wearSame && (proxy || proxy === paintProxy)) return true;
+    // Nothing to redo when nothing that draws moved, and a PROXY request for a
+    // look already on screen at full resolution would only spend the passes to
+    // make it blurrier. The one same-look case worth running is the other
+    // direction — the settle back up from a drag's proxy.
+    if (same && (proxy || proxy === paintProxy)) return true;
     paintProxy = proxy;
     const seq = ++repaintSeq;
-    const next = await ctx.run(wear, proxy ? PROXY_COMPOSITE_SIZE : undefined).catch(() => null);
+    const next = await ctx.run(wear, proxy ? PROXY_COMPOSITE_SIZE : undefined, seed).catch(() => null);
     if (!next) return false;
     if (disposed || gloveCtx !== ctx || seq !== repaintSeq) {
       next.dispose();
@@ -10718,13 +10723,13 @@ async function buildViewer(
    * hands is still a weapon being held, whereas a glove that fails to composite
    * is a black blob under a named finish.
    */
-  async function paintGloveOnto(root: import("three").Object3D, material: string, wear: number) {
+  async function paintGloveOnto(root: import("three").Object3D, material: string, wear: number, seed: number | null) {
     try {
       const def = await loadGlovePaintDef(material);
       let maps: GloveMaps | null = def ? await compositeGlove(THREE, renderer, def, { wear }) : null;
       if (!maps) {
         const mdef = await loadGloveModernDef(material);
-        maps = mdef ? await compositeGloveModern(THREE, renderer, mdef, { wear }) : null;
+        maps = mdef ? await compositeGloveModern(THREE, renderer, mdef, { wear, seed }) : null;
       }
       if (!maps) return;
       const comp = maps;
@@ -10902,7 +10907,9 @@ async function buildViewer(
         // THE HANDS WEAR THE EQUIPPED FINISH. Same compositor the glove item
         // view uses, pointed at the arms instead — a glove is a glove whichever
         // way round it is being looked at.
-        if (spec.armsPaint?.material) await paintGloveOnto(rig.root, spec.armsPaint.material, spec.armsPaint.wear ?? 0);
+        if (spec.armsPaint?.material) {
+          await paintGloveOnto(rig.root, spec.armsPaint.material, spec.armsPaint.wear ?? 0, spec.armsPaint.seed ?? null);
+        }
         arms = rig;
 
         // THE WEAPON'S OWN MOVING PARTS — one clip on each skeleton, played

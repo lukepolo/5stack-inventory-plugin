@@ -885,7 +885,9 @@ const NDIV = 1 + (IM - 1) / NTAB;
 const AM = 1.0 / IM;
 const RNMX = 1.0 - 1.2e-7;
 
-class UniformRandomStream {
+// Exported for gloveCompositeModern: a glove's RANDOM_ROLL mutator draws from
+// the same stream, just in its own order.
+export class UniformRandomStream {
   private idum: number;
   private iy = 0;
   private iv = new Array<number>(NTAB);

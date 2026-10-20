@@ -55,13 +55,21 @@
  *      compromise the legacy file documents for its wear chain.
  *   3. The second (mip-biased) substrate accumulation chain is folded into the
  *      first; g_fSubstratePatternMipBias is not applied.
+ *   4. THE PATTERN NUMBER's placement. WHAT it rolls — pattern rotation and
+ *      offset, the four layer offsets, damage and grime — with which ranges and
+ *      in which order is read off each finish and exact (gloveRolls). How the
+ *      vertex shader turns those values into UVs is not in the decompile, so
+ *      the transform order is Source's convention rather than a transcription.
+ *      And one composite serves both hands, rolled the way the game rolls the
+ *      hand seeded by the pattern itself: the other hand draws from
+ *      g_nRandomSeedAlt, which the game derives in code.
  *
  * Verify with tools/shadertest/item3d.html?flat&pm=<vcompmat>. Look at the flat
  * maps and their printed means BEFORE judging a lit render — every wrong turn on
  * the legacy compositor came from squinting at a 200px thumbnail.
  */
 import type * as ThreeNS from "three";
-import { paintFetch, paintTextureUrl } from "./paintComposite";
+import { paintFetch, paintTextureUrl, UniformRandomStream } from "./paintComposite";
 
 type Three = typeof ThreeNS;
 
@@ -102,6 +110,134 @@ export interface GloveModernDef {
   patternEmboss: boolean;
   patternRespectsTintMask: boolean;
   tintId: boolean;
+  /** What the pattern number rolls, in the game's draw order — see gloveRolls.
+   *  Empty when the finish was reached without its vcompmat. */
+  rolls: GloveRoll[];
+}
+
+/** One RANDOM_ROLL entry: a loose variable and the range each component is
+ *  drawn from (one for `.x`, two for `.xy`). */
+export interface GloveRoll {
+  name: string;
+  bounds: [number, number][];
+}
+
+/**
+ * The pattern number's draws, off the vcompmat's RANDOM_ROLL mutators.
+ *
+ * Every one of the 22 finishes declares two sets. One is seeded by
+ * econ_instance.g_nRandomSeed — the item's pattern — and runs on the hand whose
+ * seed_offset attribute is not 1. The other hand rolls from g_nRandomSeedAlt,
+ * which the game derives in code this data does not show, so only the first is
+ * reproducible and only it is read.
+ *
+ * ITS ORDER VARIES BY FINISH: half roll the four layer offsets first, half the
+ * pattern first. Same stream, different positions, so it is read off each
+ * finish rather than written down once.
+ *
+ * Bounds come off instance_params' loose variables. A flat range still takes a
+ * draw — the stream position is what keeps every later entry where the game
+ * has it.
+ */
+function gloveRolls(comp: unknown): GloveRoll[] {
+  const vars = new Map<string, Record<string, unknown>>();
+  const mutators: Record<string, unknown>[] = [];
+  const walk = (node: unknown) => {
+    if (!node) return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node !== "object") return;
+    const o = node as Record<string, unknown>;
+    if (o.m_strAlias === "instance_params") {
+      for (const v of (o.m_vecLooseVariables as Record<string, unknown>[] | undefined) ?? []) {
+        if (typeof v?.m_strName === "string") vars.set(v.m_strName, v);
+      }
+    }
+    if (o.m_nMutatorCommandType === "COMP_MAT_PROPERTY_MUTATOR_RANDOM_ROLL_INPUT_VARIABLES") mutators.push(o);
+    Object.values(o).forEach(walk);
+  };
+  walk(comp);
+  const seeded = mutators.filter(
+    (m) =>
+      m.m_strRandomRollInputVars_SeedInputVar === "econ_instance.g_nRandomSeed" &&
+      Array.isArray(m.m_vecRandomRollInputVars_InputVarsToRoll),
+  );
+  const list = (m: Record<string, unknown>) => (m.m_vecRandomRollInputVars_InputVarsToRoll as unknown[]).map(String);
+  // The hand's own roll is the one gated on seed_offset NOT being 1. The
+  // longest list is the fallback: the conditional per-layer re-rolls beside it
+  // carry one or two entries each.
+  const main =
+    seeded.find((m) =>
+      ((m.m_vecConditions as Record<string, unknown>[] | undefined) ?? []).some(
+        (c) =>
+          c.m_strMutatorConditionContainerName === "material_seed" &&
+          c.m_strMutatorConditionContainerVarName === "seed_offset" &&
+          c.m_bPassWhenTrue === "0",
+      ),
+    ) ?? seeded.sort((a, b) => list(b).length - list(a).length)[0];
+  if (!main) return [];
+  return list(main).map((entry) => {
+    // "instance_params.g_vUvOffset1.xy"
+    const [, name = "", comps = "x"] = entry.split(".");
+    const v = vars.get(name);
+    const bounds = [...comps].map((c): [number, number] => {
+      const k = c.toUpperCase();
+      const val = NUM(v?.[`m_flValueFloat${k}`], 0);
+      const lo = v?.[`m_flValueFloat${k}_Min`];
+      const hi = v?.[`m_flValueFloat${k}_Max`];
+      return lo == null || lo === "" || hi == null || hi === "" ? [val, val] : [NUM(lo, val), NUM(hi, val)];
+    });
+    return { name, bounds };
+  });
+}
+
+/** The values a pattern rolls, by variable name, drawn in the finish's order. */
+export function gloveRolled(def: GloveModernDef, seed: number): Map<string, number[]> {
+  const rs = new UniformRandomStream(seed);
+  return new Map(def.rolls.map((r) => [r.name, r.bounds.map(([lo, hi]) => rs.randomFloat(lo, hi))]));
+}
+
+/** Does the pattern change anything on this finish at all? */
+export function gloveSeedMoves(def: GloveModernDef): boolean {
+  return def.rolls.some((r) => r.bounds.some(([lo, hi]) => lo !== hi));
+}
+
+/**
+ * Where this finish's maps sit — the pattern artwork, the four fabric layers,
+ * damage and grime.
+ *
+ * Without a pattern, the finish's own authored values. With one, what the game
+ * rolls for it, which REPLACES them: the texture generator copies the finish's
+ * keys and then instance_params' over the top, so a rolled offset is absolute,
+ * not added to the authored one. (That is also why the authored placement is
+ * never what an actual item looks like — every real item has a pattern.)
+ */
+export interface GlovePlacement {
+  /** Degrees. */
+  patternRot: number;
+  patternOffset: [number, number];
+  /** Layers 1..4. */
+  uvOffset: [number, number][];
+  damageRot: number;
+  damageOffset: [number, number];
+  grimeRot: number;
+  grimeOffset: [number, number];
+}
+export function glovePlacement(def: GloveModernDef, seed?: number | null): GlovePlacement {
+  const rolled = seed != null && def.rolls.length ? gloveRolled(def, seed) : null;
+  const vec2 = (name: string): [number, number] => {
+    const v = rolled?.get(name) ?? def.vec[name];
+    return [v?.[0] ?? 0, v?.[1] ?? 0];
+  };
+  const deg = (name: string) => rolled?.get(name)?.[0] ?? def.scalar[name] ?? 0;
+  return {
+    patternRot: deg("g_fPatternTexCoordRotation"),
+    patternOffset: vec2("g_vPatternTexCoordOffset"),
+    uvOffset: LAYERS.map((i) => vec2(`g_vUvOffset${i}`)),
+    damageRot: deg("g_fDamageTexCoordRotation"),
+    damageOffset: vec2("g_vDamageTexCoordOffset"),
+    grimeRot: deg("g_fGrimeTexCoordRotation"),
+    grimeOffset: vec2("g_vGrimeTexCoordOffset"),
+  };
 }
 
 /**
@@ -204,10 +340,12 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
   // a "paint_compositor" container holding a SHARED compositor material, with
   // the finish's own vmat as a LOOSE VARIABLE on the "paint" container.
   let path = material;
+  let rolls: GloveRoll[] = [];
   if (/\.vcompmat\.json$/i.test(path)) {
     const comp = (await paintFetch(path)
       .then((r) => r.json())
       .catch(() => null)) as unknown;
+    rolls = gloveRolls(comp);
     let specific: string | null = null;
     let loose: string | null = null;
     const walk = (node: unknown) => {
@@ -366,6 +504,7 @@ export async function loadGloveModernDef(material: string): Promise<GloveModernD
     patternEmboss: BOOL(ints.get("g_bPatternPaintEmboss")),
     patternRespectsTintMask: NUM(floats.get("g_fPatternPaintRespectsTintMask"), 0) !== 0,
     tintId: BOOL(ints.get("F_TINT_ID")) && !!tex.g_tTintId,
+    rolls,
   };
 }
 
@@ -390,6 +529,16 @@ in vec2 vUv;
 out vec4 fragColor;
 uniform sampler2D uId, uT1, uT2, uT3, uT4;
 uniform vec4 uScaleX, uScaleY;
+// Per-layer offsets and one rotation (cos, sin) for the whole family: the
+// fabric layers each have their own g_vUvOffset<n>, damage and grime one
+// rotation and offset apiece. All of them are what the pattern number rolls.
+// Rotation is about the origin — on a repeating map that differs from turning
+// about the centre by a translation, which the offset is anyway.
+uniform vec4 uOffX, uOffY;
+uniform vec2 uRot;
+vec2 at(vec2 s, float sx, float sy, float ox, float oy) {
+  return mat2(uRot.x, uRot.y, -uRot.y, uRot.x) * (s * vec2(sx, sy)) + vec2(ox, oy);
+}
 void main() {
   // Plain [0,1]. The sources are authored in that range and REPEAT, which is how
   // two hands get different layouts out of one atlas — the composite reproduces
@@ -401,10 +550,10 @@ void main() {
   float rest = max(0.0, 1.0 - sum);
   vec4 w = vec4(id.x, id.y, id.z, rest) / (sum + rest);
   fragColor =
-      texture(uT1, src * vec2(uScaleX.x, uScaleY.x)) * w.x
-    + texture(uT2, src * vec2(uScaleX.y, uScaleY.y)) * w.y
-    + texture(uT3, src * vec2(uScaleX.z, uScaleY.z)) * w.z
-    + texture(uT4, src * vec2(uScaleX.w, uScaleY.w)) * w.w;
+      texture(uT1, at(src, uScaleX.x, uScaleY.x, uOffX.x, uOffY.x)) * w.x
+    + texture(uT2, at(src, uScaleX.y, uScaleY.y, uOffX.y, uOffY.y)) * w.y
+    + texture(uT3, at(src, uScaleX.z, uScaleY.z, uOffX.z, uOffY.z)) * w.z
+    + texture(uT4, at(src, uScaleX.w, uScaleY.w, uOffX.w, uOffY.w)) * w.w;
 }`;
 
 /**
@@ -429,6 +578,7 @@ uniform vec4 uDmgBevelMetal, uDmgBevelCloth, uDmgBevelRough;
 uniform vec4 uBurnMetal, uBurnCloth, uGrimeTranslucency, uSubTranslucency;
 uniform vec4 uPatternXform;      // scale.xy, offset.xy
 uniform vec2 uPatternCenter;
+uniform vec2 uPatternRot;        // cos, sin of g_fPatternTexCoordRotation
 uniform float uWear, uPatternThreshold;
 uniform bool uHasPattern, uEmboss, uRespectsTintMask, uHasTint, uPatternPaintLayer;
 uniform int uMode;
@@ -603,7 +753,12 @@ void main() {
   // ---- pattern ------------------------------------------------------------
   // The shader offsets this lookup by a view-dependent parallax vector which a
   // baked composite cannot have; see the header.
-  vec2 patUv = (uv - uPatternCenter) * uPatternXform.xy + uPatternCenter + uPatternXform.zw;
+  //
+  // Scale about the centre, then rotate, then offset — Source's own texture
+  // transform order. The vertex shader that builds this UV is not in the
+  // decompile, so the order is the convention, not a transcription.
+  vec2 patUv = mat2(uPatternRot.x, uPatternRot.y, -uPatternRot.y, uPatternRot.x) * ((uv - uPatternCenter) * uPatternXform.xy)
+             + uPatternCenter + uPatternXform.zw;
   vec4 pat = uHasPattern ? texture(uPattern, patUv) : vec4(0.0);
   if (uHasPattern && uEmboss) {
     pat.w = smoothstep(uPatternThreshold, uPatternThreshold + 0.04, pat.w);
@@ -783,9 +938,12 @@ export async function compositeGloveModern(
   THREE: Three,
   renderer: ThreeNS.WebGLRenderer,
   def: GloveModernDef,
-  opts: { wear: number; size?: number },
+  /** `seed` is the item's pattern. Absent, the finish's authored placement. */
+  opts: { wear: number; size?: number; seed?: number | null },
 ): Promise<GloveModernComposite | null> {
   const size = opts.size ?? 2048;
+  const place = glovePlacement(def, opts.seed);
+  const rad = (deg: number) => (deg * Math.PI) / 180;
 
   const names = [...SINGLES, ...FAMILIES.flatMap((f) => LAYERS.map((i) => `${f}${i}`))];
   const loaded = new Map<string, ThreeNS.Texture | null>();
@@ -837,9 +995,19 @@ export async function compositeGloveModern(
   };
 
   // ---- resolve the eight per-layer families ---------------------------------
+  // The fabric families ride each layer's own offset; damage and grime one
+  // rotation and offset for all four of their layers.
+  const famPlace = (fam: Family): { offX: number[]; offY: number[]; rot: number } => {
+    if (fam === "g_tDamage" || fam === "g_tGrime") {
+      const [ox, oy] = fam === "g_tDamage" ? place.damageOffset : place.grimeOffset;
+      return { offX: [ox, ox, ox, ox], offY: [oy, oy, oy, oy], rot: fam === "g_tDamage" ? place.damageRot : place.grimeRot };
+    }
+    return { offX: place.uvOffset.map((o) => o[0]), offY: place.uvOffset.map((o) => o[1]), rot: 0 };
+  };
   const resolved: Record<string, ThreeNS.Texture> = {};
   for (const fam of FAMILIES) {
     const rt = makeRT();
+    const fp = famPlace(fam);
     const mat = new THREE.RawShaderMaterial({
       vertexShader: VERT,
       fragmentShader: RESOLVE_FRAG,
@@ -860,6 +1028,9 @@ export async function compositeGloveModern(
         uScaleY: {
           value: fam === "g_tDamage" ? v4("g_fDamageUvScale") : fam === "g_tGrime" ? v4("g_fGrimeUvScale") : v4("uvScaleY"),
         },
+        uOffX: { value: new THREE.Vector4(fp.offX[0], fp.offX[1], fp.offX[2], fp.offX[3]) },
+        uOffY: { value: new THREE.Vector4(fp.offY[0], fp.offY[1], fp.offY[2], fp.offY[3]) },
+        uRot: { value: new THREE.Vector2(Math.cos(rad(fp.rot)), Math.sin(rad(fp.rot))) },
       },
     });
     runPass(mat, rt);
@@ -911,10 +1082,11 @@ export async function compositeGloveModern(
       value: new THREE.Vector4(
         def.vec.g_vPatternTexCoordScale?.[0] ?? 1,
         def.vec.g_vPatternTexCoordScale?.[1] ?? 1,
-        def.vec.g_vPatternTexCoordOffset?.[0] ?? 0,
-        def.vec.g_vPatternTexCoordOffset?.[1] ?? 0,
+        place.patternOffset[0],
+        place.patternOffset[1],
       ),
     },
+    uPatternRot: { value: new THREE.Vector2(Math.cos(rad(place.patternRot)), Math.sin(rad(place.patternRot))) },
     uPatternCenter: {
       value: new THREE.Vector2(def.vec.g_vPatternTexCoordCenter?.[0] ?? 0.5, def.vec.g_vPatternTexCoordCenter?.[1] ?? 0.5),
     },
