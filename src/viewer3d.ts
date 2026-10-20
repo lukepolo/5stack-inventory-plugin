@@ -6243,6 +6243,8 @@ async function buildViewer(
     // across its whole face instead of only near its centre.
     mesh.userData.stickerCenter = hit.point.clone();
     mesh.userData.stickerNormal = hit.normal.clone();
+    // The same centre in offset units — what a drag measures its grab against.
+    mesh.userData.stickerXY = [clamp(usedX ?? 0, bounds.x[0], bounds.x[1]), clamp(usedY ?? 0, bounds.y[0], bounds.y[1])];
     // Half the sticker's world size. On the UV path that is the rectangle's own
     // span measured back into world units, so the grab area still matches what
     // is on screen; decalSizeFor computes exactly that from the uv1 density.
@@ -9124,6 +9126,18 @@ async function buildViewer(
   let rotateAnchorX = 0;
   let rotateStartDeg = 0;
   /**
+   * Where on the sticker the drag took hold: its centre minus the point under
+   * the pointer, in the slot's offset units. Every move keeps that gap, so a
+   * sticker moves WITH the hand instead of jumping its centre to the cursor —
+   * which made a small nudge impossible, since the first move was a jump of
+   * however far from the centre you had pressed.
+   *
+   * Null until it can be measured: a press that grabbed by proximity rather
+   * than on the surface takes it from the first move instead, and so does the
+   * first move after a rotate, whose pointer has wandered from the press.
+   */
+  let dragGrab: { dx: number; dy: number } | null = null;
+  /**
    * The pointer that OWNS the current drag.
    *
    * Every handler below is bound to the canvas, and pointer capture is per-id,
@@ -9309,6 +9323,14 @@ async function buildViewer(
       rotateAnchorX = e.clientX;
       const cur = decals.get(drag.slot);
       rotateStartDeg = cur ? (JSON.parse(cur.key) as [string, number | null, number | null, number | null])[3] ?? 0 : 0;
+      // Where on it the press landed — see dragGrab. The pick is by screen
+      // distance, so the ray is re-armed and asked for the surface itself.
+      dragGrab = null;
+      const { mk } = slotMarkup(slot);
+      raycaster.far = Infinity;
+      raycaster.setFromCamera(pointerNdc, camera);
+      const pressHit = raycaster.intersectObjects(mk && uv1Meshes.length ? uv1Meshes : weaponMeshes, false)[0];
+      if (pressHit) takeStickerGrab(slot, pressHit);
       controls.enabled = false;
       el.setPointerCapture(e.pointerId);
     }
@@ -9428,6 +9450,29 @@ async function buildViewer(
     return best;
   }
 
+  /**
+   * The slot's offsets for a surface point, before any clamp — the same two
+   * spaces applyDrag places in (UV1 with markup, body fraction without). Null
+   * when the hit carries no UV1 to read.
+   */
+  function rawStickerOffsets(slot: number, hit: import("three").Intersection) {
+    const { mk } = slotMarkup(slot);
+    if (mk) {
+      const uv = surfaceUv1(hit);
+      return uv ? { x: uv.u - 0.5 - mk.offset[0], y: uv.v - 0.5 - mk.offset[1] } : null;
+    }
+    return {
+      x: (hit.point.getComponent(AXIS_L) - slotBaseL(slot)) / OFFSET_SCALE,
+      y: (hit.point.getComponent(AXIS_H) - baseH) / OFFSET_SCALE,
+    };
+  }
+  /** Measure dragGrab for a slot from a hit under the pointer. */
+  function takeStickerGrab(slot: number, hit: import("three").Intersection) {
+    const at = liveMesh.get(slot)?.userData.stickerXY as [number, number] | undefined;
+    const raw = rawStickerOffsets(slot, hit);
+    dragGrab = at && raw ? { dx: at[0] - raw.x, dy: at[1] - raw.y } : null;
+  }
+
   function applyDrag(e: PointerEvent) {
     if (!drag) return;
     updatePointer(e);
@@ -9447,6 +9492,7 @@ async function buildViewer(
       // for the length of a drag (`controls.enabled = false`), so the gesture
       // costs nothing that was reachable.
       if (entryNow && (twisting || touchPoints.size >= 2)) {
+        dragGrab = null;
         const angle = twoFingerAngle();
         // Latched, but the pair is broken: HOLD, and forget the reference angle
         // so the next frame with two fingers re-seats instead of applying the
@@ -9481,6 +9527,7 @@ async function buildViewer(
         return;
       }
       if (e.shiftKey && entryNow) {
+        dragGrab = null;
         // ROTATE: horizontal sweep -> degrees. Half a degree per pixel is fine
         // for the eye and lands on the 0.5 steps the game quantizes to anyway.
         //
@@ -9526,6 +9573,14 @@ async function buildViewer(
         if (STICKER_LOG) stickerCost.noHit++;
         return;
       }
+      // No grab yet: take it from here and hold still this frame, so the first
+      // move after a proximity grab or a rotate is the zero it should be.
+      if (!dragGrab) {
+        takeStickerGrab(drag.slot, hit);
+        if (dragGrab) return;
+      }
+      const gdx = dragGrab?.dx ?? 0;
+      const gdy = dragGrab?.dy ?? 0;
       // Report the drag in the game's space: read the surface UV1 under the
       // pointer and subtract the slot's own anchor. The old version measured
       // against an invented base along the body, so the numbers we stored
@@ -9542,8 +9597,8 @@ async function buildViewer(
         // Sliding to the nearest point in the region keeps the drag smooth: past
         // the edge the sticker tracks along the boundary instead of freezing,
         // and it picks the pointer straight back up on the way in.
-        let pu = uv.u - 0.5;
-        let pv = uv.v - 0.5;
+        let pu = uv.u - 0.5 + gdx;
+        let pv = uv.v - 0.5 + gdy;
         if (mk.region) {
           const [cu, cvv] = clampToRegion(mk.region, pu, pv);
           if (STICKER_LOG && (cu !== pu || cvv !== pv)) stickerCost.offRegion++;
@@ -9568,8 +9623,8 @@ async function buildViewer(
         }
         return;
       } else {
-        gx = round(clamp((hit.point.getComponent(AXIS_L) - slotBaseL(drag.slot)) / OFFSET_SCALE, bounds.x[0], bounds.x[1]), 3);
-        gy = round(clamp((hit.point.getComponent(AXIS_H) - baseH) / OFFSET_SCALE, bounds.y[0], bounds.y[1]), 3);
+        gx = round(clamp((hit.point.getComponent(AXIS_L) - slotBaseL(drag.slot)) / OFFSET_SCALE + gdx, bounds.x[0], bounds.x[1]), 3);
+        gy = round(clamp((hit.point.getComponent(AXIS_H) - baseH) / OFFSET_SCALE + gdy, bounds.y[0], bounds.y[1]), 3);
       }
       const entry = decals.get(drag.slot);
       if (entry) {
