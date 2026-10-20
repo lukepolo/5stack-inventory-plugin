@@ -1324,6 +1324,10 @@ function loadStickerTexture(url: string) {
         // Rides the texture so the stickerReady sync path (a drag rebuild
         // never re-awaits the loader) keeps the expansion flag with the map.
         tex.userData.stkRealStickerArt = realStickerArt;
+        // The crop, as a fraction of the source: left, top, width, height. The
+        // effect textures are the game's uncropped files, and the sticker
+        // shader walks the map's UV back through this to read them (STK_UV).
+        tex.userData.stkArtUv = [sx / img.width, sy / img.height, side / img.width, side / img.height];
         return { tex, aspect: w / h, realStickerArt };
       } catch {
         return null;
@@ -5434,8 +5438,30 @@ async function buildViewer(
    * the weapon between two frames of pointer movement. Without one — a fresh
    * placement, a numeric edit — prefer what the user can actually see.
    */
-  function uv1ToSurface(u: number, v: number, near?: import("three").Vector3 | null): SurfacePoint | null {
+  function uv1ToSurface(
+    u: number,
+    v: number,
+    near?: import("three").Vector3 | null,
+    reach = 0,
+  ): SurfacePoint | null {
     const all = uv1Candidates(u, v);
+    /**
+     * An anchor that falls in a seam of the unwrap is not a sticker with nowhere
+     * to go. The game projects the sticker in UV1 and draws whatever of its
+     * rectangle lands on the body; only this resolve needs a triangle under the
+     * exact centre. On the legacy AK-47 the handguard slot's anchor sits at
+     * u 0.336 against a handguard island that starts at 0.338 — two thousandths
+     * into the sticker_gaps strip — so the fourth sticker silently vanished on
+     * every legacy finish (Redline, Vulcan…). `reach` is how far the sticker's
+     * own footprint extends; look outward within it, nearest ring first.
+     */
+    for (const f of [0.1, 0.25, 0.5, 0.8]) {
+      if (all.length || !reach) break;
+      for (let k = 0; k < 8; k++) {
+        const a = (k * Math.PI) / 4;
+        all.push(...uv1Candidates(u + Math.cos(a) * reach * f, v + Math.sin(a) * reach * f));
+      }
+    }
     if (all.length <= 1) return all[0] ?? null;
     let best: SurfacePoint | null = null;
     let bestScore = Infinity;
@@ -5585,7 +5611,12 @@ async function buildViewer(
         .then((t) => {
           t.flipY = false;
           t.colorSpace = THREE.NoColorSpace;
-          t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+          // REPEAT, like every texture the game reads in UV0. The legacy bodies
+          // tile their unwrap well past the unit square — the legacy AK-47
+          // spans u -0.12..2.01 and v -4.0..3.41 on 2,014 of its 12,935
+          // vertices — and a clamped mask read those islands off its border, so
+          // a sticker crossing one was cut along the seam (the Redline AK).
+          t.wrapS = t.wrapT = THREE.RepeatWrapping;
           return t;
         })
         .catch(() => null);
@@ -6254,7 +6285,7 @@ async function buildViewer(
       // facing to report for the grab test — the GEOMETRY is cut in UV below and
       // does not depend on it.
       const near = (liveMesh.get(st.slot)?.userData.stickerCenter as import("three").Vector3 | undefined) ?? null;
-      hit = uv1ToSurface(u, v, near);
+      hit = uv1ToSurface(u, v, near, 0.5 / (mk.scale || 1));
       if (UV_DECAL) uvCut = { u, v, size: 1 / (mk.scale || 1), rot: STICKER_ROT_SIGN * ((st.r ?? 0) * Math.PI) / 180 };
     } else {
       const l = slotBaseL(st.slot) + clamp(st.x ?? 0, bounds.x[0], bounds.x[1]) * OFFSET_SCALE;
