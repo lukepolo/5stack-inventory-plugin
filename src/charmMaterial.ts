@@ -676,10 +676,11 @@ export async function loadCharmTintMasks(
     [...wanted].map(async ([name, { path, flipY }]) => {
       const tex = await loadTexture(paintTextureUrl(path)).catch(() => null);
       if (!tex) return;
-      // MATCH THE ALBEDO'S FLIP. A charm's art reaches us two ways and they do
-      // not agree: the 23 blank-mesh charms fetch theirs as a texture file
-      // (TextureLoader, flipY true), while the other 58 carry theirs inside the
-      // GLB (GLTFLoader, flipY FALSE — glTF's UV origin is top-left). The mask
+      // MATCH THE ALBEDO'S FLIP. A charm's art reaches us two ways: the 23
+      // blank-mesh charms fetch theirs as a texture file (dressCharm), the other
+      // 58 carry theirs inside the GLB. Both are glTF-oriented (flipY FALSE —
+      // dressCharm sets it now; it used to be left at TextureLoader's true, and
+      // the art hung upside down). The mask
       // always arrives by the first route, so on a model-owning charm it was
       // sampled upside down: Charm | Lil' Squatch tinted its fur and face and
       // left the shorts the mask actually covers alone.
@@ -826,9 +827,26 @@ export async function dressCharm(
   const params = await charmMaterialParams(material);
   if (!params) return false;
   const pick = (...names: string[]) => pickTexture(params, ...names);
-  const load = async (path: string | null) => {
+  // glTF's UV origin is top-left, and these maps are laid on a GLB mesh — so
+  // flipY FALSE, as GLTFLoader sets it for the 58 charms that carry their art
+  // inside the model. The shared loader leaves three's default (true), which
+  // hung every blank-mesh charm's art upside down: Lil' Happy's mouth landed
+  // between its legs and its eyes nowhere. Measured, not assumed: drawn over
+  // kc_missinglink_default's UV0, Lil' Happy's albedo puts the face on the front
+  // island exactly as authored. Only the colour is a picture; the rest are data
+  // and must not be sRGB-decoded on every sample. Set on the cached texture —
+  // these files belong to these charms alone, and tuneCharmShading's masks
+  // follow whatever flip the albedo ends up with.
+  const load = async (path: string | null, srgb = false) => {
     if (!path) return null;
     const tex = await loadTexture(paintTextureUrl(path)).catch(() => null);
+    if (!tex) return null;
+    const space = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    if (tex.flipY || tex.colorSpace !== space) {
+      tex.flipY = false;
+      tex.colorSpace = space;
+      tex.needsUpdate = true;
+    }
     return tex;
   };
   // `g_tMetalness` is where csgo_weapon.vfx binds the ROUGHNESS texture on a
@@ -836,13 +854,12 @@ export async function dressCharm(
   // feeds roughnessMap and metalness stays 0. Checked against the real
   // material rather than assumed from the slot name.
   const [color, normal, rough, ao] = await Promise.all([
-    load(pick("g_tColor", "g_tColorTexture")),
+    load(pick("g_tColor", "g_tColorTexture"), true),
     load(pick("g_tNormal", "g_tNormalMap")),
     load(pick("g_tMetalness", "g_tRoughness", "g_tRoughnessTexture")),
     load(pick("g_tAmbientOcclusion")),
   ]);
   if (!color) return false; // nothing recognisable to dress it with
-  color.colorSpace = THREE.SRGBColorSpace;
   model.traverse((n) => {
     const mesh = n as ThreeNS.Mesh;
     if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;

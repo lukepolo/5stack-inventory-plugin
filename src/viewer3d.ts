@@ -4509,6 +4509,21 @@ async function buildViewer(
     // exporter oriented, so they want the flat-on CAMERA without any of the
     // knife's bounding-box gymnastics. Nothing to rotate; just pick the vector.
     flatOn = true;
+    // ...EXCEPT a charm whose broad side the exporter left on the other axis.
+    // The weapon-hung charm already turns by the model's own answer (the charm
+    // build: `(size.z > size.x ? PI/2 : 0) + PI`, its thinnest horizontal axis
+    // being its face normal), and is right for every set. This view was right
+    // only for the sets that take PI/2 there; the Dr. Boom grenades (kc_db_*)
+    // take 0, so on their own they were drawn side-on — the "8" of 8 Ball IGL on
+    // the far edge and its grenade lever reading as a black fin over the top.
+    // Same rule, offset so the sets that were right stay exactly as they were.
+    if (kind === "charm") {
+      const size = new THREE.Box3().setFromObject(object).getSize(new THREE.Vector3());
+      if (!(size.z > size.x)) {
+        object.rotateOnWorldAxis(WORLD_Y, -Math.PI / 2);
+        object.updateMatrixWorld(true);
+      }
+    }
   }
 
   // Auto-frame: center the model and pull the camera back to fit.
