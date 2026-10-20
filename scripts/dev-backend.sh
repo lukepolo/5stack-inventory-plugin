@@ -22,6 +22,22 @@ say() { echo "--- $*"; }
 kc() { kubectl -n "$NS" "$@"; }
 
 command -v kubectl >/dev/null 2>&1 || die "kubectl not found. Run this on the machine your 5stack panel runs on."
+
+# Reach the cluster the way the panel's own plugin.sh does: the panel folder's
+# .5stack-env.config names the kubeconfig, and k3s's default stands in for it.
+# The panel folder is the current directory or the one this checkout sits in.
+if [[ -z "${KUBECONFIG:-}" ]]; then
+  for cfg in "$PWD/.5stack-env.config" "$REPO_DIR/../.5stack-env.config"; do
+    if [[ -f "$cfg" ]]; then
+      KUBECONFIG="$(grep -E '^KUBECONFIG=' "$cfg" | head -1 | cut -d= -f2- | tr -d '"' || true)"
+      [[ -n "$KUBECONFIG" ]] && break
+    fi
+  done
+  KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+  export KUBECONFIG
+fi
+kubectl version -o json >/dev/null 2>&1 ||
+  die "kubectl can't reach the cluster ($KUBECONFIG). Run it with sudo, the way you run ./plugin.sh."
 kc get deployment inventory-backend >/dev/null 2>&1 ||
   die "No inventory plugin in namespace $NS. The dev backend runs beside an installed one."
 
