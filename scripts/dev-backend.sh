@@ -60,31 +60,65 @@ case "${1:-install}" in
 esac
 
 # ---- What the live backend runs with -------------------------------------------
-# Read off the DEPLOYMENT rather than guessed: kustomize suffixes the generated
-# ConfigMap and Secret with a content hash, and older generations can linger.
-cm=$(kc get deployment inventory-backend \
-  -o jsonpath='{.spec.template.spec.containers[0].envFrom[0].configMapRef.name}')
+# Read off the live DEPLOYMENT and INGRESS rather than guessed: kustomize
+# suffixes the generated ConfigMap and Secret with a content hash, older
+# generations can linger, and an install made by an older plugin.sh wires them
+# differently (or not at all) — so every piece has a fallback.
+ctr='.spec.template.spec.containers[0]'
+cm=$(kc get deployment inventory-backend -o jsonpath="{$ctr.envFrom[*].configMapRef.name}" | awk '{print $1}')
 sec=$(kc get deployment inventory-backend \
-  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].valueFrom.secretKeyRef.name}')
-[[ -n "$cm" && -n "$sec" ]] || die "Could not read the live backend's ConfigMap/Secret names."
+  -o jsonpath="{$ctr.env[?(@.name==\"DATABASE_URL\")].valueFrom.secretKeyRef.name}")
+sec_key=$(kc get deployment inventory-backend \
+  -o jsonpath="{$ctr.env[?(@.name==\"DATABASE_URL\")].valueFrom.secretKeyRef.key}")
 
-live_domain=$(kc get configmap "$cm" -o jsonpath='{.data.INVENTORY_DOMAIN}')
-[[ -n "$live_domain" ]] || die "The live config has no INVENTORY_DOMAIN."
+# The live host, from the ingress that serves it.
+live_domain=$(kc get ingress inventory-api -o jsonpath='{.spec.rules[0].host}' 2>/dev/null || true)
+[[ -n "$live_domain" ]] ||
+  live_domain=$(kc get ingress -o jsonpath='{range .items[*]}{.spec.rules[0].host}{"\n"}{end}' | grep -m1 '^inventory\.' || true)
+[[ -n "$live_domain" || -n "${DOMAIN:-}" ]] ||
+  die "Could not find the live plugin's host. Re-run with DOMAIN=inventory-dev.<your panel domain>."
 # inventory.fulm.eu -> inventory-dev.fulm.eu. Override with DOMAIN=...
 DOMAIN="${DOMAIN:-inventory-dev.${live_domain#*.}}"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-say "Config (copied from $cm, INVENTORY_DOMAIN=$DOMAIN)"
-kc get configmap "$cm" -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{"\n"}}{{end}}' |
-  grep -v '^INVENTORY_DOMAIN=' >"$tmp/config.env" || true
+: >"$tmp/config.env"
+if [[ -n "$cm" ]]; then
+  say "Config (copied from $cm, INVENTORY_DOMAIN=$DOMAIN)"
+  kc get configmap "$cm" -o go-template='{{range $k, $v := .data}}{{$k}}={{$v}}{{"\n"}}{{end}}' |
+    grep -v '^INVENTORY_DOMAIN=' >"$tmp/config.env" || true
+else
+  # An older install with no ConfigMap: the backend's defaults already trust a
+  # panel that is a parent domain of this host, which is the usual layout.
+  say "Config (the live backend has none to copy; INVENTORY_DOMAIN=$DOMAIN)"
+fi
 echo "INVENTORY_DOMAIN=$DOMAIN" >>"$tmp/config.env"
 kc create configmap inventory-dev-config --from-env-file="$tmp/config.env" --dry-run=client -o yaml | kc apply -f -
 
-say "Database connection (copied from $sec)"
-db=$(kc get secret "$sec" -o jsonpath='{.data.DATABASE_URL}' | base64 -d)
-[[ -n "$db" ]] || die "The live secret has no DATABASE_URL."
+# The database connection: the live backend's own secret, or a value written
+# straight into its deployment, or — as plugin.sh itself does — the panel's.
+db=""
+if [[ -n "$sec" ]]; then
+  db=$(kc get secret "$sec" -o jsonpath="{.data.${sec_key:-DATABASE_URL}}" | base64 -d)
+  src="secret $sec"
+fi
+if [[ -z "$db" ]]; then
+  db=$(kc get deployment inventory-backend -o jsonpath="{$ctr.env[?(@.name==\"DATABASE_URL\")].value}")
+  src="the live deployment"
+fi
+if [[ -z "$db" ]]; then
+  panel_secret=$(kc get secret -o name | grep timescaledb-secrets | head -1 || true)
+  [[ -n "$panel_secret" ]] &&
+    db=$(kc get "$panel_secret" -o jsonpath='{.data.POSTGRES_CONNECTION_STRING}' | base64 -d)
+  src="the panel's ${panel_secret#secret/}"
+fi
+if [[ -z "$db" ]]; then
+  echo "The live backend's environment (names only):" >&2
+  kc get deployment inventory-backend -o jsonpath="{range $ctr.env[*]}{.name}{' '}{end}{'\n'}" >&2 || true
+  die "Could not find the database connection."
+fi
+say "Database connection (copied from $src)"
 kc create secret generic inventory-dev-secrets --from-literal=DATABASE_URL="$db" --dry-run=client -o yaml |
   kc apply -f -
 
@@ -110,6 +144,16 @@ if [[ -n "$live_tls" ]]; then
   say "TLS: in-cluster (certificate from ${issuer:-5stack-issuer})"
 else
   say "TLS: terminated in front of the cluster (Cloudflare / reverse proxy), no certificate"
+fi
+
+# The dev backend is pinned like the live one, to the node plugin.sh labels —
+# where the models mount and the CS2 install are. An older install may predate
+# the label; then the node the live backend runs on is the one that has them.
+if [[ -z "$(kubectl get nodes -l 5stack-inventory=true -o name 2>/dev/null)" ]]; then
+  node=$(kc get pods -l app=inventory-backend -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+  [[ -n "$node" ]] || die "No node is labeled 5stack-inventory=true and the live backend has no running pod to copy one from."
+  say "Labeling $node 5stack-inventory=true (the node the live backend runs on)"
+  kubectl label node "$node" 5stack-inventory=true --overwrite
 fi
 
 say "Applying"
