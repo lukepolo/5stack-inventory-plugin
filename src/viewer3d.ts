@@ -1909,7 +1909,13 @@ const wrapRotation = (deg: number) => ((((deg + 180) % 360) + 360) % 360) - 180;
 // ~3.2-3.5; only near-horizontal poses (the Nova) land way above. Padding those
 // back down to the cluster keeps every gun at the same on-screen scale.
 const MAX_CROP_ASPECT = 3.6;
-async function cropToContent(blob: Blob, margin = 0.03): Promise<Blob | null> {
+async function cropToContent(
+  blob: Blob,
+  margin = 0.03,
+  /** Filled with how many visible pixels there are and how many of them are
+   *  lit at all — see BLANK_BAKE_LIT. */
+  stats?: { visible: number; lit: number },
+): Promise<Blob | null> {
   try {
     const img = await createImageBitmap(blob);
     const cv = document.createElement("canvas");
@@ -1922,15 +1928,24 @@ async function cropToContent(blob: Blob, margin = 0.03): Promise<Blob | null> {
     let minY = cv.height;
     let maxX = -1;
     let maxY = -1;
+    let visible = 0;
+    let lit = 0;
     for (let y = 0; y < cv.height; y++) {
       for (let x = 0; x < cv.width; x++) {
-        if (d[(y * cv.width + x) * 4 + 3] > 8) {
+        const o = (y * cv.width + x) * 4;
+        if (d[o + 3] > 8) {
+          visible++;
+          if (Math.max(d[o], d[o + 1], d[o + 2]) > 24) lit++;
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
           if (y > maxY) maxY = y;
         }
       }
+    }
+    if (stats) {
+      stats.visible = visible;
+      stats.lit = lit;
     }
     if (maxX < 0) return blob; // fully transparent — keep as-is
     const mx = Math.round((maxX - minX + 1) * margin);
@@ -2201,6 +2216,10 @@ const PREEMPTED = Symbol("preempted");
  *  whole point of the symbol, and there is only ever the one. */
 export { INCOMPLETE };
 
+/** Below this share of visible pixels lit above near-black, a bake is a failed
+ *  frame, not a dark item. See snapshotModelNow. */
+const BLANK_BAKE_LIT = 0.02;
+
 async function snapshotModelNow(
   model: string,
   opts: Omit<ViewerOpts, "interactive" | "still">,
@@ -2242,8 +2261,25 @@ async function snapshotModelNow(
     // finishing would not fix it. INCOMPLETE (not null) so the caller can leave
     // the item queued and try again later.
     if (handle.paintIncomplete()) return INCOMPLETE;
+    // The paint was asked for and is not on the model — a network blip, a GPU
+    // hiccup. The unpainted model still renders (right for a live view), but a
+    // card made of it is stored for good: a Doppler that came back a plain
+    // Butterfly Knife on every refresh. Fail the bake; the caller retries.
+    if (handle.paintFailed()) return null;
     const raw = await handle.snapshot();
-    return raw ? await cropToContent(raw) : raw;
+    if (!raw) return raw;
+    const stats = { visible: 0, lit: 0 };
+    const out = await cropToContent(raw, undefined, stats);
+    // A black frame, with something in it: the context was lost or the scene
+    // was never lit, and the picture is a silhouette. Measured, a real render
+    // keeps far more than this lit even on the darkest item (a bare glove under
+    // the studio rig: 8% of it; under CS2: all of it) — the black Driver Gloves
+    // card that got stored kept 0.7%. Refused rather than stored for everyone.
+    if (stats.visible && stats.lit / stats.visible < BLANK_BAKE_LIT) {
+      console.warn(`[viewer3d] snapshot of ${model} came out black — not baking it`);
+      return null;
+    }
+    return out;
   } catch (e) {
     // A bake passes no signal of its own, so any abort it sees is a preemption
     // by an interactive mount. Reported as PREEMPTED so the caller retries —
@@ -2486,6 +2522,9 @@ export interface ViewerHandle {
    *  not on the mount yet (an extraction is still running). What's on screen is
    *  not the real skin, so it must not be baked into a card. */
   paintIncomplete: () => boolean;
+  /** True when a paint was asked for and is NOT on the model — it failed to load
+   *  or composite, and the unpainted model is showing. Never bake that. */
+  paintFailed: () => boolean;
   /** Measured placement frame, for tools/shadertest. See the impl for why. */
   probePlacement: () => PlacementProbe;
   /** Where the name plate landed, measured against the weapon. See NameplateProbe. */
@@ -3294,6 +3333,8 @@ async function buildViewer(
   // Set by the paint build below when a texture the skin names wasn't on the
   // mount. Read by callers before they bake a card — see ViewerHandle.
   let paintWasIncomplete = false;
+  /** A paint was asked for and is not on the model — see ViewerHandle. */
+  let paintFailed = false;
   // Which body survived the hd/legacy prune below — slot markup is per-variant.
   let bodyVariant = "body_hd";
   // What the prop cull removed — if this reads 0 tris on the Revolver or
@@ -4293,6 +4334,7 @@ async function buildViewer(
         // Sticky: a rebuild that composites cleanly clears it, but within one
         // build any missing texture means what's on screen isn't the real skin.
         paintWasIncomplete = !!comp?.incomplete;
+        if (!comp) paintFailed = true;
         // Custom paint jobs ship their own normal map (paint-UV space).
         // Gated on paint.useNormalMap, NOT on the texture existing: these
         // materials ship a real g_tNormal even with the switch off, so keying
@@ -4340,6 +4382,8 @@ async function buildViewer(
           // list, built once, so a later re-composite has somewhere to point.
           paintCtx = { paint, weaponInputs, mats: paintedMats };
         }
+      } else {
+        paintFailed = true;
       }
     } catch (e) {
       // A cancellation is not a paint failure. Without this re-throw the
@@ -4352,6 +4396,7 @@ async function buildViewer(
       // symptom of half a dozen unrelated causes and this catch used to name
       // none of them. Warn rather than throw; the viewer is still usable.
       console.warn(`[viewer3d] paint failed for ${model} (${weaponPaint}) — rendering untextured`, e);
+      paintFailed = true;
     }
     mt.mark("mat");
   }
@@ -13911,6 +13956,7 @@ async function buildViewer(
       };
     },
     paintIncomplete: () => paintWasIncomplete,
+    paintFailed: () => paintFailed,
     // Render one fresh frame and hand back a PNG of exactly what's on screen.
     async snapshot(opts?: { live?: boolean }) {
       if (disposed) return null;
