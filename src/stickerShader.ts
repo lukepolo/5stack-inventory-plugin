@@ -72,6 +72,21 @@ export interface StickerSfx {
 }
 
 /** Extra knobs for applyStickerSfx that are about the ART, not the material. */
+/**
+ * Per-material uniforms the live 3D viewer writes every frame to make holo and
+ * lenticular stickers follow the camera and the light. `uHoloLive` 0 (the
+ * default, and every baked card) keeps the fixed formula; see the holo branch.
+ * Eye and light are VIEW-space; the eye is a point, the light a direction.
+ */
+export interface StickerHoloLive {
+  uHoloLive: { value: number };
+  uHoloEye: { value: ThreeNS.Vector3 };
+  uHoloLight: { value: ThreeNS.Vector3 };
+  uHoloGlint: { value: ThreeNS.Vector3 };
+  uHoloBias: { value: number };
+  uHoloShine: { value: number };
+}
+
 export interface StickerSfxOpts {
   /**
    * True only when the map really is g_tSticker0 — the game texture whose
@@ -117,6 +132,8 @@ uniform sampler2D uScratchTex, uSfxMaskTex, uHoloTex, uGlitterTex, uNormRoughTex
 uniform bool uHasScratch, uHasSfxMask, uHasHolo, uHasGlitter, uHasNormRough;
 uniform bool uPaperBacking, uMetallic, uPreserveRough, uClampSpectrumV;
 uniform vec4 uStkArtUv;
+uniform float uHoloLive, uHoloBias, uHoloShine;
+uniform vec3 uHoloEye, uHoloLight, uHoloGlint;
 uniform bool uExpandAlpha, uPbrFit, uLegacyTint, uSelfIllum;
 uniform float uWear, uWearScratches, uSfxColorBoost, uGlitterScale, uColorBoost, uTintSaturate;
 uniform vec2 uWearBias;
@@ -407,6 +424,21 @@ export async function applyStickerSfx(
   // take it, and without one the shader would apply it to the whole sticker.
   const hasGlitter = s.glitter && !!glitterTex && !!sfxMaskTex;
   const hasHolo = s.holo && !!holoTex && !!sfxMaskTex;
+  // The live viewer's handle on the holo view term — see StickerHoloLive.
+  // Created here rather than in onBeforeCompile so the viewer can drive it
+  // before the program even exists, and shared BY REFERENCE with the shader:
+  // writing `.value` each frame is the whole update.
+  const live: StickerHoloLive | null = hasHolo
+    ? {
+        uHoloLive: { value: 0 },
+        uHoloEye: { value: new THREE.Vector3(0, 0, 1) },
+        uHoloLight: { value: new THREE.Vector3(0, 0, 1) },
+        uHoloGlint: { value: new THREE.Vector3(0, 0, 1) },
+        uHoloBias: { value: 0 },
+        uHoloShine: { value: 0 },
+      }
+    : null;
+  mat.userData.stkHolo = live;
   // Where the decal's map sits inside the game's texture — see STK_UV below.
   const crop = (mat.map?.userData as { stkArtUv?: number[] } | undefined)?.stkArtUv;
   const artUv: [number, number, number, number] =
@@ -441,6 +473,14 @@ export async function applyStickerSfx(
       uWearBias: { value: new THREE.Vector2(s.wearBias[0], s.wearBias[1]) },
       uColorTint: { value: new THREE.Vector3(...s.colorTint) },
       uStkArtUv: { value: new THREE.Vector4(...artUv) },
+      ...(live ?? {
+        uHoloLive: { value: 0 },
+        uHoloEye: { value: new THREE.Vector3(0, 0, 1) },
+        uHoloLight: { value: new THREE.Vector3(0, 0, 1) },
+        uHoloGlint: { value: new THREE.Vector3(0, 0, 1) },
+        uHoloBias: { value: 0 },
+        uHoloShine: { value: 0 },
+      }),
     });
 
     shader.fragmentShader = shader.fragmentShader
@@ -573,9 +613,21 @@ export async function applyStickerSfx(
              // texel sits in it. The view term SHIFTS along U, which is the
              // whole effect: turn the sticker and the band sweeps.
              //
-             // Valve adds dot(V,N) + dot(V,lightDir); the light half is the
-             // calibrated constant STK_HOLO_LIGHT.
-             float shift = dot(stkV, normal) + STK_HOLO_LIGHT;
+             // Valve adds dot(V,N) + dot(V,lightDir).
+             //
+             // LIVE (the 3D viewer, uHoloLive = 1): both terms are real — V
+             // from a virtual eye at a normal viewing distance, so the band
+             // moves ACROSS a sticker instead of the parallel projection's one
+             // flat colour, and L the scene's key light, so it moves as the
+             // camera orbits and as the light drifts. uHoloBias keeps the
+             // head-on frame where the game's inspect view shows it.
+             //
+             // STILL (baked cards): the parallel view and the calibrated
+             // constant STK_HOLO_LIGHT, so a card never depends on a light.
+             vec3 holoV = uHoloLive > 0.5 ? normalize(uHoloEye + vViewPosition) : stkV;
+             float shift = uHoloLive > 0.5
+               ? dot(holoV, normal) + dot(holoV, uHoloLight) + uHoloBias
+               : dot(stkV, normal) + STK_HOLO_LIGHT;
              vec2 suv = vec2(sfxM.y + shift, sfxM.z);
              if (uClampSpectrumV) suv.y = clamp(suv.y, 0.0, 1.0);
              vec3 spectrum = texture2D(uHoloTex, suv).xyz;
@@ -592,6 +644,29 @@ export async function applyStickerSfx(
              // the accumulator is knocked OUT where the holo mask is set
              // (sticker.glsl:669).
              stkMetal *= (1.0 - sfxM.x);
+             if (uHoloLive > 0.5) {
+               // The SHINE, which the game gets from its bloom and a close
+               // inspect light and an orthographic studio render does not: a
+               // glint in the foil's own colour — a tight highlight on a soft
+               // shoulder — and a glossier surface for the environment to
+               // reflect in. Its own light (uHoloGlint) wanders near the view
+               // axis, so its reflection actually crosses stickers that face
+               // the viewer; the holo light sits too far off-axis to. Live
+               // viewer only.
+               vec3 hh = normalize(uHoloGlint + holoV);
+               float nh = max(dot(normal, hh), 0.0);
+               float glint = pow(nh, 64.0) * 2.2 + pow(nh, 16.0) * 0.25;
+               // A glint off a point light only fires at the angles that
+               // mirror it, which a sticker held side-on to the viewer rarely
+               // meets. Foil also throws a SHEEN: a soft band of light lying
+               // diagonally across it that slides as the foil tilts. Driven by
+               // the same view-and-light term as the colour shift, so the band
+               // and the rainbow move together, as one surface.
+               float band = fract((stkUv.x + stkUv.y) * 0.7 - shift * 2.5) - 0.5;
+               float sheen = exp(-band * band * 90.0) * 0.55;
+               stkEmissive += refit * (glint + sheen) * uHoloShine * sfxM.x;
+               roughnessFactor = mix(roughnessFactor, min(roughnessFactor, 0.22), sfxM.x * uHoloShine);
+             }
            }
          }
          metalnessFactor = max(metalnessFactor, stkMetal);`,

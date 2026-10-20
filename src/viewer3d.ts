@@ -40,7 +40,7 @@ import {
   wakeCharmSim,
   worldToCharmDir,
 } from "./charmPhysics";
-import { applyStickerMask, applyStickerSfx, type StickerSfx } from "./stickerShader";
+import { applyStickerMask, applyStickerSfx, type StickerHoloLive, type StickerSfx } from "./stickerShader";
 import { compositeGlove, gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { compositeGloveModern, gloveSeedMoves, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
@@ -61,6 +61,7 @@ import NAMETAG_ANCHORS from "./nametagAnchors.json";
 // Same shared-prop tree the StatTrak module comes from — see MODULE_GLB.
 const NAMETAG_GLB = "extra/nametag_module";
 import {
+  alphaAsMask,
   ATLAS_ROWS,
   composeDigitAtlas,
   digitBand,
@@ -1427,18 +1428,17 @@ const posedCache = new Map<string, PosedModel>();
 /** How much the knife's digit row is enlarged before it is drawn — see
  *  digitBand. 4x turns the 512px atlas's row into a 2048 x 256 strip. */
 const KNIFE_DIGIT_SCALE = 4;
-/** The knife digit atlas exactly as the game ships it. `color` is only
- *  published when its alpha actually cuts the scratches out. */
+/** The knife digit colour atlas exactly as the game ships it — published only
+ *  when its alpha actually cuts the scratches out, which is all it is used for. */
 interface KnifeDigitArt {
-  color: HTMLImageElement | null;
-  normal: HTMLImageElement | null;
+  color: HTMLImageElement;
 }
 let knifeDigitArt: Promise<KnifeDigitArt | null> | null = null;
 /**
  * The knife's digit atlas from the stattrak-art extraction step: the game's
- * colour atlas WITH its alpha (the scratch cut-out the glTF copy drops) and the
- * normal atlas, both at the archive's own resolution. Null on a mount extracted
- * before that step — the caller then rebuilds the cut from the normals.
+ * colour atlas WITH its alpha (the scratch cut-out the glTF copy drops). Null
+ * on a mount extracted before that step — the caller then rebuilds the cut
+ * from the normals.
  * Fetched once per page.
  */
 function loadKnifeDigitArt(): Promise<KnifeDigitArt | null> {
@@ -1446,20 +1446,19 @@ function loadKnifeDigitArt(): Promise<KnifeDigitArt | null> {
     try {
       const res = await fetch(withAssetVersion(`${getAssetOrigin()}/models/stattrak-art.json`));
       if (!res.ok) return null;
-      const knife = ((await res.json()) as { knife?: { color?: unknown; normal?: unknown } })?.knife;
-      // One bad file costs only itself: the other still beats the glTF copy.
-      const load = (file: unknown) =>
-        typeof file !== "string"
-          ? Promise.resolve(null)
-          : new Promise<HTMLImageElement | null>((resolve) => {
-              const img = new Image();
-              img.crossOrigin = "anonymous";
-              img.onload = () => resolve(img);
-              img.onerror = () => resolve(null);
-              img.src = withAssetVersion(`${getAssetOrigin()}/models/${file.split("/").map(encodeURIComponent).join("/")}`);
-            });
-      const [color, normal] = await Promise.all([load(knife?.color), load(knife?.normal)]);
-      return color || normal ? { color, normal } : null;
+      // The normal atlas the step also writes is NOT used: its RGB is the
+      // module glTF's own, and its alpha is 0 throughout, which a canvas would
+      // turn into black.
+      const file = ((await res.json()) as { knife?: { color?: unknown } })?.knife?.color;
+      if (typeof file !== "string") return null;
+      const color = await new Promise<HTMLImageElement | null>((resolve) => {
+        const img = new Image();
+        img.crossOrigin = "anonymous";
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = withAssetVersion(`${getAssetOrigin()}/models/${file.split("/").map(encodeURIComponent).join("/")}`);
+      });
+      return color ? { color } : null;
     } catch {
       return null;
     }
@@ -6471,6 +6470,81 @@ async function buildViewer(
     if (!liveMesh.has(slot)) return;
     flashing.set(slot, performance.now());
   }
+  /**
+   * Holo and lenticular stickers, live: the view term follows the camera and
+   * the key light, and the light drifts a little so a still weapon shimmers.
+   *
+   * The game's holo term is dot(V,N) + dot(V,lightDir) (stickerShader's holo
+   * branch). Under our parallel projection V is one constant and there was no
+   * light at all, so a holo sticker barely changed as the weapon turned. Here
+   * V comes from a virtual eye HOLO_EYE_DIST model-lengths out — the band then
+   * runs ACROSS a sticker, as it does through a real lens — and L is a light
+   * held fixed to the CAMERA, up and to the left. That is the game's own
+   * geometry: its inspect light and camera stay put while the weapon turns,
+   * so turning the weapon changes N and never L. Here the camera orbits
+   * instead, which in view space is the same thing as long as the light rides
+   * with it; a light fixed in the world would double-count every orbit and
+   * would almost never catch a sticker facing the viewer. The idle drift is a
+   * slow wander of that light, gated by the Motion switch and
+   * prefers-reduced-motion.
+   *
+   * `holoBias` keeps the head-on frame where the game's inspect view shows it
+   * (Econometer's needle on FORCE, see STK_HOLO_LIGHT).
+   */
+  const HOLO_EYE_DIST = 1.5;
+  /** The camera-fixed holo light, view space (x right, y up, z toward the
+   *  viewer): about 37 degrees off the view axis, up and to the left. */
+  const HOLO_LIGHT = new THREE.Vector3(-0.35, 0.5, 0.8).normalize();
+  const holoBias = 0.6 - HOLO_LIGHT.z;
+  /** The glint's light: near the view axis, wandering wide (radians around
+   *  view Y, view X) so its reflection sweeps across stickers that face the
+   *  viewer instead of sitting off to one side of them. */
+  const HOLO_GLINT = new THREE.Vector3(-0.1, 0.15, 1).normalize();
+  const HOLO_GLINT_DRIFT = [0.55, 0.3];
+  /** Idle light wander in radians (around view Y, view X). Enough to swing a
+   *  lenticular a frame either way and run a holo band a good way across. */
+  const HOLO_DRIFT = [0.4, 0.22];
+  const holoTmp = {
+    eye: new THREE.Vector3(),
+    light: new THREE.Vector3(),
+    glint: new THREE.Vector3(),
+    axis: new THREE.Vector3(),
+  };
+  function stepStickerHolo(now: number) {
+    const lives: StickerHoloLive[] = [];
+    object.traverse((n) => {
+      const live = ((n as import("three").Mesh).material as import("three").Material | undefined)?.userData?.stkHolo as
+        | StickerHoloLive
+        | null
+        | undefined;
+      if (live) lives.push(live);
+    });
+    if (!lives.length) return;
+    camera.updateMatrixWorld();
+    const view = camera.matrixWorldInverse;
+    const { eye, light, glint, axis } = holoTmp;
+    eye.copy(controls.target).applyMatrix4(view);
+    eye.z += radius * HOLO_EYE_DIST;
+    light.copy(HOLO_LIGHT);
+    glint.copy(HOLO_GLINT);
+    if (motionOn && !reducedMotion.value) {
+      const t = now / 1000;
+      light.applyAxisAngle(axis.set(0, 1, 0), HOLO_DRIFT[0] * Math.sin((t * Math.PI * 2) / 7));
+      light.applyAxisAngle(axis.set(1, 0, 0), HOLO_DRIFT[1] * Math.sin((t * Math.PI * 2) / 4.3));
+      // Its own periods, so the glint does not march in step with the bands.
+      glint.applyAxisAngle(axis.set(0, 1, 0), HOLO_GLINT_DRIFT[0] * Math.sin((t * Math.PI * 2) / 5.3));
+      glint.applyAxisAngle(axis.set(1, 0, 0), HOLO_GLINT_DRIFT[1] * Math.sin((t * Math.PI * 2) / 3.7 + 1));
+    }
+    for (const live of lives) {
+      live.uHoloLive.value = 1;
+      live.uHoloEye.value.copy(eye);
+      live.uHoloLight.value.copy(light);
+      live.uHoloGlint.value.copy(glint);
+      live.uHoloBias.value = holoBias;
+      live.uHoloShine.value = 1;
+    }
+  }
+
   function stepDecalGlow(now: number) {
     const dt = glowLast ? Math.min((now - glowLast) / 1000, 0.1) : 0;
     glowLast = now;
@@ -10730,8 +10804,10 @@ async function buildViewer(
       stattrakDisposables.push(tex);
       return tex;
     };
-    const colorImg = (art?.color ?? display.map?.image) as Img | undefined;
-    const normalImg = (art?.normal ?? display.normalMap?.image) as Img | undefined;
+    // Colour and relief from the module's own (opaque) atlases; only the CUT
+    // comes from the game's file — see alphaAsMask.
+    const colorImg = display.map?.image as Img | undefined;
+    const normalImg = display.normalMap?.image as Img | undefined;
     if (!normalImg?.width) return;
     const srcNormal = display.normalMap;
     const normals = digitBand(composeDigitAtlas(normalImg, count), KNIFE_DIGIT_SCALE);
@@ -10740,10 +10816,72 @@ async function buildViewer(
       display.map = like(display.map, digitBand(composeDigitAtlas(colorImg, count), KNIFE_DIGIT_SCALE), THREE.SRGBColorSpace);
     }
     display.normalMap = normalMap;
-    display.alphaMap = art?.color ? null : like(srcNormal, engravingMask(normals), THREE.NoColorSpace);
+    const cut = art?.color
+      ? digitBand(composeDigitAtlas(alphaAsMask(art.color), count), KNIFE_DIGIT_SCALE)
+      : engravingMask(normals);
+    display.alphaMap = like(srcNormal, cut, THREE.NoColorSpace);
     if (!display.alphaTest) display.alphaTest = 0.667;
     display.alphaToCoverage = true;
     display.needsUpdate = true;
+  }
+
+  /**
+   * Rest a name plate's BACK face on the surface under it — the seating for a
+   * plate placed by its attachment's own angles (C4, knives).
+   *
+   * The plate's geometry is centred on its origin when it is mounted (see
+   * mountNameTag), so hung straight on the attachment half its thickness is in
+   * the body. On the C4 that put the label under the screen bezel, and the
+   * stickers on the bezel drew over it — in game the label is a model on top
+   * of stickers that are painted into the surface. The gun path seats along
+   * the receiver's side axis, which is not these plates' normal.
+   *
+   * "Out" is the module's own +Y (source left): the side an unrotated gun's
+   * plate faces, which the attachment's angles carry to the C4's screen and
+   * each knife's handle. Sampled across the back face; a sample further than
+   * PLATE_MAX_MOVE away is something the plate overhangs, not what it rests
+   * on. CLEAR is twice a sticker decal's lift, so the plate always sits above
+   * the stickers around it.
+   */
+  function seatPlateOnSurface(mod: import("three").Object3D) {
+    let found: import("three").Mesh | null = null;
+    mod.traverse((c) => {
+      if (!found && (c as import("three").Mesh).isMesh) found = c as import("three").Mesh;
+    });
+    const mesh = found as import("three").Mesh | null;
+    if (!mesh) return 0;
+    object.updateMatrixWorld(true);
+    mesh.geometry.computeBoundingBox();
+    const bb = mesh.geometry.boundingBox!;
+    const ctr = bb.getCenter(new THREE.Vector3());
+    const half = new THREE.Vector3().subVectors(bb.max, ctr);
+    const toWorld = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z).applyMatrix4(mesh.matrixWorld);
+    const c0 = toWorld(ctr.x, ctr.y, ctr.z);
+    const back = toWorld(ctr.x, ctr.y - half.y, ctr.z);
+    const n = c0.clone().sub(back);
+    const halfThick = n.length();
+    if (halfThick < 1e-9) return 0;
+    n.normalize();
+    const PROBE = 0.01;
+    const PLATE_MAX_MOVE = 0.004;
+    const CLEAR = sizeL * DECAL_LIFT * 2;
+    let worst = -Infinity;
+    for (const [fx, fz] of [[0, 0], [-0.8, -0.6], [0.8, -0.6], [-0.8, 0.6], [0.8, 0.6], [-0.4, 0], [0.4, 0]]) {
+      const p = toWorld(ctr.x + fx * half.x, ctr.y - half.y, ctr.z + fz * half.z).addScaledVector(n, PROBE);
+      raycaster.set(p, n.clone().negate());
+      raycaster.far = PROBE * 2;
+      const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
+      raycaster.far = Infinity;
+      if (!hit) continue;
+      const above = PROBE - hit.distance; // surface height over the back face
+      if (Math.abs(above) <= PLATE_MAX_MOVE) worst = Math.max(worst, above);
+    }
+    if (worst === -Infinity) return 0;
+    const move = worst + CLEAR;
+    const at = mod.getWorldPosition(new THREE.Vector3()).addScaledVector(n, move);
+    mod.position.copy(object.worldToLocal(at));
+    mod.updateMatrixWorld(true);
+    return move;
   }
 
   const stattrakDisposables: { dispose: () => void }[] = [];
@@ -11075,9 +11213,17 @@ async function buildViewer(
     // of its face, up its height) lays it exactly as the game does, and the
     // surface search below lands on the screen bezel's side wall instead and
     // stands the plate on edge. Valve parents it there unseated, so do we.
-    const asAuthored = model === "c4";
+    // The C4 and the knives take the attachment's own angles, composed as a
+    // real Source QAngle — the convention that also lays every knife's StatTrak
+    // plate flat on its blade. The gun path below finds "out" by searching the
+    // surface and reads the reading direction off the angles, which is right
+    // on a rifle and wrong on these: on the C4 the search lands on the screen
+    // bezel's side wall, on the Karambit and Bayonet it laid the plate
+    // diagonally across the handle or stood it on edge.
+    const asAuthored = model === "c4" || picked.knife;
     if (!placeAttachedModule(mod, picked.anchor, picked.bone, asAuthored, !asAuthored, asAuthored ? "none" : "posed")) return;
     object.add(mod);
+    if (asAuthored) seatPlateOnSurface(mod);
     /**
      * Orient the plate: flatness from the BODY, direction from the GAME DATA.
      *
@@ -13400,6 +13546,7 @@ async function buildViewer(
     updateRing();
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
+    stepStickerHolo(performance.now());
     // Split the first frame's cost in two: `wait` is everything from the last
     // build stage to the draw call (the rAF wait, controls, the charm's first
     // step), `first` is the draw itself — which is where the shader compile and

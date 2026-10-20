@@ -152,6 +152,34 @@ export function digitBand(atlas: CanvasImageSource & { width: number; height: nu
 }
 
 /**
+ * An opaque copy of an image's ALPHA (R = G = B = alpha), for use as an
+ * alphaMap.
+ *
+ * The game's knife colour atlas cuts its scratches with alpha, and handing a
+ * browser that atlas as a colour map loses what is under the cut: a 2D canvas
+ * stores premultiplied, so every texel at alpha 0 comes back black and the
+ * filtered edge of each digit darkens. Its alpha, on the other hand, survives
+ * getImageData exactly — so take only the cut from it and keep the colour (and
+ * the relief) from the module's own opaque copies.
+ */
+export function alphaAsMask(source: CanvasImageSource & { width: number; height: number }): HTMLCanvasElement {
+  const cv = document.createElement("canvas");
+  cv.width = source.width;
+  cv.height = source.height;
+  const ctx = cv.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return cv;
+  ctx.drawImage(source, 0, 0);
+  const img = ctx.getImageData(0, 0, cv.width, cv.height);
+  const px = img.data;
+  for (let i = 0; i < px.length; i += 4) {
+    px[i] = px[i + 1] = px[i + 2] = px[i + 3];
+    px[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return cv;
+}
+
+/**
  * The cut-out for the KNIFE plate, when the mount has no alpha for it: opaque
  * on the scratched digits, clear everywhere else.
  *
