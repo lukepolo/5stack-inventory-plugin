@@ -21,6 +21,7 @@
  */
 import { loadPaintDef, loadWeaponInputs, compositePaint, type PaintDef } from "./paintComposite";
 import { compositeGloveModern, loadGloveModernDef } from "./gloveCompositeModern";
+import { compositeGlove, loadGlovePaintDef } from "./gloveComposite";
 // Through the façade: a pattern scan is a rendering job, so it can afford to
 // wait for the viewer chunk — but App.vue imports SCAN_READ_SIZE from this
 // file, and a static edge here would have dragged viewer3d back into the boot
@@ -264,10 +265,14 @@ export async function comparePatterns(
   type Albedo = { albedo: import("three").Texture; release: () => void };
   let albedoAt: (THREE: typeof import("three"), renderer: import("three").WebGLRenderer, seed: number) => Promise<Albedo | null>;
   if (r.glove) {
-    const def = await loadGloveModernDef(r.paintMaterial);
-    if (!def) return null;
+    // Either generation — the older 73 roll their print's placement too.
+    const ldef = await loadGlovePaintDef(r.paintMaterial);
+    const def = ldef ? null : await loadGloveModernDef(r.paintMaterial);
+    if (!ldef && !def) return null;
     albedoAt = (THREE, renderer, seed) =>
-      compositeGloveModern(THREE, renderer, def, { wear: SCAN_WEAR, size: SCAN_SIZE, seed })
+      (ldef
+        ? compositeGlove(THREE, renderer, ldef, { wear: SCAN_WEAR, size: SCAN_SIZE, seed })
+        : compositeGloveModern(THREE, renderer, def!, { wear: SCAN_WEAR, size: SCAN_SIZE, seed }))
         .then((c) => (c ? { albedo: c.albedo, release: c.dispose } : null))
         .catch(() => null);
   } else {

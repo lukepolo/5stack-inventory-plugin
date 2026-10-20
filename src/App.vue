@@ -162,6 +162,7 @@ import { MAX_STATTRAK } from "./stattrakModule";
 import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
 import { formatGunTrait, gunPlacement, gunPlacementTable, gunPlacementTraits } from "./gunPattern";
 import { gloveSeedMoves, loadGloveModernDef, type GloveModernDef } from "./gloveCompositeModern";
+import { gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { glovePlacementAt, glovePlacementTable, glovePlacementTraits } from "./glovePattern";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
@@ -1981,11 +1982,16 @@ const gunTraits = computed<TraitRow[]>(() => {
 });
 /** A gun's patterns are 1..1000 (randomizeCraft draws the same range). */
 const gunTable = () => (craftPaintDef.value ? gunPlacementTable(craftPaintDef.value, 1, 1000) : null);
-/** The open GLOVE's Gen2 def — null for the 73 older finishes, whose pattern
- *  rolls nothing the data spells out. Set by the same watcher as patternMoves. */
+/** The open GLOVE's Gen2 def — null for the 73 older finishes, which roll only
+ *  the print's offset and rotation and so have no placement bars to show. Set
+ *  by the same watcher as patternMoves. */
 const craftGloveDef = shallowRef<GloveModernDef | null>(null);
+/** An older finish whose pattern moves its print — what it has instead. */
+const craftGloveLegacyMoves = ref(false);
 /** Does this glove's pattern change the 3D preview? */
-const gloveSeedLive = computed(() => !!craftGloveDef.value && gloveSeedMoves(craftGloveDef.value));
+const gloveSeedLive = computed(
+  () => (!!craftGloveDef.value && gloveSeedMoves(craftGloveDef.value)) || craftGloveLegacyMoves.value,
+);
 /** The glove's twin of gunTraits: where the pattern puts the artwork. */
 const gloveTraits = computed<TraitRow[]>(() => {
   const def = craftGloveDef.value;
@@ -2132,12 +2138,13 @@ watch(
     patternMoves.value = null;
     craftPaintDef.value = null;
     craftGloveDef.value = null;
+    craftGloveLegacyMoves.value = false;
     // A GLOVE carries a pattern and is rendered by a different compositor.
     // Asking the weapon paint def about it would answer a question about a
     // shader that is not the one drawing this, so the weapon rail stays off.
-    // The glove's own answer is its Gen2 def: on those 22 finishes the pattern
-    // rolls the artwork's placement (gloveRolls), and the glove control shows
-    // it live. The other 73 load null and keep the plain field.
+    // The glove's own answer is its own def: on the 22 Gen2 finishes the
+    // pattern rolls the artwork's placement (gloveRolls), on the other 73 the
+    // print's offset and rotation — either way the glove control shows it live.
     //
     // Asked of the ECONOMY TYPE as well as the viewer kind, because the two
     // become known at different moments and only one of them is synchronous.
@@ -2147,10 +2154,14 @@ watch(
     if (kind === "glove" || type === "glove") {
       patternMoves.value = false;
       if (!pm) return;
-      const gdef = await loadGloveModernDef(pm).catch(() => null);
+      const [ldef, gdef] = await Promise.all([
+        loadGlovePaintDef(pm).catch(() => null),
+        loadGloveModernDef(pm).catch(() => null),
+      ]);
       // Same subject check as below, for the same out-of-order reason.
       if ((craft.value?.skin.paintMaterial ?? null) !== pm) return;
       craftGloveDef.value = gdef;
+      craftGloveLegacyMoves.value = !!ldef && gloveLegacySeedMoves(ldef);
       return;
     }
     if (!pm) return;

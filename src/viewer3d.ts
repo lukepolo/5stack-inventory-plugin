@@ -41,7 +41,7 @@ import {
   worldToCharmDir,
 } from "./charmPhysics";
 import { applyStickerSfx, type StickerSfx } from "./stickerShader";
-import { compositeGlove, loadGlovePaintDef } from "./gloveComposite";
+import { compositeGlove, gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { compositeGloveModern, gloveSeedMoves, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
 import { hasModel, modelUrlFor } from "./modelAvailability";
@@ -4038,10 +4038,11 @@ async function buildViewer(
    * full rebuild — a fresh GLB load, a fresh context and a fresh 2048² composite
    * per pointer move, which is the slideshow the weapon path stopped having.
    *
-   * The SEED matters only on the 22 substrate/surface finishes, whose vcompmat
-   * rolls the artwork's placement from it (gloveRolls in gloveCompositeModern).
-   * The other 73 have no roll the data spells out, so on those a pattern change
-   * stays a no-op rather than a repaint — `seeded` says which this is.
+   * The SEED places the artwork on both generations: the 22 substrate/surface
+   * finishes roll it in their own vcompmat, the other 73 in the shared include
+   * they all pull in (gloveRolls in gloveCompositeModern). A finish whose rolls
+   * are all flat ignores it, so a pattern change there stays a no-op rather
+   * than a repaint — `seeded` says which this is.
    */
   let gloveCtx: {
     run: (wear: number, size?: number, seed?: number | null) => Promise<GloveMaps | null>;
@@ -4080,10 +4081,10 @@ async function buildViewer(
       // resolved to, and re-deciding it per tick would re-fetch both defs and
       // re-run the whole "try 73, fall back to 22" probe on every pointer move.
       let run: ((wear: number, size?: number, seed?: number | null) => Promise<GloveMaps | null>) | null = def
-        ? (w, s) => compositeGlove(THREE, renderer, def, { wear: w, size: s })
+        ? (w, s, sd) => compositeGlove(THREE, renderer, def, { wear: w, size: s, seed: sd })
         : null;
-      let seeded = false;
-      let right: GloveMaps | null = run ? await run(opts?.wear ?? 0) : null;
+      let seeded = !!def && gloveLegacySeedMoves(def);
+      let right: GloveMaps | null = run ? await run(opts?.wear ?? 0, undefined, opts?.seed ?? null) : null;
       if (!right) {
         const mdef = await loadGloveModernDef(opts.paintMaterial);
         run = mdef ? (w, s, sd) => compositeGloveModern(THREE, renderer, mdef, { wear: w, size: s, seed: sd }) : null;
@@ -10867,7 +10868,7 @@ async function buildViewer(
   async function paintGloveOnto(root: import("three").Object3D, material: string, wear: number, seed: number | null) {
     try {
       const def = await loadGlovePaintDef(material);
-      let maps: GloveMaps | null = def ? await compositeGlove(THREE, renderer, def, { wear }) : null;
+      let maps: GloveMaps | null = def ? await compositeGlove(THREE, renderer, def, { wear, seed }) : null;
       if (!maps) {
         const mdef = await loadGloveModernDef(material);
         maps = mdef ? await compositeGloveModern(THREE, renderer, mdef, { wear, seed }) : null;

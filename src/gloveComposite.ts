@@ -49,7 +49,7 @@
  *      weight per slot so region boundaries are soft rather than stair-stepped.
  *      The blur is not a detail to skip; it IS the colour. Result is sRGB.
  *
- *   2. PATTERN PALETTE, which most finishes take (g_bPattern). The pattern's RGB
+ *   2. PATTERN PALETTE, which most finishes take (F_PATTERN). The pattern's RGB
  *      blends FOUR palette entries chosen by g_vPatternPaletteIndices. Modes 1/3
  *      print over everything; 0/2 REPLACE one palette slot, and that slot's
  *      accumulated weight is the coverage — which is why paletteColour has to
@@ -73,7 +73,8 @@
  *      per-texel scale cannot be resolved ahead of the blend.
  */
 import type * as ThreeNS from "three";
-import { paintFetch, paintTextureUrl } from "./paintComposite";
+import { paintFetch, paintTextureUrl, texXform } from "./paintComposite";
+import { gloveRolled, gloveRolls, type GloveRoll } from "./gloveCompositeModern";
 
 type Three = typeof ThreeNS;
 
@@ -93,6 +94,9 @@ export interface GlovePaintDef {
   pattern: boolean;
   patternMode: number;
   patternReplaceIndex: number;
+  /** What the pattern number draws — the print's offset and rotation among
+   *  them. See compositeGlove's placement. */
+  rolls: GloveRoll[];
 }
 
 /**
@@ -140,6 +144,8 @@ const MATERIAL_DEFAULTS: Record<string, number> = {
   g_fPatternMetalness: 0,
   g_fPatternDetailInfluence: 0,
   g_flSheenScale: 0.667,
+  g_fPatternTexCoordScale: 1,
+  g_fPatternTexCoordRotation: 0,
 };
 
 const NUM = (v: unknown, d: number) => {
@@ -172,12 +178,16 @@ export async function loadGlovePaintDef(material: string): Promise<GlovePaintDef
   // near-black. That was "Sport Gloves | Ultra Violent renders black". Take
   // whichever is present rather than special-casing either.
   let path = material;
+  let rolls: GloveRoll[] = [];
   if (/\.vcompmat\.json$/i.test(path)) {
-    const comp = (await paintFetch(path)
-      .then((r) => r.json())
-      .catch(() => null)) as unknown;
+    const fetchJson = (p: string) =>
+      paintFetch(p)
+        .then((r) => r.json())
+        .catch(() => null) as Promise<unknown>;
+    const comp = await fetchJson(path);
     let specific: string | null = null;
     let loose: string | null = null;
+    const includes: string[] = [];
     const walk = (node: unknown) => {
       if (!node) return;
       if (Array.isArray(node)) return node.forEach(walk);
@@ -189,12 +199,19 @@ export async function loadGlovePaintDef(material: string): Promise<GlovePaintDef
           if (typeof v?.m_strResourceMaterial === "string") loose ??= v.m_strResourceMaterial;
         }
       }
+      for (const inc of (o.m_vecCompMatIncludes as unknown[] | undefined) ?? []) {
+        if (typeof inc === "string") includes.push(inc);
+      }
       Object.values(o).forEach(walk);
     };
     walk(comp);
     const found = specific ?? loose;
     if (!found) return null;
     path = found;
+    // The pattern number's rolls are not in the finish's own file: every one of
+    // these includes _shared_paint_generic, and the RANDOM_ROLL lives there.
+    // The finish only re-declares a range it narrows. Read both, include first.
+    rolls = gloveRolls([...(await Promise.all(includes.map(fetchJson))), comp]);
   }
   const doc = (await paintFetch(path)
     .then((r) => r.json())
@@ -273,7 +290,7 @@ export async function loadGlovePaintDef(material: string): Promise<GlovePaintDef
   const scalar: Record<string, number> = {};
   for (const k of ["g_fColorMaskBlur", "g_fPaintThickness", "g_fPaintDurability", "g_fPaintShadowPower",
                    "g_fPatternRoughnessBrightness", "g_fPatternMetalness", "g_fPatternDetailInfluence",
-                   "g_flSheenScale"]) {
+                   "g_flSheenScale", "g_fPatternTexCoordScale", "g_fPatternTexCoordRotation"]) {
     scalar[k] = NUM(floats.get(k), MATERIAL_DEFAULTS[k] ?? 0);
   }
   const vec: Record<string, number[]> = {};
@@ -287,10 +304,31 @@ export async function loadGlovePaintDef(material: string): Promise<GlovePaintDef
     vec,
     cloth: NUM(ints.get("F_CLOTH_SHADING"), 0) === 1,
     anisoGloss: NUM(ints.get("F_ANISOTROPIC_GLOSS"), 0) === 1,
-    pattern: NUM(ints.get("g_bPattern"), 0) === 1,
+    // F_PATTERN, the static combo, is what the finishes set: 55 of the 73 say
+    // F_PATTERN 1 and none says g_bPattern — the runtime bool the shader reads,
+    // which a finish's combo sets. Reading only g_bPattern switched the print
+    // off on every glove, so Crimson Web had no web and every DDPAT no camo;
+    // the 18 left set neither and name a blank default_tga as their pattern.
+    pattern: NUM(ints.get("F_PATTERN"), 0) === 1 || NUM(ints.get("g_bPattern"), 0) === 1,
     patternMode: NUM(ints.get("g_nPatternMode"), 0),
     patternReplaceIndex: NUM(ints.get("g_nPatternReplaceIndex"), 0),
+    rolls,
   };
+}
+
+/**
+ * Does the pattern number change what this compositor draws?
+ *
+ * Only through the print: of what the include rolls, the print's offset and
+ * rotation are what reach the shader here (grunge placement rolls too, and its
+ * transform is not wired). So a finish with no print — 18 of the 73, which name
+ * a blank default_tga — looks the same at every pattern, as it does here.
+ */
+export function gloveLegacySeedMoves(def: GlovePaintDef): boolean {
+  return (
+    def.pattern &&
+    def.rolls.some((r) => r.name.startsWith("g_fPatternTexCoord") && r.bounds.some(([lo, hi]) => lo !== hi))
+  );
 }
 
 // NO explicit #version and NO `uv` attribute — three prepends the directive for
@@ -700,7 +738,7 @@ export async function compositeGlove(
   THREE: Three,
   renderer: ThreeNS.WebGLRenderer,
   def: GlovePaintDef,
-  opts: { wear: number; size?: number },
+  opts: { wear: number; size?: number; seed?: number | null },
 ): Promise<GloveComposite | null> {
   const size = opts.size ?? 2048;
   const need = (n: string) => def.tex[n];
@@ -759,6 +797,22 @@ export async function compositeGlove(
     const v = def.vec[name] ?? dflt;
     return new THREE.Vector4(v[0] ?? dflt[0], v[1] ?? dflt[1], v[2] ?? dflt[2], v[3] ?? dflt[3]);
   };
+
+  // Where the print sits. The shader reads g_vPatternTexCoordXform0/1, which no
+  // finish stores — the engine bakes them from scale, rotation and offset with
+  // the same Expression a weapon's pattern uses (texXform). Rotation and offset
+  // are what the pattern number rolls, and a rolled value REPLACES the authored
+  // one; without a pattern number the finish's own values stand. The rotation
+  // alone, unscaled, turns the print's relief normals with it.
+  const rolled = opts.seed != null && def.rolls.length ? gloveRolled(def, opts.seed) : null;
+  const patRot = rolled?.get("g_fPatternTexCoordRotation")?.[0] ?? def.scalar.g_fPatternTexCoordRotation;
+  const patOff = rolled?.get("g_fPatternTexCoordOffset") ?? def.vec.g_fPatternTexCoordOffset ?? [0, 0];
+  const [px0, px1] = texXform(patRot, def.scalar.g_fPatternTexCoordScale, patOff[0] ?? 0, patOff[1] ?? 0);
+  const [pr0, pr1] = texXform(patRot, 1, 0, 0);
+  const patXform0 = new THREE.Vector4(px0[0], px0[1], px0[2], px0[3]);
+  const patXform1 = new THREE.Vector4(px1[0], px1[1], px1[2], px1[3]);
+  const patRot0 = new THREE.Vector4(pr0[0], pr0[1], 0, 0);
+  const patRot1 = new THREE.Vector4(pr1[0], pr1[1], 0, 0);
 
   // ---- 1..4: resolve the per-layer families -----------------------------------
   const blank = new THREE.DataTexture(new Uint8Array([128, 128, 128, 255]), 1, 1);
@@ -860,16 +914,21 @@ export async function compositeGlove(
         uColorMaskBlur: { value: def.scalar.g_fColorMaskBlur || 1 },
         uHasPatternFlag: { value: def.pattern && !!loaded.get("g_tPattern") },
         uPatternMode: { value: def.patternMode },
-        uPatternReplaceIndex: { value: def.patternReplaceIndex },
+        // 1-based in the vmat, like the palette indices beside it; the shader
+        // indexes its 8 accumulated weights from 0. The finishes say 1..8 and
+        // never 0 — four Sport Gloves say 8, past the end of a 0-based array —
+        // and read raw, Crimson Web printed its web over the red strap (slot 2)
+        // instead of the grey back (slot 1) its own palette starts from.
+        uPatternReplaceIndex: { value: Math.min(7, Math.max(0, def.patternReplaceIndex - 1)) },
         uPatternPaletteIdx: { value: paletteIdx },
         uPatternMetalness: { value: def.scalar.g_fPatternMetalness },
         uPatternRoughBright: { value: def.scalar.g_fPatternRoughnessBrightness || 1 },
         uPaintThickness: { value: def.scalar.g_fPaintThickness },
         uDetailNormalContrast: { value: v4("g_fDetailNormalContrast") },
-        uPatternRotXform0: { value: xform("g_vPatternTexRotationXform0", [1, 0, 0, 0]) },
-        uPatternRotXform1: { value: xform("g_vPatternTexRotationXform1", [0, 1, 0, 0]) },
-        uPatternXform0: { value: xform("g_vPatternTexCoordXform0", [1, 0, 0, 0]) },
-        uPatternXform1: { value: xform("g_vPatternTexCoordXform1", [0, 1, 0, 0]) },
+        uPatternRotXform0: { value: patRot0 },
+        uPatternRotXform1: { value: patRot1 },
+        uPatternXform0: { value: patXform0 },
+        uPatternXform1: { value: patXform1 },
         uDamageLevelsA: { value: dmgLevels(0) },
         uDamageLevelsB: { value: dmgLevels(2) },
       },

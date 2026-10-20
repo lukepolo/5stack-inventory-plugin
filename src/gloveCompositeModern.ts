@@ -138,8 +138,13 @@ export interface GloveRoll {
  * Bounds come off instance_params' loose variables. A flat range still takes a
  * draw — the stream position is what keeps every later entry where the game
  * has it.
+ *
+ * The older 73 roll the same way, from the _shared_paint_generic include rather
+ * than their own file — so gloveComposite passes `[include, finish]`, and a
+ * variable the finish declares again (Crimson Web pins its rotation at 25.2)
+ * replaces the include's, as the walk sets it last.
  */
-function gloveRolls(comp: unknown): GloveRoll[] {
+export function gloveRolls(comp: unknown): GloveRoll[] {
   const vars = new Map<string, Record<string, unknown>>();
   const mutators: Record<string, unknown>[] = [];
   const walk = (node: unknown) => {
@@ -191,13 +196,13 @@ function gloveRolls(comp: unknown): GloveRoll[] {
 }
 
 /** The values a pattern rolls, by variable name, drawn in the finish's order. */
-export function gloveRolled(def: GloveModernDef, seed: number): Map<string, number[]> {
+export function gloveRolled(def: { rolls: GloveRoll[] }, seed: number): Map<string, number[]> {
   const rs = new UniformRandomStream(seed);
   return new Map(def.rolls.map((r) => [r.name, r.bounds.map(([lo, hi]) => rs.randomFloat(lo, hi))]));
 }
 
 /** Does the pattern change anything on this finish at all? */
-export function gloveSeedMoves(def: GloveModernDef): boolean {
+export function gloveSeedMoves(def: { rolls: GloveRoll[] }): boolean {
   return def.rolls.some((r) => r.bounds.some(([lo, hi]) => lo !== hi));
 }
 
