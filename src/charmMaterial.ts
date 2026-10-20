@@ -229,33 +229,26 @@ interface CharmTune extends CharmAdjust {
  * the rail can paint 100000 patterns instantly instead of rendering a hundred.
  */
 /**
- * Params evaluated at a FIXED pattern instead of the item's own — a deliberate
- * deviation from Valve's data, and the only one in this file.
+ * Params evaluated at a FIXED pattern instead of the item's own. Empty: every
+ * dynamic param follows the item's pattern, as Valve's data says.
  *
- * `g_flLiquidLevelHeight = lerp(0.45, 0.8, frac(seed * 100))` genuinely is in
- * Charm | Butane Buddy's vmat. The bytecode decodes cleanly with no leftover
- * bytes (`07 45c` `07 8` `19 $KeychainSeed` `07 100` `15 mul` `06 03 frac`
- * `06 08 lerp` `00`), and `frac(seed * 100)` sweeps the fill through its whole
- * 0.45..0.8 range every 1000 patterns — a third of the vessel's height.
+ * It used to hold Charm | Butane Buddy's fill level. Its vmat really does say
+ * `g_flLiquidLevelHeight = lerp(0.45, 0.8, frac(seed * 100))` — the bytecode
+ * decodes cleanly with no leftover bytes (`07 45c` `07 8` `19 $KeychainSeed`
+ * `07 100` `15 mul` `06 03 frac` `06 08 lerp` `00`) — so over the normalised
+ * seed the fill sweeps 45%..80% of the vessel every 1000 patterns: pattern 1
+ * sits lowest, ~500 halfway, 999 fullest, 1000 starts over.
  *
- * We do not honour it, for two reasons:
+ * It was pinned to pattern 1 because the level was reported not to vary in
+ * game and csgoskins' viewer (which has no expression VM at all) never moves
+ * it. Honoured again on request, 2026-10-20. Pinning is one entry here:
+ * `new Set(["g_flLiquidLevelHeight"])` puts every Butane Buddy back at pattern
+ * 1's level, the one the official icon shows.
  *
- *  1. It is not what the item does in game. Reported repeatedly from the actual
- *     item; the level is not what its patterns vary.
- *  2. csgoskins' viewer does not honour it either, and theirs is the render that
- *     matches CS2. Their bundle contains NO expression VM at all — zero uses of
- *     `frac`, no opcode table, no dynamic-param evaluator — so every material
- *     param is whatever their server resolved once, and their charm-pattern
- *     slider cannot move the level.
- *
- * The hue is NOT pinned: `lerp(0, 320, seed)` is the visible, famous behaviour of
- * this charm's patterns, and it is confirmed correct by the official icon being
- * RED at pattern 1 (a normalised seed gives ~0 shift there; a raw one would give
- * 320 degrees and the wrong colour).
- *
- * To restore Valve's behaviour, empty this set. Nothing else changes.
+ * The hue was never pinned: `lerp(0, 320, seed)` is this charm's famous
+ * pattern behaviour, confirmed by the official icon being RED at pattern 1.
  */
-const PINNED_TO_PREVIEW = new Set(["g_flLiquidLevelHeight"]);
+const PINNED_TO_PREVIEW = new Set<string>();
 /** Pattern 1 normalised — every charm's previewSeed, so this is the level the
  *  official icon and csgoskins both show. */
 const PREVIEW_T = 1 / 100000;
