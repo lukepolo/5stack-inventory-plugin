@@ -172,6 +172,13 @@ export interface CatalogItem {
   audio?: string | null;
   /** The egg is the one pet that cannot be named. */
   hasNameTag?: boolean;
+  /** Per-item facts the resolver sends for every item — see `Skin.hasWear`.
+   *  Absent means "no per-item answer, use the type-level one". */
+  hasWear?: boolean;
+  hasSeed?: boolean;
+  hasStatTrak?: boolean;
+  seedMin?: number | null;
+  seedMax?: number | null;
   /** PETS only: how many alternate looks the breed has (0 for the egg and the
    *  chick). Style 1..styleCount; unset is the stock look. */
   styleCount?: number;
@@ -832,6 +839,8 @@ export const craftItem = (body: {
   wear?: number | null;
   seed?: number | null;
   stattrak?: boolean;
+  /** Kills to start the module on. Only honoured with `stattrak`. */
+  stattrak_count?: number;
   nametag?: string | null;
   style?: number | null;
   upgrade_level?: number | null;
@@ -851,6 +860,8 @@ export const updateInstance = (
     wear?: number | null;
     seed?: number | null;
     stattrak?: boolean;
+    /** Overwrite the kill count. Omit to leave it to the game server. */
+    stattrak_count?: number;
     nametag?: string | null;
     style?: number | null;
     upgrade_level?: number | null;

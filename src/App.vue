@@ -158,6 +158,7 @@ import { useAttachmentPicker, type PickerRow } from "./composables/useAttachment
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
 import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { stackByDesign, TINT_SUFFIX } from "./decks";
+import { MAX_STATTRAK } from "./stattrakModule";
 import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
 import { formatGunTrait, gunPlacement, gunPlacementTable, gunPlacementTraits } from "./gunPattern";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
@@ -721,7 +722,7 @@ async function loadSkins(key: string) {
     if (sheetKey.value !== key) return; // a newer selection won
     // After, never with: the picker must paint as soon as the catalog lands.
     void loadStockPrices(key);
-    sheetSkins.value = data.skins;
+    sheetSkins.value = key === "c4" ? c4Craftables(data) : data.skins;
     sheetFacets.value = { groups: data.groups, tints: data.tints };
     sheetGroup.value = sheetDefaultGroup.value;
   } catch (e) {
@@ -729,6 +730,22 @@ async function loadSkins(key: string) {
   } finally {
     if (sheetKey.value === key) sheetLoading.value = false;
   }
+}
+/**
+ * What the C4 sheet's Craft tab offers.
+ *
+ * The C4 has no finishes, so its catalog is a base item and an empty list — and
+ * the tab was empty. The plain C4 is still a real, ownable item that takes
+ * stickers, a charm and a name tag (cs2-lib, and the backend's craft route,
+ * both say so), so it is offered as the one thing to craft. The per-item facts
+ * are spelled out because a listing's `type` alone would hand it a float, a
+ * pattern and StatTrak, none of which a C4 has.
+ */
+function c4Craftables(data: { base: Skin | null; skins: Skin[] }): Skin[] {
+  if (data.skins.length || !data.base) return data.skins;
+  return [
+    { ...data.base, type: "weapon", model: "c4", hasWear: false, hasSeed: false, hasStatTrak: false, hasNameTag: true },
+  ];
 }
 // One place to clear the catalog-shaped filters, because there are four of them
 // and four reset points — a filter left set on a list it no longer applies to
@@ -1792,6 +1809,9 @@ const craft = ref<{
   wear: number;
   seed: number;
   stattrak: boolean;
+  /** Kills on the StatTrak module. Seeded from the owned row on an edit; the
+   *  game server keeps counting from whatever is saved. */
+  stattrakCount: number;
   nametag: string;
   stickers: (Attach | null)[];
   patches: (Attach | null)[];
@@ -1859,6 +1879,14 @@ const craftType = computed(() => craft.value?.skin.type ?? craftInst.value?.item
  *  catalog listing that predates the field. */
 const craftSlotSays = (nope: string[]) => !nope.includes(selected.value);
 /**
+ * The item's OWN answer, when it gives one. The type gates below are right for
+ * every finish and wrong for a vanilla weapon — a plain C4 is `type: "weapon"`
+ * with no float, pattern or StatTrak — so an explicit `false` from cs2-lib
+ * closes the control the type would open. Absent leaves the type's answer.
+ */
+const craftItemSays = (fact: "hasWear" | "hasSeed" | "hasStatTrak" | "hasNameTag") =>
+  (craft.value?.skin ?? craftInst.value?.item)?.[fact] !== false;
+/**
  * Is the pattern being edited a CHARM's?
  *
  * Charms and weapons both have one, and they are not the same control: a
@@ -1867,10 +1895,12 @@ const craftSlotSays = (nope: string[]) => !nope.includes(selected.value);
  */
 const craftSeedIsCharm = computed(() => craftType.value === "keychain");
 const craftHasSeed = computed(() =>
-  craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible"]),
+  craftItemSays("hasSeed") &&
+  (craftType.value ? hasSeed({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible"])),
 );
 const craftHasWear = computed(() =>
-  craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "pet"]),
+  craftItemSays("hasWear") &&
+  (craftType.value ? hasWear({ type: craftType.value }) : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "pet"])),
 );
 /**
  * A pet's own facts — style count, stages, whether it takes a name — off the
@@ -1968,21 +1998,35 @@ const craftWearRange = computed(() => {
  * because `selected` was still on a rifle.
  */
 const craftHasNameTag = computed(() =>
-  craftType.value
+  craftItemSays("hasNameTag") &&
+  (craftType.value
     // Guns and knives only. A name tag is applied with a Name Tag tool, and CS2
     // will not let you put one on gloves, an agent, a music kit or a charm —
     // the field was offered to gloves and charms purely because the old
     // exclusion list was written before either could be opened on its own.
     ? ["weapon", "melee"].includes(craftType.value) || (craftType.value === "pet" && !!craftPet.value?.hasNameTag)
-    : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "gloves"]),
+    : craftSlotSays(["agent", "musickit", "graffiti", "collectible", "gloves"])),
 );
 // StatTrak is weapons, knives and music kits — NOT gloves, which do have a float
 // and a pattern. That distinction is invisible to a slot-shaped gate.
 const craftHasStatTrak = computed(() =>
-  craftType.value
+  craftItemSays("hasStatTrak") &&
+  (craftType.value
     ? ["weapon", "melee", "musickit"].includes(craftType.value)
-    : craftSlotSays(["agent", "graffiti", "collectible", "pet"]),
+    : craftSlotSays(["agent", "graffiti", "collectible", "pet"])),
 );
+/**
+ * A GLOVE's pattern range. Gloves get their own plain control rather than a
+ * rail: gloveComposite never reads the seed, so there is no look to score or
+ * aim at — but the seed is still a real attribute that rides the equipped feed
+ * to the game server, so it is worth being able to set.
+ */
+const craftGloveSeedRange = computed(() => {
+  const i = (craft.value?.skin ?? craftInst.value?.item) as { seedMin?: number | null; seedMax?: number | null } | undefined;
+  // Only a FINISH carries a range — the ten unpainted gloves have no pattern,
+  // and their listings say so by leaving it out.
+  return { known: i?.seedMin != null, min: i?.seedMin ?? 1, max: i?.seedMax ?? 1000 };
+});
 /**
  * Does the options column have anything to put in it?
  *
@@ -2176,7 +2220,7 @@ function openCraft(skin: Skin) {
   const skinIsWeapon = !skin.type || skin.type === "weapon" || skin.type === "melee";
   craftModel.value =
     skin.model ?? (skinIsWeapon && isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
-  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null, style: null, stage: null };
+  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, stattrakCount: 0, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null, style: null, stage: null };
   craftBaseline = ""; // new craft — no stored render to reuse
   // A brand-new craft gets a URL too: /craft/<skinId>, with the draft itself in
   // the query. Without it the one state worth sharing before you commit to it
@@ -2214,6 +2258,7 @@ async function restoreDraftRoute(skinId: number) {
         wear: d.wear,
         seed: d.seed,
         stattrak: d.stattrak,
+        stattrakCount: 0,
         nametag: d.nametag,
         stickers: d.stickers
           .slice(0, MAX_STICKERS)
@@ -2269,10 +2314,14 @@ function openEdit(inst: InventoryItem) {
     skin: {
       id: inst.item.id, name: inst.item.name, altName: inst.item.altName ?? null, rarity: inst.item.rarity ?? "", image: inst.item.image, paintMaterial: inst.item.paintMaterial ?? null, legacyPaint: !!inst.item.legacyPaint, type: inst.item.type, model: inst.item.model ?? null, def: inst.item.def,
       hasNameTag: inst.item.hasNameTag, styleCount: inst.item.styleCount, upgradeLevels: inst.item.upgradeLevels, defaultUpgradeLevel: inst.item.defaultUpgradeLevel,
+      // The per-item facts the craftHas* gates ask first (craftItemSays), and
+      // the pattern range the glove control is bounded by.
+      hasWear: inst.item.hasWear, hasSeed: inst.item.hasSeed, hasStatTrak: inst.item.hasStatTrak, seedMin: inst.item.seedMin, seedMax: inst.item.seedMax,
     },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,
     stattrak: inst.stattrak,
+    stattrakCount: inst.stattrak_count ?? 0,
     nametag: inst.nametag ?? "",
     stickers,
     patches,
@@ -2454,7 +2503,7 @@ function randomSeed() {
 function resetCraft() {
   if (craft.value)
     Object.assign(craft.value, {
-      wear: DEFAULT_WEAR, seed: 1, stattrak: false, nametag: "",
+      wear: DEFAULT_WEAR, seed: 1, stattrak: false, stattrakCount: 0, nametag: "",
       stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null,
       style: null, stage: null,
     });
@@ -2479,6 +2528,7 @@ function craftBody() {
     wear: craftHasWear.value || craftHasScratch.value ? c.wear : null,
     seed: craftHasSeed.value ? c.seed : null,
     stattrak: craftHasStatTrak.value ? c.stattrak : false,
+    stattrak_count: craftStatTrakCountToSend(),
     nametag: craftHasNameTag.value ? c.nametag.trim() || null : null,
     // Left OFF the body (undefined) for anything but a pet, rather than sent as
     // null: on these two a null is a value — "back to the default" — and the
@@ -2491,6 +2541,23 @@ function craftBody() {
     charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null, inst: c.charm.inst ?? null } : null,
   };
 }
+/** The form's kill count, clamped to what the module can show (six digits). */
+const craftStatTrakCount = () =>
+  Math.min(MAX_STATTRAK, Math.max(0, Math.floor(Number(craft.value?.stattrakCount) || 0)));
+/**
+ * The kill count save should send, or undefined to leave the row's alone.
+ *
+ * A NEW item (a craft, or a duplicate) sends whatever the form shows. An EDIT
+ * sends it only when it was changed: the game server keeps incrementing the
+ * saved count while the editor is open, and re-sending the number the form
+ * loaded with would quietly undo every kill made in the meantime.
+ */
+function craftStatTrakCountToSend(): number | undefined {
+  if (!craftHasStatTrak.value || !craft.value?.stattrak) return undefined;
+  const count = craftStatTrakCount();
+  if (editingId.value != null && count === (craftInst.value?.stattrak_count ?? 0)) return undefined;
+  return count;
+}
 // Inspect the DRAFT — works before the craft has ever been saved.
 async function openCraftInspect() {
   if (!craft.value) return;
@@ -2498,11 +2565,9 @@ async function openCraftInspect() {
     fetchDraftInspectLink({
       item_id: craft.value!.skin.id,
       ...craftBody(),
-      // Kills are NOT part of craftBody(): they live on the owned row, not in
-      // the form, and craftBody() is also what save sends. Same number the 3D
-      // stage puts on the module, so inspecting an edit of a StatTrak item
-      // opens CS2 on its real count instead of a fresh 0.
-      stattrak_count: craft.value!.stattrak ? craftInst.value?.stattrak_count ?? 0 : 0,
+      // The count on screen, always — craftBody() leaves an unchanged one off
+      // for save's sake, but the inspect link has no row to fall back on.
+      stattrak_count: craft.value!.stattrak ? craftStatTrakCount() : 0,
     }),
   );
 }
@@ -2605,14 +2670,17 @@ async function saveCraft(andEquip = false) {
               wear: updated.wear,
               seed: updated.seed,
               stattrak: updated.stattrak,
+              stattrak_count: updated.stattrak_count,
               nametag: updated.nametag,
               style: updated.style,
               upgrade_level: updated.upgrade_level,
             }
           : r,
       );
+      warnIfStatTrakCountIgnored(body.stattrak_count, updated);
     } else {
       const inst = await craftItem({ item_id: craft.value.skin.id, ...body });
+      warnIfStatTrakCountIgnored(body.stattrak_count, inst);
       void generateRender(inst).then((ok) => {
         if (ok) bakeStamp.value = { ...bakeStamp.value, [inst.id]: Date.now() };
       });
@@ -2653,6 +2721,22 @@ async function saveCraft(andEquip = false) {
   } finally {
     craftBusy.value = false;
   }
+}
+/**
+ * The frontend and backend ship separately, and a backend from before kill
+ * counts were editable drops the field without complaint — the save succeeds
+ * and the count quietly stays where it was. Say so instead of letting the
+ * number on the form look saved.
+ */
+function warnIfStatTrakCountIgnored(sent: number | undefined, saved: InventoryItem) {
+  if (sent === undefined || saved.stattrak_count === sent) return;
+  notify(
+    tr(
+      "inventory.notify.stattrak_count_unsupported",
+      "Saved, but this server can't set StatTrak™ kills yet, so the count was left as it was.",
+    ),
+    "error",
+  );
 }
 
 // Fire-and-forget: snapshot the painted 3D model and cache it as this
@@ -3475,12 +3559,10 @@ async function mountModalViewer() {
               sleeve: fpvSleeve.value,
             }
           : null,
-      // Live 3D, so a real readout — the owned item's count when the modal is
-      // showing one (craftInstId covers editing AND duplicating, which
-      // editingId does not), and 0 for a brand-new craft that has no kills.
-      stattrak: craft.value?.stattrak
-        ? { count: inventory.value.find((i) => i.id === craftInstId.value)?.stattrak_count ?? 0 }
-        : null,
+      // Live 3D, so a real readout — the form's count, which starts from the
+      // owned item's when the modal is showing one (editing or duplicating) and
+      // from 0 for a brand-new craft.
+      stattrak: craft.value?.stattrak ? { count: craftStatTrakCount() } : null,
       nametag: craft.value?.nametag ?? null,
       // Drags write straight into the craft form — the numeric inputs follow
       // live, and confirm sends the same offsets to the game server.
@@ -3753,15 +3835,20 @@ function repaint(proxy: boolean) {
 // StatTrak toggle → attach/detach the module on the live viewer. Deliberately
 // NOT folded into the wear/seed remount above: the module is independent of the
 // paint composite, and remounting would reset the camera on every flip.
+//
+// The kill count rides the same watcher, debounced: setStatTrak rebuilds the
+// module, and typing "1500" should rebuild it once, not four times.
+let stattrakCountTimer: ReturnType<typeof setTimeout> | undefined;
 watch(
-  () => craft.value?.stattrak,
-  (on) => {
-    if (!modalViewer.current() || !craft.value) return;
-    modalViewer.current()!.setStatTrak(
-      on
-        ? { count: inventory.value.find((i) => i.id === craftInstId.value)?.stattrak_count ?? 0 }
-        : null,
-    );
+  () => [craft.value?.stattrak, craft.value?.stattrakCount] as const,
+  ([on], [wasOn]) => {
+    clearTimeout(stattrakCountTimer);
+    const apply = () => {
+      if (!modalViewer.current() || !craft.value) return;
+      modalViewer.current()!.setStatTrak(craft.value.stattrak ? { count: craftStatTrakCount() } : null);
+    };
+    if (on !== wasOn) apply();
+    else stattrakCountTimer = setTimeout(apply, 250);
   },
 );
 // Name tag → swap the engraved plate on the live viewer. Its own watcher for
@@ -9900,6 +9987,29 @@ if (MDEBUG) {
                 <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
               </div>
             </div>
+            <!-- A GLOVE's pattern. No rail: gloveComposite never reads the seed,
+                 so there is nothing on screen to score or aim at. It is still the
+                 real paint seed the equipped feed hands the game server, so it
+                 gets the plain field-plus-slider the float has, on the neutral
+                 pattern track (an index, not a better-or-worse scale). -->
+            <div v-else-if="craftHasSeed && craftType === 'glove' && craftGloveSeedRange.known" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+              <div class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                <input
+                  v-model.number="craft.seed"
+                  type="number" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                />
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+              </div>
+              <div class="mt-2 flex items-center gap-2">
+                <input v-model.number="craft.seed" type="range" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1" class="pattern-range w-full" />
+              </div>
+              <div class="mt-1 flex items-center justify-between font-mono text-f9 text-muted-foreground">
+                <span>{{ craftGloveSeedRange.min }}–{{ craftGloveSeedRange.max }}</span>
+                <span>Applies in game · not previewed here</span>
+              </div>
+            </div>
             <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
               <div class="flex items-center gap-2">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
@@ -9946,22 +10056,41 @@ if (MDEBUG) {
             </div>
             <div
               v-if="craftHasStatTrak"
-              class="animate-sheet-in flex items-center justify-between rounded-md bg-secondary/40 p-2.5"
+              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
               :style="{ '--i': 5 }"
             >
-              <span class="text-f10 uppercase tracking-cs1" :class="craft.stattrak ? 'text-[hsl(var(--tac-stattrak))]' : 'text-muted-foreground'">StatTrak™</span>
-              <button
-                role="switch"
-                :aria-checked="craft.stattrak"
-                class="relative h-5 w-9 flex-none rounded-full transition-colors"
-                :class="craft.stattrak ? 'bg-[#e0a92e]' : 'bg-muted'"
-                @click="craft.stattrak = !craft.stattrak"
-              >
-                <span
-                  class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
-                  :class="craft.stattrak && 'translate-x-4'"
-                ></span>
-              </button>
+              <div class="flex items-center justify-between">
+                <span class="text-f10 uppercase tracking-cs1" :class="craft.stattrak ? 'text-[hsl(var(--tac-stattrak))]' : 'text-muted-foreground'">StatTrak™</span>
+                <button
+                  role="switch"
+                  :aria-checked="craft.stattrak"
+                  class="relative h-5 w-9 flex-none rounded-full transition-colors"
+                  :class="craft.stattrak ? 'bg-[#e0a92e]' : 'bg-muted'"
+                  @click="craft.stattrak = !craft.stattrak"
+                >
+                  <span
+                    class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
+                    :class="craft.stattrak && 'translate-x-4'"
+                  ></span>
+                </button>
+              </div>
+              <!-- The counter itself. Six digits is all the module can show, so
+                   the field stops there; the game server keeps counting from
+                   whatever is saved. -->
+              <div v-if="craft.stattrak" class="mt-2 flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Kills</span>
+                <input
+                  v-model.number="craft.stattrakCount"
+                  type="number" min="0" :max="MAX_STATTRAK" step="1"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 tabular-nums outline-none transition-colors focus:border-[color:var(--acc)]"
+                  @change="craft.stattrakCount = craftStatTrakCount()"
+                />
+                <button
+                  class="grid h-9 flex-none place-items-center rounded-md border border-input px-2.5 font-mono text-f10 uppercase text-muted-foreground tac-action"
+                  title="Reset the counter"
+                  @click="craft.stattrakCount = 0"
+                >0</button>
+              </div>
             </div>
 
           </div>

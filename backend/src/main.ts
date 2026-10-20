@@ -96,6 +96,7 @@ import {
   isBaseWeapon,
   getStickerBounds,
   validateCraftAttrs,
+  clampStatTrakCount,
   itemStoresWear,
   itemStoresSeed,
   STICKER_LIMITS,
@@ -2458,12 +2459,21 @@ async function detachElsewhere(steamId: string, insts: number[], keepRowId: numb
   }
 }
 
+/**
+ * A kill count set from the editor, clamped to the six digits the module can
+ * show. null = the request didn't send one, which an edit reads as "leave the
+ * column alone" — the game server is the other writer, and an editor that
+ * re-sent the count it loaded with would erase every kill made since.
+ */
+const editorStatTrakCount = (n: unknown): number | null =>
+  typeof n === "number" && Number.isFinite(n) ? clampStatTrakCount(n) : null;
+
 app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
-  const { item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
+  const { item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
     request.body;
   if (typeof item_id !== "number" || !getItem(item_id)) {
     return reply.status(400).send({ error: "That item doesn't exist." });
@@ -2489,9 +2499,10 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   const linked = await linkAttachments(identity.steamId, { stickers, patches, charm_id, charm_offset }, null);
   const { rows } = await pool.query<ItemRow>(
     `INSERT INTO inventory.owned_items
-       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12)
-     RETURNING id, item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
+       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level,
+        stattrak_count)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12,$13)
+     RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
     [
       identity.steamId, item_id,
       checked.clean.wear ?? null, checked.clean.seed ?? null,
@@ -2500,6 +2511,9 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
       linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
       normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
       checked.clean.style ?? null, checked.clean.upgrade_level ?? null,
+      // Only a StatTrak item has a counter; validateCraftAttrs has already
+      // refused StatTrak on anything that can't carry it.
+      checked.clean.stattrak ? editorStatTrakCount(stattrak_count) ?? 0 : 0,
     ],
   );
   return {
@@ -2534,7 +2548,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
       return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
     }
     const id = Number(request.params.id);
-    const { wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
+    const { wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
       request.body;
     const attachErr = checkAttachments(chk.rows[0].item_id, stickers, charm_id, patches);
     if (attachErr) {
@@ -2577,9 +2591,12 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
          -- CASE, not COALESCE: null is a real answer for these two ("back to the
          -- stock look"), so only a key the request never sent leaves them alone.
          style = CASE WHEN $14 THEN $15::integer ELSE style END,
-         upgrade_level = CASE WHEN $16 THEN $17::integer ELSE upgrade_level END
+         upgrade_level = CASE WHEN $16 THEN $17::integer ELSE upgrade_level END,
+         -- COALESCE: an edit that doesn't mention the count leaves it to the
+         -- game server, which may have counted kills while the editor was open.
+         stattrak_count = COALESCE($18::integer, stattrak_count)
        WHERE id = $1 AND steam_id = $2
-       RETURNING id, item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
+       RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
       [
         // `?? null` keeps the COALESCE contract: a key validateCraftAttrs left
         // unset is one the request never sent, and null means "leave it alone".
@@ -2592,6 +2609,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
         hasPatches, hasPatches && normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
         "style" in checked.clean, checked.clean.style ?? null,
         "upgrade_level" in checked.clean, checked.clean.upgrade_level ?? null,
+        editorStatTrakCount(stattrak_count),
       ],
     );
     if (!rows.length) {

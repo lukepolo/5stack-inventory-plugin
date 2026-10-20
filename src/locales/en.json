@@ -8,6 +8,7 @@
       "crafted_equipped": "Crafted and equipped.",
       "crafted_not_equipped": "Crafted — it's in your inventory. Nothing on this side can hold it, so it isn't equipped.",
       "copy_created": "Editable copy created in your inventory.",
+      "stattrak_count_unsupported": "Saved, but this server can't set StatTrak™ kills yet, so the count was left as it was.",
       "inspect_sent": "Sent to your game client — CS2 will open the inspect view.",
       "inspect_copied": "Too long for a Steam link — the inspect command is on your clipboard. Paste it into the CS2 console.",
       "loadout_copied": "Copied {summary} into your inventory and equipped them on your own loadout.",
