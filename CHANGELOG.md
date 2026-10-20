@@ -36,7 +36,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **CS2 scene presets**: Ancient (night), Italy and Italy (alley) place the item in front of a blurred in-game screenshot of the map. The same image lights the item's reflections.
 - **Knife StatTrak counter**: the kill count is scratched into the blade as in game, at each knife's exact spot from the game's own attachment data. The digits use the game's own cut-out texture and stay sharp however close you zoom.
 - **C4 name tag**: the name label sits over the top of the C4's LCD, on top of any stickers, as in game.
-- **Live holo and lenticular stickers**: in the 3D viewer, holo rainbows cycle and lenticular stickers flip frames strongly as you turn the weapon, and a slow light drift keeps them shimmering when it is still. The effect is deliberately stronger than the game's, with a moving glint and sheen on the foil; the drift stops with the Motion switch or the system's reduce-motion setting.
+- **Live holo and lenticular stickers**: in the 3D viewer, holo colours and lenticular frames follow the camera angle the way the game computes them, with a light fixed to the camera and a faint glint. Nothing moves unless the camera does, and a lenticular shows one clean frame at a time.
 - **Sticker masks**: stickers are hidden wherever the game hides them, such as under the C4's LCD module, wires and tape.
 - **Live Gen2 glove patterns**: on the 22 newer glove finishes, the 3D model repaints as you change the pattern. First-person arms wear the equipped glove's pattern too.
 - **Charm detail textures**: charms with a detail layer now show it, such as the pattern-coloured triangle in 8 Ball IGL's window.

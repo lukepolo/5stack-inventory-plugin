@@ -293,6 +293,13 @@ compositor already did, matched an in-game screenshot of the same pattern
 number exactly. Compare one specific pattern number against the game before
 trusting a transform.
 
+Read which *inputs* a term uses, not just its shape. The holo/lenticular view
+term `dot(V,N) + dot(V,L)` takes the GEOMETRIC normal (`_24347`, the
+interpolated vertex normal), not the normal-mapped one. Feeding it the bumpy
+per-pixel normal made lenticular frames flicker texel by texel; amplifying it
+and drifting the light made stickers animate on their own, which the game never
+does.
+
 ### 4.6 A card is wrong or stale
 
 Cards are baked once and kept. The viewer reports a failed paint

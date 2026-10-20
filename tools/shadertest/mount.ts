@@ -25,6 +25,7 @@
 //   t=0,1.5,3             seconds after load to shoot, per angle (live only)
 //   still=0               the LIVE viewer (render loop, holo drift, inspect
 //                         idle) instead of the card/bake path (default 1)
+//   interactive=1         edit mode — the live camera holds still (no idle spin)
 //   plain=1               also shoot without stickers/StatTrak/name tag, for
 //                         diffing: the difference bbox IS the feature
 //   size=1400             host width in CSS px (height 9/14 of it)
@@ -99,7 +100,8 @@ async function shoot(va: number, plain: boolean) {
       legacyPaint: q.get("legacy") === "1",
       wear: num("wear", 0.05),
       seed: num("seed", 1),
-      interactive: false,
+      // Edit mode: also the one way to hold a LIVE camera still (no idle spin).
+      interactive: q.get("interactive") === "1",
       still,
       viewAngle: va || undefined,
       stickers: plain

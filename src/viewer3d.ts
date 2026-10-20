@@ -6471,22 +6471,21 @@ async function buildViewer(
     flashing.set(slot, performance.now());
   }
   /**
-   * Holo and lenticular stickers, live: the view term follows the camera and
-   * the key light, and the light drifts a little so a still weapon shimmers.
+   * Holo and lenticular stickers, live: the game's view term, from the camera.
    *
-   * The game's holo term is dot(V,N) + dot(V,lightDir) (stickerShader's holo
-   * branch). Under our parallel projection V is one constant and there was no
-   * light at all, so a holo sticker barely changed as the weapon turned. Here
-   * V comes from a virtual eye HOLO_EYE_DIST model-lengths out — the band then
-   * runs ACROSS a sticker, as it does through a real lens — and L is a light
-   * held fixed to the CAMERA, up and to the left. That is the game's own
-   * geometry: its inspect light and camera stay put while the weapon turns,
-   * so turning the weapon changes N and never L. Here the camera orbits
-   * instead, which in view space is the same thing as long as the light rides
-   * with it; a light fixed in the world would double-count every orbit and
-   * would almost never catch a sticker facing the viewer. The idle drift is a
-   * slow wander of that light, gated by the Motion switch and
-   * prefers-reduced-motion.
+   * The game's holo term is dot(V,N) + dot(V,L) (stickerShader's holo branch).
+   * Under our parallel projection V is one constant and there was no light, so
+   * here V comes from a virtual eye HOLO_EYE_DIST model-lengths out, as the
+   * game's inspect camera is close, and L is a light held fixed to the CAMERA,
+   * up and to the left. That is the game's own geometry: its inspect light and
+   * camera stay put while the weapon turns, so turning the weapon changes N and
+   * never L. Here the camera orbits instead, which in view space is the same
+   * thing as long as the light rides with it.
+   *
+   * NOTHING MOVES ON ITS OWN. An earlier pass drifted the light over time and
+   * swung the term up to 6x the game's; against the game that read as a
+   * sticker animating by itself, erratic and far too strong. A lenticular's
+   * frame is a function of the camera angle and nothing else.
    *
    * `holoBias` keeps the head-on frame where the game's inspect view shows it
    * (Econometer's needle on FORCE, see STK_HOLO_LIGHT).
@@ -6496,26 +6495,11 @@ async function buildViewer(
    *  viewer): about 37 degrees off the view axis, up and to the left. */
   const HOLO_LIGHT = new THREE.Vector3(-0.35, 0.5, 0.8).normalize();
   const holoBias = 0.6 - HOLO_LIGHT.z;
-  /** The glint's light: near the view axis, wandering wide (radians around
-   *  view Y, view X) so its reflection sweeps across stickers that face the
-   *  viewer instead of sitting off to one side of them. */
+  /** The faint glint's light, also camera-fixed: near the view axis, so its
+   *  reflection can cross a sticker that faces the viewer. */
   const HOLO_GLINT = new THREE.Vector3(-0.1, 0.15, 1).normalize();
-  const HOLO_GLINT_DRIFT = [0.55, 0.3];
-  /** Idle light wander in radians (around view Y, view X). Enough to swing a
-   *  lenticular a frame either way and run a holo band a good way across. */
-  const HOLO_DRIFT = [0.35, 0.2];
-  /** How much harder the live view swings the holo/lenticular term than the
-   *  game — see uHoloGain in stickerShader. 6 runs a rainbow holo through a
-   *  full cycle in about a third of a radian of orbit, roughly the three
-   *  cycles across a turn the game shows. */
-  const HOLO_GAIN = 6;
-  const holoTmp = {
-    eye: new THREE.Vector3(),
-    light: new THREE.Vector3(),
-    glint: new THREE.Vector3(),
-    axis: new THREE.Vector3(),
-  };
-  function stepStickerHolo(now: number) {
+  const holoTmp = { eye: new THREE.Vector3() };
+  function stepStickerHolo() {
     // The decals live in the SCENE, not under `object` (see buildDecal), so
     // they are found through the slot map rather than a traversal.
     const lives: StickerHoloLive[] = [];
@@ -6528,28 +6512,16 @@ async function buildViewer(
     }
     if (!lives.length) return;
     camera.updateMatrixWorld();
-    const view = camera.matrixWorldInverse;
-    const { eye, light, glint, axis } = holoTmp;
-    eye.copy(controls.target).applyMatrix4(view);
+    const { eye } = holoTmp;
+    eye.copy(controls.target).applyMatrix4(camera.matrixWorldInverse);
     eye.z += radius * HOLO_EYE_DIST;
-    light.copy(HOLO_LIGHT);
-    glint.copy(HOLO_GLINT);
-    if (motionOn && !reducedMotion.value) {
-      const t = now / 1000;
-      light.applyAxisAngle(axis.set(0, 1, 0), HOLO_DRIFT[0] * Math.sin((t * Math.PI * 2) / 7));
-      light.applyAxisAngle(axis.set(1, 0, 0), HOLO_DRIFT[1] * Math.sin((t * Math.PI * 2) / 4.3));
-      // Its own periods, so the glint does not march in step with the bands.
-      glint.applyAxisAngle(axis.set(0, 1, 0), HOLO_GLINT_DRIFT[0] * Math.sin((t * Math.PI * 2) / 5.3));
-      glint.applyAxisAngle(axis.set(1, 0, 0), HOLO_GLINT_DRIFT[1] * Math.sin((t * Math.PI * 2) / 3.7 + 1));
-    }
     for (const live of lives) {
       live.uHoloLive.value = 1;
       live.uHoloEye.value.copy(eye);
-      live.uHoloLight.value.copy(light);
-      live.uHoloGlint.value.copy(glint);
+      live.uHoloLight.value.copy(HOLO_LIGHT);
+      live.uHoloGlint.value.copy(HOLO_GLINT);
       live.uHoloBias.value = holoBias;
       live.uHoloShine.value = 1;
-      live.uHoloGain.value = HOLO_GAIN;
     }
   }
 
@@ -13554,7 +13526,7 @@ async function buildViewer(
     updateRing();
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
-    stepStickerHolo(performance.now());
+    stepStickerHolo();
     // Split the first frame's cost in two: `wait` is everything from the last
     // build stage to the draw call (the rAF wait, controls, the charm's first
     // step), `first` is the draw itself — which is where the shader compile and

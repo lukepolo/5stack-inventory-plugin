@@ -85,7 +85,6 @@ export interface StickerHoloLive {
   uHoloGlint: { value: ThreeNS.Vector3 };
   uHoloBias: { value: number };
   uHoloShine: { value: number };
-  uHoloGain: { value: number };
 }
 
 export interface StickerSfxOpts {
@@ -133,7 +132,7 @@ uniform sampler2D uScratchTex, uSfxMaskTex, uHoloTex, uGlitterTex, uNormRoughTex
 uniform bool uHasScratch, uHasSfxMask, uHasHolo, uHasGlitter, uHasNormRough;
 uniform bool uPaperBacking, uMetallic, uPreserveRough, uClampSpectrumV;
 uniform vec4 uStkArtUv;
-uniform float uHoloLive, uHoloBias, uHoloShine, uHoloGain;
+uniform float uHoloLive, uHoloBias, uHoloShine;
 uniform vec3 uHoloEye, uHoloLight, uHoloGlint;
 uniform bool uExpandAlpha, uPbrFit, uLegacyTint, uSelfIllum;
 uniform float uWear, uWearScratches, uSfxColorBoost, uGlitterScale, uColorBoost, uTintSaturate;
@@ -437,7 +436,6 @@ export async function applyStickerSfx(
         uHoloGlint: { value: new THREE.Vector3(0, 0, 1) },
         uHoloBias: { value: 0 },
         uHoloShine: { value: 0 },
-        uHoloGain: { value: 1 },
       }
     : null;
   mat.userData.stkHolo = live;
@@ -492,7 +490,6 @@ export async function applyStickerSfx(
         uHoloGlint: { value: new THREE.Vector3(0, 0, 1) },
         uHoloBias: { value: 0 },
         uHoloShine: { value: 0 },
-        uHoloGain: { value: 1 },
       }),
     });
 
@@ -626,39 +623,26 @@ export async function applyStickerSfx(
              // texel sits in it. The view term SHIFTS along U, which is the
              // whole effect: turn the sticker and the band sweeps.
              //
-             // Valve adds dot(V,N) + dot(V,lightDir).
+             // The game's term, sticker.glsl:647: dot(V,N) + dot(V,L), where
+             // N is the GEOMETRIC normal (the interpolated vertex normal,
+             // _24347 — not the normal-mapped one) and V points from the
+             // surface to the camera. So the frame a lenticular shows, and
+             // where a holo's rainbow sits, depend on the camera angle alone,
+             // and a flat sticker shows one coherent frame. Reading the
+             // normal-mapped normal here made frames flicker texel by texel.
              //
-             // LIVE (the 3D viewer, uHoloLive = 1): both terms are real — V
-             // from a virtual eye at a normal viewing distance, so the band
-             // moves ACROSS a sticker instead of the parallel projection's one
-             // flat colour, and L the scene's key light, so it moves as the
-             // camera orbits and as the light drifts. uHoloBias keeps the
-             // head-on frame where the game's inspect view shows it.
+             // LIVE (the 3D viewer, uHoloLive = 1): V from a virtual eye at an
+             // inspect-like distance, and L a light fixed to the camera, as the
+             // game's inspect light is fixed while the weapon turns. Nothing
+             // moves unless the camera does. uHoloBias keeps the head-on frame
+             // where the game's inspect view shows it.
              //
              // STILL (baked cards): the parallel view and the calibrated
              // constant STK_HOLO_LIGHT, so a card never depends on a light.
              vec3 holoV = uHoloLive > 0.5 ? normalize(uHoloEye + vViewPosition) : stkV;
-             // LIVE is deliberately stronger than the game's term, which moves
-             // as the cosine of the viewing angle and so is flat near head-on:
-             // a lenticular changed a frame or two for a big turn of the
-             // weapon, and a holo cycled its rainbow under once across a
-             // curved part where the game shows it about three times. Live:
-             //   - the sticker's TILT against the view (the unperturbed
-             //     normal's sideways and vertical lean), which changes
-             //     linearly with angle, as a lens does;
-             //   - the curvature/angle term dot(V,N) and the light term;
-             // both scaled by uHoloGain, so turning the weapon sweeps the
-             // frames and a curved sticker cycles the rainbow across itself.
-             // The sticker's own normal-map detail is added unscaled (scaled
-             // it reads as noise). Head-on and at rest it lands where the card
-             // does, 1 + STK_HOLO_LIGHT.
              float shift = uHoloLive > 0.5
-               ? (1.0 + STK_HOLO_LIGHT)
-                 + uHoloGain * (0.5 * (nonPerturbedNormal.x + 0.5 * nonPerturbedNormal.y)
-                                + (dot(holoV, nonPerturbedNormal) - 1.0)
-                                + dot(holoV, uHoloLight) + uHoloBias - STK_HOLO_LIGHT)
-                 + (dot(holoV, normal) - dot(holoV, nonPerturbedNormal))
-               : dot(stkV, normal) + STK_HOLO_LIGHT;
+               ? dot(holoV, nonPerturbedNormal) + dot(holoV, uHoloLight) + uHoloBias
+               : dot(stkV, nonPerturbedNormal) + STK_HOLO_LIGHT;
              vec2 suv = vec2(sfxM.y + shift, sfxM.z);
              if (uClampSpectrumV) suv.y = clamp(suv.y, 0.0, 1.0);
              vec3 spectrum = texture2D(uHoloTex, suv).xyz;
@@ -676,27 +660,16 @@ export async function applyStickerSfx(
              // (sticker.glsl:669).
              stkMetal *= (1.0 - sfxM.x);
              if (uHoloLive > 0.5) {
-               // The SHINE, which the game gets from its bloom and a close
-               // inspect light and an orthographic studio render does not: a
-               // glint in the foil's own colour — a tight highlight on a soft
-               // shoulder — and a glossier surface for the environment to
-               // reflect in. Its own light (uHoloGlint) wanders near the view
-               // axis, so its reflection actually crosses stickers that face
-               // the viewer; the holo light sits too far off-axis to. Live
-               // viewer only.
+               // A little SHINE the game gets from its bloom and close inspect
+               // light: a small glint in the foil's own colour off a light that
+               // wanders near the view axis, and a slightly glossier surface.
+               // Kept faint — stronger, with a sliding sheen band on top, it
+               // washed the artwork out under the rainbow, which the game does
+               // not do. Live viewer only.
                vec3 hh = normalize(uHoloGlint + holoV);
                float nh = max(dot(normal, hh), 0.0);
-               float glint = pow(nh, 48.0) * 3.0 + pow(nh, 12.0) * 0.4;
-               // A glint off a point light only fires at the angles that
-               // mirror it, which a sticker held side-on to the viewer rarely
-               // meets. Foil also throws a SHEEN: a soft band of light lying
-               // diagonally across it that slides as the foil tilts. Driven by
-               // the same view-and-light term as the colour shift, so the band
-               // and the rainbow move together, as one surface.
-               float band = fract((stkUv.x + stkUv.y) * 0.7 - shift * 2.5) - 0.5;
-               float sheen = exp(-band * band * 60.0) * 0.6;
-               stkEmissive += refit * (glint + sheen) * uHoloShine * sfxM.x;
-               roughnessFactor = mix(roughnessFactor, min(roughnessFactor, 0.22), sfxM.x * uHoloShine);
+               stkEmissive += refit * pow(nh, 64.0) * 0.6 * uHoloShine * sfxM.x;
+               roughnessFactor = mix(roughnessFactor, min(roughnessFactor, 0.35), 0.5 * sfxM.x * uHoloShine);
              }
            }
          }
