@@ -239,6 +239,12 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v35 (2026-10-20): charm-shading.json gains `detail` — csgo_weapon's
+# F_DETAIL_TEXTURE over the albedo (mode, blend, scale, rotation, authored
+# offset, masked by the tint mask or not), and the detail texture joins the
+# charm textures the paint chain extracts. Charm | 8 Ball IGL is the reason:
+# the triangle in its window — the one its pattern turns green, yellow… — is
+# this texture, and without it the window was empty glass.
 # v34 (2026-10-20): STICKER MASKS (new step sticker-masks -> models/
 # <key>.stickermask.{hd,legacy}.webp + sticker-masks.json). csgo_weapon's
 # g_tStickerWepInputs, per body: the game draws stickers through its R channel,
@@ -297,7 +303,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=34
+EXTRACT_VERSION=35
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -3050,6 +3056,31 @@ for block in BLOCKS:
         # only at mask=1 — so the flag rides along and the renderer unfolds.
         if num(block, "g_bMaskRoughnessAdjustmentsByTintMask", "m_nValue"):
             entry["maskRoughness"] = True
+    # ---- A DETAIL texture over the albedo ------------------------------------
+    #
+    # csgo_weapon.slang: `Feature( F_DETAIL_TEXTURE, 0..1 (0="Multiply",
+    # 1="Replace") )`, `g_tDetail` (sRGB), placed by its own scale / rotation /
+    # offset and, with g_bMaskDetailTextureByTintMask, only where the tint mask
+    # is. Charm | 8 Ball IGL is the reason: the triangle floating in its window —
+    # the one the pattern turns green, yellow… — is this texture, Replace mode,
+    # inside the mask. Without it the window was empty glass.
+    #
+    # The offset is shipped AUTHORED; the shader's Expression folds scale and
+    # rotation into it, and the renderer does that fold so the two stay one rule.
+    # Only a real texture counts: every csgo_weapon material names one, and the
+    # default is a white multiply that changes nothing.
+    det = re.search(r'm_name = "g_tDetail"\s*\n\s*m_pValue = resource:"([^"]+)"', block)
+    if det and "default_detail" not in det.group(1):
+        entry["detail"] = {
+            "tex": f"/textures/{tex_out_name(det.group(1))}",
+            "mode": int(num(block, "F_DETAIL_TEXTURE", "m_nValue") or 0),
+            "blend": num(block, "g_fDetailBlendFactor", "m_flValue") if num(block, "g_fDetailBlendFactor", "m_flValue") is not None else 1.0,
+            "scale": vec(block, "g_vDetailTexCoordScale", 2) or [1.0, 1.0],
+            "offset": vec(block, "g_vDetailTexCoordOffset", 2) or [0.0, 0.0],
+            "rotation": num(block, "g_flDetailTexCoordRotation", "m_flValue") or 0.0,
+            "maskByTint": bool(num(block, "g_bMaskDetailTextureByTintMask", "m_nValue")),
+        }
+        mask_textures[det.group(1) + "_c"] = tex_out_name(det.group(1))
     remap = re.search(r'm_name = "g_vMetalnessRemapRange"\s*\n\s*m_value = \[ ([^\]]+) \]', block)
     if remap:
         lo, hi = [float(x) for x in remap.group(1).split(",")[:2]]

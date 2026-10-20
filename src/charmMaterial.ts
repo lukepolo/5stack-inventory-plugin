@@ -50,6 +50,22 @@ export interface CharmShading {
    * charmLiquid's parseCharmLiquid, which is the module that knows the shape.
    */
   liquid?: Record<string, unknown>;
+  /**
+   * A detail texture over the albedo — csgo_weapon's F_DETAIL_TEXTURE: mode 0
+   * multiplies, 1 replaces; placed by its own scale / rotation / authored
+   * offset; with `maskByTint`, only where the tint mask is. Charm | 8 Ball IGL's
+   * fortune triangle is one: the pattern grade then recolours it (green,
+   * yellow…), which is why it is applied before the grade, not after.
+   */
+  detail?: {
+    tex: string;
+    mode: number;
+    blend: number;
+    scale: [number, number];
+    offset: [number, number];
+    rotation: number;
+    maskByTint: boolean;
+  };
 }
 export type VfxNode = number | { f: string; a: VfxNode[] };
 
@@ -399,6 +415,10 @@ export function charmAdjustSrgb(px: Uint8ClampedArray, adj: CharmAdjust, mask?: 
  * hue 172 (teal), matching the published pattern guide band for band.
  */
 const charmAdjustGlsl = (hasMapUv: boolean) => `
+uniform sampler2D uDetail;
+uniform vec4 uDetailXf;
+uniform vec2 uDetailOff;
+uniform vec4 uDetailOn;
 uniform vec2 uRoughAdjust;
 uniform vec4 uColorAdjust;
 uniform vec2 uCharmMask;
@@ -432,7 +452,41 @@ vec3 csCharmAdjust( vec3 linear ) {
   vec3 hued = mix( vec3( dot( c, W ) ), rot, pow( hsvSat, 0.125 ) );
   vec3 outC = clamp( mix( vec3( dot( hued, W ) ), hued, uColorAdjust.y ), 0.0, 1.0 );
   return csToLinear( mix( authored, outC, csCharmMask() ) );
+}
+// The detail texture, in the albedo's own UV — csgo_weapon.slang's
+// g_vDetailTexCoordXform / g_vDetailTexCoordOffset (see detailUniforms).
+// uDetailOn = (on, replace, blend, masked).
+vec3 csCharmDetail( vec3 albedo ) {
+  ${
+    hasMapUv
+      ? `if ( uDetailOn.x < 0.5 ) return albedo;
+  vec2 duv = vec2( dot( vMapUv, uDetailXf.xy ), dot( vMapUv, uDetailXf.zw ) ) + uDetailOff;
+  vec3 det = texture2D( uDetail, duv ).rgb;
+  float k = uDetailOn.z * ( uDetailOn.w > 0.5 ? csCharmMask() : 1.0 );
+  return uDetailOn.y > 0.5 ? mix( albedo, det, k ) : albedo * mix( vec3( 1.0 ), det, k );`
+      : "return albedo;"
+  }
 }`;
+
+/**
+ * A detail's placement as the shader reads it. csgo_weapon.slang:
+ *
+ *   g_vDetailTexCoordXform = scale.xxyy * (cos, -sin, sin, cos)
+ *   g_vDetailTexCoordOffset = -0.5 * scale * (cos - sin, sin + cos) + offset + 0.5
+ *
+ * i.e. scaled and turned about the texture's centre, then moved. The offset is
+ * shipped as authored, so this is where the fold happens.
+ */
+function detailUniforms(d: NonNullable<CharmShading["detail"]>) {
+  const r = (d.rotation * Math.PI) / 180;
+  const c = Math.cos(r);
+  const sn = Math.sin(r);
+  const [sx, sy] = d.scale;
+  return {
+    xf: [sx * c, -sx * sn, sy * sn, sy * c] as const,
+    off: [-0.5 * sx * (c - sn) + d.offset[0] + 0.5, -0.5 * sy * (sn + c) + d.offset[1] + 0.5] as const,
+  };
+}
 
 /**
  * Correct the raw texture channels to what csgo_weapon.vfx actually renders.
@@ -506,6 +560,7 @@ export function tuneCharmShading(
     if (
       !seedDriven &&
       !v.liquid &&
+      !tune.detail &&
       v.roughContrast === 1 &&
       v.roughBright === 1 &&
       !v.graded &&
@@ -558,6 +613,19 @@ export function tuneCharmShading(
     owned.userData.lqMetal = lqMetal ?? whiteTexture(THREE);
     owned.userData.lqMetalBound = !!lqMetal;
     if (v.liquid) setCharmLiquidUniforms(THREE, owned, v.liquid);
+    // The detail texture, bound on every tuned charm for the same one-program
+    // reason the mask is; uDetailOn.x is what decides whether it is read.
+    const detailTex = tune.detail ? (masks?.get(`${mat.name}\u0000detail`) ?? null) : null;
+    const du = tune.detail && detailTex ? detailUniforms(tune.detail) : null;
+    owned.userData.detail = detailTex ?? whiteTexture(THREE);
+    owned.userData.detailXf = new THREE.Vector4(...(du?.xf ?? [1, 0, 0, 1]));
+    owned.userData.detailOff = new THREE.Vector2(...(du?.off ?? [0, 0]));
+    owned.userData.detailOn = new THREE.Vector4(
+      du ? 1 : 0,
+      tune.detail?.mode === 1 ? 1 : 0,
+      tune.detail?.blend ?? 1,
+      tune.detail?.maskByTint ? 1 : 0,
+    );
     // Material.clone does not carry onBeforeCompile, so a patch the material
     // already had is lost under ours unless it is run first by hand. The pet
     // chick's fur was: its no-flip (petMaterial.ts) went, and every fur card
@@ -572,6 +640,10 @@ export function tuneCharmShading(
       shader.uniforms.uColorAdjust = { value: owned.userData.colorAdjust };
       shader.uniforms.uCharmMask = { value: owned.userData.charmMask };
       shader.uniforms.uTintMask = { value: owned.userData.tintMask };
+      shader.uniforms.uDetail = { value: owned.userData.detail };
+      shader.uniforms.uDetailXf = { value: owned.userData.detailXf };
+      shader.uniforms.uDetailOff = { value: owned.userData.detailOff };
+      shader.uniforms.uDetailOn = { value: owned.userData.detailOn };
       shader.fragmentShader = shader.fragmentShader
         .replace("void main() {", `${charmAdjustGlsl(!!owned.map)}\nvoid main() {`)
         // Three materials fade the roughness adjust by the mask too, and the
@@ -589,7 +661,8 @@ export function tuneCharmShading(
         )
         .replace(
           "#include <map_fragment>",
-          "#include <map_fragment>\n\tdiffuseColor.rgb = csCharmAdjust( diffuseColor.rgb );",
+          // The detail BEFORE the grade: the grade is what recolours it.
+          "#include <map_fragment>\n\tdiffuseColor.rgb = csCharmAdjust( csCharmDetail( diffuseColor.rgb ) );",
         );
       // AFTER the block above, never before: both inject at `void main() {`, so
       // whichever runs last sits closest to it — and the liquid calls
@@ -640,6 +713,7 @@ export async function loadCharmTintMasks(
   const wanted = new Map<string, { path: string; flipY: boolean }>();
   const wantedRough = new Map<string, { path: string; flipY: boolean }>();
   const wantedMetal = new Map<string, { path: string; flipY: boolean }>();
+  const wantedDetail = new Map<string, { path: string; flipY: boolean }>();
   model.traverse((n) => {
     const mesh = n as ThreeNS.Mesh;
     if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
@@ -671,6 +745,9 @@ export async function loadCharmTintMasks(
     // The ALBEDO's orientation, carried along, because the mask has to be read
     // in the same one — see the flipY note below.
     if (url && name) wanted.set(name, { path: url, flipY: mat.map?.flipY ?? true });
+    // The detail texture, read in the albedo's UV and so in its orientation too.
+    const det = tune?.detail?.tex;
+    if (typeof det === "string" && name) wantedDetail.set(name, { path: det, flipY: mat.map?.flipY ?? true });
   });
   await Promise.all(
     [...wanted].map(async ([name, { path, flipY }]) => {
@@ -738,6 +815,21 @@ export async function loadCharmTintMasks(
         tex.needsUpdate = true;
       }
       out.set(`${name}\u0000metal`, tex);
+    }),
+  );
+  await Promise.all(
+    [...wantedDetail].map(async ([name, { path, flipY }]) => {
+      const tex = await loadTexture(paintTextureUrl(path)).catch(() => null);
+      if (!tex) return;
+      // A PICTURE (sRGB, as g_tDetail is declared) that TILES: its transform
+      // runs the window's UV past [0,1] by design.
+      if (tex.flipY !== flipY || tex.colorSpace !== THREE.SRGBColorSpace || tex.wrapS !== THREE.RepeatWrapping) {
+        tex.flipY = flipY;
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        tex.needsUpdate = true;
+      }
+      out.set(`${name}\u0000detail`, tex);
     }),
   );
   return out;

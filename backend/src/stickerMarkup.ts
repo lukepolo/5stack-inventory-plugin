@@ -397,6 +397,21 @@ export interface CharmShading {
    * and a param this file filtered out would be invisible to diagnose.
    */
   liquid?: Record<string, unknown>;
+  /**
+   * A detail texture over the albedo (csgo_weapon's F_DETAIL_TEXTURE): mode 0
+   * multiplies, 1 replaces; placed by its own scale / rotation / authored
+   * offset; with `maskByTint`, only where the tint mask is. Charm | 8 Ball IGL's
+   * fortune triangle is one.
+   */
+  detail?: {
+    tex: string;
+    mode: number;
+    blend: number;
+    scale: [number, number];
+    offset: [number, number];
+    rotation: number;
+    maskByTint: boolean;
+  };
 }
 
 const CHARM_FILE = path.join(MODELS_DIR, "charm-models.json");
@@ -436,6 +451,25 @@ export async function getCharmShading(): Promise<Record<string, CharmShading>> {
         // far better than no liquid at all.
         if (typeof liquid.mask === "string" && !liquid.mask.startsWith("/textures/")) delete liquid.mask;
         out.liquid = liquid;
+      }
+      const d = e.detail as Record<string, unknown> | undefined;
+      // Whole or nothing, and path-checked like tintMask: a detail with a NaN in
+      // its placement would sample nowhere and paint the window one colour.
+      if (d && typeof d.tex === "string" && d.tex.startsWith("/textures/")) {
+        const pair = (v: unknown, dflt: number): [number, number] => {
+          const a = Array.isArray(v) ? v.map(Number) : [];
+          return [Number.isFinite(a[0]) ? a[0] : dflt, Number.isFinite(a[1]) ? a[1] : dflt];
+        };
+        const blend = Number(d.blend);
+        out.detail = {
+          tex: d.tex,
+          mode: Number(d.mode) === 1 ? 1 : 0,
+          blend: Number.isFinite(blend) ? blend : 1,
+          scale: pair(d.scale, 1),
+          offset: pair(d.offset, 0),
+          rotation: Number.isFinite(Number(d.rotation)) ? Number(d.rotation) : 0,
+          maskByTint: d.maskByTint === true,
+        };
       }
       if (Object.keys(out).length) map[stem] = out;
     }
