@@ -61,7 +61,9 @@ import NAMETAG_ANCHORS from "./nametagAnchors.json";
 // Same shared-prop tree the StatTrak module comes from — see MODULE_GLB.
 const NAMETAG_GLB = "extra/nametag_module";
 import {
+  ATLAS_ROWS,
   composeDigitAtlas,
+  digitBand,
   engravingMask,
   isDisplayMaterial,
   MODULE_GLB,
@@ -1417,6 +1419,49 @@ interface PoseBones {
   modelQuat: import("three").Quaternion | null;
 }
 const posedCache = new Map<string, PosedModel>();
+
+/** How much the knife's digit row is enlarged before it is drawn — see
+ *  digitBand. 4x turns the 512px atlas's row into a 2048 x 256 strip. */
+const KNIFE_DIGIT_SCALE = 4;
+/** The knife digit atlas exactly as the game ships it. `color` is only
+ *  published when its alpha actually cuts the scratches out. */
+interface KnifeDigitArt {
+  color: HTMLImageElement | null;
+  normal: HTMLImageElement | null;
+}
+let knifeDigitArt: Promise<KnifeDigitArt | null> | null = null;
+/**
+ * The knife's digit atlas from the stattrak-art extraction step: the game's
+ * colour atlas WITH its alpha (the scratch cut-out the glTF copy drops) and the
+ * normal atlas, both at the archive's own resolution. Null on a mount extracted
+ * before that step — the caller then rebuilds the cut from the normals.
+ * Fetched once per page.
+ */
+function loadKnifeDigitArt(): Promise<KnifeDigitArt | null> {
+  knifeDigitArt ??= (async () => {
+    try {
+      const res = await fetch(withAssetVersion(`${getAssetOrigin()}/models/stattrak-art.json`));
+      if (!res.ok) return null;
+      const knife = ((await res.json()) as { knife?: { color?: unknown; normal?: unknown } })?.knife;
+      // One bad file costs only itself: the other still beats the glTF copy.
+      const load = (file: unknown) =>
+        typeof file !== "string"
+          ? Promise.resolve(null)
+          : new Promise<HTMLImageElement | null>((resolve) => {
+              const img = new Image();
+              img.crossOrigin = "anonymous";
+              img.onload = () => resolve(img);
+              img.onerror = () => resolve(null);
+              img.src = withAssetVersion(`${getAssetOrigin()}/models/${file.split("/").map(encodeURIComponent).join("/")}`);
+            });
+      const [color, normal] = await Promise.all([load(knife?.color), load(knife?.normal)]);
+      return color || normal ? { color, normal } : null;
+    } catch {
+      return null;
+    }
+  })();
+  return knifeDigitArt;
+}
 // Matches GLTF_CACHE_MAX — there is no point holding posed geometry for a model
 // whose source has already been evicted. ~1MB an entry.
 const POSED_CACHE_MAX = 12;
@@ -10551,20 +10596,22 @@ async function buildViewer(
   }
 
   /**
-   * Lift a knife's engraved plate out of the blade where it is buried.
+   * Lay a knife's engraved plate flush on the blade.
    *
-   * Placed from the attachment alone, most plates already lie on the blade —
-   * measured 0 to 0.2mm off the surface on 17 of 22 knives. The rest is our
-   * extraction disagreeing with the game by a hair: the Falchion's plate sits
-   * up to 2.1mm INSIDE the blade and the Flip's 1.1mm, which hides most of the
-   * count. A quarter-millimetre engraving has no thickness to spare, so any
-   * burial at all reads as missing digits.
+   * Placed from the attachment alone, the plate lands within a couple of
+   * millimetres of the steel but rarely ON it — measured across the 22 knives,
+   * the Butterfly's floats 1.8mm off its blade and the M9's 1.2mm (a visible
+   * gap edge-on), while the Falchion's sits 2.1mm INSIDE its blade and the
+   * Widowmaker's 1.7mm, which hides most of the count. The game draws the same
+   * quad with a depth bias and gets away with it; a scratch has no thickness to
+   * spare here, so the plate is moved along its own normal until its outermost
+   * sample sits CLEAR above the surface.
    *
    * Sampled across the plate rather than at its centre, because a blade is not
-   * flat, and only ever moved OUT along the plate's own normal. A sample buried
-   * deeper than KNIFE_MAX_LIFT is not the blade but a raised feature the plate
-   * overlaps (the Stiletto's bolster, 7.6mm proud) — lifting the whole plate
-   * clear of it would float the rest off the steel, so it is left out.
+   * flat. A sample further than KNIFE_MAX_LIFT from the plate is not the blade
+   * under it but something it overlaps or overhangs (the Stiletto's bolster,
+   * 7.6mm proud) and is left out, so it can neither lift the whole plate off
+   * the steel nor drag it down to it.
    *
    * Returns how far the plate moved.
    */
@@ -10607,13 +10654,65 @@ async function buildViewer(
       const hit = raycaster.intersectObjects(weaponMeshes, false)[0];
       if (!hit) continue;
       const buried = PROBE - hit.distance;
-      if (buried <= KNIFE_MAX_LIFT) worst = Math.max(worst, buried);
+      if (Math.abs(buried) <= KNIFE_MAX_LIFT) worst = Math.max(worst, buried);
     }
-    if (worst === -Infinity || worst <= -CLEAR) return 0;
+    if (worst === -Infinity) return 0;
     const lift = worst + CLEAR;
     const at = mod.getWorldPosition(new THREE.Vector3()).addScaledVector(n, lift);
     mod.position.copy(object.worldToLocal(at));
     return lift;
+  }
+
+  /**
+   * The knife plate's maps: the count's digits, scratched.
+   *
+   * Three things differ from the gun's lit readout. The digits are carried by
+   * the NORMAL map (the colour atlas is flat grey steel). Only the scratches
+   * draw — csgo_weapon alpha-tests the colour atlas's alpha at 0.667, and the
+   * loader carries that test over from the glTF's MASK mode. And the strokes
+   * are a few texels wide, so everything is built on an enlarged copy of the
+   * one atlas row the plate reads (see digitBand) and the test's edge is
+   * anti-aliased by coverage — the game's own g_flAntiAliasedEdgeStrength — so
+   * the numerals keep a clean outline however close the camera gets.
+   *
+   * The alpha comes from the game's own colour atlas when the mount carries it
+   * (the stattrak-art step); the glTF's copy has none, and an older mount falls
+   * back to rebuilding the cut from the normals (engravingMask).
+   */
+  function dressKnifeDigits(
+    display: import("three").MeshStandardMaterial,
+    count: number | null,
+    art: KnifeDigitArt | null,
+  ) {
+    type Img = CanvasImageSource & { width: number; height: number };
+    const like = (t: import("three").Texture | null, img: HTMLCanvasElement, colorSpace: string) => {
+      const tex = new THREE.CanvasTexture(img);
+      tex.flipY = t?.flipY ?? false;
+      tex.colorSpace = colorSpace as import("three").ColorSpace;
+      tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+      // Row 0 of the atlas is the whole band: scale v by the row count so the
+      // plate's own UVs land on it unchanged.
+      const rep = t?.repeat ?? new THREE.Vector2(1, 1);
+      const off = t?.offset ?? new THREE.Vector2(0, 0);
+      tex.repeat.set(rep.x, rep.y * ATLAS_ROWS);
+      tex.offset.set(off.x, off.y * ATLAS_ROWS);
+      stattrakDisposables.push(tex);
+      return tex;
+    };
+    const colorImg = (art?.color ?? display.map?.image) as Img | undefined;
+    const normalImg = (art?.normal ?? display.normalMap?.image) as Img | undefined;
+    if (!normalImg?.width) return;
+    const srcNormal = display.normalMap;
+    const normals = digitBand(composeDigitAtlas(normalImg, count), KNIFE_DIGIT_SCALE);
+    const normalMap = like(srcNormal, normals, THREE.NoColorSpace);
+    if (colorImg?.width) {
+      display.map = like(display.map, digitBand(composeDigitAtlas(colorImg, count), KNIFE_DIGIT_SCALE), THREE.SRGBColorSpace);
+    }
+    display.normalMap = normalMap;
+    display.alphaMap = art?.color ? null : like(srcNormal, engravingMask(normals), THREE.NoColorSpace);
+    if (!display.alphaTest) display.alphaTest = 0.667;
+    display.alphaToCoverage = true;
+    display.needsUpdate = true;
   }
 
   const stattrakDisposables: { dispose: () => void }[] = [];
@@ -10622,6 +10721,9 @@ async function buildViewer(
     const picked = pickAnchor(STATTRAK_ANCHORS as Record<string, import("./stattrakModule").StatTrakAnchorSet | undefined>, model, !!opts?.legacyPaint);
     if (!picked) return; // no attachment (the C4 has none) — nothing to hang
     const { anchor, knife, bone } = picked;
+    // A knife's count is a scratch, not a lit display: with no count (the baked
+    // 2D card) there is nothing to draw at all, so the module is not loaded.
+    if (knife && spec.count == null) return;
     // Knives take their own module (stattrak_module_knife): a bare plate whose
     // readout is unwrapped with the SAME digit-cell convention as the gun's
     // (measured: both span u = 1 .. 6.3671875), so the column permutation
@@ -10640,6 +10742,7 @@ async function buildViewer(
     } catch {
       return; // module art missing from the mount: render the weapon regardless
     }
+    const knifeArt = knife ? await loadKnifeDigitArt() : null;
     // clone(true) shares materials with the cached glTF, so the display
     // material MUST be cloned before its maps are swapped or every other
     // viewer's counter changes to this item's.
@@ -10652,6 +10755,10 @@ async function buildViewer(
       const display = mat.clone();
       mesh.material = display;
       stattrakDisposables.push(display);
+      if (knife) {
+        dressKnifeDigits(display, spec.count, knifeArt);
+        return;
+      }
       // No UV surgery. The plate is already unwrapped into ATLAS space — its
       // six digit quads fract to columns 0..5 under Repeat wrapping — so the
       // replacement is an atlas of the same shape with the columns permuted,
@@ -10680,20 +10787,6 @@ async function buildViewer(
       // map is either absent or already per-digit consistent.
       const engraved = swap(display.normalMap);
       if (engraved) display.normalMap = engraved;
-      // Only the scratches draw — see engravingMask. alphaTest is already the
-      // vmat's 0.667, carried over by the loader from the glTF's MASK mode.
-      if (knife && engraved) {
-        const cut = new THREE.CanvasTexture(engravingMask(engraved.image as HTMLCanvasElement));
-        cut.flipY = engraved.flipY;
-        cut.colorSpace = THREE.NoColorSpace;
-        cut.wrapS = engraved.wrapS;
-        cut.wrapT = engraved.wrapT;
-        cut.repeat.copy(engraved.repeat);
-        cut.offset.copy(engraved.offset);
-        stattrakDisposables.push(cut);
-        display.alphaMap = cut;
-        if (!display.alphaTest) display.alphaTest = 0.667;
-      }
       // Glow follows the DIGITS, not g_tSelfIllumMask. That mask is a 1x1
       // near-white pixel — a constant meaning "all of it may glow", with the
       // actual shape coming from the albedo (the vmat's
@@ -10728,7 +10821,7 @@ async function buildViewer(
     // The gun pass pushes along the receiver's side axis, which on a knife runs
     // ALONG the blade — knives seat along the plate's own normal instead.
     const clearance = knife ? null : clearReadout(mod);
-    if (clearance?.pushed || (knife && seatKnifePlate(mod) > 0)) object.updateMatrixWorld(true);
+    if (clearance?.pushed || (knife && seatKnifePlate(mod) !== 0)) object.updateMatrixWorld(true);
     // Placement introspection for tools/shadertest/stattrak.html. Off unless
     // the rig sets the flag, so production pays nothing — and measuring these
     // boxes is what finally settled placement after several wrong theories.
@@ -10946,7 +11039,13 @@ async function buildViewer(
     // instead, so placeAttachedModule only has to supply the POSITION.
     // seating="posed" — the plate, unlike the StatTrak module, is a bare sticker
     // of a thing that has to end up ON the surface, so it does get seated.
-    if (!placeAttachedModule(mod, picked.anchor, picked.bone, false, true, "posed")) return;
+    // The C4 is the exception: its label goes on the LCD's flat front, where
+    // the attachment's own QAngle ([0, 90, 90]: forward along the screen, out
+    // of its face, up its height) lays it exactly as the game does, and the
+    // surface search below lands on the screen bezel's side wall instead and
+    // stands the plate on edge. Valve parents it there unseated, so do we.
+    const asAuthored = model === "c4";
+    if (!placeAttachedModule(mod, picked.anchor, picked.bone, asAuthored, !asAuthored, asAuthored ? "none" : "posed")) return;
     object.add(mod);
     /**
      * Orient the plate: flatness from the BODY, direction from the GAME DATA.
@@ -10965,7 +11064,7 @@ async function buildViewer(
      */
     const anchorAngles = picked.anchor.angles;
     const normal = surfaceNormalAt(mod.position);
-    if (normal && anchorAngles.length === 3) {
+    if (!asAuthored && normal && anchorAngles.length === 3) {
       const rad = Math.PI / 180;
       // Negated XYZ — settled by sweeping every order/permutation/sign against
       // those two weapons rather than derived from a convention we cannot check.

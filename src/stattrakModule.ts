@@ -128,20 +128,46 @@ export function composeDigitAtlas(
 }
 
 /**
- * The cut-out for the KNIFE plate: opaque on the scratched digits, clear
- * everywhere else.
+ * Atlas row 0 — the only row a readout samples — cut out of a composed atlas
+ * and enlarged `scale` times with the browser's high-quality resampling.
+ *
+ * The knife's numerals are scratches a few texels wide: at the shipped 512px a
+ * glyph cell is 32 x 38 texels, which on a 3.9cm plate is 0.2mm a texel, and
+ * an alpha test straight off that grid cuts every stroke into visible stairs.
+ * Enlarging only the row keeps the cost to a 2048 x 256 strip instead of a
+ * 2048-square atlas, and the plate reaches it unchanged through the texture's
+ * repeat: v x ATLAS_ROWS lands row 0 on the whole strip.
+ */
+export function digitBand(atlas: CanvasImageSource & { width: number; height: number }, scale: number): HTMLCanvasElement {
+  const band = document.createElement("canvas");
+  const rowH = atlas.height / ATLAS_ROWS;
+  band.width = Math.round(atlas.width * scale);
+  band.height = Math.round(rowH * scale);
+  const ctx = band.getContext("2d");
+  if (!ctx) return band;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(atlas, 0, 0, atlas.width, rowH, 0, 0, band.width, band.height);
+  return band;
+}
+
+/**
+ * The cut-out for the KNIFE plate, when the mount has no alpha for it: opaque
+ * on the scratched digits, clear everywhere else.
  *
  * In game a knife's kill count is scratched into the blade — no plate, the
  * paint simply missing where the numerals are cut. The material does that with
  * an alpha test (F_ALPHA_TEST, reference 0.667) on the colour atlas's alpha,
- * but the extracted atlas comes out flat grey with NO alpha, so taken as-is the
- * whole 3.9 x 1cm quad draws as a grey sticker on the blade.
+ * but the colour atlas inside the module's glTF comes out flat grey with NO
+ * alpha, so taken as-is the whole 3.9 x 1cm quad draws as a grey sticker. The
+ * stattrak-art extraction step ships the real one; this is the fallback for a
+ * mount extracted before it.
  *
- * The digit shapes survive in the normal atlas, though: its background is one
- * flat normal and every stroke bends away from it. So the mask is "differs
- * from the background normal", grown by a pixel so the groove's flat floor and
- * its anti-aliased rim stay inside the cut. Built from the column-permuted
- * atlas, so it follows the count exactly as the engraving does.
+ * The digit shapes survive in the normal atlas: its background is one flat
+ * normal and every stroke bends away from it. So the mask is how far a texel
+ * bends, as a SMOOTH ramp rather than a threshold — run on an enlarged band
+ * (see digitBand) the alpha test then cuts along a smooth contour instead of
+ * the texel grid.
  */
 export function engravingMask(normals: HTMLCanvasElement): HTMLCanvasElement {
   const { width: w, height: h } = normals;
@@ -152,7 +178,7 @@ export function engravingMask(normals: HTMLCanvasElement): HTMLCanvasElement {
   const ctx = out.getContext("2d");
   if (!src || !ctx) return out;
   const px = src.data;
-  // The background is whatever normal covers most of the atlas — measured
+  // The background is whatever normal covers most of the strip — measured
   // (128, 117, 254), not the textbook (128, 128, 255), so it is read rather
   // than assumed.
   const votes = new Map<number, number>();
@@ -165,29 +191,15 @@ export function engravingMask(normals: HTMLCanvasElement): HTMLCanvasElement {
   for (const [key, n] of votes) if (n > most) [bg, most] = [key, n];
   const r0 = bg >> 8;
   const g0 = bg & 0xff;
-  const cut = new Uint8Array(w * h);
-  for (let p = 0; p < w * h; p++) {
-    cut[p] = Math.hypot(px[p * 4] - r0, px[p * 4 + 1] - g0) > 10 ? 1 : 0;
-  }
+  // 0 below a bend of 4/255, 1 above 16: the 0.667 test lands at 12, which
+  // traces the groove's shoulder rather than its floor or the flat around it.
   const img = ctx.createImageData(w, h);
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let on = 0;
-      for (let dy = -1; dy <= 1 && !on; dy++) {
-        const yy = y + dy;
-        if (yy < 0 || yy >= h) continue;
-        for (let dx = -1; dx <= 1; dx++) {
-          const xx = x + dx;
-          if (xx >= 0 && xx < w && cut[yy * w + xx]) {
-            on = 1;
-            break;
-          }
-        }
-      }
-      const o = (y * w + x) * 4;
-      img.data[o] = img.data[o + 1] = img.data[o + 2] = on ? 255 : 0;
-      img.data[o + 3] = 255;
-    }
+  for (let p = 0; p < w * h; p++) {
+    const bend = Math.hypot(px[p * 4] - r0, px[p * 4 + 1] - g0);
+    const a = Math.round(255 * Math.min(1, Math.max(0, (bend - 4) / 12)));
+    const o = p * 4;
+    img.data[o] = img.data[o + 1] = img.data[o + 2] = a;
+    img.data[o + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
   return out;
