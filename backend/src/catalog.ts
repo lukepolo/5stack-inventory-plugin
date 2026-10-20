@@ -892,8 +892,19 @@ export function getItemsByIds(ids: number[]): (CatalogSkin & {
   return out;
 }
 
+/**
+ * Glove FINISHES — the 94 that exist as items.
+ *
+ * A glove is never an item without its finish: "Bloodhound Gloves" on its own
+ * is the model every Bloodhound finish is painted onto, not something anyone
+ * can own. cs2-lib still lists the eight bare models, and the two stock pairs,
+ * as glove items; offered here they made the craft sheet a list of things the
+ * game has no such item for. The stock pairs are still the slot's default —
+ * getDefaults reads them separately — and an owned instance of any of the ten
+ * still resolves, since nothing here touches getItem.
+ */
 export function getGloves(): CatalogSkin[] {
-  return items.filter((i) => i.type === "glove").map(paintedListing);
+  return items.filter((i) => i.type === "glove" && !!i.variantIndex).map(paintedListing);
 }
 
 /**
