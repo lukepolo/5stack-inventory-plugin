@@ -804,10 +804,16 @@ void main() {
   // The shader offsets this lookup by a view-dependent parallax vector which a
   // baked composite cannot have; see the header.
   //
-  // Scale about the centre, then rotate, then offset — Source's own texture
-  // transform order. The vertex shader that builds this UV is not in the
-  // decompile, so the order is the convention, not a transcription.
-  vec2 patUv = mat2(uPatternRot.x, uPatternRot.y, -uPatternRot.y, uPatternRot.x) * ((uv - uPatternCenter) * uPatternXform.xy)
+  // Scale from the ORIGIN, then offset — the convention the fabric layers
+  // (RESOLVE_FRAG) and the weapon compositor's texXform both use. Scaling
+  // about g_vPatternTexCoordCenter instead slid every pattern by
+  // (0.5 - 0.5 x scale): a quarter of the artwork sideways on Specialist
+  // Gloves | Blackbook (scale 1.5), so pattern #30 showed the signature tag
+  // where the game shows the dripping hand. Measured against an in-game #30:
+  // with this, AIK, the Q, the hand and the arrow land where the game puts
+  // them. The vertex shader that builds this UV is not in the decompile;
+  // rotation turns about the centre (unverified — Blackbook rolls none).
+  vec2 patUv = mat2(uPatternRot.x, uPatternRot.y, -uPatternRot.y, uPatternRot.x) * (uv * uPatternXform.xy - uPatternCenter)
              + uPatternCenter + uPatternXform.zw;
   vec4 pat = uHasPattern ? texture(uPattern, patUv) : vec4(0.0);
   if (uHasPattern && uEmboss) {
