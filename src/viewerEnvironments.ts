@@ -187,7 +187,9 @@ const CS2_LIGHT = {
  *
  * Each is a screenshot taken in game with the HUD off (the FPS counter and build
  * line cropped away), drawn behind the item and turned into its reflections —
- * see ViewerEnvironment.backdrop. The lamps start as the CS2 rig's; `tune`
+ * see ViewerEnvironment.backdrop. The depth of field is BAKED IN (Gaussian,
+ * radius 7 at 1600px): a mip bias strong enough to match the game's blur reads
+ * as blocky, so the shader only adds a touch on top. The lamps start as the CS2 rig's; `tune`
  * overrides them per scene, closed against in-game inspects in that scene.
  */
 const cs2Scene = (
@@ -204,7 +206,7 @@ const cs2Scene = (
   lighting: { ...CS2_LIGHT.lighting, ...tune.lighting },
   exposure: tune.exposure ?? CS2_LIGHT.exposure,
   colors: { ...CS2_LIGHT.colors, ...tune.colors },
-  backdrop: { image: bundled(image), blur: 2.2 },
+  backdrop: { image: bundled(image), blur: 0.8 },
 });
 
 export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
