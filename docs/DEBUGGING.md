@@ -300,6 +300,15 @@ per-pixel normal made lenticular frames flicker texel by texel; amplifying it
 and drifting the light made stickers animate on their own, which the game never
 does.
 
+Check what the EXTRACTOR did to a texture before decoding it the game's way.
+Source2Viewer's default (`--texture_decode_flags auto`) unpacks some formats on
+export: a hemi-octahedral normal map (`HemiOctIsoRoughness_RG_B`) comes out as a
+plain RGB normal with its roughness moved from blue to alpha. The sticker shader
+ran the game's hemi-oct decode over it and read roughness from blue (the
+rebuilt z, ~1), so every sticker was fully matte and deep relief spiked. The
+test: if blue equals `sqrt(1 - x² - y²) * 0.5 + 0.5` from red and green, the
+texture was already decoded.
+
 ### 4.6 A card is wrong or stale
 
 Cards are baked once and kept. The viewer reports a failed paint

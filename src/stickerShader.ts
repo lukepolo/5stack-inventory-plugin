@@ -180,13 +180,18 @@ float stkSmoothInv(float e0, float e1, float x) {
 }
 
 /**
- * Valve's 2-channel normal decode, shared by the sticker normal and the glitter
- * flake sheet. 1.00392163 is 256/255 — the encode is not quite symmetric.
+ * The sticker normal and the glitter flake sheet, as they reach US: an ordinary
+ * RGB tangent-space normal map. The game stores them hemi-octahedral in RG
+ * (decoded in the shader with (r+g)-256/255, r-g), but the extractor's
+ * Source2Viewer decodes on export ("auto" decode flags, TextureCodec.HemiOctRB):
+ * it writes n*0.5+0.5 to RGB and moves the roughness that sat in B into ALPHA.
+ * Measured: blue equals the reconstructed z on every one checked. Running the
+ * game's hemi-oct decode over already-decoded RGB bent the normals hard enough
+ * on steep bevels to face away from the camera (the spikes on Bolt Charge
+ * (Foil)'s tip).
  */
 vec3 stkDecodeNormal(vec4 t) {
-  float nx = (t.x + t.y) - 1.00392163;
-  float ny = t.x - t.y;
-  return normalize(vec3(nx, ny, (1.0 - abs(nx)) - abs(ny)));
+  return normalize(t.xyz * 2.0 - 1.0);
 }
 
 /**
@@ -525,7 +530,12 @@ export async function applyStickerSfx(
       .replace(
         "#include <roughnessmap_fragment>",
         `#include <roughnessmap_fragment>
-         if (uHasNormRough) roughnessFactor = texture2D(uNormRoughTex, stkUv).z;
+         // ALPHA, not blue: the extractor moved the game's roughness channel
+         // there when it decoded the normal (see stkDecodeNormal). Blue is the
+         // reconstructed normal z, ~1 everywhere, which made every sticker
+         // fully rough — foil and gold that should mirror the light came out
+         // matte.
+         if (uHasNormRough) roughnessFactor = texture2D(uNormRoughTex, stkUv).w;
          roughnessFactor = mix(roughnessFactor, 0.8, stkRoughKick);`,
       )
       // Normals are resolved by here, which the effects need for the view term.
@@ -548,6 +558,11 @@ export async function applyStickerSfx(
            vec3 sn = stkDecodeNormal(texture2D(uNormRoughTex, stkUv));
            sn.y = -sn.y;
            normal = normalize(normal + sn * stkExpandedA * 2.0);
+           // Never let the relief tip the normal away from the surface: a
+           // grazing normal is where the specular term blows up into the white
+           // flares bloom then spreads.
+           float stkFace = dot(normal, nonPerturbedNormal);
+           if (stkFace < 0.3) normal = normalize(normal + nonPerturbedNormal * (0.3 - stkFace) * 2.0);
          }
          // The art BEFORE any finish work: the glitter modulation colour reads
          // it (sticker.glsl:516 refits the raw sample, not the tinted one).
@@ -610,7 +625,10 @@ export async function applyStickerSfx(
            if (uLegacyTint) diffuseColor.rgb *= uColorBoost;
          }
          // Self-illum rides .w of the normal/rough texture and reads the
-         // POST-refit, PRE-holo albedo (sticker.glsl:625-628). Not scaled by
+         // POST-refit, PRE-holo albedo (sticker.glsl:625-628). Caveat: on a
+         // texture the extractor decoded as hemi-oct (see stkDecodeNormal)
+         // .w now holds the roughness, and the game's own .w did not survive
+         // the export. Not scaled by
          // alpha here: the game's mix(0, emissive, alpha) at :941 is exactly
          // what the alpha blend applies to outgoingLight already.
          if (uSelfIllum && uHasNormRough) {

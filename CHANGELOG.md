@@ -48,6 +48,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
 - Legacy-body finishes such as AK-47 | Redline dropped the fourth sticker on the handguard.
 - Foil, gold and other metal stickers came out flat grey or the wrong colour; hovering one brought the colour back. They now keep their artwork's colours, and gold stickers turn gold, matching the game's own icons.
+- Every sticker rendered fully matte, so foil and gold never reflected the light, and stickers with deep relief (Bolt Charge (Foil)) threw white spikes at some angles. Both came from reading the sticker's normal and roughness texture in the game's packed format after the extractor had already unpacked it.
 - Newer (Gen2) glove patterns sat in the wrong place: Specialist Gloves | Blackbook #30 showed a different part of the artwork than in game. The pattern is now placed as the game places it, checked against an in-game #30.
 - Knife name tags lay diagonally across the handle (Karambit) or stood on edge (Bayonet). They now lie flat along the handle.
 - Older glove finishes drew no print: Crimson Web had no web, and the DDPAT, kimono, snakeskin, leopard and Fade prints were missing.

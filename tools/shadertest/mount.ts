@@ -21,6 +21,7 @@
 //   nomask=1              draw stickers without the weapon's sticker mask
 //   stattrak=1337         StatTrak count ("dark" = the card's unlit module)
 //   nametag=Some%20Name   name tag
+//   decal=/images/….webp  a STANDALONE sticker (model=__sticker&kind=sticker)
 //   va=0,1.57             camera orbit angles (radians), one shot each
 //   t=0,1.5,3             seconds after load to shoot, per angle (live only)
 //   still=0               the LIVE viewer (render loop, holo drift, inspect
@@ -119,6 +120,8 @@ async function shoot(va: number, plain: boolean) {
       stickerMasks: q.get("nomask") ? undefined : bounds.masks,
       stattrak: plain || stattrak == null ? null : { count: stattrak === "dark" ? null : Number(stattrak) },
       nametag: plain ? null : q.get("nametag"),
+      // A standalone sticker/patch: model=__sticker&kind=sticker&decal=/images/….webp
+      decal: q.get("decal") ? { image: q.get("decal")!, wear: num("decalwear", 0) } : null,
     } as never);
     await new Promise((r) => setTimeout(r, settle));
     let last = 0;
