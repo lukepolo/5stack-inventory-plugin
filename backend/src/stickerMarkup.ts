@@ -146,7 +146,8 @@ export function slotCount(slots: StickerSlot[], mesh = "body_hd"): number {
 // ---- Sticker masks ------------------------------------------------------------
 //
 // Where a sticker may SHOW on each body: csgo_weapon's g_tStickerWepInputs
-// (R = mask, G = cavity), in the same TEXCOORD_1 space as the anchors above.
+// (R = mask, G = cavity), in the body's UV0 — not the TEXCOORD_1 the anchors
+// above are in (see applyStickerMask in the frontend for how that was measured).
 // The game draws stickers through it, so whatever is modelled over the sticker
 // band — the C4's LCD module, wires and tape — hides the part of a sticker under
 // it. extract-models.sh §3d2 writes one image per body beside the GLBs and

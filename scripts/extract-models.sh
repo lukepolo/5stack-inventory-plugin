@@ -2515,8 +2515,9 @@ fi
 if step_if "sticker-masks"; then
 # Where a sticker may SHOW on each weapon body: csgo_weapon's
 # `g_tStickerWepInputs` (csgo_weapon.slang: R = TextureStickerMask, G =
-# TextureStickerCavity, ATI2N), authored in the same TEXCOORD_1 space the
-# sticker anchors are. The game draws stickers through it, so anything modelled
+# TextureStickerCavity, ATI2N), authored in the body's UV0 — the main texture
+# space, NOT the TEXCOORD_1 the sticker anchors live in (measured: the masks'
+# white shapes are the UV0 islands exactly). The game draws stickers through it, so anything modelled
 # on top of the sticker band — the C4's LCD module, wires and tape, a rifle's
 # moving parts — hides the part of a sticker under it. Without it the viewer
 # painted stickers straight over all of that.

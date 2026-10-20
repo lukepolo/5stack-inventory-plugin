@@ -299,12 +299,20 @@ function loadTex(
 /**
  * Draw a weapon decal through its weapon's STICKER MASK.
  *
- * csgo_weapon's g_tStickerWepInputs (R = TextureStickerMask, G = cavity), in the
- * weapon's TEXCOORD_1 space — the space stickers are placed in. The game draws
- * every sticker through R, so whatever is modelled over the sticker band (the
- * C4's LCD module, wires and tape) hides the part of a sticker beneath it.
- * Sampled at `uvBody`, the body UV1 the decal cutter writes per vertex; a
- * geometry without that attribute must not get this patch.
+ * csgo_weapon's g_tStickerWepInputs (R = TextureStickerMask, G = cavity). The
+ * game draws every sticker through R — white where a sticker may show, black on
+ * hardware, seams and whatever is modelled over the sticker band.
+ *
+ * IN UV0, the weapon's main texture space — NOT the TEXCOORD_1 stickers are
+ * placed in. Measured, not assumed: drawn over the real masks, the UV0 islands
+ * of the C4 and the AK-47 match the mask's white shapes exactly (cut-outs and
+ * all) and the UV1 layout matches nothing. Sampling it at UV1 chopped stickers
+ * into blocks. Sampled at `uvBody`, the body UV0 the decal cutter carries per
+ * vertex (-1 where a mesh has none, read as unmasked); a geometry without that
+ * attribute must not get this patch.
+ *
+ * G is left alone: it sits at ~0.5 across the C4, so it is a signed cavity term,
+ * not a multiplier, and how the game applies it is not known yet.
  *
  * Layered over applyStickerSfx rather than folded into it: that patch is skipped
  * for a plain sticker, and the mask applies to every sticker. Before
@@ -323,7 +331,7 @@ export function applyStickerMask(mat: ThreeNS.MeshStandardMaterial, mask: ThreeN
       .replace("#include <common>", "#include <common>\nuniform sampler2D uWepMask;\nvarying vec2 vUvBody;")
       .replace(
         "#include <alphatest_fragment>",
-        "diffuseColor.a *= texture2D( uWepMask, vUvBody ).r;\n#include <alphatest_fragment>",
+        "if (vUvBody.x >= 0.0) diffuseColor.a *= texture2D( uWepMask, vUvBody ).r;\n#include <alphatest_fragment>",
       );
   };
   // Its own program: a masked decal and an unmasked one must not share one.

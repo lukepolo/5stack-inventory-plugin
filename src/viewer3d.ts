@@ -5641,17 +5641,20 @@ async function buildViewer(
     const pos: number[] = [];
     const nor: number[] = [];
     const uvs: number[] = [];
-    // The body's own UV1 under each vertex — what the weapon's sticker mask is
-    // authored in (applyStickerMask). toSticker inverted, so it is exact.
+    // The body's UV0 under each vertex — the space the weapon's sticker mask is
+    // authored in (applyStickerMask). NOT the UV1 this cut is made in: the two
+    // unwraps are unrelated, so it rides along through the clip like position.
     const body: number[] = [];
     // A clipped vertex carries everything it needs to be interpolated: sticker
-    // coords for the cut, world position and normal for the output.
-    type CutVert = { s: number; t: number; p: import("three").Vector3; n: import("three").Vector3 };
+    // coords for the cut, world position, normal and UV0 for the output.
+    type CutVert = { s: number; t: number; p: import("three").Vector3; n: import("three").Vector3; u0: number; v0: number };
     const lerpVert = (a: CutVert, b: CutVert, f: number): CutVert => ({
       s: a.s + (b.s - a.s) * f,
       t: a.t + (b.t - a.t) * f,
       p: a.p.clone().lerp(b.p, f),
       n: a.n.clone().lerp(b.n, f),
+      u0: a.u0 + (b.u0 - a.u0) * f,
+      v0: a.v0 + (b.v0 - a.v0) * f,
     });
     // Sutherland–Hodgman against the four edges of the unit square.
     const clipEdge = (poly: CutVert[], axis: "s" | "t", keepAbove: boolean, at: number) => {
@@ -5679,6 +5682,8 @@ async function buildViewer(
       const ix = uvIndexFor(mesh);
       if (!ix) continue;
       const { uv, pos: posAttr, nrm, idx } = ix;
+      // -1 marks "no UV0 here", which the mask reads as unmasked.
+      const uv0 = (mesh.geometry as import("three").BufferGeometry).getAttribute("uv");
       // Candidate triangles: every cell the rectangle's UV bbox touches, plus
       // the oversized ones the index keeps aside.
       const seen = new Set<number>();
@@ -5710,6 +5715,8 @@ async function buildViewer(
           n: nrm
             ? new THREE.Vector3().fromBufferAttribute(nrm, i).transformDirection(mesh.matrixWorld)
             : new THREE.Vector3(0, 1, 0),
+          u0: uv0 ? uv0.getX(i) : -1,
+          v0: uv0 ? uv0.getY(i) : -1,
         });
         let poly: CutVert[] = [mk3(ia, va), mk3(ib, vb), mk3(ic, vc)];
         // ONE PATCH, not every preimage. An unwrap maps several separate pieces
@@ -5744,9 +5751,7 @@ async function buildViewer(
             nor.push(tmp.x, tmp.y, tmp.z);
             // The image is authored with V down, as textures are.
             uvs.push(v.s, 1 - v.t);
-            const a = (v.s - 0.5) * sizeUv;
-            const b = (v.t - 0.5) * sizeUv;
-            body.push(cu + a * cos - b * sin, cv + a * sin + b * cos);
+            body.push(v.u0, v.v0);
           }
         }
       }
