@@ -346,12 +346,18 @@ async function fetchPaintDef(paintMaterial: string): Promise<PaintDef | null> {
       };
       vmatJson = vmat;
       tex = (n) => vmat.m_textureParams?.find((t) => t.m_name === n)?.m_pValue;
+      // Each from the OTHER list too: Valve does not file params by their
+      // g_fl / g_b prefix. P90 | Death by Kitty keeps g_flPatternTexCoordScale
+      // (2) and its rotation in m_intParams, and a float read of the float list
+      // alone took the default 1 — every kitty twice the size the game draws.
+      const fromFloats = (n: string) => vmat.m_floatParams?.find((f) => f.m_name === n)?.m_flValue;
+      const fromInts = (n: string) => vmat.m_intParams?.find((f) => f.m_name === n)?.m_nValue;
       flt = (n, d) => {
-        const v = vmat.m_floatParams?.find((f) => f.m_name === n)?.m_flValue;
+        const v = fromFloats(n) ?? fromInts(n);
         return v != null ? Number(v) : d;
       };
       int = (n, d) => {
-        const v = vmat.m_intParams?.find((f) => f.m_name === n)?.m_nValue;
+        const v = fromInts(n) ?? fromFloats(n);
         return v != null ? Number(v) : d;
       };
       vec = (n) => vmat.m_vectorParams?.find((x) => x.m_name === n)?.m_value?.map(Number);

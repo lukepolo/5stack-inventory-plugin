@@ -174,8 +174,10 @@ void main() {
 // "+masks": the fork's g_bOverrideDefaultMasks binding (paintComposite) changes
 // what stored composites contain without touching either shader source, so it
 // has to move the generation itself — and under a name an upstream bump can
-// never collide with.
-export const VALVE_RUNTIME_REV = `vcs72-r4+masks ${RUNTIME_EPILOGUE}`;
+// never collide with. "+intparams" for the same reason: reading a float param
+// filed under m_intParams (paintComposite's flt) changed the composites of every
+// finish that does it.
+export const VALVE_RUNTIME_REV = `vcs72-r4+masks+intparams ${RUNTIME_EPILOGUE}`;
 
 // The vertex stage, written by hand: Valve's VS is four affine transforms of
 // the mesh UV (decompiled, csgo_customweapon_vulkan_50_vs.vcs — every combo is
