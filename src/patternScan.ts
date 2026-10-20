@@ -20,6 +20,7 @@
  * the blue ones is the job; quoting a tier is not.
  */
 import { loadPaintDef, loadWeaponInputs, compositePaint, type PaintDef } from "./paintComposite";
+import { compositeGloveModern, loadGloveModernDef } from "./gloveCompositeModern";
 // Through the façade: a pattern scan is a rendering job, so it can afford to
 // wait for the viewer chunk — but App.vue imports SCAN_READ_SIZE from this
 // file, and a static edge here would have dragged viewer3d back into the boot
@@ -204,6 +205,9 @@ export interface ScanRequest {
    * for a mounted model rather than scanning early and caching the weaker answer.
    */
   weights?: Float32Array | null;
+  /** A GLOVE finish: composited by gloveCompositeModern rather than the weapon
+   *  compositor. Only comparePatterns honours it — there are no hunts for one. */
+  glove?: boolean;
   /** Called with 0..1 as the sweep proceeds. */
   onProgress?: (f: number) => void;
   /** Checked between chunks — return false to abandon the sweep. */
@@ -254,9 +258,31 @@ export async function comparePatterns(
   b: number,
 ): Promise<number | null> {
   if (a === b) return 0;
-  const def = await loadPaintDef(r.paintMaterial);
-  if (!def) return null;
-  const weapon = await loadWeaponInputs(r.model, r.legacy);
+  // The albedo for one pattern, from whichever compositor owns this finish. A
+  // glove's has no weapon inputs and nothing refcounted — its render targets are
+  // owned, so releasing them is a dispose.
+  type Albedo = { albedo: import("three").Texture; release: () => void };
+  let albedoAt: (THREE: typeof import("three"), renderer: import("three").WebGLRenderer, seed: number) => Promise<Albedo | null>;
+  if (r.glove) {
+    const def = await loadGloveModernDef(r.paintMaterial);
+    if (!def) return null;
+    albedoAt = (THREE, renderer, seed) =>
+      compositeGloveModern(THREE, renderer, def, { wear: SCAN_WEAR, size: SCAN_SIZE, seed })
+        .then((c) => (c ? { albedo: c.albedo, release: c.dispose } : null))
+        .catch(() => null);
+  } else {
+    const def = await loadPaintDef(r.paintMaterial);
+    if (!def) return null;
+    const weapon = await loadWeaponInputs(r.model, r.legacy);
+    albedoAt = (THREE, renderer, seed) =>
+      compositePaint(THREE, renderer, def, {
+        wear: SCAN_WEAR,
+        seed,
+        weapon,
+        model: r.model,
+        maxSize: SCAN_SIZE,
+      }).catch(() => null);
+  }
   const { withSharedRenderer } = await viewer3d();
   return withSharedRenderer(async (THREE, renderer) => {
     const rt = new THREE.WebGLRenderTarget(READ_SIZE, READ_SIZE, {
@@ -269,13 +295,7 @@ export async function comparePatterns(
     const mat = new THREE.MeshBasicMaterial();
     scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
     const read = async (seed: number) => {
-      const comp = await compositePaint(THREE, renderer, def, {
-        wear: SCAN_WEAR,
-        seed,
-        weapon,
-        model: r.model,
-        maxSize: SCAN_SIZE,
-      }).catch(() => null);
+      const comp = await albedoAt(THREE, renderer, seed);
       if (!comp) return null;
       mat.map = comp.albedo;
       mat.needsUpdate = true;

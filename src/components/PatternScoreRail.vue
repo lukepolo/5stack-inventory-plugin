@@ -45,8 +45,17 @@ const props = withDefaults(
     weightsFor?: (() => Float32Array | null) | null;
     min?: number;
     max?: number;
+    /**
+     * A GLOVE's pattern. Same rail — scrub, hover-preview, type, roll, compare —
+     * but no hunts (nothing about a glove's pattern is a colour to rank) and the
+     * comparison composites through the glove compositor.
+     */
+    glove?: boolean;
+    /** Offer "Compare with another". Off where the viewer cannot show a pattern
+     *  change at all, so a blink would alternate two identical pictures. */
+    compare?: boolean;
   }>(),
-  { modelValue: null, paintMaterial: null, model: null, legacyPaint: false, weightsFor: null, min: 1, max: 1000 },
+  { modelValue: null, paintMaterial: null, model: null, legacyPaint: false, weightsFor: null, min: 1, max: 1000, glove: false, compare: true },
 );
 
 const emit = defineEmits<{
@@ -322,7 +331,7 @@ watch([pinned, seed, dragging, () => target.value], async () => {
   if (!t || p == null || p === seed.value || dragging.value) return;
   const id = ++diffId;
   const d = await comparePatterns(
-    { ...t, weights: props.weightsFor?.() ?? null, min: props.min, max: props.max },
+    { ...t, weights: props.weightsFor?.() ?? null, min: props.min, max: props.max, glove: props.glove },
     p,
     seed.value,
   );
@@ -363,7 +372,9 @@ watch(
     metrics.value = [];
     metric.value = null;
     const t = target.value;
-    if (!t) return;
+    // A glove has no hunts, and asking the WEAPON loader about its material
+    // would answer a question about a shader that is not the one drawing it.
+    if (!t || props.glove) return;
     const def = await loadPaintDef(t.paintMaterial);
     if (!def || target.value?.paintMaterial !== t.paintMaterial) return;
     metrics.value = metricsFor(def);
@@ -459,7 +470,7 @@ watch(
       :aria-valuemin="min"
       :aria-valuemax="max"
       :aria-valuenow="seed"
-      :aria-label="tr('inventory.pattern.weapon_aria', 'Weapon pattern')"
+      :aria-label="glove ? tr('inventory.pattern.glove_aria', 'Glove pattern') : tr('inventory.pattern.weapon_aria', 'Weapon pattern')"
       @pointerdown="onDown"
       @pointermove="onMove"
       @pointerup="onUp"
@@ -577,6 +588,7 @@ watch(
         >{{ m.hunt }}</button>
       </template>
       <button
+        v-if="compare"
         class="ml-auto transition-colors"
         :class="pinned != null ? 'text-[color:var(--acc)]' : 'text-muted-foreground hover:text-foreground'"
         :title="

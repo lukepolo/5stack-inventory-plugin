@@ -10012,12 +10012,14 @@ if (MDEBUG) {
                 <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
               </div>
             </div>
-            <!-- A GLOVE's pattern: the field-plus-slider the float has, on the
-                 neutral pattern track (an index, not a better-or-worse scale).
-                 On the 22 Gen2 finishes the pattern rolls the artwork's placement,
-                 so they also get the gun's Placement bars and a live 3D preview;
-                 the older 73 roll nothing the data spells out, so their number
-                 still only rides the equipped feed to the game server. -->
+            <!-- A GLOVE's pattern: the gun's own controls — Placement bars over
+                 the scored rail — so the two read as the same tool. On the 22
+                 Gen2 finishes the pattern rolls the artwork's placement and the
+                 rail previews it live (one composite dresses both hands, though
+                 CS2 rolls the second from a seed derived in game code). The older
+                 73 roll nothing the data spells out: the rail still sets the
+                 number the equipped feed sends, but there is nothing to compare,
+                 and the line under it says the look is not previewed. -->
             <div v-else-if="craftHasSeed && craftType === 'glove' && craftGloveSeedRange.known" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
               <div v-if="gloveTraits.length" class="mb-3">
                 <div class="mb-1 flex items-baseline gap-2">
@@ -10026,28 +10028,18 @@ if (MDEBUG) {
                 </div>
                 <TraitBars :traits="gloveTraits" :table="gloveTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
               </div>
-              <div class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-                <input
-                  v-model.number="craft.seed"
-                  type="number" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
-              </div>
-              <div class="mt-2 flex items-center gap-2">
-                <input v-model.number="craft.seed" type="range" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1" class="pattern-range w-full" />
-              </div>
-              <div class="mt-1 flex items-center justify-between font-mono text-f9 text-muted-foreground">
-                <span>{{ craftGloveSeedRange.min }}–{{ craftGloveSeedRange.max }}</span>
-                <!-- One composite dresses both hands; CS2 rolls its second hand
-                     from a seed derived in game code (see gloveCompositeModern). -->
-                <span
-                  v-if="gloveSeedLive"
-                  title="The 3D view shows where this pattern puts the artwork. In game, your other hand rolls its own placement."
-                >Live in 3D · one hand</span>
-                <span v-else>Applies in game · not previewed here</span>
-              </div>
+              <PatternScoreRail
+                glove
+                :compare="gloveSeedLive"
+                :model-value="craft.seed"
+                :paint-material="craft.skin.paintMaterial"
+                :model="craftTarget?.model ?? craftModel"
+                :min="craftGloveSeedRange.min"
+                :max="craftGloveSeedRange.max"
+                @update:model-value="craft!.seed = $event"
+                @preview="previewPattern"
+              />
+              <div v-if="!gloveSeedLive" class="mt-1 text-right font-mono text-f8 text-muted-foreground/60">Applies in game · not previewed here</div>
             </div>
             <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
               <div class="flex items-center gap-2">
