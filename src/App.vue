@@ -106,6 +106,7 @@ import SlotStatus from "./components/SlotStatus.vue";
 import WearBar from "./components/WearBar.vue";
 import ItemTile from "./components/ItemTile.vue";
 import MusicPlayer from "./components/MusicPlayer.vue";
+import MusicVolume from "./components/MusicVolume.vue";
 import TileActions from "./components/TileActions.vue";
 import FilterDropdown from "./components/FilterDropdown.vue";
 import InfiniteSentinel from "./components/InfiniteSentinel.vue";
@@ -2086,6 +2087,10 @@ const craftGloveSeedRange = computed(() => {
  *
  * Declared after the gates it sums; see the note on craftHasNameTag.
  */
+/** A music kit with a track to play — the editor's preview section. */
+const craftHasMusic = computed(
+  () => craft.value?.skin.type === "musickit" && !!(craft.value.skin.audio || craft.value.skin.mvpAudio),
+);
 const craftHasOptions = computed(
   () =>
     craftHasNameTag.value ||
@@ -2095,6 +2100,7 @@ const craftHasOptions = computed(
     craftHasStatTrak.value ||
     craftHasStyle.value ||
     craftHasStage.value ||
+    craftHasMusic.value ||
     attachKind.value !== "none",
 );
 const editingId = ref<number | null>(null);
@@ -2381,6 +2387,8 @@ function openEdit(inst: InventoryItem) {
       // 0.9 and then failed to save.
       hasWear: inst.item.hasWear, hasSeed: inst.item.hasSeed, hasStatTrak: inst.item.hasStatTrak, seedMin: inst.item.seedMin, seedMax: inst.item.seedMax,
       wearMin: inst.item.wearMin, wearMax: inst.item.wearMax,
+      // Music kits: what the editor's player plays.
+      audio: inst.item.audio ?? null, mvpAudio: inst.item.mvpAudio ?? null,
     },
     wear: inst.wear ?? DEFAULT_WEAR,
     seed: inst.seed ?? 1,
@@ -8936,6 +8944,10 @@ if (MDEBUG) {
             />
             <SortDirection v-model="sheetDir" :kind="sheetSortKind" :hint="sheetSortHint" />
           </template>
+          <!-- Music kits: ONE volume for the whole grid, here, instead of a
+               slider on every card — on Owned and Craft alike. The level is
+               shared, so every player follows it. -->
+          <MusicVolume v-if="sheetMode !== 'replace' && sheetKey === 'musickit'" wide class="px-1" />
           <!-- Owned only: same Synced/Crafted filter as the Inventory grid, so
                read-only Steam imports can be kept out of the equip picker. -->
           <PillTabs
@@ -9326,6 +9338,7 @@ if (MDEBUG) {
                 :show-price="pricesOn"
                 :price-pending="pricesPending"
                 :price-source="priceSourceLabel"
+                :music-volume="false"
                 :class="sheetCellClass(idx)"
                 :style="{ '--i': idx + 2 }"
                 draggable="true"
@@ -9450,7 +9463,7 @@ if (MDEBUG) {
                        a music kit from, and until now every card on it was a
                        name and a disc. The player is a <span> tree precisely so
                        it can live inside this <button> — see MusicPlayer. -->
-                  <MusicPlayer v-if="st.card.audio" :src="st.card.audio" class="relative z-[2] mt-1.5" />
+                  <MusicPlayer v-if="st.card.audio" :src="st.card.audio" :volume="false" class="relative z-[2] mt-1.5" />
                 </button>
               </div>
               <InfiniteSentinel
@@ -10238,6 +10251,28 @@ if (MDEBUG) {
                   title="Reset the counter"
                   @click="craft.stattrakCount = 0"
                 >0</button>
+              </div>
+            </div>
+            <!-- Music kits: the kit IS its sound, so the editor plays it — the
+                 full menu theme and, when the mount has it, the round-MVP
+                 anthem the game plays when you top a round. One volume for
+                 both, the same shared level as every other player. -->
+            <div
+              v-if="craftHasMusic"
+              class="animate-sheet-in flex flex-col gap-2 rounded-md bg-secondary/40 p-2.5"
+              :style="{ '--i': 6 }"
+            >
+              <div class="flex items-center justify-between">
+                <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.preview', 'Preview') }}</span>
+                <MusicVolume wide />
+              </div>
+              <div v-if="craft.skin.audio" class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.full_song', 'Full song') }}</span>
+                <MusicPlayer :src="craft.skin.audio" :volume="false" class="min-w-0 flex-1" />
+              </div>
+              <div v-if="craft.skin.mvpAudio" class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.mvp', 'MVP') }}</span>
+                <MusicPlayer :src="craft.skin.mvpAudio" :volume="false" class="min-w-0 flex-1" />
               </div>
             </div>
 

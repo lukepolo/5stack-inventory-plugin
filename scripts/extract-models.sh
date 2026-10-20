@@ -239,6 +239,10 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v37 (2026-10-20): MVP ANTHEMS (step music-audio). Each kit's
+# roundmvpanthem — the clip the game plays when you are the round's MVP — is
+# decoded next to its menu theme as <folder>.mvp.<ext>, indexed in its own
+# music-mvp.json so music-kits.json and every existing preview are untouched.
 # v36 (2026-10-20): STATTRAK ART (new step stattrak-art -> models/stattrak/ +
 # stattrak-art.json + knife-attachments.json). A knife's kill count is
 # scratched into the blade through an alpha test on the digit atlas's ALPHA,
@@ -312,7 +316,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=36
+EXTRACT_VERSION=37
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -5448,6 +5452,37 @@ with open(os.path.join(dest, "music-kits.json"), "w") as fh:
 print(f"--- Music kits: {len(written)}/{len(folders)} themes -> {dest} ({len(index)} kits mapped)")
 if missing:
     print(f"!!! {len(missing)} kits have no mainmenu track in this build, e.g. {missing[:4]}")
+
+# ---- MVP anthems ---------------------------------------------------------------
+# The clip played when you are the round's MVP, one per kit beside the menu
+# theme. A separate pass, after the themes are safely written: `-f` takes exact
+# paths, and a name that does not exist must not be able to cost a kit its
+# theme. Named roundmvpanthem_01 in every kit folder seen; plain roundmvpanthem
+# is tried for whatever the first pass missed.
+mvp_written = {}
+for cand in ("roundmvpanthem_01", "roundmvpanthem"):
+    todo = [name for name in folders if name not in mvp_written]
+    if not todo:
+        break
+    shutil.rmtree(raw, ignore_errors=True)
+    os.makedirs(raw, exist_ok=True)
+    paths = [f"sounds/music/{name}/{cand}.vsnd_c" for name in todo]
+    stride = max(1, (len(paths) + workers - 1) // workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(grab, [paths[i:i + stride] for i in range(0, len(paths), stride)]))
+    for name in todo:
+        stem = os.path.join(raw, "sounds", "music", name, cand)
+        hit = next(iter(sorted(glob.glob(glob.escape(stem) + ".*"))), None)
+        if hit is None:
+            continue
+        out = name + ".mvp" + os.path.splitext(hit)[1].lower()
+        shutil.move(hit, os.path.join(dest, out))
+        mvp_written[name] = out
+shutil.rmtree(raw, ignore_errors=True)
+mvp_index = {idx: mvp_written[name] for idx, name in kits.items() if name in mvp_written}
+with open(os.path.join(dest, "music-mvp.json"), "w") as fh:
+    json.dump(mvp_index, fh, indent=1, sort_keys=True)
+print(f"--- Music kits: {len(mvp_written)}/{len(folders)} MVP anthems ({len(mvp_index)} kits mapped)")
 PYEOF
 
 # ---- swap staging into place -------------------------------------------------

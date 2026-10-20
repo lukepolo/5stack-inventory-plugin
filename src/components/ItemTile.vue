@@ -75,8 +75,11 @@ const props = withDefaults(
     /** Which market the prices came from, for the "why is this blank" caption.
      *  A name, not a lookup: the tile has no business knowing the settings. */
     priceSource?: string;
+    /** Draw the music kit player's own volume control. Off in the loadout
+     *  sheet, which has one volume control on its toolbar for the whole grid. */
+    musicVolume?: boolean;
   }>(),
-  { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false, row: false, showPrice: false, pricePending: false, priceSource: "the price feed" },
+  { active: false, selected: false, disabled: false, stripWeaponName: false, showHeader: false, hideActions: false, row: false, showPrice: false, pricePending: false, priceSource: "the price feed", musicVolume: true },
 );
 
 const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
@@ -321,7 +324,7 @@ const audioSrc = computed(() => props.inst.item?.audio ?? null);
     <!-- Where the wear bar would be. Same reasoning as the row above: a kit has
          no float, so this takes nothing from the card — and it is the only thing
          on it that says what the kit actually sounds like. -->
-    <MusicPlayer v-if="audioSrc" :src="audioSrc" class="relative z-[2] mt-2" />
+    <MusicPlayer v-if="audioSrc" :src="audioSrc" :volume="musicVolume" class="relative z-[2] mt-2" />
     <WearBar v-else :item="inst.item" :wear="inst.wear" :seed="inst.seed" class="relative z-[2] mt-2" />
     </template>
   </button>

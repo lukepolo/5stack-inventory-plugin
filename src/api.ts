@@ -104,6 +104,8 @@ export interface Skin {
   tintName?: string;
   /** MUSIC KITS only: the kit's menu theme, ready to play. See `CatalogItem`. */
   audio?: string | null;
+  /** MUSIC KITS only: the round-MVP anthem, the same way. */
+  mvpAudio?: string | null;
   /** PETS only: how many alternate looks the breed has (0 for the egg and the
    *  chick). Style 1..styleCount; unset is the stock look. */
   styleCount?: number;
@@ -179,6 +181,8 @@ export interface CatalogItem {
    * transport is never rendered against a track that cannot load.
    */
   audio?: string | null;
+  /** MUSIC KITS only: the round-MVP anthem, the same way (pipeline v37). */
+  mvpAudio?: string | null;
   /** The egg is the one pet that cannot be named. */
   hasNameTag?: boolean;
   /** Per-item facts the resolver sends for every item — see `Skin.hasWear`.

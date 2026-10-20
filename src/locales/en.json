@@ -81,6 +81,9 @@
       "seek": "Seek preview",
       "failed": "Preview unavailable",
       "volume": "Preview volume",
+      "preview": "Preview",
+      "full_song": "Full song",
+      "mvp": "MVP",
       "mute": "Mute",
       "unmute": "Unmute"
     },
