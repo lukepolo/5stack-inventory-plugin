@@ -8783,22 +8783,26 @@ async function buildViewer(
     // Off the weapon: slide along the silhouette rather than inventing a point.
     const raw = surf ?? nearestOnBody();
     if (!raw) return null;
-    // FREE PLACEMENT. The charm goes exactly where the pointer says, kept on
-    // the surface and nothing else. Two rules were tried here and both
-    // reverted, each by measurement:
-    //   - a quad SEAT moved the average USP-S drag frame 16mm off the pointer
-    //     (64mm before the bones were unfiltered), enforcing a restriction no
-    //     source could confirm the game has;
-    //   - a clamp into charmBoundsBox (cs2-lib's own reading of the game's
-    //     limit) fought the surface snap — a clamped point snaps back to the
-    //     nearest surface, which is outside the box again wherever the box
-    //     excludes real body (the AK's magazine, which players demonstrably
-    //     charm in game). ?drop=1 scored the fight: 77% of AK frames
-    //     "escaped", every one of them flush on the gun at the pointer.
-    // The box survives as TELEMETRY (dropAt reports inBox) so the day someone
-    // places a charm in game at an out-of-box offset and reads it back, the
-    // question of whether the game clamps has a measurement waiting.
-    const anchor = snapToSurface(raw, true);
+    // LEGAL PLACEMENT: on the authored KeychainMarkup quads, the surfaces the
+    // game itself lets a charm go. Pointing at one puts the charm exactly there;
+    // pointing anywhere else on the gun slides it to the nearest legal point,
+    // so a charm can no longer be dropped on a trigger. On an AK-47 the quads
+    // cover 31% of the body, 13% of the bolt, 1.5% of the magazine and none of
+    // the trigger (vertices within 6mm of a quad).
+    //
+    // This was tried once and reverted: it moved the average USP-S drag frame
+    // 16mm off the pointer, "enforcing a restriction no source could confirm
+    // the game has", and the AK's magazine was believed charmable in game. The
+    // source is the quads themselves — Valve's own placement data — and a
+    // charm hanging IN FRONT of the magazine hangs from the receiver above it,
+    // which is quad. The offset still goes to the game exactly as placed (see
+    // offsetToWorld), so what is shown is what the game draws.
+    //
+    // The clamp into charmBoundsBox stays out (it fought the surface snap; see
+    // dropAt's inBox telemetry): the quads are tighter than the box anyway.
+    const onSurface = snapToSurface(raw, true);
+    const legal = charmSurfaceTris ? nearestOnCharmSurface(onSurface) : null;
+    const anchor = legal && legal.dist > CHARM_LEGAL_TOL ? legal.point.clone() : onSurface;
     // Pointing at a hole is not a placement — but only where there is no
     // authored data at all (a knife, or a mount extracted before the markup
     // existed): with a map the box is the game's own rule and the guess does
@@ -8852,6 +8856,9 @@ async function buildViewer(
    * bite has always been sized for. Same value here, same reason.
    */
   const CHARM_CLEARANCE = 0.0003;
+  /** How far a drag point may sit from an authored quad and still count as on
+   *  it: the quads are flat and the shell is not, by up to a few mm. Metres. */
+  const CHARM_LEGAL_TOL = 0.002;
   /** A point on an authored quad, put on the mesh under it — the quads are flat
    *  and the shell is not, so this is what turns a quad point into a seat with a
    *  real outward normal. */
@@ -9126,21 +9133,16 @@ async function buildViewer(
   ring.visible = false;
   scene.add(ring);
   /**
-   * `?charmmap=1` — paint the authored KeychainMarkup quads on the weapon.
-   *
-   * A DEBUG VIEW, not UI. The quads stopped being the placement rule (a drag is
-   * free anywhere on the body inside their bounding box — see
-   * resolveDragAnchor), so lighting them during a drag told the user a rule
-   * that no longer exists; the drag-time highlight is gone. The flag remains
-   * because the quads still do two jobs — seat the unplaced default, and
-   * supply the clamp box — and "are they on the mesh we render" is a question
-   * someone will need drawn again (it is how the elite's 33-96mm map offset
-   * was found).
+   * The authored KeychainMarkup quads, painted on the weapon: where a charm may
+   * go. Shown WHILE A CHARM IS DRAGGED, because the quads are the placement
+   * rule (see resolveDragAnchor) and a rule the pointer slides against has to
+   * be visible. `charmmap` (Developer tab) keeps them up the whole time — how
+   * the elite's 33-96mm map offset was found.
    */
   const CHARM_MAP_ALWAYS = debugFlag("charmmap");
   const charmMap = (() => {
     const xyz = charmSurfaceTris;
-    if (!xyz || opts?.still || !CHARM_MAP_ALWAYS) return null;
+    if (!xyz || opts?.still) return null;
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(xyz), 3));
     const mat = new THREE.MeshBasicMaterial({
@@ -9161,11 +9163,19 @@ async function buildViewer(
     });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.renderOrder = 29; // over the weapon, under the ring at 30
+    mesh.visible = CHARM_MAP_ALWAYS;
     scene.add(mesh);
     return { mesh, mat, geo };
   })();
 
     function updateRing() {
+    if (charmMap) {
+      const dragging = !!charm && charmDragging;
+      charmMap.mesh.visible = CHARM_MAP_ALWAYS || dragging;
+      // Strong enough to read on a busy finish while it is the rule being
+      // dragged against; the always-on debug view keeps the light wash.
+      charmMap.mat.opacity = dragging ? 0.35 : 0.2;
+    }
     if (!charm) {
       ring.visible = false;
       return;
