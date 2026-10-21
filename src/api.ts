@@ -873,8 +873,6 @@ export const craftItem = (body: {
   wear?: number | null;
   seed?: number | null;
   stattrak?: boolean;
-  /** Kills to start the module on. Only honoured with `stattrak`. */
-  stattrak_count?: number;
   nametag?: string | null;
   style?: number | null;
   upgrade_level?: number | null;
@@ -894,8 +892,6 @@ export const updateInstance = (
     wear?: number | null;
     seed?: number | null;
     stattrak?: boolean;
-    /** Overwrite the kill count. Omit to leave it to the game server. */
-    stattrak_count?: number;
     nametag?: string | null;
     style?: number | null;
     upgrade_level?: number | null;

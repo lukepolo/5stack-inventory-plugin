@@ -159,7 +159,6 @@ import { useAttachmentPicker, type PickerRow } from "./composables/useAttachment
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
 import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, weaponName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { stackByDesign, TINT_SUFFIX } from "./decks";
-import { MAX_STATTRAK } from "./stattrakModule";
 import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
 import { formatGunTrait, gunPlacement, gunPlacementTable, gunPlacementTraits } from "./gunPattern";
 import { gloveSeedMoves, loadGloveModernDef, type GloveModernDef } from "./gloveCompositeModern";
@@ -1837,8 +1836,8 @@ const craft = ref<{
   wear: number;
   seed: number;
   stattrak: boolean;
-  /** Kills on the StatTrak module. Seeded from the owned row on an edit; the
-   *  game server keeps counting from whatever is saved. */
+  /** Kills on the StatTrak module, for display only: the owned row's on an
+   *  edit, 0 for a new craft. Only the game server writes the count. */
   stattrakCount: number;
   nametag: string;
   stickers: (Attach | null)[];
@@ -2600,7 +2599,6 @@ function craftBody() {
     wear: craftHasWear.value || craftHasScratch.value ? c.wear : null,
     seed: craftHasSeed.value ? c.seed : null,
     stattrak: craftHasStatTrak.value ? c.stattrak : false,
-    stattrak_count: craftStatTrakCountToSend(),
     nametag: craftHasNameTag.value ? c.nametag.trim() || null : null,
     // Left OFF the body (undefined) for anything but a pet, rather than sent as
     // null: on these two a null is a value — "back to the default" — and the
@@ -2613,23 +2611,9 @@ function craftBody() {
     charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null, inst: c.charm.inst ?? null } : null,
   };
 }
-/** The form's kill count, clamped to what the module can show (six digits). */
-const craftStatTrakCount = () =>
-  Math.min(MAX_STATTRAK, Math.max(0, Math.floor(Number(craft.value?.stattrakCount) || 0)));
-/**
- * The kill count save should send, or undefined to leave the row's alone.
- *
- * A NEW item (a craft, or a duplicate) sends whatever the form shows. An EDIT
- * sends it only when it was changed: the game server keeps incrementing the
- * saved count while the editor is open, and re-sending the number the form
- * loaded with would quietly undo every kill made in the meantime.
- */
-function craftStatTrakCountToSend(): number | undefined {
-  if (!craftHasStatTrak.value || !craft.value?.stattrak) return undefined;
-  const count = craftStatTrakCount();
-  if (editingId.value != null && count === (craftInst.value?.stattrak_count ?? 0)) return undefined;
-  return count;
-}
+/** The kill count the module shows. Read-only: kills are the game server's to
+ *  write, so save never sends one. */
+const craftStatTrakCount = () => craft.value?.stattrakCount ?? 0;
 // Inspect the DRAFT — works before the craft has ever been saved.
 async function openCraftInspect() {
   if (!craft.value) return;
@@ -2637,8 +2621,9 @@ async function openCraftInspect() {
     fetchDraftInspectLink({
       item_id: craft.value!.skin.id,
       ...craftBody(),
-      // The count on screen, always — craftBody() leaves an unchanged one off
-      // for save's sake, but the inspect link has no row to fall back on.
+      // Not part of craftBody(), which is also what save sends and kills are
+      // never saved from here. Same number the 3D stage shows, so inspecting
+      // an edit opens CS2 on its real count instead of a fresh 0.
       stattrak_count: craft.value!.stattrak ? craftStatTrakCount() : 0,
     }),
   );
@@ -2749,10 +2734,8 @@ async function saveCraft(andEquip = false) {
             }
           : r,
       );
-      warnIfStatTrakCountIgnored(body.stattrak_count, updated);
     } else {
       const inst = await craftItem({ item_id: craft.value.skin.id, ...body });
-      warnIfStatTrakCountIgnored(body.stattrak_count, inst);
       void generateRender(inst).then((ok) => {
         if (ok) bakeStamp.value = { ...bakeStamp.value, [inst.id]: Date.now() };
       });
@@ -2793,22 +2776,6 @@ async function saveCraft(andEquip = false) {
   } finally {
     craftBusy.value = false;
   }
-}
-/**
- * The frontend and backend ship separately, and a backend from before kill
- * counts were editable drops the field without complaint — the save succeeds
- * and the count quietly stays where it was. Say so instead of letting the
- * number on the form look saved.
- */
-function warnIfStatTrakCountIgnored(sent: number | undefined, saved: InventoryItem) {
-  if (sent === undefined || saved.stattrak_count === sent) return;
-  notify(
-    tr(
-      "inventory.notify.stattrak_count_unsupported",
-      "Saved, but this server can't set StatTrak™ kills yet, so the count was left as it was.",
-    ),
-    "error",
-  );
 }
 
 // Fire-and-forget: snapshot the painted 3D model and cache it as this
@@ -3680,9 +3647,8 @@ async function mountModalViewer() {
               sleeve: fpvSleeve.value,
             }
           : null,
-      // Live 3D, so a real readout — the form's count, which starts from the
-      // owned item's when the modal is showing one (editing or duplicating) and
-      // from 0 for a brand-new craft.
+      // Live 3D, so a real readout — the owned item's count when the modal is
+      // showing one (editing or duplicating), and 0 for a brand-new craft.
       stattrak: craft.value?.stattrak ? { count: craftStatTrakCount() } : null,
       nametag: craft.value?.nametag ?? null,
       // Drags write straight into the craft form — the numeric inputs follow
@@ -3956,20 +3922,11 @@ function repaint(proxy: boolean) {
 // StatTrak toggle → attach/detach the module on the live viewer. Deliberately
 // NOT folded into the wear/seed remount above: the module is independent of the
 // paint composite, and remounting would reset the camera on every flip.
-//
-// The kill count rides the same watcher, debounced: setStatTrak rebuilds the
-// module, and typing "1500" should rebuild it once, not four times.
-let stattrakCountTimer: ReturnType<typeof setTimeout> | undefined;
 watch(
-  () => [craft.value?.stattrak, craft.value?.stattrakCount] as const,
-  ([on], [wasOn]) => {
-    clearTimeout(stattrakCountTimer);
-    const apply = () => {
-      if (!modalViewer.current() || !craft.value) return;
-      modalViewer.current()!.setStatTrak(craft.value.stattrak ? { count: craftStatTrakCount() } : null);
-    };
-    if (on !== wasOn) apply();
-    else stattrakCountTimer = setTimeout(apply, 250);
+  () => craft.value?.stattrak,
+  (on) => {
+    if (!modalViewer.current() || !craft.value) return;
+    modalViewer.current()!.setStatTrak(on ? { count: craftStatTrakCount() } : null);
   },
 );
 // Name tag → swap the engraved plate on the live viewer. Its own watcher for
@@ -10235,22 +10192,11 @@ if (MDEBUG) {
                   ></span>
                 </button>
               </div>
-              <!-- The counter itself. Six digits is all the module can show, so
-                   the field stops there; the game server keeps counting from
-                   whatever is saved. -->
+              <!-- The counter, read-only. Kills are the game server's to write:
+                   an editable count would let anyone claim any number. -->
               <div v-if="craft.stattrak" class="mt-2 flex items-center gap-2">
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Kills</span>
-                <input
-                  v-model.number="craft.stattrakCount"
-                  type="number" min="0" :max="MAX_STATTRAK" step="1"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 tabular-nums outline-none transition-colors focus:border-[color:var(--acc)]"
-                  @change="craft.stattrakCount = craftStatTrakCount()"
-                />
-                <button
-                  class="grid h-9 flex-none place-items-center rounded-md border border-input px-2.5 font-mono text-f10 uppercase text-muted-foreground tac-action"
-                  title="Reset the counter"
-                  @click="craft.stattrakCount = 0"
-                >0</button>
+                <span class="font-mono text-f13 tabular-nums text-foreground">{{ craftStatTrakCount().toLocaleString() }}</span>
               </div>
             </div>
             <!-- Music kits: the kit IS its sound, so the editor plays it — the

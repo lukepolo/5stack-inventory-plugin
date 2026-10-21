@@ -7,7 +7,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 
 ### Features
 
-- **Editable StatTrak kill count**: the craft editor has a Kills field under the StatTrak switch, and the 3D preview shows the number live. Saving an edit sends the count only if you changed it, so kills the game server counts while the editor is open are never overwritten.
+- **StatTrak kill count in the editor**: the craft editor shows the item's kill count under the StatTrak switch, and the 3D preview shows it on the module. It is read-only: only the game server writes kills.
 - **Craftable C4**: the C4's Craft tab now offers the plain C4, which takes stickers, a charm and a name tag. Items with no finishes, the C4 included, are no longer offered a float, pattern or StatTrak they can't have.
 - **Glove pattern control**: every painted glove gets the same pattern tools as weapons: type a number, roll the dice, scrub the rail with a live 3D preview, and "Compare with another". Newer (Gen2) finishes whose artwork moves with the pattern also get Placement bars (Shift X, Shift Y, Rotation).
 - **Knives and gloves grouped by model**: the knife and glove Craft tabs open on one card per model, such as Butterfly Knife or Bloodhound Gloves, with a finish count. Finish cards carry the grey model label and the price, like owned cards.
