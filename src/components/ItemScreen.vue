@@ -20,12 +20,22 @@
 import { onBeforeUnmount, ref, watch } from "vue";
 import { PanelRightOpen } from "lucide-vue-next";
 import ItemIdentity from "./ItemIdentity.vue";
+import { isCompact } from "../responsive";
 
 const props = defineProps<{
   /** Passed through to ItemIdentity — see it for the shape. */
   identity: InstanceType<typeof ItemIdentity>["$props"];
   /** First person — folds the details panel away. See below. */
   held?: boolean;
+  /**
+   * The stage is NOT pulled out to the card's edges, so it starts exactly where
+   * this header does — and the name and the buttons sat on its very corner. That
+   * never showed while the stage was the card's own dark colour; a lit backdrop
+   * (the CS2 haze) draws the stage's edge, and the text was jammed against it.
+   * Set by the item modal while editing; focus and view-only pull the stage out
+   * past their padding, which already insets the header.
+   */
+  inset?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -101,7 +111,10 @@ onBeforeUnmount(() => panelRO?.disconnect());
          see `over-art` in the stylesheet, a shadow that costs the image
          nothing. Pointer-transparent except the controls: the gap between the
          name and the buttons is stage, and dragging there turns the model. -->
-    <div class="over-art pointer-events-none absolute inset-x-0 top-0 z-[7] flex items-start justify-between gap-4">
+    <div
+      class="over-art pointer-events-none absolute inset-x-0 top-0 z-[7] flex items-start justify-between gap-4"
+      :class="inset && (isCompact ? 'px-3 pt-2.5' : 'px-5 pt-4')"
+    >
       <div class="pointer-events-auto"><ItemIdentity v-bind="identity" /></div>
       <div class="pointer-events-auto flex flex-none items-center gap-2.5"><slot name="actions" /></div>
     </div>

@@ -8618,8 +8618,53 @@ if (MDEBUG) {
 
     <!-- Loading: a ghost of the loadout screen, breathing. Same skeleton for
          both views — the shape says "your loadout is coming" either way, and
-         the real content's entrance cascade lands on top of it. -->
-    <div v-if="loading" aria-busy="true" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+         the real content's entrance cascade lands on top of it.
+         DESKTOP IS BUILT FROM THE REAL BOXES: LoadoutGrid's column, header and
+         cell classes, three rows of extras, and the sheet's own toolbar row
+         and card tracks (pickerCardTracks). Drawn freehand it had a taller
+         agent, two rows of extras and a sheet of tall cards with no toolbar,
+         and the whole screen visibly shrank when the real one landed on it. -->
+    <div v-if="loading && !isCompact" aria-busy="true" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div class="flex min-h-0 flex-1 overflow-hidden">
+        <div class="flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col pb-3 pl-4 pr-1 pt-3">
+          <div class="flex items-baseline border-b border-border/60 px-1 pb-2">
+            <span class="animate-skeleton rounded bg-secondary/40 text-f11 font-semibold uppercase tracking-cs2 text-transparent" :style="{ '--i': 0 }">Equipment</span>
+          </div>
+          <div class="flex flex-1 flex-col gap-2.5 pt-2">
+            <div v-for="r in 2" :key="'rail' + r" class="animate-skeleton min-h-[96px] flex-1 rounded-lg bg-secondary/40" :style="{ '--i': r }"></div>
+            <div class="animate-skeleton min-h-[132px] flex-[1.6] rounded-lg bg-secondary/40" :style="{ '--i': 3 }"></div>
+            <div class="grid flex-none grid-cols-2 gap-2">
+              <div v-for="(x, r) in EXTRAS" :key="x.slot" class="animate-skeleton h-[70px] rounded-lg bg-secondary/40" :style="{ '--i': 4 + r }"></div>
+            </div>
+          </div>
+        </div>
+        <div class="flex flex-1 gap-3 overflow-hidden px-4 pb-4 pt-3">
+          <div v-for="c in 3" :key="'col' + c" class="flex min-w-[212px] max-w-[460px] flex-1 flex-col">
+            <div class="flex items-baseline border-b border-border/60 px-1 pb-2">
+              <span class="animate-skeleton rounded bg-secondary/40 text-f11 font-semibold uppercase tracking-cs2 text-transparent" :style="{ '--i': c }">Pistols</span>
+            </div>
+            <div class="flex flex-1 flex-col gap-2 pt-2">
+              <div v-for="r in 5" :key="'cell' + r" class="animate-skeleton min-h-[96px] flex-1 rounded-lg bg-secondary/40" :style="{ '--i': r * 3 + c }"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="flex flex-none flex-col overflow-hidden border-t border-border" :style="{ height: SHEET_COLLAPSED_CSS }">
+        <div class="flex flex-none items-center gap-2.5 border-b border-border px-6 py-2.5">
+          <div class="animate-skeleton h-8 w-[178px] rounded-lg bg-secondary/40" :style="{ '--i': 0 }"></div>
+          <div class="animate-skeleton h-8 w-28 rounded-md bg-secondary/40" :style="{ '--i': 1 }"></div>
+          <div class="animate-skeleton h-8 w-28 rounded-md bg-secondary/40" :style="{ '--i': 2 }"></div>
+          <div class="animate-skeleton ml-auto h-8 w-[220px] rounded-md bg-secondary/40" :style="{ '--i': 3 }"></div>
+        </div>
+        <div
+          class="grid min-h-0 flex-1 content-start gap-2.5 overflow-hidden px-6 pb-6 pt-3.5"
+          :style="{ gridTemplateColumns: pickerCardTracks.columns, gridAutoRows: pickerCardTracks.row }"
+        >
+          <div v-for="r in 6" :key="'sh' + r" class="animate-skeleton rounded-lg bg-secondary/40" :style="{ '--i': r }"></div>
+        </div>
+      </div>
+    </div>
+    <div v-else-if="loading" aria-busy="true" class="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div class="flex min-h-0 flex-1 gap-3 overflow-hidden px-4 pb-4 pt-3">
         <div class="flex w-full min-w-[200px] max-w-[340px] flex-1 flex-col gap-2.5 py-0">
           <div class="animate-skeleton h-3 w-24 rounded bg-secondary/40" :style="{ '--i': 0 }"></div>
@@ -9971,7 +10016,7 @@ if (MDEBUG) {
           <!-- THE SAME SCREEN THE FOCUS VIEW IS. Identity, actions, stage,
                footer — in that order, decided by ItemScreen rather than here,
                which is the only way two surfaces stay one surface. -->
-          <ItemScreen class="min-w-[220px]" :held="craftHeld && modal3d" @panel-width="(w) => (craftPanelW = w)" :identity="{ ...craftIdentityName, price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
+          <ItemScreen class="min-w-[220px]" :inset="!viewOnly" :held="craftHeld && modal3d" @panel-width="(w) => (craftPanelW = w)" :identity="{ ...craftIdentityName, price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
             <template #actions>
             <!-- Settings, then which picture, then what you can do with the
                  item — broadest question first. Both screens carry the same
