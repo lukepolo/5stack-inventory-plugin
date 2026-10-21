@@ -3316,6 +3316,10 @@ export interface ViewerOpts {
   /** Orbit the camera by this many radians about Y. tools/shadertest only —
    *  lets a sweep measure the same decal from many angles deterministically. */
   viewAngle?: number;
+  /** Raise the camera by this many radians above its framed elevation, after
+   *  viewAngle. tools/shadertest only — for anything that depends on looking
+   *  down at the item (the charm liquid's back-wall term). */
+  viewElevation?: number;
   /** Force decals to ignore depth. tools/shadertest only: renders the decal's
    *  unoccluded silhouette, which is the upper bound a correct render must
    *  match. Comparing against it turns "is the sticker behind the gun?" into a
@@ -4836,6 +4840,11 @@ async function buildViewer(
     const { x, z } = camera.position;
     camera.position.x = x * Math.cos(a) - z * Math.sin(a);
     camera.position.z = x * Math.sin(a) + z * Math.cos(a);
+  }
+  if (opts?.viewElevation) {
+    const sph = new THREE.Spherical().setFromVector3(camera.position);
+    sph.phi = Math.min(Math.PI - 0.01, Math.max(0.01, sph.phi - opts.viewElevation));
+    camera.position.setFromSpherical(sph);
   }
   camera.lookAt(0, 0, 0);
 

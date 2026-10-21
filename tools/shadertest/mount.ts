@@ -23,6 +23,8 @@
 //   nametag=Some%20Name   name tag
 //   decal=/images/….webp  a STANDALONE sticker (model=__sticker&kind=sticker)
 //   va=0,1.57             camera orbit angles (radians), one shot each
+//   ve=0.8                raise the camera this many radians (look down)
+//   charm=/images/….webp  hang a charm (charmseed= its pattern)
 //   t=0,1.5,3             seconds after load to shoot, per angle (live only)
 //   still=0               the LIVE viewer (render loop, holo drift, inspect
 //                         idle) instead of the card/bake path (default 1)
@@ -61,7 +63,7 @@ const note = (s: string) => {
   out.appendChild(d);
 };
 
-const bounds = images.length
+const bounds = images.length || q.get("charm")
   ? await fetch(`/api/catalog/sticker-bounds/${model}`).then((r) => r.json()).catch(() => ({}))
   : {};
 
@@ -105,6 +107,7 @@ async function shoot(va: number, plain: boolean) {
       interactive: q.get("interactive") === "1",
       still,
       viewAngle: va || undefined,
+      viewElevation: num("ve", 0) || undefined,
       stickers: plain
         ? []
         : images.map((image, i) => ({
@@ -120,6 +123,8 @@ async function shoot(va: number, plain: boolean) {
       stickerMasks: q.get("nomask") ? undefined : bounds.masks,
       stattrak: plain || stattrak == null ? null : { count: stattrak === "dark" ? null : Number(stattrak) },
       nametag: plain ? null : q.get("nametag"),
+      charm: plain || !q.get("charm") ? null : { image: q.get("charm")!, x: null, y: null, z: null, seed: num("charmseed", 1) },
+      charmSurfaces: bounds.charmQuads,
       // A standalone sticker/patch: model=__sticker&kind=sticker&decal=/images/….webp
       decal: q.get("decal") ? { image: q.get("decal")!, wear: num("decalwear", 0) } : null,
     } as never);

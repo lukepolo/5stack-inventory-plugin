@@ -3,9 +3,11 @@
 //
 //   node tools/standalone/drive.mjs http://127.0.0.1:8787/ tools/standalone/steps.example.json out/ [width height]
 //
-// A steps file is a JSON array of { name?, js?, wait?, shot? }: `js` runs in the
-// page (a returned Promise is awaited and its value printed), then the driver
-// waits `wait` ms (default 1500) and, with `shot`, writes <out>/<shot>.png.
+// A steps file is a JSON array of { name?, js?, reload?, wait?, shot? }: `js`
+// runs in the page (a returned Promise is awaited and its value printed),
+// `reload: true` reloads the page (a fresh session, same server state — do not
+// call location.reload() from `js`, the evaluate never returns), then the
+// driver waits `wait` ms (default 1500) and, with `shot`, writes <out>/<shot>.png.
 // DPR=2 in the environment renders at device pixel ratio 2.
 //
 // Console errors and uncaught exceptions are printed at the end. The Chrome
@@ -105,6 +107,7 @@ await send("Emulation.setDeviceMetricsOverride", {
 await send("Page.navigate", { url });
 await sleep(6000);
 for (const [i, st] of steps.entries()) {
+  if (st.reload) await send("Page.reload", { ignoreCache: true });
   const v = st.js ? await evaluate(st.js) : undefined;
   if (v !== undefined) console.log(`step ${i} ${st.name ?? ""}:`, typeof v === "string" ? v : JSON.stringify(v));
   await sleep(st.wait ?? 1500);

@@ -19,8 +19,10 @@
 // and item ids come from cs2-lib (see backend/src/catalog.ts getItemIdByName).
 // MOCK_LOADOUT is the /api/loadout answer, inline JSON (default []).
 //
-// Saving does nothing: write endpoints are proxied to a backend that will
-// refuse them without a session. This is for LOOKING at the UI.
+// Editing an item (POST /api/inventory/<id>) is answered here and applied to
+// the in-memory inventory, so Save -> card re-bake can be tested; other writes
+// are proxied to a backend that will refuse them without a session. Card
+// uploads are accepted and dropped.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join, resolve, dirname } from "node:path";
@@ -53,6 +55,7 @@ const INVENTORY = seed.map((e, n) => ({
   origin: "crafted",
 }));
 
+const CARDS = new Map();
 const MIME = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -87,6 +90,33 @@ createServer(async (req, res) => {
       for (const s of list) prices[s.id] = { value: 100 + (s.id % 900), window: "7d", marketHashName: s.name, wearTier: 1 };
       return json(res, { ready: true, window: "7d", prices });
     }
+    const edit = req.method === "POST" && p.match(/^\/api\/inventory\/(\d+)$/);
+    if (edit) {
+      const row = INVENTORY.find((r) => r.id === edit[1]);
+      if (!row) return json(res, { error: "not found" });
+      const body = JSON.parse(await new Promise((ok) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => ok(b || "{}")); }));
+      for (const k of ["wear", "seed", "stattrak", "stattrak_count", "nametag"]) if (k in body) row[k] = body[k];
+      if (Array.isArray(body.stickers)) {
+        row.stickers = body.stickers.map((sp) =>
+          sp && sp.id ? { ...cat.getItem(sp.id), x: sp.x ?? null, y: sp.y ?? null, r: sp.r ?? 0, w: sp.w ?? 0 } : null,
+        );
+      }
+      return json(res, row);
+    }
+    // Card store, the way a backend WITHOUT card_look keys it: one file per
+    // instance whatever its stickers — the case where a stale card can win.
+    const up = req.method === "POST" && p.match(/^\/api\/render\/(\d+)$/);
+    if (up) {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      CARDS.set(up[1], Buffer.concat(chunks));
+      return json(res, { ok: true });
+    }
+    const card = p.match(/^\/api\/renders\/inst-(\d+)-/);
+    if (card && CARDS.has(card[1])) {
+      res.writeHead(200, { "content-type": "image/png" });
+      return res.end(CARDS.get(card[1]));
+    }
     if (p === "/api/loadout") return json(res, LOADOUT);
     if (p === "/api/inventory") return json(res, INVENTORY);
     if (p === "/api/wishlist" || p === "/api/loadout/presets") return json(res, []);
@@ -101,7 +131,9 @@ createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/javascript" });
       return res.end(await readFile(join(REPO, "node_modules/vue/dist/vue.esm-browser.prod.js")));
     }
-    if (p === "/" || p === "/index.html") {
+    // The app routes in the address bar (/items, /admin…), so a reload lands
+    // on one of those: answer every extension-less path with the app itself.
+    if (p === "/" || p === "/index.html" || !extname(p)) {
       const html = (await readFile(join(DIST, "index.html"), "utf8")).replace(
         "<head>",
         '<head><script type="module">import * as vue from "/vue.js"; globalThis.__5stack_shared__ = { vue };</script>',
