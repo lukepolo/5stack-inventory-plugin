@@ -2,7 +2,7 @@
 
 How the fixes in [CHANGELOG.md](../CHANGELOG.md) were found, and how to find the
 next one. It covers placement (StatTrak, name tags, stickers), texture spaces,
-sticker effects, cards and the extraction. For a **paint/skin that renders
+sticker effects, cards, the extraction and 3D load time. For a **paint/skin that renders
 wrong**, start with
 [tools/shadertest/DEBUGGING-SKINS.md](../tools/shadertest/DEBUGGING-SKINS.md)
 instead; the rig itself is described in
@@ -38,6 +38,8 @@ from your machine (`https://inventory.5stack.gg/...`).
 | `models/sticker-masks.json`, `models/<key>.stickermask.{hd,legacy}.webp` | where a sticker may show, per body (R channel, UV0) | open the webp; the R channel is the mask |
 | `models/stattrak-art.json`, `models/stattrak/knife_digits_color.webp` | the knife digit atlas with its real alpha cut-out | the alpha channel is the scratch shape |
 | `models/extract-version.json` | pipeline version, CS2 build, per-step durations | `curl` |
+| `models/<key>.inputs[.hd]/meta.json` | a weapon's composite inputs; `textures2048` names the 2048 copies of the ones over 2048 (v39+, HD guns only) | `curl` |
+| `models/**/*.{glb,json}.gz` | gzip copies the servers send instead (v39+); deleted at the start of every extraction, rewritten by its last step | `curl -H 'Accept-Encoding: gzip' -I` |
 | `paints/materials/<name>.vmat.json` | a sticker's, charm's or paint's compiled material (`m_shaderName`, `m_intParams`, `m_floatParams`, `m_textureParams`, dynamic expressions) | `curl` + `python3 -m json.tool` |
 | `paints/textures/<name>.webp` | the textures those materials name | download and inspect channel by channel |
 | `/api/catalog/sticker-bounds/<model>` | sticker slots **per body** (`mesh: body_hd/body_legacy`, offset, scale), bounds, masks, charm quads | `curl` |
@@ -149,6 +151,9 @@ registry is `src/devFlags.ts`.
 | `pivotdot` | a dot at the point an orbit drag rotates around |
 | `perf` | per-frame timing HUD |
 | `inspectanim` | the idle inspect motion (also gates the holo drift) |
+| `compositelog` | every composite store lookup: generation, stem, `HIT`/`MISS`, uploads (not in the HUD) |
+| `prefetchlog` | every prefetch warm (`start`, `ready`, `missing`), every file a loader took from it (`HIT`, `loader waits for`), and `window.__prefetch.stats()`; see [§4.16](#416-opening-an-item-in-3d-is-slow) |
+| `noprefetch` | turns prefetching off, for timing a cold open against a warm one |
 | `globalThis.__stDebug = true` (in a rig) | StatTrak placement and readout clearance, logged as `[st]` / `[st-clear]` |
 
 **Live vs card path.** `still: true` (cards, bakes) and the live viewer differ:
@@ -170,9 +175,30 @@ node tools/standalone/drive.mjs http://127.0.0.1:8787/ tools/standalone/steps.ex
 
 `mock-server.mjs` answers the signed-in endpoints itself and the knife/glove
 catalog from your working tree's `catalog.ts`; everything else is proxied.
+It also keeps its own in-memory composite store (uploads and reads), so the
+store can be exercised end to end without touching a real one; see
+[§4.13](#413-checking-the-composite-store).
 `drive.mjs` runs a JSON list of steps (JS to run, wait, screenshot) and prints
-console errors. Saves don't work (there's no session), and a "saving it failed"
-notice for card renders is expected.
+console errors. Saves don't work (there's no session), except item edits and
+card uploads, which the mock keeps. Cards go through the backend's own
+`cardStore.ts`, so they're stored and served as the real backend would.
+`CARDS_DIR=<dir>` keeps them between runs (as `inst-<id>.png|.webp`), and
+`MOCK_CARD_FORMATS=png` plays a backend from before WebP cards
+(`refuse-webp`: one that advertises WebP but refuses it); see
+[§4.6](#46-a-card-is-wrong-or-stale).
+
+Two switches on the mock matter for anything about load time:
+
+- `MOCK_CARDS=stub` answers every card with a placeholder, so the card backfill
+  never runs. Without it, every card-less item is baked on load, and each bake
+  pulls the same GLB and composite into the viewer's caches that the open you
+  are timing would have fetched.
+- The mock always keeps the paint composites it is sent (in memory, checked
+  like the backend checks them), so the first open of a skin stores it and the
+  next browser session gets a store HIT. Anything it does not hold is a 404,
+  i.e. a MISS; `MOCK_COMPOSITES=keep` instead reads those through from the dev
+  backend's store, for timing a HIT on skins someone opened against the dev
+  mount.
 
 ### 3.7 Data tools
 
@@ -181,6 +207,10 @@ notice for card renders is expected.
 - `node tools/knife-anchors.mjs <knife-attachments.json|url> [--dry-run]`
   regenerates the knife StatTrak anchors from game data and checks the knife name
   tags against it.
+- `CHUNKS=App-,viewer3d- npx vite build --config tools/bundle-report.config.ts --outDir /tmp/inv-report`
+  prints what is in each named chunk and what loads with it ([§4.15](#415-the-first-load-is-heavy-or-something-downloads-before-it-is-needed)).
+- `python3 tools/hdr-half.py <in.hdr> <out.hdr>` halves a Radiance HDRI in
+  linear light. It is how `src/assets/venice_sunset_512.hdr` was made.
 - **Offline simulation.** Before changing GLSL, re-implement the formula in a
   few lines of Python against the real textures and sweep the free variable.
   The lenticular fix started with a 30-line simulation that showed the needle
@@ -345,6 +375,33 @@ bump one to force a re-bake after a change that alters stored art. A bad
 picture that the client did not flag as failed (the Safari Doppler cards) is
 already stored under the current key, so it needs **Clear renders** as well.
 
+**Which file a card is.** The key still ends in `.png`, but that is only its
+name: a card is stored as `<stem>.webp` or `<stem>.png`, and
+`/api/renders/<key>` (and nginx's `/renders/`) answers with the WebP if there
+is one, the PNG otherwise, each under its own Content-Type
+(`backend/src/cardStore.ts`). Check what you're getting with
+`curl -sI https://inventory.5stack.gg/api/renders/<key> | grep -i content-type`.
+Anything that looks a card up by its key must go through `findCard`/`readCard`;
+a `stat` on the bare key misses every WebP card.
+
+How a card becomes WebP depends on who baked it:
+
+- Chrome and Firefox encode it themselves at quality 0.9 (`src/cardEncode.ts`),
+  checked by its magic bytes.
+- Safari can't: WebKit's `toBlob("image/webp")` silently hands back a PNG. It
+  uploads the PNG and the backend transcodes it with `cwebp -q 90 -sharp_yuv`.
+  A backend without `cwebp` (a bare dev run) stores the PNG.
+- A client only sends WebP when `/api/catalog` lists it in `cardFormats`. An
+  older backend doesn't, and 400s anything but a PNG, so it keeps getting PNGs.
+  If a WebP is refused anyway, the PNG follows and WebP is off for the session.
+
+Cards stored before this stay PNGs and keep being served; they become WebP when
+they're next baked (the next extraction re-keys them all). The quality was
+picked by measuring 16 bakes against their PNGs (the table is in
+`cardStore.ts`); re-run that before changing it. To test a pairing locally, run
+`tools/standalone` with `MOCK_CARD_FORMATS` ([§3.6](#36-the-real-ui-locally-toolsstandalone))
+and watch the mock's `card <id>: got … stored …` lines.
+
 ### 4.7 Something stutters
 
 Time the operation (`performance.now()` around it, or the `perf` HUD) before
@@ -368,7 +425,9 @@ Add an extraction step to `scripts/extract-models.sh`:
    - Encode with `cwebp -exact -lossless` (keeps RGB under alpha 0). Keep raw
      dumps on the mount so a parser fix doesn't need another run.
 4. The node has `python3` but no imaging library. Read PNGs with `zlib` (see
-   `png_alpha_range` in the stattrak-art step).
+   `png_alpha_range` in the stattrak-art step). For per-pixel work over whole
+   images use Node instead (typed arrays, zlib on a thread pool):
+   `scripts/lighten-assets.mjs` has an 8-bit PNG decoder and encoder.
 5. Test the step's Python locally before shipping. Pull the heredoc into a file,
    then run its functions on a downloaded sample (the C4's attachment dump, a
    generated RGBA PNG). `bash -n scripts/extract-models.sh` checks the shell.
@@ -452,16 +511,266 @@ scratch map as its R channel BEFORE resizing: its alpha is 0, Pillow
 premultiplies RGBA on resize, and the scratches silently become all zero. That
 made a correct shader look like it under-wore.
 
+### 4.12 An asset re-downloads on every load, or a stale one sticks
+
+The rules are in [CACHING.md](CACHING.md); this is how to tell which one broke.
+
+1. **Read the headers the browser got**, with the URL the client really asked
+   for (DevTools → Network → copy as cURL, or build it: `?v=` is the catalog's
+   `assetVersion`):
+   `curl -sI -H 'Accept-Encoding: gzip' '<url>' | grep -i -e cache-control -e etag -e content-encoding -e content-type -e cf-cache`.
+   No `?v=` on a mount URL means the caller skipped `withAssetVersion`; a
+   `content-type: application/octet-stream` on a `.glb` means the answer came
+   from a server without these types.
+2. **Find out which server answered.** nginx sends `server: nginx` and no
+   `vary: Origin`; the backend sends `vary: Origin, …` (from @fastify/cors).
+   Behind Cloudflare both are hidden, so ask the pods directly with
+   `kubectl -n 5stack exec deploy/inventory-frontend -- wget -qSO /dev/null 'http://127.0.0.1/models/ak47.glb'`.
+3. **Reproduce it locally** before changing a server. `nginx.conf` runs as is
+   in `docker run --rm -p 127.0.0.1:8811:80 -v "$PWD/nginx.conf:/etc/nginx/conf.d/default.conf:ro" -v <tree>:/cs2-models:ro --add-host inventory-backend:host-gateway nginx:alpine`
+   against a few real files downloaded into `<tree>/models/…`;
+   `nginx -t` in the same image validates it. The backend runs locally with
+   `MODELS_DIR`, `PAINTS_DIR`, … pointed at the same tree (it needs a Postgres;
+   a throwaway `postgres:16-alpine` container does), and `scripts/serve.mjs`
+   takes the same variables. Running the same `curl` list against all three is
+   how they were checked against each other.
+4. **Check the decoded bytes, not just the headers.** `curl --compressed` the
+   file and compare its hash with the file on disk; a gzip body under the wrong
+   type or a stale `.gz` "loads" fine and is wrong.
+
+`npm run check:assets` covers the shared Node logic (ETags, 304s, `.gz`
+freshness, ranges, HEAD).
+
+### 4.13 Checking the composite store
+
+The composite store fills as people open skins in 3D: the first viewer of a
+skin composites it and uploads the pair, and every later viewer and card bake
+of that skin loads the pair instead of the weapon's composite inputs. Card
+bakes read the store but never write it, and the upload route only accepts a
+skin the uploader owns. `EXTRACT_VERSION` is in the composite generation, so a
+new extraction starts an empty store.
+
+- `?compositelog=1` logs every lookup, upload and refusal (`[composite] …`).
+  A `key drift` line means `compositeKey` and `compositeStem` disagree, and
+  nothing will ever hit. Only the stem and kind count: Safari's canvas can't
+  encode WebP and sends a PNG under the `.webp` name, and the backend names
+  the file by its bytes (transcoding to WebP when ImageMagick is there), so a
+  different extension is expected.
+- Open a skin twice with `?compositelog=1`: the second open (and a card bake)
+  must log `HIT` for the stem the first one stored.
+- Locally, against the mock: build with `VITE_INVENTORY_API`, start
+  `mock-server.mjs` with an inventory that has the items you care about, and
+  open them in 3D. The mock rejects any upload whose filename is not the
+  backend's stem, and `GET /__mock/composites` lists what landed.
+- To prove a stored pair is bit-identical to a fresh render, open the skin with
+  `?compositeverify=1` ([§4.9](#49-it-works-in-chrome-but-not-in-safari)
+  explains why that matters for Safari).
+
+### 4.14 Making an asset smaller without changing what renders
+
+`scripts/lighten-assets.mjs` (steps `inputs-2048` and `precompress`, v39) adds
+lighter copies beside the originals and never replaces one: the installed plugin
+shares the mount and is an older client. Before adding another such copy, measure
+it the way these were:
+
+1. **Compare the render targets, not screenshots.** A throwaway rig page
+   (`tools/shadertest/zz-*.ts`, §3.4) composites the same skin twice and passes
+   `reference` to `compositePaint`, whose callback receives the raw `albedoRT` and
+   `rmRT`. Read both with `readRenderTargetPixels` and report mean and max
+   absolute difference and the share of pixels more than 2 levels off, for the
+   albedo and for roughness (G) and metalness (B) separately. Run it in Chrome
+   AND WebKit (Safari decodes the inputs in JS, `src/rawPng.ts`).
+2. **Pick skins that exercise the inputs.** Legacy finishes, knives and Dopplers
+   use bundles that are all 2048 or smaller, so they only prove the harness
+   (exactly 0). The 4096 inputs are on HD gun bodies: case hardening (Five-SeveN
+   | Heat Treated), gunsmith style 8 (Glock-18 | AXIA), custom paints, and a
+   projected style at cap 2048 (`maxSize`).
+3. **Then the whole viewer.** Render `mount.html` against a local models dir
+   with and without the copies (`MODELS_DIR`, see `tools/shadertest/vite.config.ts`)
+   and diff the PNGs.
+
+Results on 2026-10-21. 2048 copies at cap 2048 (and 1024): every skin within 2
+levels, 0% of pixels over 2, mean under 0.12 in every channel, in both
+browsers. The full viewer differed in 11 (Chrome) and 3 (WebKit) of 2.8M pixels,
+specular sparkles on bare metal. The copies match a numpy reference within 1
+level and keep the RGB under zero alpha: 83% of the AK-47's `color.png` has
+alpha 0 and colour underneath.
+
+Two candidates were measured and REJECTED:
+
+- **The grunge texture** (`gun_grunge_psd_f3419fed_ca3c5c93.webp`, 7.5MB,
+  shared by every paint). Lossy WebP keeps its alpha lossless, and that alpha
+  is most of the file: q98 saves only 31% and moved AK-47 | Case Hardened's
+  metalness by up to 14 levels (1.7% of pixels over 2). A 1024 copy saves 64% and
+  moved up to 29% of pixels by more than 2. It stays lossless at 2048.
+- **EXT_meshopt_compression for the GLBs.** Lossless is possible (no
+  quantisation, no filters, index sequences rather than triangles, so not even a
+  triangle's indices rotate): 15 models came back identical through three's
+  decoder, every attribute, index, skin and animation track. But it only
+  repacks the float bytes gzip already packs: 8 models were 8.12MB as `.gz` and
+  7.95MB as meshopt + gzip, 2% less, for a second copy of every GLB and a
+  decoder in the client. Its usual 5-10x comes from quantising, which moves
+  vertices.
+
+### 4.15 The first load is heavy, or something downloads before it is needed
+
+Measure what each phase downloads before moving any code.
+
+1. **Network per phase, in the standalone mock** ([§3.6](#36-the-real-ui-locally-toolsstandalone)).
+   Record every request with its encoded and decoded size between steps: load,
+   open the inventory, open one item in 3D. CDP's `Network` events are the
+   reliable source; `performance.getEntriesByType("resource")` caps at 250
+   entries unless the page calls `performance.setResourceTimingBufferSize`
+   first. `Network.emulateNetworkConditions` throttles the same run. Three
+   things skew the numbers:
+   - The mock serves files uncompressed, so its transfer size is the raw size.
+     Compare against the gzip column Vite prints for production.
+   - Missing cards are baked in the browser, which pulls in all of three,
+     the HDRI and the GLBs as soon as the inventory opens. Run the flow once to
+     fill the mock's card store, then measure a second, fresh-profile run.
+   - `vue.js` (about 170kB) is the mock's stand-in for the panel's Vue. It is
+     not part of the plugin.
+2. **What is in a chunk, and why**: `tools/bundle-report.config.ts` lists each
+   named chunk's modules, largest first, with what loads with the chunk and
+   what it can load later.
+3. **Bound a split before doing it.** In a throwaway config, a `resolveId` hook
+   can send the UI's imports of a module to a stub that exports the same names.
+   The boot chunk's size with the stub is the most that a real split can save.
+   This is how the 2026-10-21 split was chosen: the paint, glove, charm and pet
+   pipelines were about a third of the App chunk (75kB of 228kB gzipped).
+4. **The trap is shared modules.** A module lives in exactly one chunk. When
+   the boot chunk imports one small function from a heavy module, such as
+   `loadPaintDef` from `paintComposite.ts`, the whole module lands in a chunk
+   that the boot chunk imports statically. It downloads at load, even if every
+   other importer is lazy. `defineAsyncComponent` fixes this cheaply when a
+   component is the only static importer: the pattern rails, `ItemSpecs` and
+   `PetControls` took charm liquid, charm material and pet material with them.
+   App.vue's own imports of the paint and glove definition loaders still keep
+   `paintComposite` and `gloveComposite` (about 150kB, 51kB gzipped) in the boot
+   graph. Moving them out would mean splitting each file into a definition
+   half and a GPU half, about 1,100 lines of upstream code.
+5. **A smaller asset that feeds a renderer**: compare renders, not files. Card
+   bakes (`mount.html`, default `still=1`) are deterministic. Two identical runs
+   differ by exactly 0, so any difference is the change. Live renders of
+   animated items are not deterministic: a live glove differed from itself on
+   58% of its pixels. Serve the candidate through a temporary `?zz…=` override
+   and diff over the drawn pixels: mean absolute difference, 99th percentile,
+   and the share of pixels more than 2 levels off. For the studio HDRI the
+   threshold was a mean under 0.25, a 99th percentile of at most 1, and under
+   0.1% of pixels over 2.
+
+   Watch for anything sized from its input. `PMREMGenerator` builds its cube
+   at the source width / 4, so a 512-wide HDRI prefilters at 128 instead of
+   256 and shifts every roughness level. Used as is, the half-size file failed
+   on the glove (6.9% of pixels over 2). Widened back to 1024 before the
+   prefilter, it passed on all four items (mean 0.06 or less, 99th percentile 1,
+   0.02% of pixels over 2). Check WebKit too (`shoot-webkit.mjs`). It gave the
+   same numbers.
+
+### 4.16 Opening an item in 3D is slow
+
+A cold open is almost all network, and it is a chain: the GLB, then the
+textures its JSON names, then the paint chain and the composite store lookup,
+and on a store MISS the composite's sources (the weapon's `.inputs[.hd]`,
+10-40MB, plus the paint's own textures). `?perf=1` puts the mount's per-stage
+milliseconds and its MB over the wire in the HUD.
+
+`src/prefetch.ts` starts that chain before the click: on a tile hover, on the
+Edit / View in 3D press, and for the equipped items once the page is idle (not
+on phones; its header says what each one fetches). The bytes go into `src/prefetchStore.ts`
+and the loaders take them from there through four hooks (`prefetchedFetch`,
+`prefetchedUrl`, `prefetchedUrlSync`, `settlePrefetched`); nothing depends on
+the HTTP cache. **Prefetch log** (`prefetchlog`) shows every `start`, `ready` and `missing`, and
+on the loader side every `HIT`, `loader waits for` and `in use`;
+`window.__prefetch.stats()` has the totals. **No prefetch** (`noprefetch`) is the baseline.
+
+**Timing an open.** Run tools/standalone with `MOCK_CARDS=stub` (§3.6), click
+Edit from a page script, then poll the new canvas every frame until it has lit
+pixels. Two traps:
+
+- Use a real GPU (`--use-angle=metal` on macOS). Under SwiftShader the
+  composite alone takes ~20s and buries every network effect.
+- Proxied to the dev mount, the same cold open varies 2-3x between runs (one
+  AK-47 took 8.7-13.1s). For before/after numbers, serve the assets from memory
+  through one paced link of fixed bandwidth and round trip instead. The table
+  below came from a copy of the mock doing that at 100 Mbit/s and 30ms
+  (median of 3, click to first frame, composite store MISS):
+
+| Item | Bytes | No prefetch | Press only | Hover 1.5s, then Edit | Hover 8s |
+| --- | --- | --- | --- | --- | --- |
+| Bayonet \| Doppler | 15MB | 2.02s | 1.85s | 0.71s | 0.70s |
+| AK-47 \| Redline (legacy body, 3 stickers) | 31MB | 3.65s | 2.63s¹ | 1.63s | 1.57s |
+| AK-47 \| Predator (HD body, projected) | 76MB | 8.44s | 7.36s | 6.00s | 4.50s |
+
+¹ Partly the idle warm of the equipped AK-47 | First Class, which shares the
+legacy body's GLB and textures. A hover never fetches the composite inputs, so
+the Predator's 36MB of them are still downloaded after the click. A build
+without the prefetch code at all opens in the same time as the "No prefetch"
+column (2.01s and 8.46s), so the hooks cost nothing when nothing is warmed.
+With the card backfill left on, the bakes take what the idle warm fetched:
+the page loaded 116.8MB with prefetch and 116.8MB without.
+
+The same items once their composite is in the store (`MOCK_COMPOSITES=keep`,
+median of 2), where an open needs no inputs at all:
+
+| Item | Bytes | No prefetch | Press only | Hover 1.5s, then Edit | Hover 8s |
+| --- | --- | --- | --- | --- | --- |
+| Bayonet \| Doppler | 3MB | 0.48s | 0.33s | 0.26s | 0.25s |
+| AK-47 \| Redline | 15MB | 1.38s | 0.50s¹ | 0.48s | 0.49s |
+| AK-47 \| Predator | 53MB | 3.92s | 3.48s | 2.09s | 1.26s |
+
+In WebKit (Playwright, same lab link) the Bayonet's store-miss open went from
+2.05-2.13s to 0.78-0.86s after an 8s hover, with masks.png served from the
+store through the raw PNG path (§4.9) and the Doppler painted.
+
+**Checking "never downloads twice".** Count requests per URL in CDP's Network
+domain during hover and open. The one duplicate this found: a finish drawn
+through Valve's combo shader loads its pattern twice, once for the combo and
+once for the port, with different sampler settings, so the texture cache misses
+and the second `<img>` load relied on the browser's image cache to pair it with
+the first by URL. A blob: URL for the first and the real URL for the second
+broke the pairing (1MB extra on AK-47 | Predator). The store now hands every
+load of a taken file the same blob: URL for a minute.
+
+**The politeness rules**, one at a time: Save-Data and 2g by overriding
+`navigator.connection` before the page loads (CDP
+`Page.addScriptToEvaluateOnNewDocument`); a hidden tab by overriding
+`document.hidden` and dispatching `visibilitychange`; the concurrency cap and
+the yield to a building viewer by sampling `window.__prefetch.stats()`
+(`activeBackground`, `peakBackground`, `viewerBusy`) every 50ms.
+
 ## 5. Gotchas
 
 - **Disk.** Headless Chrome profiles are large; use the runners in this repo,
   which delete theirs.
+- **`npm i --no-save playwright` rewrites `yarn.lock`.** Put it back
+  (`git checkout yarn.lock`) before committing.
+- **A prefetched file loads from a `blob:` URL.** In devtools it shows as a
+  blob: request; the real URL was fetched earlier by src/prefetchStore.ts, at
+  low priority unless a press asked for it.
+- **The weapon never moves, first person included.** Stickers are cut in world
+  space and the charm's pivot, cord and collision grid are world-space, all
+  measured once at mount. First person moves the arms, the eye and the lamps
+  by the inverse of the clip's `wpn` placement (`syncFpvSeat`), and the held
+  weapon stays skinned at BIND, so the placement code reads skinned twins of
+  its meshes (`weaponMeshes`) and the charm's icon-pose anchor goes through
+  `charmPoseFix`. `window.__mount` on mount.html is the live handle, so
+  drive.mjs can call `setFpvAction("reload")` between shots.
 - **An attached charm's gravity is the camera's down**, not world −Y. Anything
   physical on a charm (cloth, liquid) must use `charmGravity`'s axis.
+- **Safari's canvas can't encode WebP.** `toBlob(cb, "image/webp")` returns a
+  PNG without an error. Check an encode by its magic bytes (`RIFF….WEBP`).
 - **Alpha is data in the composite inputs.** `masks.png` alpha is unused and 0,
   `ao.png` alpha is noPaint. Any loader for them must keep RGB under alpha 0,
   which Safari's image path does not do for a fully transparent file; go
   through `loadRawPngTexture` (src/rawPng.ts).
+- **A `.gz` beside a mount file is sent instead of it**, and nginx never checks
+  that the two still match. The extraction deletes every `.gz` before its first
+  step and `precompress` writes them back last. Anything else that rewrites a
+  file under `/models` must delete that file's `.gz`.
+- **Composite inputs come in two sizes** from v39. At a cap of 2048 or less the
+  compositor reads the `textures2048` copies, so when chasing an input texel,
+  look at the `.2048.png` too.
 - **Headless WebGL** needs `--use-angle=swiftshader --enable-unsafe-swiftshader`;
   without them every render is blank and looks like a shader bug.
 - **The live path needs an on-screen host.** An off-screen host can be treated
@@ -479,5 +788,16 @@ made a correct shader look like it under-wore.
   accident upstream. Leave it alone so merges stay clean.
 - **`BAKE_ENVIRONMENT`** in `src/viewerEnvironments.ts` must stay `"studio"` in
   commits; switch it only for local bake experiments.
+- **The default live rig never touches the studio HDRI.** CS2 lights by its own
+  painted sky, so a live `mount.html` shot tests the HDRI only with `&env=studio`
+  (or another studio rig). A still (`still=1`, the default) always uses the
+  bake rig, and the bake rig is Studio.
+- **Nothing 3D loads at startup.** `viewer3d`, three and GLTFLoader are fetched
+  together by the first `viewer3d()` call (`src/viewer3dLazy.ts`), which is a 3D
+  view or a card bake. Code that wants them earlier has to call
+  `prefetchViewer3d()` on a real signal of intent.
 - **In-game screenshots are not orthographic.** Compare ratios and sides, never
   absolute pixel positions.
+- **A `.gz` beside a mount file is what gzip clients get.** nginx never checks
+  that it matches the file; if an asset looks stale only in some clients,
+  compare the `.gz` with its original.

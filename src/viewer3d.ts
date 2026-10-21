@@ -45,6 +45,7 @@ import { compositeGlove, gloveLegacySeedMoves, loadGlovePaintDef } from "./glove
 import { compositeGloveModern, gloveSeedMoves, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
 import { hasModel, modelUrlFor } from "./modelAvailability";
+import { gltfUseKey, notePrefetchUse, prefetchedFetch, prefetchedUrlSync, settlePrefetched } from "./prefetchStore";
 import { INCOMPLETE } from "./viewerSentinel";
 // The one media query the viewer answers to. Everything else about layout is a
 // component's business, but "should this move on its own" is the renderer's.
@@ -76,10 +77,16 @@ import {
 import { createViewerCursor, type CursorMode } from "./viewerCursor";
 // Bundled, not fetched from anyone's CDN: CC0 from Poly Haven, see
 // src/assets/README.md. `?url` so Vite emits it as an asset and hands back a
-// base-correct URL instead of trying to parse 1.4MB of Radiance HDR as a module.
-import HDR_URL from "./assets/venice_sunset_1k.hdr?url";
+// base-correct URL instead of trying to parse Radiance HDR as a module.
+// Half the 1k original's resolution, and widened back on load: see
+// upsampleStudioHdr for why that, and not the file as it is.
+import HDR_URL from "./assets/venice_sunset_512.hdr?url";
 
 export { loadPaintDef, type PaintDef } from "./paintComposite";
+// What src/prefetch.ts needs to name a mount's files, reached through the one
+// lazy import it already pays for (viewer3dLazy) rather than its own imports.
+export { compositeSizeCap, loadWeaponInputs, paintTextureUrl, weaponInputsAt } from "./paintComposite";
+export { compositeKey, storedCompositeUrls } from "./compositeStore";
 
 export type ThreeBundle = {
   THREE: typeof import("three");
@@ -88,8 +95,8 @@ export type ThreeBundle = {
   DecalGeometry: typeof import("three/examples/jsm/geometries/DecalGeometry.js").DecalGeometry;
   RoomEnvironment: typeof import("three/examples/jsm/environments/RoomEnvironment.js").RoomEnvironment;
   cloneSkeleton: typeof import("three/examples/jsm/utils/SkeletonUtils.js").clone;
-  /** The lighting environment, or null if it could not be fetched — see loadThree. */
-  hdr: import("three").DataTexture | null;
+  /** Parses the studio HDRI — see loadStudioHdr. */
+  RGBELoader: typeof import("three/examples/jsm/loaders/RGBELoader.js").RGBELoader;
   EffectComposer: typeof import("three/examples/jsm/postprocessing/EffectComposer.js").EffectComposer;
   RenderPass: typeof import("three/examples/jsm/postprocessing/RenderPass.js").RenderPass;
   UnrealBloomPass: typeof import("three/examples/jsm/postprocessing/UnrealBloomPass.js").UnrealBloomPass;
@@ -214,16 +221,8 @@ function loadThree(): Promise<ThreeBundle> {
     DecalGeometry: decal.DecalGeometry,
     RoomEnvironment: env.RoomEnvironment,
     cloneSkeleton: skel.clone,
-    // THE LIGHTING ENVIRONMENT. Loaded here because getSharedGL is synchronous
-    // and this is not — and it has to exist before the first PMREM, or the very
-    // first mount of a session would light against the fallback and every later
-    // one against the HDRI.
-    //
-    // NULL ON FAILURE, never a throw: the URL is resolved by the bundler and this
-    // ships as a FEDERATED REMOTE, so it is loaded from the panel's origin rather
-    // than its own. If that ever resolves wrong, the viewer must fall back to
-    // RoomEnvironment and keep working rather than refusing to render anything.
-    hdr: await new rgbe.RGBELoader().loadAsync(HDR_URL).catch(() => null),
+    // The HDRI itself is NOT fetched here any more — see loadStudioHdr.
+    RGBELoader: rgbe.RGBELoader,
     EffectComposer: comp.EffectComposer,
     RenderPass: rp.RenderPass,
     UnrealBloomPass: bloom.UnrealBloomPass,
@@ -231,6 +230,120 @@ function loadThree(): Promise<ThreeBundle> {
   }));
   return threePromise;
 }
+
+/**
+ * THE STUDIO LIGHTING ENVIRONMENT (venice_sunset), fetched only by a rig that
+ * lights with it.
+ *
+ * It used to ride inside loadThree, so every first 3D view waited for 1.4MB of
+ * HDRI after three itself had arrived, and only then started on its GLB. The
+ * CS2 daylight rig lights by its own painted sky and never looks at it; the
+ * photographed CS2 scenes light by their photograph. Only the studio rigs
+ * (Studio, Showcase, which is the default, Warm, Dark), and with them every
+ * card bake, reflect it. So it is asked for by the mount that needs it (rigUsesStudioEnv),
+ * BEFORE that mount awaits three, and downloads alongside three and the GLB.
+ *
+ * The bytes are fetched directly so the download does not wait for three's
+ * chunk; RGBELoader then parses them off a blob URL, which keeps its decode
+ * path (half-float DataTexture, its own filters) exactly what it always was.
+ *
+ * NULL ON FAILURE, never a throw: the URL is resolved by the bundler and this
+ * ships as a FEDERATED REMOTE, so it is loaded from the panel's origin rather
+ * than its own. If that ever resolves wrong, the viewer must fall back to
+ * RoomEnvironment and keep working rather than refusing to render anything.
+ */
+let studioHdrPromise: Promise<import("three").DataTexture | null> | null = null;
+function loadStudioHdr(): Promise<import("three").DataTexture | null> {
+  studioHdrPromise ??= (async () => {
+    const bytes = fetch(HDR_URL)
+      .then((r) => (r.ok ? r.blob() : null))
+      .catch(() => null);
+    const [{ THREE, RGBELoader }, blob] = await Promise.all([loadThree(), bytes]);
+    if (!blob) return null;
+    const url = URL.createObjectURL(blob);
+    try {
+      return upsampleStudioHdr(THREE, await new RGBELoader().loadAsync(url));
+    } catch {
+      return null;
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  })();
+  return studioHdrPromise;
+}
+
+/**
+ * The width the studio HDRI is prefiltered at: the 1k original's.
+ *
+ * PMREMGenerator sizes its cube from the SOURCE (width / 4, rounded down to a
+ * power of two), so the 512-wide file as shipped would prefilter into a 128
+ * cube instead of 256 and shift every roughness level, not only the sharpest.
+ * Measured on card bakes against the 1k file: used as is, the glove came out
+ * with 6.9% of its pixels more than 2 levels off (99th percentile 7); widened
+ * back to 1024 first, the worst of a Doppler knife, a foil sticker, a matte AK
+ * and a glove was mean 0.06 levels, 99th percentile 1 level, 0.02% of pixels
+ * more than 2 off (isolated texels at the glint's soft edge), in Chrome and in
+ * WebKit alike. The detail the half-size file lost is only the sun's sharpest
+ * texels, which the prefilter spreads anyway; it is 371kB where the 1k one was
+ * 1.4MB. Method: docs/DEBUGGING.md §4.12.
+ */
+const STUDIO_HDR_WIDTH = 1024;
+
+/**
+ * Bilinear resize of the decoded HDRI (half-float RGBA) to STUDIO_HDR_WIDTH,
+ * in place on the loader's texture so its type, filters and orientation stay
+ * exactly the loader's. Longitude wraps, as the panorama does; latitude clamps
+ * at the poles. Once per session, ~20ms.
+ */
+function upsampleStudioHdr(THREE: ThreeBundle["THREE"], tex: import("three").DataTexture): import("three").DataTexture {
+  const { width: w, height: h, data } = tex.image as { width: number; height: number; data: Uint16Array };
+  if (w >= STUDIO_HDR_WIDTH || !(data instanceof Uint16Array)) return tex;
+  const { fromHalfFloat, toHalfFloat } = THREE.DataUtils;
+  const W = STUDIO_HDR_WIDTH;
+  const H = Math.round((h * W) / w);
+  const src = new Float32Array(w * h * 4);
+  for (let i = 0; i < src.length; i++) src[i] = fromHalfFloat(data[i]);
+  const out = new Uint16Array(W * H * 4);
+  const one = toHalfFloat(1);
+  for (let y = 0; y < H; y++) {
+    const sy = ((y + 0.5) * h) / H - 0.5;
+    const y0 = Math.floor(sy);
+    const ty = sy - y0;
+    const r0 = Math.min(Math.max(y0, 0), h - 1) * w;
+    const r1 = Math.min(Math.max(y0 + 1, 0), h - 1) * w;
+    for (let x = 0; x < W; x++) {
+      const sx = ((x + 0.5) * w) / W - 0.5;
+      const x0 = Math.floor(sx);
+      const tx = sx - x0;
+      const c0 = ((x0 % w) + w) % w;
+      const c1 = (x0 + 1) % w;
+      const a = (r0 + c0) * 4;
+      const b = (r0 + c1) * 4;
+      const c = (r1 + c0) * 4;
+      const d = (r1 + c1) * 4;
+      const o = (y * W + x) * 4;
+      for (let k = 0; k < 3; k++) {
+        const top = src[a + k] + (src[b + k] - src[a + k]) * tx;
+        const bot = src[c + k] + (src[d + k] - src[c + k]) * tx;
+        out[o + k] = toHalfFloat(top + (bot - top) * ty);
+      }
+      out[o + 3] = one;
+    }
+  }
+  tex.image = { data: out, width: W, height: H };
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** Whether a rig reflects the studio HDRI at mount — see loadStudioHdr. The
+ *  daylight rig has its own sky and a photographed scene its photograph (it
+ *  falls back to the HDRI only if the photograph fails, see buildViewer). */
+const rigUsesStudioEnv = (rig: ViewerEnvironment) => !rig.daylight && !rig.backdrop;
+
+/** The rig a mount opens under. One expression for the two places that need
+ *  it: the HDRI prefetch at the top of buildViewer, and the rig itself. */
+const mountRig = (opts?: ViewerOpts) =>
+  viewerEnvironment(opts?.still ? (getBakeEnvironment() ?? BAKE_ENVIRONMENT) : debugChoice("env"));
 
 // Model availability moved to ./modelAvailability. It is asked on paths that
 // never mount anything — a slot's context menu, the card-art backfill walking
@@ -260,7 +373,10 @@ export { hasModel, hasModelSync, modelUrlFor } from "./modelAvailability";
  */
 interface SharedGL {
   renderer: import("three").WebGLRenderer;
-  env: import("three").Texture;
+  /** The studio rigs' prefiltered HDRI — built on first use, see getStudioEnv. */
+  env?: Promise<import("three").Texture>;
+  /** The same, once it has resolved: a live rig switch applies it synchronously. */
+  envReady?: import("three").Texture;
   /** The daylight rig's sky and backdrop — built on first use, see getDaylight. */
   daylight?: { env: import("three").Texture; plate: import("three").Texture };
   /** Reflections built from a backdrop photograph, by its URL — see getBackdropEnv. */
@@ -443,11 +559,7 @@ function loadPlate(THREE: ThreeBundle["THREE"], url: string): Promise<import("th
   return p;
 }
 
-function getSharedGL(
-  THREE: ThreeBundle["THREE"],
-  RoomEnvironment: ThreeBundle["RoomEnvironment"],
-  hdr?: ThreeBundle["hdr"],
-): SharedGL {
+function getSharedGL(THREE: ThreeBundle["THREE"]): SharedGL {
   if (sharedGL) return sharedGL;
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   /**
@@ -470,23 +582,6 @@ function getSharedGL(
   // the frame is "bright". A rig may override it — drawFrame applies each
   // viewer's own before every frame (ViewerEnvironment.exposure).
   renderer.toneMappingExposure = BASE_EXPOSURE;
-  // Image-based studio lighting carries the shading (composited metal/rough
-  // maps need real reflections); directionals only shape highlights.
-  const pmrem = new THREE.PMREMGenerator(renderer);
-  // venice_sunset_1k, which is what csgoskins light with — and METAL IS NOTHING
-  // BUT THIS. A metalness map only decides how much of the environment a surface
-  // mirrors; RoomEnvironment is a flat neutral box, so a correctly-metallic
-  // chrome case rendered against it still comes out flat grey. Recovering the
-  // metalness from g_tColorA.a did not make Butane Buddy's lighter look like
-  // steel until there was a sky and a ground for it to reflect.
-  //
-  // RoomEnvironment stays as the fallback: a failed fetch must degrade to the
-  // old look, not to a black scene.
-  const env = hdr
-    ? pmrem.fromEquirectangular(hdr).texture
-    : pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-  hdr?.dispose();
-  pmrem.dispose();
   // Losing the shared context takes every viewer with it rather than one, so it
   // is latched here and every live viewer is told. The next mount rebuilds it.
   renderer.domElement.addEventListener("webglcontextlost", (e) => {
@@ -497,7 +592,42 @@ function getSharedGL(
     sharedGL = null;
     for (const cb of [...contextLostSubscribers]) cb();
   });
-  return (sharedGL = { renderer, env });
+  return (sharedGL = { renderer });
+}
+
+/**
+ * The studio rigs' environment, prefiltered once per context.
+ *
+ * Async because the HDRI is fetched on first need (loadStudioHdr), and AWAITED
+ * by every mount that lights with it, so no mount ever renders against the
+ * fallback while the HDRI is still on its way and the next one against the HDRI.
+ */
+function getStudioEnv(
+  THREE: ThreeBundle["THREE"],
+  RoomEnvironment: ThreeBundle["RoomEnvironment"],
+  gl: SharedGL,
+): Promise<import("three").Texture> {
+  gl.env ??= loadStudioHdr().then((hdr) => {
+    // Image-based studio lighting carries the shading (composited metal/rough
+    // maps need real reflections); directionals only shape highlights.
+    const pmrem = new THREE.PMREMGenerator(gl.renderer);
+    // venice_sunset, which is what csgoskins light with — and METAL IS NOTHING
+    // BUT THIS. A metalness map only decides how much of the environment a surface
+    // mirrors; RoomEnvironment is a flat neutral box, so a correctly-metallic
+    // chrome case rendered against it still comes out flat grey. Recovering the
+    // metalness from g_tColorA.a did not make Butane Buddy's lighter look like
+    // steel until there was a sky and a ground for it to reflect.
+    //
+    // RoomEnvironment stays as the fallback: a failed fetch must degrade to the
+    // old look, not to a black scene.
+    const env = hdr
+      ? pmrem.fromEquirectangular(hdr).texture
+      : pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    hdr?.dispose();
+    pmrem.dispose();
+    return (gl.envReady = env);
+  });
+  return gl.env;
 }
 /** Live viewers wanting to know the shared context died under them. */
 const contextLostSubscribers = new Set<() => void>();
@@ -640,6 +770,45 @@ function discardableImages(json: Record<string, unknown>, variant: GltfVariant):
   return drop;
 }
 
+/** What loadGltf's URL modifier turns a GLB texture URL into: BLANK_PNG for an
+ *  image `drop` skips, otherwise the version-stamped URL that is fetched. */
+function gltfTextureUrl(url: string, drop: Set<string>): string {
+  if (/^(data|blob):/.test(url)) return url;
+  const file = decodeURIComponent(url.split("/").pop()?.split("?")[0] ?? "");
+  if (drop.has(file)) return BLANK_PNG;
+  // The GLB's sibling textures are referenced by bare filename, and this is
+  // the only place their URLs exist — so the extraction stamp has to be
+  // applied here or the biggest files on the mount stay uncacheable.
+  return /[?&]v=/.test(url) ? url : withAssetVersion(url);
+}
+
+/** The texture URLs a parse of this GLB will request, spelled exactly as the
+ *  URL modifier spells them. Only the relative URIs the extraction writes;
+ *  anything else is left to the loader. */
+function keptTextureUrls(json: Record<string, unknown>, drop: Set<string>): string[] {
+  const base = `${getAssetOrigin()}/models/`;
+  const out: string[] = [];
+  for (const img of (json as { images?: { uri?: string }[] }).images ?? []) {
+    const uri = img.uri;
+    if (!uri || /^([a-z][a-z0-9+.-]*:|\/)/i.test(uri)) continue;
+    const url = gltfTextureUrl(base + uri, drop);
+    if (url !== BLANK_PNG) out.push(url);
+  }
+  return out;
+}
+
+/**
+ * What src/prefetch.ts warms for a model: the textures loadGltf will fetch for
+ * this GLB and variant, after the same discardableImages() skip. Lives beside
+ * loadGltf so the two cannot drift apart — a stale list here would only cost a
+ * wasted or an un-warmed download, never a wrong texture, but it would cost it
+ * on every hover.
+ */
+export function gltfTextureUrls(buf: ArrayBuffer, variant: GltfVariant): string[] {
+  const json = glbJson(buf);
+  return json ? keptTextureUrls(json, discardableImages(json, variant)) : [];
+}
+
 // Parsed-GLTF LRU (the heavy part — geometry + textures). Keyed by model AND
 // variant: the two bodies and the painted/unpainted cases each drop a different
 // set of textures, so they are genuinely different parses.
@@ -649,6 +818,8 @@ const gltfCache = new Map<string, Promise<import("three/examples/jsm/loaders/GLT
 const GLTF_CACHE_MAX = 12;
 async function loadGltf(model: string, variant: GltfVariant) {
   const key = `${model}|${variant.legacy ? "legacy" : "hd"}|${variant.painted ? "p" : "u"}`;
+  // Hit or miss, this parse is in use — src/prefetch.ts won't warm it again.
+  notePrefetchUse(gltfUseKey(modelUrlFor(model), variant));
   const existing = gltfCache.get(key);
   if (existing) {
     // refresh LRU order
@@ -661,25 +832,28 @@ async function loadGltf(model: string, variant: GltfVariant) {
     // Fetched here rather than through GLTFLoader so the JSON chunk can be read
     // BEFORE the loader starts pulling images — deciding what to skip is only
     // possible while there is still something to skip.
-    const buf = await fetch(modelUrlFor(model)).then((r) => {
+    // prefetchedFetch: from src/prefetch.ts's store when a hover or a press
+    // already fetched it, otherwise this exact fetch.
+    const buf = await prefetchedFetch(modelUrlFor(model)).then((r) => {
       if (!r.ok) throw new Error(`model ${model}: HTTP ${r.status}`);
       return r.arrayBuffer();
     });
     const json = glbJson(buf);
     const drop = json ? discardableImages(json, variant) : new Set<string>();
+    // Textures a warm is still downloading are waited for rather than asked
+    // for a second time — the modifier below can only hand over what is
+    // already held. Free when nothing was warmed.
+    if (json) await settlePrefetched(keptTextureUrls(json, drop));
 
     // A loader-local manager, NOT three's default one: a URL modifier on the
     // default manager would rewrite every texture every other loader in the app
     // ever fetches.
     const manager = new THREE.LoadingManager();
     manager.setURLModifier((url) => {
-      if (/^(data|blob):/.test(url)) return url;
-      const file = decodeURIComponent(url.split("/").pop()?.split("?")[0] ?? "");
-      if (drop.has(file)) return BLANK_PNG;
-      // The GLB's sibling textures are referenced by bare filename, and this is
-      // the only place their URLs exist — so the extraction stamp has to be
-      // applied here or the biggest files on the mount stay uncacheable.
-      return /[?&]v=/.test(url) ? url : withAssetVersion(url);
+      const out = gltfTextureUrl(url, drop);
+      if (out === BLANK_PNG || /^(data|blob):/.test(out)) return out;
+      // A warmed texture loads from its held bytes, through the same loader.
+      return prefetchedUrlSync(out) ?? out;
     });
     const loader = new GLTFLoader(manager);
     // Textures are flat-copied to the models ROOT, but a .glb in a subdirectory
@@ -2177,8 +2351,8 @@ function releaseViewer() {
 export async function withSharedRenderer<T>(
   fn: (three: ThreeBundle["THREE"], renderer: import("three").WebGLRenderer) => Promise<T>,
 ): Promise<T> {
-  const { THREE, RoomEnvironment, hdr } = await loadThree();
-  const { renderer } = getSharedGL(THREE, RoomEnvironment, hdr);
+  const { THREE } = await loadThree();
+  const { renderer } = getSharedGL(THREE);
   try {
     return await fn(THREE, renderer);
   } finally {
@@ -3385,7 +3559,10 @@ async function buildViewer(
   mounted: { view?: HTMLCanvasElement } = {},
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
-  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton, hdr,
+  // A studio rig (every card bake among them) starts its HDRI download now, so
+  // it arrives alongside three and the GLB instead of after them.
+  if (rigUsesStudioEnv(mountRig(opts))) void loadStudioHdr();
+  const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton,
     EffectComposer, RenderPass, UnrealBloomPass, OutputPass } = await loadThree();
   mt.mark("three");
   throwIfAborted(signal);
@@ -3447,7 +3624,11 @@ async function buildViewer(
   // download isn't wasted either way.
   throwIfAborted(signal);
 
-  const { renderer, env: envTex } = getSharedGL(THREE, RoomEnvironment, hdr);
+  const gl = getSharedGL(THREE);
+  const { renderer } = gl;
+  // The studio rigs' HDRI, once this viewer has it — fetched only for a rig that
+  // reflects it (see the rig below and setEnvironment), so it is often null.
+  let envTex = gl.envReady ?? null;
   // This viewer's own visible surface. The shared renderer draws into its single
   // offscreen canvas; each frame is then blitted here. Keeping a real canvas per
   // viewer means layout, sizing, pointer events and OrbitControls all work
@@ -3534,7 +3715,7 @@ async function buildViewer(
   // except the re-read itself.
   // A bake follows the SERVER's rig when it names one: the cards land in its
   // store, so it alone decides how they are lit (Catalog.bakeEnvironment).
-  const rig = viewerEnvironment(opts?.still ? (getBakeEnvironment() ?? BAKE_ENVIRONMENT) : debugChoice("env"));
+  const rig = mountRig(opts);
   const L = { ...rig.lighting, ...(opts?.lighting ?? {}) };
   // Which preset those numbers came from, so a live re-light can skip the frames
   // where nothing changed — the poll runs every frame and the answer is the same
@@ -3550,6 +3731,12 @@ async function buildViewer(
   // shipped with the bundle, cached after the first viewer.
   const mountPhoto = rig.backdrop ? await loadPlate(THREE, rig.backdrop.image) : null;
   if (mountPhoto && rig.backdrop) scene.environment = getBackdropEnv(THREE, renderer, rig.backdrop.image, mountPhoto);
+  // The studio HDRI is awaited the same way, for the same reason: a studio rig
+  // (every card bake) or a scene whose photograph did not load lights by it.
+  // Its download started at the top of this build — see loadStudioHdr.
+  if (rigUsesStudioEnv(rig) || (rig.backdrop && !mountPhoto)) {
+    scene.environment = envTex = await getStudioEnv(THREE, RoomEnvironment, gl);
+  }
   let exposureNow = rig.exposure ?? BASE_EXPOSURE;
   scene.environmentIntensity = L.env;
   // Theirs too: the HDRI is a real place, so which way it faces decides where the
@@ -5227,6 +5414,66 @@ async function buildViewer(
     if ((mesh as unknown as { isMesh?: boolean }).isMesh && !isGapMesh(mesh)) weaponMeshes.push(mesh);
   });
   /**
+   * FIRST PERSON: the surfaces everything is placed against, as they are DRAWN.
+   *
+   * A held weapon stays skinned (see "FIRST PERSON KEEPS THE SKELETON") so its
+   * parts can move, and its skeleton carries the inch→metre scale: the stored
+   * vertices are in inches and only the bones make them metres. Every probe
+   * below reads `geometry` + `matrixWorld` directly (the UV1 cut, DecalGeometry,
+   * the surface lookups), so on a live skin it measured a gun 39 times too big
+   * and cut every sticker two metres wide and three metres off — in the picture,
+   * simply gone.
+   *
+   * So in first person each skinned mesh is stood in for, in this list only, by
+   * an unrendered twin whose positions and normals are the skin as posed now
+   * (bind, plus the hidden props): the weapon never moves in this mode (see
+   * syncFpvSeat), so once is enough. The real meshes keep rendering and keep
+   * their skeleton; the twins share their material, name and userData.
+   */
+  if (fpvSpec) {
+    object.updateMatrixWorld(true);
+    const v = new THREE.Vector3();
+    const p = new THREE.Vector3();
+    const n = new THREE.Vector3();
+    for (let i = 0; i < weaponMeshes.length; i++) {
+      const skinned = weaponMeshes[i] as import("three").SkinnedMesh;
+      if (!skinned.isSkinnedMesh) continue;
+      const geom = skinned.geometry.clone();
+      const pos = geom.getAttribute("position");
+      const nrm = geom.getAttribute("normal");
+      const outP = new Float32Array(pos.count * 3);
+      const outN = nrm ? new Float32Array(nrm.count * 3) : null;
+      for (let k = 0; k < pos.count; k++) {
+        v.fromBufferAttribute(pos, k);
+        skinned.applyBoneTransform(k, p.copy(v));
+        outP[k * 3] = p.x;
+        outP[k * 3 + 1] = p.y;
+        outP[k * 3 + 2] = p.z;
+        if (nrm && outN) {
+          // A normal is a direction: skin a point one unit along it and take
+          // the difference, which carries the bones' rotation and not their
+          // translation.
+          skinned.applyBoneTransform(k, n.fromBufferAttribute(nrm, k).add(v));
+          n.sub(p).normalize();
+          outN[k * 3] = n.x;
+          outN[k * 3 + 1] = n.y;
+          outN[k * 3 + 2] = n.z;
+        }
+      }
+      geom.setAttribute("position", new THREE.BufferAttribute(outP, 3));
+      if (outN) geom.setAttribute("normal", new THREE.BufferAttribute(outN, 3));
+      geom.computeBoundingBox();
+      geom.computeBoundingSphere();
+      const twin = new THREE.Mesh(geom, skinned.material);
+      twin.name = skinned.name;
+      twin.userData = skinned.userData;
+      twin.matrixAutoUpdate = false;
+      twin.matrix.copy(skinned.matrixWorld);
+      twin.matrixWorld.copy(skinned.matrixWorld);
+      weaponMeshes[i] = twin;
+    }
+  }
+  /**
    * The subset that carries TEXCOORD_1 — i.e. the surfaces the game maps
    * stickers onto. A drag measures the pointer in UV1, so it must aim at these
    * and ONLY these: on a multi-mesh weapon the ray otherwise lands on a
@@ -6520,9 +6767,10 @@ async function buildViewer(
       if (live) lives.push(live);
     }
     if (!lives.length) return;
-    camera.updateMatrixWorld();
+    const cam = fpvEye ?? camera;
+    cam.updateMatrixWorld();
     const { eye } = holoTmp;
-    eye.copy(controls.target).applyMatrix4(camera.matrixWorldInverse);
+    eye.copy(controls.target).applyMatrix4(cam.matrixWorldInverse);
     eye.z += radius * HOLO_EYE_DIST;
     for (const live of lives) {
       live.uHoloLive.value = 1;
@@ -7836,6 +8084,43 @@ async function buildViewer(
     z: v.y / SRC_TO_M + charmBase[2] + CHARM_CAL.z,
   });
 
+  /**
+   * FIRST PERSON: from the pose the charm data was measured on to the pose the
+   * held weapon is in.
+   *
+   * The keychain point (and a stored charm offset) is model space at the ICON
+   * pose, the one the item view bakes. A held weapon stays skinned at BIND (see
+   * "FIRST PERSON KEEPS THE SKELETON"), where its `weapon` bone, and the whole
+   * body with it, sits elsewhere: on the USP-S 0.27m along the barrel. The
+   * recentre takes the body back to the origin either way, so a point measured
+   * on the icon pose landed that far from the gun, at the grip under the hand,
+   * and the charm vanished in first person. This maps it with the body: the
+   * bone at bind, after the bone at the icon pose undone. The icon pose is the
+   * pose clip's first key, the same clip the props are hidden from. Null in the
+   * item view, where the two poses are one.
+   */
+  const charmPoseFix = (() => {
+    if (!fpvSpec || !poseClip) return null;
+    const bone = object.getObjectByName("weapon");
+    if (!bone) return null;
+    const track = (prop: string) => poseClip.tracks.find((t) => t.name === `weapon.${prop}`);
+    const pt = track("position");
+    const qt = track("quaternion");
+    const st = track("scale");
+    if (!pt && !qt) return null;
+    object.updateMatrixWorld(true);
+    const at = new THREE.Vector3().copy(bone.position);
+    const turn = new THREE.Quaternion().copy(bone.quaternion);
+    const size = new THREE.Vector3().copy(bone.scale);
+    if (pt) at.fromArray(pt.values, 0);
+    if (qt) turn.fromArray(qt.values, 0);
+    if (st) size.fromArray(st.values, 0);
+    const icon = new THREE.Matrix4().compose(at, turn, size);
+    if (bone.parent) icon.premultiply(bone.parent.matrixWorld);
+    return new THREE.Matrix4().multiplyMatrices(bone.matrixWorld, icon.invert());
+  })();
+  const charmPoseUnfix = charmPoseFix ? charmPoseFix.clone().invert() : null;
+
   const charmAnchor = (() => {
     const a = (CHARM_ANCHORS as Record<string, { keychain: number[] } | undefined>)[model];
     if (!a || a.keychain.length !== 3) return null;
@@ -7844,7 +8129,8 @@ async function buildViewer(
     // Bone-relative and already in GLB metres — the base belongs to the game's
     // offset space only, so it must NOT be added here.
     const p = new THREE.Vector3(a.keychain[0], a.keychain[1], a.keychain[2]);
-    return p.sub(center);
+    p.sub(center);
+    return charmPoseFix ? p.applyMatrix4(charmPoseFix) : p;
   })();
 
   // The anchor CS2 gives us is a clip point, which on some weapons sits just
@@ -8693,7 +8979,7 @@ async function buildViewer(
     if (charmAnchor) {
       // Absolute, to match what the game consumes — undo the recentering to get
       // back into model space rather than measuring from the anchor.
-      const off = worldToOffset(p.clone().add(center));
+      const off = worldToOffset((charmPoseUnfix ? p.clone().applyMatrix4(charmPoseUnfix) : p.clone()).add(center));
       return { x: round(off.x, 3), y: round(off.y, 3), z: round(off.z, 3) };
     }
     // The length fraction spans the WHOLE usable body (t 0.05..0.95), not the
@@ -8727,7 +9013,9 @@ async function buildViewer(
     // is what an unplaced charm previews at.
     if (charmAnchor) {
       const placed = c.x != null || c.y != null || c.z != null;
-      return liftOutOfBody(placed ? offsetToWorld(c).sub(center) : charmAnchor.clone());
+      const stored = placed ? offsetToWorld(c).sub(center) : null;
+      if (stored && charmPoseFix) stored.applyMatrix4(charmPoseFix);
+      return liftOutOfBody(stored ?? charmAnchor.clone());
     }
     const t = clamp(0.5 + (c.x ?? 0) * 0.45, 0.05, 0.95);
     const l = cbox.min.getComponent(AXIS_L) + t * sizeL;
@@ -9111,9 +9399,18 @@ async function buildViewer(
    * in the game's inspect.
    */
   const gravityScratch = new Float32Array(3);
+  /** The first-person eye once there is one. Declared up here, not where it is
+   *  built, because the charm can settle before the mount gets that far. */
+  let fpvEye: import("three").Camera | null = null;
+  const eyeQ = new THREE.Quaternion();
+  /** World orientation of the camera being drawn with — the orbit camera, or
+   *  the first-person eye, which sits in a moving frame (syncFpvSeat). */
+  const eyeQuaternion = () => (fpvEye ? fpvEye.getWorldQuaternion(eyeQ) : eyeQ.copy(camera.quaternion));
   const gravityWorld = new THREE.Vector3();
   function charmGravity(sim: CharmSim) {
-    gravityWorld.set(0, -1, 0).applyQuaternion(camera.quaternion);
+    // The eye that is drawing: in first person that moves with the arms (see
+    // syncFpvSeat), so the charm swings as the gun comes up.
+    gravityWorld.set(0, -1, 0).applyQuaternion(eyeQuaternion());
     worldToCharmDir(sim.space!, gravityWorld.x, gravityWorld.y, gravityWorld.z, gravityScratch);
     return gravityScratch;
   }
@@ -9259,8 +9556,8 @@ async function buildViewer(
     // An epsilon, not exact inequality: OrbitControls' damping tail leaves the
     // quaternion twitching in the last float digits long after the view has
     // visually stopped, and waking on that would mean the charm never sleeps.
-    if (charmCamQ.angleTo(camera.quaternion) > 1e-4) {
-      charmCamQ.copy(camera.quaternion);
+    if (charmCamQ.angleTo(eyeQuaternion()) > 1e-4) {
+      charmCamQ.copy(eyeQuaternion());
       wakeCharmSim(sim);
       wakeCharm(); // keeps the perf HUD's settle timer honest
     }
@@ -9338,7 +9635,7 @@ async function buildViewer(
     // above the gun left the charm hanging down the screen while its liquid
     // thought it was being looked at from above, and the Butane Buddy flooded
     // to the brim. A charm shown on its own does not hang, and keeps world up.
-    const up = kind === "charm" ? WORLD_Y : lqCameraUp.set(0, 1, 0).applyQuaternion(camera.quaternion);
+    const up = kind === "charm" ? WORLD_Y : lqCameraUp.set(0, 1, 0).applyQuaternion(eyeQuaternion());
     tickCharmLiquid(THREE, root, up, dt);
   }
 
@@ -11411,8 +11708,15 @@ async function buildViewer(
         const mesh = n as import("three").Mesh;
         if (!(mesh as unknown as { isMesh?: boolean }).isMesh) return;
         const mat = mesh.material as import("three").MeshStandardMaterial;
-        // Skin is not painted — the finish has no say over the forearm.
-        if (!mat || /bare_arm/i.test(mat.name ?? "")) return;
+        // THE GLOVE ONLY. Every glove material in the arm models is
+        // `glove_<model>_<side>` (glove_sporty_left, glove_hardknuckle_black…);
+        // the skin is `bare_arm_*`, and the agent's grafted sleeve keeps the
+        // agent's own (sleeve_ctm_sas, tm_leet_v2_body_variantg). This used to
+        // paint everything but the skin, so the sleeve wore the glove's finish
+        // up to the elbow, and since the sleeve's material is the cached agent
+        // model's own, the agent wore it too. Matched positively, and the
+        // sleeve mesh is skipped by name as well.
+        if (!mat || !/^glove_/i.test(mat.name ?? "") || /firstperson_sleeves/i.test(mesh.name ?? "")) return;
         mat.map = comp.albedo;
         mat.color.setScalar(1);
         mat.roughnessMap = comp.rm;
@@ -11461,9 +11765,14 @@ async function buildViewer(
   // the origin and nothing has to be framed or solved.
   let arms: ArmsRig | null = null;
   let fpvCamera: import("three").PerspectiveCamera | null = null;
-  /** Set only on the clip-driven path — see the two ways to hold it, below. */
-  let fpvSeat: import("three").Object3D | null = null;
+  /** What carries the ARMS AND THE EYE in first person — never the weapon.
+   *  See syncFpvSeat. */
+  let fpvFrame: import("three").Object3D | null = null;
+  /** The node whose world transform says where the clip holds the weapon: the
+   *  rig's `wpn` bone, or the hand on the fallback path. */
   let fpvWpn: import("three").Object3D | null = null;
+  /** What follows `fpvWpn` to the weapon's own frame: the attachment bone and
+   *  the object's transform undone (clip path), or the hand seat (fallback). */
   let fpvUnbake: import("three").Matrix4 | null = null;
   /** The auto-framed orientation. Yaw and pitch are offsets ON this. */
   let fpvBase: import("three").Quaternion | null = null;
@@ -11515,29 +11824,50 @@ async function buildViewer(
   const fpvTune = new THREE.Quaternion();
   const fpvEuler = new THREE.Euler();
   /**
-   * Place the weapon from the clip's own `wpn` track.
+   * Place the weapon from the clip's own `wpn` track — by moving everything
+   * ELSE.
    *
-   * A function rather than inline in the render loop because the framing pass
-   * has to step the clip and re-measure, and it must see the weapon where the
-   * loop would have put it.
+   * The weapon itself never moves in first person. Everything hung on it is
+   * stated in world space and measured once at mount, with the weapon at rest:
+   * a sticker is cut out of the body's world geometry and added to the scene,
+   * and the charm's pivot, cord and collision grid are world-space (see the
+   * inspect driver's "MOVING THE WEAPON IS NOT ON OFFER"). This used to carry
+   * the weapon off into the hands and left every sticker and the charm behind
+   * where it had stood, so in first person both were simply gone.
    *
-   * POSITION AND ROTATION ONLY — the scale is deliberately dropped. The two
-   * trees measure in different units and put the conversion in different
-   * places: the glove skeleton is authored in INCHES under a root that scales
-   * by 0.0254, so `wpn.matrixWorld` carries that factor, while the weapon's
-   * geometry is already in METRES because bakePose flattened the skin,
-   * conversion and all, into its vertices. Taking the whole matrix applied
-   * 0.0254 a second time and rendered a two-centimetre AUG — correctly placed,
-   * correctly oriented, and forty times too small.
+   * So the clip's placement is applied inverted, to the frame that holds the
+   * arms and the eye: where the clip says the weapon is RELATIVE to them is
+   * exactly preserved, which is the whole picture. The lamps and the
+   * environment take the same transform (placeFpvLights), so the light on the
+   * gun is what it was too, and the backdrop is pinned to the screen anyway.
+   *
+   * The scales cancel: `wpn` carries the glove skeleton's inch→metre 0.0254 and
+   * fpvUnbake the weapon bone's inverse 39.37 (see fpvUnbake).
    */
+  const fpvRel = new THREE.Matrix4();
+  const fpvLightQ = new THREE.Quaternion();
   function syncFpvSeat() {
-    if (!fpvSeat || !fpvWpn || !fpvUnbake) return;
-    fpvWpn.updateMatrixWorld(true);
-    // wpn -> (undo the weapon's own attachment bone) -> (undo the object's own
-    // transform). See fpvUnbake for what the middle term is and why the scales
-    // cancel to exactly 1.
-    fpvSeat.matrix.multiplyMatrices(fpvWpn.matrixWorld, fpvUnbake);
-    fpvSeat.updateMatrixWorld(true);
+    if (!fpvFrame || !fpvWpn || !fpvUnbake) return;
+    fpvFrame.updateMatrixWorld(true);
+    // Where the clip holds the weapon, in the frame's own space: wpn -> undo
+    // the weapon's attachment bone -> undo the object's own transform.
+    fpvRel.copy(fpvFrame.matrixWorld).invert().multiply(fpvWpn.matrixWorld).multiply(fpvUnbake);
+    // ...inverted, so the weapon stays at rest and the arms and eye come to it.
+    fpvFrame.matrix.copy(fpvRel).invert();
+    fpvFrame.updateMatrixWorld(true);
+    placeFpvLights(fpvFrame.matrix);
+  }
+  /** The lamps and the environment ride with the eye — see syncFpvSeat. Same
+   *  split as applyInspect: a directional lamp's position is only a direction
+   *  (its target is the origin), the spot is a real point. */
+  function placeFpvLights(m: import("three").Matrix4) {
+    m.decompose(fpvPos, fpvLightQ, fpvScale);
+    key.position.copy(keyBase).applyQuaternion(fpvLightQ);
+    rim.position.copy(rimBase).applyQuaternion(fpvLightQ);
+    spot.position.copy(spotBase).applyMatrix4(m);
+    spot.target.position.copy(spotTargetBase).applyMatrix4(m);
+    spot.target.updateMatrixWorld(true);
+    scene.environmentRotation.setFromQuaternion(envQuat.copy(fpvLightQ).multiply(envBase));
   }
 
   if (fpvSpec) {
@@ -11569,14 +11899,13 @@ async function buildViewer(
       // extraction has no clip for.
       const seatM = rig && !rig.wpn ? weaponSeat(THREE, object, hand) : null;
       if (rig && rig.wpn) {
-        // The weapon is placed each frame from the clip — see `driveWeapon`.
-        const seat = new THREE.Group();
-        seat.name = "fpv-seat";
-        seat.matrixAutoUpdate = false;
-        object.removeFromParent();
-        seat.add(object);
-        scene.add(seat);
-        scene.add(rig.root);
+        // The weapon is placed each frame from the clip — by moving this frame,
+        // which holds the arms and (below) the eye. See syncFpvSeat.
+        const frame = new THREE.Group();
+        frame.name = "fpv-frame";
+        frame.matrixAutoUpdate = false;
+        scene.add(frame);
+        frame.add(rig.root);
         if (spec.offset) rig.root.position.set(spec.offset.x, spec.offset.y, spec.offset.z);
         // THE HANDS WEAR THE EQUIPPED FINISH. Same compositor the glove item
         // view uses, pointed at the arms instead — a glove is a glove whichever
@@ -11633,7 +11962,7 @@ async function buildViewer(
         // The flash rides the clip's own muzzle bone.
         const tipBone = rig.root.getObjectByName("wpnTip");
         if (tipBone) flash = buildMuzzleFlash(THREE, scene, tipBone, rig.wpn, FPV_UP);
-        fpvSeat = seat;
+        fpvFrame = frame;
         fpvWpn = rig.wpn;
         /**
          * THE CLIP'S `wpn` DESCRIBES THE WEAPON'S OWN ATTACHMENT BONE, NOT ITS
@@ -11677,7 +12006,9 @@ async function buildViewer(
         // and says so outright — "simulates how the viewmodel looks in-game at
         // this ratio, independent of the browser window's shape".
         fpvCamera = new THREE.PerspectiveCamera(spec.fov ?? debugNumber("fpvfov", 54), FPV_ASPECT, 0.01, 100);
-        scene.add(fpvCamera);
+        // In the frame with the arms: the eye moves with them, the weapon stays.
+        frame.add(fpvCamera);
+        fpvEye = fpvCamera;
         // THE EYE IS THE ORIGIN, AND THE AXES ARE MEASURED — no framing solve.
         //
         // Composing the clip offline from its own rest pose and channels gives
@@ -11713,15 +12044,18 @@ async function buildViewer(
         // offsets, the charm pivot, the collision grid, every world-space probe.
         // Re-parenting it under a group whose matrix undoes the recentre leaves
         // all of them arithmetically untouched.
-        const seat = new THREE.Group();
-        seat.name = "fpv-seat";
-        seat.matrixAutoUpdate = false;
-        seat.matrix.copy(seatM);
-        object.removeFromParent();
-        seat.add(object);
-        rig.hand.add(seat);
+        // Same as the clip path: the weapon stays where it is and the frame
+        // holding the arms and the eye moves, here so the weapon lands on the
+        // hand through `seatM` (syncFpvSeat).
+        const frame = new THREE.Group();
+        frame.name = "fpv-frame";
+        frame.matrixAutoUpdate = false;
+        scene.add(frame);
         if (spec.offset) rig.root.position.set(spec.offset.x, spec.offset.y, spec.offset.z);
-        scene.add(rig.root);
+        frame.add(rig.root);
+        fpvFrame = frame;
+        fpvWpn = rig.hand;
+        fpvUnbake = seatM.clone();
         arms = rig;
         // Near plane is TIGHT: the weapon sits ~15cm from the eye, so the item
         // view's `radius / 100` would clip the muzzle clean off.
@@ -11729,7 +12063,8 @@ async function buildViewer(
         // At the origin, looking down -Z — three's default orientation, so no
         // lookAt is needed and none should be added: a lookAt would re-derive
         // the basis from a target and quietly reintroduce roll.
-        scene.add(fpvCamera);
+        frame.add(fpvCamera);
+        fpvEye = fpvCamera;
       } else {
         rig?.dispose();
         console.warn(
@@ -12739,8 +13074,10 @@ async function buildViewer(
         });
       }
     } else if (next.backdrop) {
-      // The studio sky until the photograph lands, then the scene's own.
-      scene.environment = envTex;
+      // The studio sky until the photograph lands, then the scene's own. (A
+      // viewer that never needed the studio sky keeps its current light for
+      // that beat rather than fetching the HDRI to show it for one.)
+      if (envTex) scene.environment = envTex;
       setBackdrop(null, false);
       applyPhotoBackdrop(next);
     } else if (next.daylight) {
@@ -12748,7 +13085,15 @@ async function buildViewer(
       scene.environment = day.env;
       setBackdrop(day.plate, true);
     } else {
-      scene.environment = envTex;
+      // A studio rig picked on a viewer that opened under another one: the
+      // HDRI may not have been fetched yet. Same arrival check as the map rigs.
+      if (envTex) scene.environment = envTex;
+      else {
+        void getStudioEnv(THREE, RoomEnvironment, gl).then((env) => {
+          envTex = env;
+          if (!disposed && rigKey === next.key) scene.environment = env;
+        });
+      }
       setBackdrop(null, false);
     }
     const lit = { ...next.lighting, ...(opts?.lighting ?? {}) };

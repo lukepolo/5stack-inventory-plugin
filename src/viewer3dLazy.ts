@@ -15,30 +15,44 @@
  *  - `INCOMPLETE` — a comparison, not a call. ./viewerSentinel.
  * Both exist so the common paths never touch this file at all.
  *
- * three is NOT prefetched with the chunk: viewer3d imports it lazily itself and
- * always has, and first mount is still where that cost lands.
+ * NOTHING here runs at load. The app used to warm this chunk at idle
+ * (prefetchViewer3d, called from App.vue's onMounted), which put ~220kB in
+ * front of every visitor who only browses the grid, and still left three for
+ * the first open. Now the first ask fetches BOTH at once — see viewer3d() —
+ * so the open costs one round trip rather than two, without the idle warm.
  */
 import type * as Viewer3d from "./viewer3d";
 
 let loaded: typeof Viewer3d | null = null;
 let loading: Promise<typeof Viewer3d> | null = null;
 
-/** The viewer module, fetching its chunk on first ask. Repeat calls share the
- *  one import. */
+/**
+ * The viewer module, fetching its chunk on first ask. Repeat calls share the
+ * one import.
+ *
+ * three (and GLTFLoader, the other large addon) are asked for in the same
+ * breath. viewer3d imports them lazily itself, so on their own they would only
+ * start once this chunk had arrived and run: two round trips, with the larger
+ * download second. Fired here they come down alongside it, and viewer3d's own
+ * import() then resolves from the module map. A failure is not reported here:
+ * the viewer's own import repeats it and surfaces it.
+ */
 export function viewer3d(): Promise<typeof Viewer3d> {
-  if (!loading) loading = import("./viewer3d").then((m) => (loaded = m));
+  if (!loading) {
+    void import("three").catch(() => {});
+    void import("three/examples/jsm/loaders/GLTFLoader.js").catch(() => {});
+    loading = import("./viewer3d").then((m) => (loaded = m));
+  }
   return loading;
 }
 
 /**
- * Warm the chunk once the app is idle.
+ * Warm the chunk (and three with it) once the app is idle.
  *
- * Without this the split just moves the wait: viewer3d is what imports three,
- * so a cold first open would fetch this chunk and only THEN start on three's
- * 190kB — two round trips where there used to be one. Idle time after first
- * paint is free, and by the time anyone clicks a model the import is resolved.
- * Skipped under Save-Data or on a 2g estimate, where the grid's own card art is
- * the better use of the connection.
+ * Not called at load any more (see the top of this file). Kept for a caller
+ * with a real signal that a 3D view is about to open, such as a pointer
+ * resting on an item. Skipped under Save-Data or on a 2g estimate, where the
+ * grid's own card art is the better use of the connection.
  */
 export function prefetchViewer3d(): void {
   if (loading || typeof window === "undefined") return;

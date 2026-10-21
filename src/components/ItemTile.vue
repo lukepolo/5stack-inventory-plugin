@@ -21,6 +21,7 @@ import ItemBadges from "./ItemBadges.vue";
 import SlotStatus from "./SlotStatus.vue";
 import { approxNote, PRICE_WINDOW_LABEL } from "../api";
 import { wearTier } from "../itemVisuals";
+import { hoverPrefetch } from "../prefetch";
 
 const props = withDefaults(
   defineProps<{
@@ -150,6 +151,11 @@ function onClickCapture(e: MouseEvent) {
   e.preventDefault();
 }
 
+// A pointer resting on the tile is the best early sign that its 3D view is
+// about to be opened, so start fetching what that needs. Not where the tile has
+// no way to open one (bulk select, read-only). See src/prefetch.ts.
+const warm = hoverPrefetch(() => (props.hideActions || props.disabled ? null : props.inst));
+
 // Bake status comes from App's single render pipeline (same provide as ItemArt).
 const art = inject<{
   renderingIds: { value: Set<number> };
@@ -196,6 +202,10 @@ const audioSrc = computed(() => props.inst.item?.audio ?? null);
     @pointermove="onPressMove"
     @pointerup="cancelPress"
     @pointercancel="cancelPress"
+    @pointerenter="warm.enter"
+    @pointerleave="warm.leave"
+    @focus="warm.enter"
+    @blur="warm.leave"
     @click.capture="onClickCapture"
   >
     <span class="pointer-events-none absolute inset-0" :style="glowStyle(inst.item?.rarity, 0.22)"></span>

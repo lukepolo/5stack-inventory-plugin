@@ -32,6 +32,7 @@
 //   spray/anodized-air styles, uvScale for everything else
 import { getAssetOrigin, withAssetVersion } from "./api";
 import { loadRawPngTexture } from "./rawPng";
+import { prefetchedUrl } from "./prefetchStore";
 import {
   buildValveMaterials,
   loadValveCombo,
@@ -791,6 +792,12 @@ export interface WeaponInputs {
    *  .exr (RGBA16161616F), not .png — always take the filename from meta.json. */
   position?: string;
   surface?: string;
+  /** 2048 copies of the inputs above that are larger (extraction v39+, meta.json
+   *  `textures2048`; only HD gun bodies have any). compositePaint swaps them in
+   *  when it composites at 2048 or less, where a 4096 input is read at its 2048
+   *  mip anyway: ~6MB instead of ~35MB for an AK-47's color + metalness, and
+   *  measured identical output within a level. Absent on older mounts. */
+  at2048?: Partial<Pick<WeaponInputs, "ao" | "masks" | "color" | "metalness">>;
   weaponLength?: number;
   uvScale?: number;
   separateChannels?: boolean;
@@ -846,10 +853,19 @@ export function loadWeaponInputs(model: string, legacy = false): Promise<WeaponI
         // are fixed while an extraction rewrites what is behind them.
         const res = await fetch(withAssetVersion(`${getAssetOrigin()}/models/${encodeURIComponent(d)}/meta.json`));
         if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) return null;
-        const meta = (await res.json()) as WeaponInputs & { textures?: Record<string, string> };
+        const meta = (await res.json()) as WeaponInputs & {
+          textures?: Record<string, string>;
+          textures2048?: Record<string, string>;
+        };
         const base = `${getAssetOrigin()}/models/${encodeURIComponent(d)}/`;
         const rel = (p?: string) => (p ? withAssetVersion(base + p) : undefined);
+        // Only the keys that HAVE a copy: compositePaint spreads this over the
+        // full set, and an undefined `ao` would erase the real one.
+        const small = meta.textures2048 ?? {};
+        const at2048: WeaponInputs["at2048"] = {};
+        for (const k of ["ao", "masks", "color", "metalness"] as const) if (small[k]) at2048[k] = rel(small[k]);
         return {
+          at2048: Object.keys(at2048).length ? at2048 : undefined,
           ao: rel(meta.textures?.ao),
           masks: rel(meta.textures?.masks),
           color: rel(meta.textures?.color),
@@ -1898,7 +1914,9 @@ function loadTex(
     // The weapon inputs are PNGs with data in their alpha, which Safari empties
     // when the file is fully transparent -- see rawPng.ts.
     cached = loadRawPngTexture(THREE, url)
-      .then((raw) => raw ?? new THREE.TextureLoader().loadAsync(url))
+      // prefetchedUrl: held bytes when src/prefetch.ts warmed this file. The
+      // cache key above stays the real URL either way.
+      .then((raw) => raw ?? prefetchedUrl(url).then((src) => new THREE.TextureLoader().loadAsync(src)))
       .then((t) => {
         t.colorSpace = opts.srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
         if (opts.addr) {
@@ -1952,7 +1970,10 @@ export interface CompositeResult {
 // killed. Halving to 1k quarters the cost, and at phone screen sizes the
 // detail difference isn't visible anyway.
 const COARSE_POINTER = typeof matchMedia !== "undefined" && matchMedia("(pointer: coarse)").matches;
-const MAX_COMPOSITE_SIZE = COARSE_POINTER ? 1024 : 2048;
+/** What a coarse-pointer device (a phone) caps every composite at, whatever the
+ *  style. */
+const PHONE_COMPOSITE_SIZE = 1024;
+const MAX_COMPOSITE_SIZE = COARSE_POINTER ? PHONE_COMPOSITE_SIZE : 2048;
 // Projected styles (2 spraypaint, 5 anodized airbrushed) build the pattern from a
 // triplanar projection of the 1024 position map. The flame/spray graphic is
 // high-frequency, and at 2048 the projection undersamples it — Deagle | Blaze's
@@ -1960,7 +1981,7 @@ const MAX_COMPOSITE_SIZE = COARSE_POINTER ? 1024 : 2048;
 // 4096 (matching its 4096 color/metalness inputs; the position map is natively
 // 1024 for the game too, so resolution here is the atlas, not the input). Match
 // it on desktop; coarse-pointer devices stay at 1024 for memory.
-const MAX_COMPOSITE_SIZE_PROJECTED = COARSE_POINTER ? 1024 : 4096;
+const MAX_COMPOSITE_SIZE_PROJECTED = COARSE_POINTER ? PHONE_COMPOSITE_SIZE : 4096;
 
 type CacheEntry = { result: Omit<CompositeResult, "release">; refs: number; dispose: () => void };
 type RendererCache = Map<string, CacheEntry>;
@@ -2039,6 +2060,29 @@ export interface CompositeReferenceCtx extends ValveInputs {
   makeRT: (srgb: boolean) => import("three").WebGLRenderTarget;
 }
 
+/**
+ * The resolution cap a composite of `def` is made and STORED at on this device
+ * (`maxSize`: see compositePaint). It is part of the shared store's key
+ * (CompositeIdentity.cap), so anything that names a stored composite without
+ * rendering it (the prefetch in prefetch.ts) must ask here rather than repeat
+ * the constants, or it warms files no viewer looks up.
+ */
+export function compositeSizeCap(def: PaintDef, maxSize?: number): number {
+  const wantsProjection = def.style === 2 || def.style === 5;
+  return Math.min(wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE, maxSize ?? Infinity);
+}
+
+/**
+ * The weapon inputs a composite at `sizeCap` actually samples. At a cap of 2048
+ * or less the GPU would read a 4096 input at its 2048 mip, so the 2048 copies
+ * (WeaponInputs.at2048, extraction v39) are the same texels for a quarter of the
+ * download; above it, the full set. compositePaint and src/prefetch.ts both ask
+ * here, so what a prefetch warms is what the composite then loads.
+ */
+export function weaponInputsAt(weapon: WeaponInputs | null | undefined, sizeCap: number): WeaponInputs | null | undefined {
+  return weapon?.at2048 && sizeCap <= 2048 ? { ...weapon, ...weapon.at2048 } : weapon;
+}
+
 export async function compositePaint(
   three: THREE,
   renderer: import("three").WebGLRenderer,
@@ -2096,10 +2140,11 @@ export async function compositePaint(
   // projected skin is sixteen times the pixels of a 1024² one for an answer the
   // eye cannot use mid-gesture. The full-size composite still runs when the
   // drag stops, so nothing ships at proxy resolution.
-  const sizeCap = Math.min(
-    wantsProjection ? MAX_COMPOSITE_SIZE_PROJECTED : MAX_COMPOSITE_SIZE,
-    opts.maxSize ?? Infinity,
-  );
+  const sizeCap = compositeSizeCap(def, opts.maxSize);
+  // The weapon's own inputs at the resolution this composite can use (see
+  // weaponInputsAt). Only the four paint-UV maps have 2048 copies; everything
+  // else is the full set unchanged.
+  const inputs = weaponInputsAt(opts.weapon, sizeCap);
   const key = `${def.pattern ?? "-"}|${def.overlay ?? "-"}|${def.style}|${wear.toFixed(4)}|${seed}|${wkey}|d${opts.debug ?? 0}|${def.caseHardening ? `ch${def.caseHardeningRamp ?? "-"}${def.chRampOffset}` : ""}|a${def.patternAddrH}_${def.patternAddrV}|c${sizeCap}`;
   const cache = cacheFor(renderer);
   const hit = opts.reference || opts.forcePort ? undefined : cache.get(key);
@@ -2190,11 +2235,11 @@ export async function compositePaint(
     (def.masksSkinSpecific && (def.overrideDefaultMasks || (def.caseHardening && def.style === 8))
       ? await urlOf(def.masks)
       : null) ??
-      opts.weapon?.masks ??
+      inputs?.masks ??
       (await urlOf(def.masks)),
-    opts.weapon?.ao ?? urlOf(def.ao),
-    opts.weapon?.color ?? urlOf(def.baseColor),
-    opts.weapon?.metalness ?? urlOf(def.baseRM),
+    inputs?.ao ?? urlOf(def.ao),
+    inputs?.color ?? urlOf(def.baseColor),
+    inputs?.metalness ?? urlOf(def.baseRM),
     urlOf(def.paintRoughnessTex),
     urlOf(def.paintMetalnessTex),
     urlOf(def.overlay),
@@ -2627,7 +2672,8 @@ export async function compositePaint(
       await opts.reference({
         ...valveInputs,
         renderer,
-        weapon: opts.weapon,
+        // The set actually composited from, so the reference reads the same texels.
+        weapon: inputs,
         seed,
         size,
         quad: quadGeom!,

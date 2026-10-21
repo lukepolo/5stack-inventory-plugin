@@ -1,4 +1,4 @@
-import { readFileSync, createReadStream, createWriteStream } from "node:fs";
+import { readFileSync, createWriteStream } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
@@ -12,7 +12,7 @@ import Fastify, { LogController } from "fastify";
 import type { PoolClient } from "pg";
 import { pool } from "./db.ts";
 // Shared with scripts/serve.mjs — see the module header for why it is .mjs.
-import { parseByteRange } from "./byteRange.mjs";
+import { IMMUTABLE, openAssetBody, planAsset } from "./assetResponse.mjs";
 import { getIdentity } from "./identity.ts";
 import { isAllowedOrigin, originPolicyFromEnv, refuseCrossSite, requestHost } from "./originGuard.ts";
 import { autoExtractor, installProblem } from "./autoExtract.ts";
@@ -42,11 +42,23 @@ import {
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
 import { GRID_SLOT_IDS, GRID_SLOTS, resolveGrid } from "./loadoutGrid.ts";
+import { compositeStem } from "./compositeStore.ts";
+import {
+  CARD_FILE_RE,
+  CARD_FORMATS,
+  CARD_KEY_RE,
+  cardFormatOf,
+  cardPixelSize,
+  cardStem,
+  findCard,
+  plausibleCard,
+  readCard,
+  storeCard,
+} from "./cardStore.ts";
 import {
   itemDescription,
   itemTitle,
   parseShareTarget,
-  pngPixelSize,
   renderUnfurl,
   requestOrigin,
   truncate,
@@ -267,6 +279,10 @@ app.get("/api/catalog", async () => {
     // copy's) can bake under another rig without a single card in a shared store
     // ending up lit two different ways.
     bakeEnvironment: process.env.BAKE_ENVIRONMENT || undefined,
+    // The image formats the card uploads take (see cardStore.ts). A client
+    // sends WebP only when this says it may: a backend from before WebP cards
+    // sends nothing here and refuses anything but a PNG.
+    cardFormats: CARD_FORMATS,
   };
 });
 
@@ -317,6 +333,9 @@ export function renderKeyForRow(
   // count: the 2D module renders a blank display, so the card is identical at 0
   // kills and 4000, and keying on the count would re-bake every card on every
   // kill. Must match renderKeyFor in src/api.ts.
+  //
+  // The `.png` is part of the NAME only: the file behind it may be the WebP
+  // with the same stem (storeCard / findCard in cardStore.ts).
   const st = row.stattrak ? "-st" : "";
   // A PET's coat and life stage change its card as much as a seed does, so they
   // key it too — as suffixes present only when SET, which leaves every other
@@ -354,11 +373,12 @@ async function pruneRenders(): Promise<number> {
   // is-stale. Deleting the whole cache on that reading would be the worst
   // possible response to a read failure.
   if (!current) return 0;
-  const suffix = `-v${current}.png`;
+  const suffix = `-v${current}`;
   let removed = 0;
   for (const name of await fs.readdir(RENDERS_DIR).catch(() => [])) {
     // `cat-` is the catalog store (see /api/render/catalog), same versioning.
-    if (!/^(inst|cat)-/.test(name) || !name.endsWith(".png") || name.endsWith(suffix)) continue;
+    // Either format: a card is its key's stem plus `.png` or `.webp`.
+    if (!CARD_FILE_RE.test(name) || cardStem(name).endsWith(suffix)) continue;
     await fs.rm(path.join(RENDERS_DIR, name), { force: true }).catch(() => {});
     removed++;
   }
@@ -366,14 +386,17 @@ async function pruneRenders(): Promise<number> {
 }
 // The size check below allows 3MB, but Fastify's 1MB default would have
 // rejected anything over 1MB before the handler saw it — so that ceiling was
-// never real. Card PNGs are ~100KB, which is why it never surfaced.
+// never real. Card PNGs are 0.2-1MB (measured on 16 bakes), WebPs a tenth of it.
+//
+// PNG or WebP, told apart by their magic bytes (cardStore.ts), and stored as
+// whichever it is, a PNG transcoded to WebP when cwebp is there.
 app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
     return reply.status(401).send({ error: "not signed in" });
   }
   const body = request.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > 3_000_000 || !/^\x89PNG/.test(body.subarray(0, 4).toString("latin1"))) {
+  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > 3_000_000 || !cardFormatOf(body)) {
     return reply.status(400).send({ error: "bad render" });
   }
   const { rows } = await pool.query(
@@ -389,11 +412,7 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
   }
   try {
     const [resolved] = await withAttachments(identity.steamId, [rows[0]]);
-    await fs.mkdir(RENDERS_DIR, { recursive: true });
-    await fs.writeFile(
-      path.join(RENDERS_DIR, renderKeyForRow({ ...rows[0], look: cardLook(resolved) }, await renderVersion())),
-      body,
-    );
+    await storeCard(RENDERS_DIR, renderKeyForRow({ ...rows[0], look: cardLook(resolved) }, await renderVersion()), body);
     return { ok: true };
   } catch {
     return reply.status(500).send({ error: "render store unavailable" });
@@ -420,18 +439,10 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
 //    the session (bakeCatalogArt) and simply doesn't publish it.
 //  - Only these types, and FIRST WRITER WINS: a stored card is never replaced
 //    by an upload, only by the version sweep after an extraction.
-//  - The PNG's own header must describe a plausible card, not just start with
-//    the magic bytes.
+//  - The PNG's or WebP's own header must describe a plausible card, not just
+//    start with the magic bytes (plausibleCard in cardStore.ts).
 const CATALOG_RENDER_TYPES = new Set(["pet", "glove"]);
 export const catalogRenderKey = (itemId: number, version: number) => `cat-${itemId}-v${version}.png`;
-/** IHDR sanity: the signature, an IHDR chunk first, and card-sized dimensions. */
-function plausibleCardPng(buf: Buffer): boolean {
-  if (buf.length < 33 || !buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
-  if (buf.readUInt32BE(8) !== 13 || buf.subarray(12, 16).toString("latin1") !== "IHDR") return false;
-  const w = buf.readUInt32BE(16);
-  const h = buf.readUInt32BE(20);
-  return w >= 16 && h >= 16 && w <= 4096 && h <= 4096;
-}
 app.post<{ Params: { id: string } }>("/api/render/catalog/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
@@ -441,16 +452,15 @@ app.post<{ Params: { id: string } }>("/api/render/catalog/:id", { bodyLimit: 3_0
     return reply.status(400).send({ error: "not an item that takes a catalog render" });
   }
   const body = request.body as Buffer;
-  if (!Buffer.isBuffer(body) || body.length > 3_000_000 || !plausibleCardPng(body)) {
+  if (!Buffer.isBuffer(body) || body.length > 3_000_000 || !plausibleCard(body)) {
     return reply.status(400).send({ error: "bad render" });
   }
   try {
-    await fs.mkdir(RENDERS_DIR, { recursive: true });
-    // `wx`: fails if it exists, which is the first-writer-wins rule above.
-    await fs.writeFile(path.join(RENDERS_DIR, catalogRenderKey(id, await renderVersion())), body, { flag: "wx" });
-    return { ok: true };
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "EEXIST") return { ok: true, existing: true };
+    // `exclusive`: nothing is written if a card is already there in either
+    // format, which is the first-writer-wins rule above.
+    const stored = await storeCard(RENDERS_DIR, catalogRenderKey(id, await renderVersion()), body, { exclusive: true });
+    return stored === "exists" ? { ok: true, existing: true } : { ok: true };
+  } catch {
     return reply.status(500).send({ error: "render store unavailable" });
   }
 });
@@ -504,12 +514,18 @@ const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
 const MODELS_DIR = process.env.MODELS_DIR ?? "/cs2-models/models";
 const MUSIC_DIR = process.env.MUSIC_DIR ?? "/cs2-models/music";
+const ANIMS_DIR = process.env.ANIMS_DIR ?? "/cs2-models/anims";
 const ASSET_TYPES: Record<string, string> = {
   ".json": "application/json",
   ".webp": "image/webp",
   ".png": "image/png",
   ".glb": "model/gltf-binary",
-  ".exr": "application/octet-stream",
+  // A weapon's composite-input position map (<key>.inputs.hd/position.exr).
+  // It was missing here, so a cross-node miss on it was a 404 and the two
+  // projected paint styles lost their placement.
+  ".exr": "image/x-exr",
+  // The map panoramas and backdrop plates under /anims/env/.
+  ".jpg": "image/jpeg",
   // Music kit menu themes. Both containers, because the extractor probes what
   // Source2Viewer actually wrote rather than assuming mp3 — the format follows
   // the codec inside the .vsnd_c.
@@ -521,82 +537,80 @@ const ASSET_TYPES: Record<string, string> = {
 // own CS2 install (scripts/extract-models.sh). A miss is a 404 and stays a
 // 404: there is no upstream to fall back to by design, so an unpopulated or
 // out-of-date mount shows up as a visible error instead of silently serving
-// someone else's copy. nginx serves these directly; these routes only back its
+// someone else's copy. nginx serves these directly; these routes back its
 // static-miss fallback (frontend/backend pods can land on different nodes).
-function serveAssetDir(routePrefix: string, dir: string) {
-  app.get<{ Params: { "*": string } }>(`${routePrefix}/*`, async (request, reply) => {
-    const rel = request.params["*"] ?? "";
-    const type = ASSET_TYPES[path.extname(rel).toLowerCase()];
-    if (!type || rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+$/.test(rel)) {
-      return reply.status(404).send({ error: "not found" });
-    }
-    reply.header("Access-Control-Allow-Origin", "*");
-    // On EVERY reply, not just ranged ones: a browser only attempts a range
-    // request after an ordinary response told it ranges are available, so an
-    // <audio> element that never sees this header treats the track as
-    // unseekable and downloads all 3.5MB before the first note.
-    reply.header("Accept-Ranges", "bytes");
-    const file = path.join(dir, rel);
-    // Two very different lifetimes behind one route:
-    //
-    //  - TEXTURES and ICONS carry a content hash in the filename, so a given
-    //    URL never changes meaning. Cache them hard.
-    //  - MATERIAL JSON does NOT: the filename comes from cs2-lib and is fixed,
-    //    while the content (and the texture names it points at) is rewritten
-    //    by every extraction. Caching those for a day meant a browser kept a
-    //    material referencing textures the new run had renamed — every one
-    //    404'd and the skin rendered white long after the mount was correct.
-    //  - MUSIC is the material case again: `valve_cs2_01.mp3` is a name the
-    //    extractor reuses every run, so it is NOT self-versioning either, and
-    //    treating it as immutable on filename alone would pin a browser to one
-    //    CS2 build's audio forever.
-    //
-    // So both are only immutable once the client has stamped the extraction
-    // version on them (see withAssetVersion). Unversioned requests still
-    // revalidate, which keeps old clients and hand-typed URLs correct.
-    // Set on the SUCCESS paths only, never up here. A miss on this route is a
-    // 404, and the extractor's atomic directory swap makes misses real: for the
-    // instant between its two renames the live directory does not exist, and a
-    // pod whose mount is a run behind answers 404 for longer than that. A 404
-    // that goes out `immutable` is a 404 the browser and Cloudflare keep for a
-    // year against a URL whose content now exists, so the skin stays white long
-    // after the mount is correct — the exact trap /images had to be fixed for
-    // once already.
-    //
-    // And a miss says `no-store` OUT LOUD. Sending no Cache-Control at all was
-    // meant to mean "revalidate every time", but Cloudflare stamps its default
-    // browser TTL (max-age=14400) on any response without one, 404s included:
-    // the glove tint maps restored after a CS2 format change stayed missing in
-    // browsers for four hours, every 22-finish glove still flat cyan.
-    const versioned = (request.query as { v?: string } | undefined)?.v != null;
-    const selfVersioning = type !== "application/json" && !type.startsWith("audio/");
-    const cacheControl = selfVersioning || versioned ? "public, max-age=31536000, immutable" : "no-cache";
-    try {
-      // Only stat when a range was actually asked for: the icon and texture
-      // routes are hot and pay nothing for a feature they never use.
-      if (request.headers.range) {
-        const { size } = await fs.stat(file);
-        const range = parseByteRange(request.headers.range, size);
-        if (range === false) {
-          return reply.code(416).header("Content-Range", `bytes */${size}`).send();
-        }
-        if (range) {
-          reply.header("Cache-Control", cacheControl);
-          reply.header("Content-Range", `bytes ${range.start}-${range.end}/${size}`);
-          reply.header("Content-Length", range.end - range.start + 1);
-          return reply.code(206).type(type).send(createReadStream(file, { start: range.start, end: range.end }));
-        }
+//
+// The answer itself — validators and 304s, the extractor's `.gz` siblings,
+// on-the-fly gzip, byte ranges — is decided in assetResponse.mjs, which
+// scripts/serve.mjs shares, so the three servers (nginx being the third) send
+// the same thing for the same URL.
+//
+// GET and HEAD are declared together instead of leaving HEAD to Fastify: its
+// automatic HEAD route runs the GET handler, so the viewer's HEAD existence
+// probe on a GLB read the whole file, and it then reset Content-Length to 0.
+function serveAssetDir(routePrefix: string, dir: string, opts: { immutable?: boolean } = {}) {
+  app.route<{ Params: { "*": string }; Querystring: { v?: string } }>({
+    method: ["GET", "HEAD"],
+    url: `${routePrefix}/*`,
+    handler: async (request, reply) => {
+      const rel = request.params["*"] ?? "";
+      const type = ASSET_TYPES[path.extname(rel).toLowerCase()];
+      if (!type || rel.includes("..") || rel.includes("\\") || !/^[\w\-./ %()]+$/.test(rel)) {
+        return reply.status(404).send({ error: "not found" });
       }
-      const buf = await fs.readFile(file);
-      reply.header("Cache-Control", cacheControl);
-      return reply.type(type).send(buf);
-    } catch {
-      return reply.status(404).header("Cache-Control", "no-store").send({ error: "not extracted" });
-    }
+      reply.header("Access-Control-Allow-Origin", "*");
+      // As nginx sends it: without it a cross-origin Resource Timing entry
+      // reports 0 bytes, and ?perf=1's byte counter is blind to these files.
+      reply.header("Timing-Allow-Origin", "*");
+      const file = path.join(dir, rel);
+      // Every tree behind this route except the icons is rewritten in place by
+      // an extraction under names that do not change: paint MATERIALS (cs2-lib's
+      // names), paint TEXTURES (hashed over their archive path, not their
+      // bytes), models and their textures, music (`valve_cs2_01.mp3` every
+      // run), clips. Caching a material for a day once kept a browser pointing
+      // at textures the next run had renamed, and every skin rendered white. So
+      // a file is only immutable once the client has stamped the extraction
+      // version on its URL (withAssetVersion); unversioned requests revalidate,
+      // which keeps old clients and hand-typed URLs correct — and with an ETag
+      // on every answer, revalidating costs a 304 rather than the file.
+      //
+      // This used to treat every non-JSON, non-audio file as self-versioning.
+      // That is true of the icons and of nothing else here: an unversioned GLB
+      // or texture from this route was pinned for a year, where nginx, the
+      // primary server for the same URL, revalidated it. Item ICONS keep it:
+      // their hash is cs2-lib's, over the image itself.
+      //
+      // An empty `?v=` is no stamp, as in nginx's map.
+      const cacheControl = opts.immutable || request.query?.v ? IMMUTABLE : "no-cache";
+      // Cache-Control is set on the SUCCESS paths only. A miss on this route is
+      // a 404, and the extractor's atomic directory swap makes misses real: for
+      // the instant between its two renames the live directory does not exist,
+      // and a pod whose mount is a run behind answers 404 for longer than that.
+      // A 404 that goes out `immutable` is a 404 the browser and Cloudflare keep
+      // for a year against a URL whose content now exists, so the skin stays
+      // white long after the mount is correct — the exact trap /images had to be
+      // fixed for once already.
+      //
+      // And a miss says `no-store` OUT LOUD. Sending no Cache-Control at all was
+      // meant to mean "revalidate every time", but Cloudflare stamps its default
+      // browser TTL (max-age=14400) on any response without one, 404s included:
+      // the glove tint maps restored after a CS2 format change stayed missing in
+      // browsers for four hours, every 22-finish glove still flat cyan.
+      const plan = await planAsset({ file, type, method: request.method, headers: request.headers, cacheControl }).catch(
+        () => null,
+      );
+      if (!plan) return reply.status(404).header("Cache-Control", "no-store").send({ error: "not extracted" });
+      for (const [name, value] of Object.entries(plan.headers)) {
+        // Appended, not set: @fastify/cors may already have put `Origin` there.
+        const prior = name === "Vary" ? reply.getHeader("vary") : undefined;
+        reply.header(name, prior ? `${prior}, ${value}` : value);
+      }
+      return reply.code(plan.status).send(plan.body ? openAssetBody(plan.body) : undefined);
+    },
   });
 }
 serveAssetDir("/paints", PAINTS_DIR);
-serveAssetDir("/images", IMAGES_DIR);
+serveAssetDir("/images", IMAGES_DIR, { immutable: true });
 // Models were the one mount-backed tree with no static-miss fallback: nginx
 // ended its /models/ block in `=404`. That was survivable while the tree was 36
 // weapons written in one early step, but agents mirror their whole archive path
@@ -609,26 +623,35 @@ serveAssetDir("/models", MODELS_DIR);
 // nginx's /music/ block ends in `try_files $uri @backend` — and it is the one
 // mount whose clients seek, which is why serveAssetDir learned byte ranges.
 serveAssetDir("/music", MUSIC_DIR);
+// First-person clips with their sounds and effect textures, and the map
+// panoramas. nginx's /anims/ block has always ended in `try_files $uri
+// @backend`, but nothing answered here, so a cross-node miss was Fastify's own
+// "route not found" and first person stood still.
+serveAssetDir("/anims", ANIMS_DIR);
 
 // Serve renders directly too — nginx falls back here when its mount copy
 // misses (e.g. frontend/backend pods on different nodes).
 // Registered under BOTH paths: /api/renders/* is the canonical client path
 // (the /api ingress provably reaches this pod — uploads use it); bare
 // /renders/* backs nginx's static-miss fallback.
+//
+// The key names the card, not its format: `<key>.png` answers with the WebP
+// when that is what is stored, as image/webp (readCard in cardStore.ts).
 for (const route of ["/api/renders/:key", "/renders/:key"]) {
   app.get<{ Params: { key: string } }>(route, async (request, reply) => {
   const key = request.params.key;
-  if (!/^[\w.-]+\.png$/.test(key)) {
+  if (!CARD_KEY_RE.test(key)) {
     return reply.status(404).send({ error: "not found" });
   }
   try {
-    const buf = await fs.readFile(path.join(RENDERS_DIR, key));
+    const card = await readCard(RENDERS_DIR, key);
+    if (!card) throw new Error("not stored");
     // CORS comes from @fastify/cors (echoed origin + allow-credentials). A
     // manual `*` here overrides that echo, and browsers reject `*` on
     // credentialed fetches — the client's "already baked?" HEAD check then
     // fails every load and cards re-bake despite the render being served.
     reply.header("Cache-Control", "public, max-age=3600");
-    return reply.type("image/png").send(buf);
+    return reply.type(card.type).send(card.body);
   } catch {
     // A MISS must never be cached. `.png` is an extension Cloudflare caches by
     // default, 404s included, so a card asked for a moment before its first
@@ -723,7 +746,7 @@ interface ShareArt {
  * a Location header would put the owner's row handle in a public response, which
  * is exactly what withoutInstanceHandle exists to prevent one level down.
  */
-async function bakedShareRender(facts: ShareFacts, version: number): Promise<string | null> {
+async function bakedShareRender(facts: ShareFacts, version: number): Promise<{ file: string; type: string } | null> {
   if (facts.instanceId == null) return null;
   // The card's look (stickers, charm) is in its filename too, and the facts do
   // not carry it — read it off the row with its links resolved, as the upload
@@ -732,11 +755,11 @@ async function bakedShareRender(facts: ShareFacts, version: number): Promise<str
     steam_id: string; stickers: unknown[] | null; charm_id: number | null; charm_offset: ItemRow["charm_offset"];
   }>(`SELECT steam_id, stickers, charm_id, charm_offset FROM inventory.owned_items WHERE id = $1`, [facts.instanceId]);
   const look = rows[0] ? cardLook((await withAttachments(String(rows[0].steam_id), [rows[0]]))[0]) : "";
-  const file = path.join(
+  // Either format — the bake is a WebP or a PNG under the same key.
+  return findCard(
     RENDERS_DIR,
     renderKeyForRow({ id: facts.instanceId, wear: facts.wear, seed: facts.seed, stattrak: facts.stattrak, look }, version),
   );
-  return (await fs.stat(file).then((s) => s.isFile(), () => false)) ? file : null;
 }
 
 /** The econ icon's path on the mount, or null if the catalog's value is not the
@@ -766,7 +789,7 @@ function econIconFile(image: string | null | undefined): string | null {
 async function shareArtFor(facts: ShareFacts | null, version: number): Promise<ShareArt | null> {
   if (!facts) return null;
   const baked = await bakedShareRender(facts, version);
-  if (baked) return { file: baked, type: "image/png", baked: true };
+  if (baked) return { ...baked, baked: true };
   const image = getItem(facts.itemId)?.image ?? null;
   const icon = econIconFile(image);
   if (icon && (await fs.stat(icon).then((s) => s.isFile(), () => false))) {
@@ -1031,15 +1054,16 @@ function sharePluginPath(target: ShareTarget): string {
   }
 }
 
-/** PNG dimensions without reading the file: 24 bytes off the front. Only the
- *  bakes are PNGs, so an icon simply has no dimensions to declare. */
+/** A bake's dimensions without reading the file: 30 bytes off the front, PNG
+ *  or WebP (cardPixelSize). Only bakes are asked, so an icon simply has no
+ *  dimensions to declare. */
 async function pngSizeOf(file: string): Promise<{ width: number; height: number } | null> {
   let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
   try {
     handle = await fs.open(file, "r");
-    const head = Buffer.alloc(24);
-    const { bytesRead } = await handle.read(head, 0, 24, 0);
-    return pngPixelSize(head.subarray(0, bytesRead));
+    const head = Buffer.alloc(30);
+    const { bytesRead } = await handle.read(head, 0, 30, 0);
+    return cardPixelSize(head.subarray(0, bytesRead));
   } catch {
     return null;
   } finally {
@@ -1087,7 +1111,7 @@ app.get("/api/share/meta", async (request, reply) => {
   const query = flatQuery(request.query);
   const { target, art, title, description } = await resolveShare(query);
   const origin = requestOrigin(request);
-  const size = art?.file && art.type === "image/png" ? await pngSizeOf(art.file) : null;
+  const size = art?.file && art.baked ? await pngSizeOf(art.file) : null;
   reply.header("Cache-Control", "public, max-age=300");
   return {
     kind: target.kind,
@@ -1111,7 +1135,7 @@ app.get("/api/share/unfurl", async (request, reply) => {
   const query = flatQuery(request.query);
   const { target, art, title, description } = await resolveShare(query);
   const origin = requestOrigin(request);
-  const size = art?.file && art.type === "image/png" ? await pngSizeOf(art.file) : null;
+  const size = art?.file && art.baked ? await pngSizeOf(art.file) : null;
   const canonical = panelShareUrl(sharePluginPath(target), forwardedShareQuery(query));
   // og:url is the address of the THING, so it is the panel's page when we know
   // it and the URL actually fetched when we do not — never a guess. The human
@@ -1136,30 +1160,27 @@ app.get("/api/share/unfurl", async (request, reply) => {
 });
 
 // ---- Composite store routes ---------------------------------------------------
-// Filename builder. MUST agree with compositeKey() in src/compositeStore.ts.
-//
-// Unlike renderKeyForRow, a disagreement here is harmless: the backend derives
-// the name from the identity it verified, so a drift means clients simply never
-// hit the cache. It can never serve one skin's pixels under another's name.
-// The POST response echoes the derived name so a mismatch shows up in the
-// client console instead of silently costing every hit.
-const safeSeg = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
-function compositeStem(id: {
-  model: string; legacy: boolean; material: string; wear: number; seed: number; cap: number;
-}) {
-  return [
-    safeSeg(id.model),
-    id.legacy ? "legacy" : "hd",
-    safeSeg(id.material.replace(/\.(vcompmat|vmat)\.json$/i, "")),
-    Math.min(Math.max(id.wear, 0), 1).toFixed(4),
-    Math.max(0, Math.trunc(id.seed)),
-    `c${id.cap}`,
-  ].join("__");
-}
+// The filename builder (compositeStem) lives in ./compositeStore.ts, so the
+// standalone mock checks uploads with the same code. It MUST agree with
+// compositeKey() in src/compositeStore.ts.
 // Only the caps the client can actually composite at (see MAX_COMPOSITE_SIZE and
 // MAX_COMPOSITE_SIZE_PROJECTED). Bounded so a client cannot invent an unlimited
 // number of variants of the same skin.
 const COMPOSITE_CAPS = new Set([1024, 2048, 4096]);
+
+type CompositeClaim = { model: string; legacy: boolean; material: string; wear: number; seed: number };
+/** Does this user own an item that composites to this tuple? The wear/seed pair
+ *  is effectively unique per instance, so it is matched first in SQL. */
+async function ownedBy(steamId: string, c: CompositeClaim): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT item_id FROM inventory.owned_items
+      WHERE steam_id = $1 AND seed = $2 AND ROUND(wear::numeric, 4) = ROUND($3::numeric, 4)`,
+    [steamId, c.seed, c.wear],
+  );
+  return getItemsByIds(rows.map((r: { item_id: number }) => Number(r.item_id))).some(
+    (i) => i.model === c.model && i.paintMaterial === c.material && !!i.legacyPaint === c.legacy,
+  );
+}
 
 // Fastify's default bodyLimit is 1MB, which silently 413s every composite
 // before the handler ever runs — a lossless 2k pair is a few MB and a 4k
@@ -1212,14 +1233,7 @@ app.post<{ Params: { gen: string; file: string } }>("/api/composite/:gen/:file",
   // actually owns: the wear/seed pair is effectively unique per instance, so
   // this bounds the blast radius of a doctored client to its own items rather
   // than to every viewer of that skin.
-  const { rows } = await pool.query(
-    `SELECT item_id FROM inventory.owned_items
-      WHERE steam_id = $1 AND seed = $2 AND ROUND(wear::numeric, 4) = ROUND($3::numeric, 4)`,
-    [identity.steamId, seed, wear],
-  );
-  const owns = getItemsByIds(rows.map((r: { item_id: number }) => Number(r.item_id))).some(
-    (i) => i.model === model && i.paintMaterial === material && !!i.legacyPaint === legacy,
-  );
+  const owns = await ownedBy(identity.steamId, { model, legacy, material, wear, seed });
   if (!owns) return reply.status(403).send({ error: "not your item" });
 
   const stem = compositeStem({ model, legacy, material, wear, seed, cap });
@@ -5522,6 +5536,10 @@ async function migrateLegacyTypeCfgs(
 // That is exactly what happened once. They are reported here but NOT clearable;
 // re-running the extraction is the way to rebuild them.
 type DirStat = { files: number; bytes: number };
+/** A bucket also says what it costs to SEND when some of its files have a
+ *  precompressed `.gz` sibling (extraction v39): each such file counts at its
+ *  `.gz` size. Absent when nothing in the bucket has one. */
+type BucketStat = DirStat & { sentBytes?: number };
 
 /**
  * Walk a tree once, bucketing every file by what it IS.
@@ -5534,10 +5552,14 @@ type DirStat = { files: number; bytes: number };
 async function dirStats(
   dir: string,
   classify?: (rel: string) => string | null,
-): Promise<DirStat & { buckets: Record<string, DirStat> }> {
+): Promise<DirStat & { buckets: Record<string, BucketStat> }> {
   let files = 0;
   let bytes = 0;
-  const buckets: Record<string, DirStat> = {};
+  const buckets: Record<string, BucketStat> = {};
+  // Every classified file's size and bucket, so the `.gz` siblings can be
+  // matched up once the walk is done (a sibling can be listed before or after
+  // its original).
+  const seen = new Map<string, { size: number; key: string }>();
   async function walk(d: string, rel: string) {
     let entries;
     try {
@@ -5558,11 +5580,18 @@ async function dirStats(
           const b = (buckets[key] ??= { files: 0, bytes: 0 });
           b.files++;
           b.bytes += size;
+          seen.set(childRel, { size, key });
         }
       }
     }
   }
   await walk(dir, "");
+  for (const [rel, { size, key }] of seen) {
+    const gz = rel.endsWith(".gz") ? undefined : seen.get(`${rel}.gz`);
+    if (!gz) continue;
+    const b = buckets[key];
+    b.sentBytes = (b.sentBytes ?? b.bytes) - size + gz.size;
+  }
   return { files, bytes, buckets };
 }
 
@@ -5579,12 +5608,20 @@ async function dirStats(
  * row that read as if it were a few hundred MB of GLBs.
  */
 function classifyModelFile(rel: string): string | null {
+  const base = rel.split("/").pop() ?? "";
+  // Copies the extraction adds BESIDE an original (v39), counted on their own
+  // so the rows above show what the mount holds rather than what it holds
+  // twice: gzip copies the servers send instead of a model or a JSON file
+  // (they used to land in "anchors & markup" and tripled it), and the 2048
+  // copies of the largest composite inputs.
+  if (base.endsWith(".gz")) return "compressedCopies";
   // Agents keep their archive path (agents/models/<faction>/<name>.glb).
   if (rel.startsWith("agents/")) return "agents";
+  const inInputs = /(^|\/)[^/]+\.inputs(\.hd)?\//.test(rel);
+  if (inInputs && /\.2048\.png$/.test(base)) return "inputs2048";
   // Per-weapon paint compositor sources — by far the largest bucket, and the
   // one an operator low on disk most wants to see.
-  if (/(^|\/)[^/]+\.inputs(\.hd)?\//.test(rel)) return "compositeInputs";
-  const base = rel.split("/").pop() ?? "";
+  if (inInputs) return "compositeInputs";
   if (base.startsWith("kc_") && base.endsWith(".glb")) return "charms";
   if (base.endsWith(".glb")) return "meshes"; // weapons, knives, gloves, modules
   if (base.endsWith(".webp") || base.endsWith(".png")) return "modelTextures";

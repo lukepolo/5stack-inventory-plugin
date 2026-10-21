@@ -239,6 +239,27 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v39 (2026-10-21): LIGHTER ASSETS, same pixels (scripts/lighten-assets.mjs).
+#   inputs-2048  every composite input over 2048px gets a 2048 copy beside it
+#                (`<name>.2048.png`, listed in meta.json as `textures2048`). The
+#                compositor renders at 2048 outside the projected styles and
+#                reads a 4096 input at its 2048 mip anyway, so an HD AK-47 skin
+#                now downloads ~10MB of color/metalness instead of ~35MB. Only the
+#                HD gun bundles have such inputs (90 maps in 35 bundles); measured
+#                composite output within 2 levels, 0% of pixels over 2.
+#   precompress  `<file>.gz` (gzip -9) beside every .glb and .json over 1KB on
+#                /models, for the servers to send instead of the raw file. Nothing
+#                compressed a GLB on the wire before: ak47.glb went out at 3.3MB,
+#                its .gz is 1.1MB. Every .gz is deleted at the START of a run (see
+#                "Precompressed siblings" below), because nginx's gzip_static sends
+#                a .gz without checking it still matches its original.
+# Nothing existing changes: originals stay as they were, so the installed plugin,
+# which shares this mount, keeps loading exactly what it loads today.
+# v38 (2026-10-21): require a readable econ schema before producing
+# schema-dependent assets (a single archive match can be written as the output
+# file itself unless the destination directory exists, leaving pets, gloves and
+# music empty), and keep floating-point paint/position textures as EXR with
+# their real format referenced, where cwebp silently dropped them.
 # v37 (2026-10-20): MVP ANTHEMS (step music-audio). Each kit's
 # roundmvpanthem — the clip the game plays when you are the round's MVP — is
 # decoded next to its menu theme as <folder>.mvp.<ext>, indexed in its own
@@ -316,12 +337,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-# v38: require a readable econ schema before producing schema-dependent assets.
-# A single archive match can be written as the output file itself unless the
-# destination directory already exists, leaving pets, gloves and music empty.
-# Also preserve floating-point paint/position textures as EXR and reference
-# their real format. Passing them to cwebp silently left missing paint inputs.
-EXTRACT_VERSION=38
+EXTRACT_VERSION=39
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -430,7 +446,7 @@ export PROGRESS_FILE
 # previous step, which reads as a hang. (model-textures was added in v9 and did
 # exactly that for one run: several minutes of texture compression with the UI
 # still showing "Mapping models to catalog keys" as the last thing that moved.)
-STEPS=(decompile-models rename-models pet-models model-textures composite-inputs charm-anchors sticker-markup sticker-masks stattrak-art charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims stamp)
+STEPS=(decompile-models rename-models pet-models model-textures composite-inputs inputs-2048 charm-anchors sticker-markup sticker-masks stattrak-art charm-models charm-physics econ-icons paint-chain sticker-art music-audio viewmodel-anims precompress stamp)
 
 # Read-modify-write via python: the file is shared with the embedded python
 # steps, and hand-rolling JSON in shell got the quoting wrong the first time.
@@ -519,6 +535,10 @@ step() { # step "Name" — closes the previous step and opens this one
 #                                          (model-textures is what turns the
 #                                          GLBs' PNGs into webp; it touches no
 #                                          GLB that already references webp)
+#   ONLY_STEPS=inputs-2048    ~0s once made   the 2048 composite-input copies
+#
+# `precompress` runs on every run, scoped or not (add it to SKIP_STEPS to stop
+# it): each run starts by deleting every .gz, so it is what puts them back.
 #
 # Only reach for the paint chain when a NEW TEXTURE has to be extracted; params
 # alone never need it. Two things make scoped runs safe, and both had to be
@@ -580,6 +600,17 @@ else
 fi
 
 mkdir -p "$RAW" "$DEST/knives" "$DEST/extra" "$CLI_DIR"
+
+# ---- Precompressed siblings: gone until the run has finished writing ----------
+# The precompress step (near the end) writes <file>.gz beside the GLBs and JSON,
+# and nginx's gzip_static sends that .gz to every browser WITHOUT checking it
+# still matches its original. Almost every step below rewrites files in place
+# (the GLBs are re-copied, their JSON re-pointed at webp, meta.json and every
+# sidecar re-dumped), so a .gz left standing would serve the previous run's bytes
+# for as long as this run takes, and forever if it dies halfway. Delete them all
+# now; until precompress runs, the servers simply send the originals. This runs
+# on a scoped run too, which is why precompress does as well.
+find "$DEST" -type f -name '*.gz' -delete 2>/dev/null || true
 
 # ---- 1. Fetch Source 2 Viewer CLI (linux-x64) --------------------------------
 CLI="$CLI_DIR/Source2Viewer-CLI"
@@ -2072,6 +2103,25 @@ if missing_tex:
               file=sys.stderr)
 PYEOF
 
+fi
+
+# ---- 3b2. 2048 copies of the large composite inputs --------------------------
+# v39. The HD gun bundles ship color/metalness (and some masks) at 4096, and the
+# compositor renders at 2048 for every style but the projected two — where the
+# GPU then reads the 4096 map at its 2048 mip. This writes that mip once, as
+# <name>.2048.png beside the original, and lists it in meta.json `textures2048`;
+# the client swaps it in only at a cap of 2048 or less. `textures` and every
+# original are untouched, so a client that predates this reads exactly what it
+# always did. Per channel, sRGB-correct for ao/color, RGB under zero alpha kept,
+# 8-bit RGBA PNG (the shape src/rawPng.ts decodes for Safari). Incremental: a
+# copy whose source is unchanged (fingerprinted inside the PNG) is kept, so only
+# the first run, or a CS2 update that changes an input, pays ~2s a texture.
+if step_if "inputs-2048"; then
+  # Not fatal: without the copies every client loads the full-size inputs, which
+  # is what they did before this step existed.
+  if ! node "$(dirname "$0")/lighten-assets.mjs" inputs-2048 --models "$DEST" --step inputs-2048; then
+    echo "!! 2048 composite inputs failed — clients load the full-size inputs."
+  fi
 fi
 
 # ---- 3c. Keychain (charm) anchor points --------------------------------------
@@ -5640,6 +5690,28 @@ else
   echo "!! Viewmodel extraction failed — first person will have no animations on this instance."
 fi
 
+fi
+
+# ---- 5d. Precompressed siblings ----------------------------------------------
+# v39. <file>.gz (gzip -9) beside every .glb and .json over 1KB on /models, which
+# nginx (gzip_static) and the Node servers send in place of the raw file when the
+# browser accepts gzip. GLBs went out uncompressed before this: ak47.glb is 3.3MB
+# raw and 1.1MB here; sticker-markup.json 559KB -> 24KB. PNG/WebP/EXR and audio
+# are never precompressed (already compressed, or range-streamed).
+#
+# LAST, after every step that writes a GLB or a JSON, because a .gz is only right
+# for as long as its original does not change — and the run deleted every .gz up
+# front for exactly that reason. So unlike the other steps this one runs on a
+# SCOPED run too (ONLY_STEPS does not skip it; SKIP_STEPS=precompress does, and
+# then the mount is simply served uncompressed).
+if [[ ",${SKIP_STEPS:-}," != *",precompress,"* ]]; then
+  step "precompress"
+  if ! node "$(dirname "$0")/lighten-assets.mjs" gzip --models "$DEST" --step precompress; then
+    echo "!! Precompression failed — the servers send the uncompressed files."
+  fi
+else
+  echo "--- [precompress] SKIPPED (SKIP_STEPS)"
+  prog "precompress" done
 fi
 
 # ---- 6. Stamp the pipeline version -------------------------------------------

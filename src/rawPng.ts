@@ -24,6 +24,7 @@
 // browser that has the bug, these PNGs are inflated and unfiltered here and
 // uploaded as a DataTexture. Elsewhere the browser's own decoder is kept, since
 // it runs off the main thread.
+import { prefetchedFetch } from "./prefetchStore";
 
 /** 1x1 PNG, RGBA (255, 128, 0, 0). */
 const PROBE_PNG =
@@ -173,7 +174,9 @@ export async function loadRawPngTexture(
   url: string,
 ): Promise<import("three").Texture | null> {
   if (!/\.png(?:[?#]|$)/i.test(url) || !(await imagesLoseTransparentRgb())) return null;
-  const res = await fetch(url);
+  // The same bytes whether src/prefetch.ts fetched them first or not: the
+  // decode below is what matters, and it is unchanged.
+  const res = await prefetchedFetch(url);
   if (!res.ok) throw new Error(`${res.status} ${url}`);
   const img = await decodePng(await res.arrayBuffer());
   if (!img) return null;

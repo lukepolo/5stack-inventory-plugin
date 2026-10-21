@@ -7,6 +7,9 @@
 // enabled, and a copy under scripts/ would be unreachable from the first —
 // Dockerfile.backend copies `backend/` and nothing else.
 //
+// (Both now reach it through assetResponse.mjs, which decides the rest of an
+// asset's answer the same way.)
+//
 // It lived as two byte-for-byte copies before that, which is precisely the
 // nginx-vs-serve.mjs divergence the comments around both call sites say the
 // range handling exists to prevent: a fix to one (multi-range support, say)

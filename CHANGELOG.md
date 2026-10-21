@@ -1,7 +1,7 @@
 # Changelog
 
 Changes in the LCrew fork of `lukepolo/5stack-inventory-plugin`, all made on 2026-10-20.
-The 3D model extraction is now at pipeline version 37; run it once to get every asset listed below.
+The 3D model extraction is now at pipeline version 39; run it once to get every asset listed below.
 
 ## Crafting & Editing
 
@@ -45,6 +45,8 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 
 ### Bug Fixes
 
+- In first person the agent's sleeve wore the equipped glove's finish up to the elbow. Only the gloves take the finish now, and the sleeve keeps the agent's own look.
+- Stickers and charms disappeared in first person. They stay on the gun now, hidden only where the hand covers them, and a charm swings as the gun moves through reloads and shots.
 - In Safari, Doppler, Gamma Doppler, Marble Fade and other region-painted finishes showed the bare weapon on 23 models, including the Bayonet, Butterfly Knife, M9 Bayonet and AWP. Safari empties a fully transparent image on its way to the GPU, which is how those models' paint-region masks are stored, so Safari now decodes them byte-exact itself.
 - The Butane Buddy's liquid filled the whole ball once the camera was turned to look down at the gun. It now settles against the same gravity the charm hangs by, so the fill stays level and sloshes as you turn the gun.
 - Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
@@ -62,19 +64,36 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 
 ### Features
 
+- **True sizes on the models mount**: Asset Cache lists the compressed copies and the 2048 px input copies in their own rows and gives the mount's size without them. Rows whose files have a compressed copy also say what they cost to download, such as the models' "sent as" size.
 - **Glove model cards**: the eight bare glove models get cards baked from their 3D model, kept in the shared card store.
+- **Smaller cards**: new cards are stored as WebP, about a tenth of the size of the PNG they replace, so the inventory grid loads much faster with no visible difference. Cards already stored keep showing as they are, and cards baked in Safari are converted by the server.
 
 ### Bug Fixes
 
+- Switching "Verify composites" off in the Developer tab left it on, so that browser compared paint composites with the shared store but never saved any. Off now means off.
 - Editing an item's stickers or charm now re-renders its card. Card files were named only by wear, pattern and StatTrak, so moving, swapping or scratching a sticker kept the old picture until the cache was cleared.
 - A card whose paint failed to load, or which came out black, is retried instead of stored. This caused the Driver Gloves card to be black.
 - Paint composites saved to the shared store before the Safari fix are no longer used, since Safari could have stored a bare weapon for a Doppler there.
 
 ## Performance
 
+### Features
+
+- **Compressed models and data**: the plugin's web server compresses 3D models, animations and other data files, and sends the extraction's ready-made compressed copies when they exist. An AK-47's model goes from 3.3 MB to 1.1 MB on the wire, and its inspect animation from 273 KB to 32 KB.
+- **Lighter HD skin downloads**: HD gun finishes load their weapon textures at 2048 instead of 4096 pixels where the skin is drawn at 2048 anyway, so an AK-47 skin fetches about 10MB instead of 35MB with no visible difference. Spray-paint and airbrushed finishes keep the full-size textures on desktop, where they are drawn at 4096.
+- **Lighter first load**: the 3D viewer, the editor's pattern rails, the item spec panel, the Craft catalog and the sticker and charm picker now download when first used instead of at startup. Before any 3D view opens, the plugin loads about a third less code (218 kB compressed instead of 335 kB).
+- **Faster first 3D view**: the default CS2 lighting no longer waits for the studio lighting file, and the 3D engine downloads alongside the viewer instead of after it. Opening the first item in 3D downloads about 1 MB less.
+- **Smaller studio lighting**: the lighting behind the Studio, Showcase, Warm and Dark presets is 371 kB instead of 1.4 MB, and is fetched only when one of them is in use. Test renders are unchanged to within 1 level in 99% of pixels.
+- **3D views load ahead of the click**: resting the pointer on an item card starts downloading what its 3D view needs, so a Bayonet | Doppler then opens in Edit in 0.7 s instead of 2 s on a 100 Mbit/s connection. Moving off the card before a download starts cancels it.
+- **Edit starts every download at once**: pressing Edit or View in 3D fetches the model, its textures and the paint together, instead of one after another as the viewer reaches each.
+- **Equipped items warm in the background**: once the loadout has loaded, the equipped items' 3D models are fetched while the page is idle, up to a fixed memory budget. Not on phones, where it would spend mobile data nobody asked for.
+- Prefetching stays out of the way: it is off under Save-Data and on 2G, and pauses while the tab is hidden or a 3D view is loading. The large paint inputs are only fetched once Edit or View in 3D is pressed, never on hover.
+
 ### Bug Fixes
 
 - Scrubbing glove patterns no longer stutters: each repaint went from 60–100 ms to about 1 ms with identical output.
+- Models, EXR maps, HDR lighting and WAV music kits are served with their real file types instead of as unknown binary data.
+- When the web server had to hand a file to the backend, unversioned models and textures were kept by browsers for a year, and a re-check downloaded the whole file. They are now re-checked like everywhere else, with a tiny "not modified" answer, and first-person animations and projected-finish position maps no longer come back missing on that path.
 
 ## Model Extraction
 
@@ -83,6 +102,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **v34, sticker masks**: each weapon body's sticker mask is extracted, which is what hides stickers under modelled parts.
 - **v35, charm detail textures**: each charm material's detail layer and its placement are recorded, and the texture is extracted.
 - **v37, MVP anthems**: each music kit's round-MVP anthem is extracted beside its menu theme, with its own manifest.
+- **v39, lighter assets**: composite inputs larger than 2048 pixels get a 2048 copy beside the original, and every model and data file gets a gzip copy. No existing file changes, so older clients keep loading what they always did.
 - **v36, StatTrak art and knife data**: the knife digit texture is extracted with its cut-out channel intact. Every knife's attachment points and bone chain are written out as the source for knife counter and name tag placement.
 - **C4 model**: the extraction publishes the C4 model with its sticker slots and charm surfaces.
 
@@ -95,6 +115,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **Base model on listings**: knife and glove catalog listings carry their base model's id, name and image.
 - **Sticker masks endpoint**: the sticker bounds endpoint returns each weapon body's sticker mask.
 - **Bake lighting**: the catalog reports which lighting the server bakes cards under. Charm shading data includes detail textures.
+- **WebP cards**: card uploads accept WebP as well as PNG, checked by their magic bytes, and a PNG upload is converted to WebP when `cwebp` is installed. The catalog lists the accepted formats as `cardFormats`, and a card is served in whichever format is stored, under the same `.png` URL.
 
 ## Dev Tooling & Deployment
 
@@ -104,6 +125,12 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **Test tools**: `mount.html` renders any item with any options from the URL, `tools/standalone` runs the real UI against a fake inventory, and `glb-info`/`knife-anchors` read and apply the game's model data.
 - **Safari test runner**: `shoot-webkit.mjs` renders the same test pages in Safari's engine (WebKit) headlessly, for bugs that only Safari shows.
 - **Live camera drags**: `drag.mjs` turns the camera with the mouse after a viewer has loaded and screenshots each step, for bugs that only appear once the view moves.
+- **Caching guide**: `docs/CACHING.md` explains how files are cached and compressed, how to check it, and how to add an optional Cloudflare cache rule safely.
+- **Card store in the mock server**: `tools/standalone` keeps baked cards (`CARDS_DIR` saves them between runs) and can play a backend from before WebP cards (`MOCK_CARD_FORMATS=png`).
+- **Composite store in the standalone mock**: `tools/standalone/mock-server.mjs` accepts composite uploads after checking their names the way the backend does, and serves them back.
+- **Bundle report**: `tools/bundle-report.config.ts` builds the plugin and lists what each chunk contains and what loads with it.
+- **Prefetch switches**: **Prefetch log** in the Developer tab logs every prefetch and whether the viewer used it, and **No prefetch** turns prefetching off to time a cold open.
+- **Load-time testing in the standalone UI**: `MOCK_CARDS=stub` stops the card backfill, whose bakes would otherwise pre-load the model being timed. The mock keeps the paint composites it is sent, so a second session opens with a store hit, and `MOCK_COMPOSITES=keep` also reads the dev server's store for the rest.
 
 ### Removed
 
@@ -112,3 +139,4 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 ### Bug Fixes
 
 - The headless render runner (`shoot.mjs`) now deletes its temporary Chrome profile and finishes as soon as the page is done. Leftover profiles had grown to several gigabytes.
+- The hot-swap dev server answered a refresh on any page below the plugin (such as `/admin`) with an error instead of the app.

@@ -199,6 +199,22 @@ export const FLAGS: DevFlag[] = [
     remount: true,
     group: "Diagnostics",
   },
+  {
+    name: "prefetchlog",
+    label: "Prefetch log",
+    hint: "Console trace of every 3D prefetch, and whether the viewer used what it fetched.",
+    dflt: false,
+    remount: true,
+    group: "Diagnostics",
+  },
+  {
+    name: "noprefetch",
+    label: "No prefetch",
+    hint: "Never fetch a 3D view before it opens, to time a cold open.",
+    dflt: false,
+    remount: true,
+    group: "Diagnostics",
+  },
 ];
 
 /**

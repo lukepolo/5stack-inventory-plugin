@@ -3,13 +3,13 @@
 // STALE builds until restarted. This reads from disk on every request and sends
 // no-store so neither the browser nor Cloudflare caches remoteEntry.js.
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 // Shared with the backend rather than reimplemented here — one behaviour in
-// both environments is the whole point of this file having ranges at all.
-import { parseByteRange } from "../backend/src/byteRange.mjs";
+// both environments is the whole point of this file having ranges, validators
+// and the extractor's `.gz` siblings at all.
+import { IMMUTABLE, openAssetBody, planAsset } from "../backend/src/assetResponse.mjs";
 
 const root = fileURLToPath(new URL("../dist", import.meta.url));
 // Extracted CS2 models live on a hostPath mount (see k8s/deployment.yaml);
@@ -52,6 +52,12 @@ const MIME = {
   ".woff2": "font/woff2",
   ".glb": "model/gltf-binary",
   ".webp": "image/webp",
+  // Map panoramas and backdrop plates (/anims/env/), a composite input's
+  // position map, the bundled lighting HDRI, and any decoder the bundle ships.
+  ".jpg": "image/jpeg",
+  ".exr": "image/x-exr",
+  ".hdr": "image/vnd.radiance",
+  ".wasm": "application/wasm",
   ".map": "application/json",
   // Music kit audio. Both, because the extractor probes the container rather
   // than assuming it — Source2Viewer picks the format from the codec inside the
@@ -83,7 +89,7 @@ const HEADERS = {
 //                         the contents are rewritten by every extraction, so
 //                         this one has to revalidate. Caching it is what left a
 //                         browser asking for textures a later run had renamed.
-const IMMUTABLE = "public, max-age=31536000, immutable";
+//                         Every answer carries an ETag, so that costs a 304.
 function cacheControlFor(base, pathname, query) {
   if (base === imagesDir) return IMMUTABLE;
   // A composite's URL carries both the shader generation and the extraction
@@ -143,20 +149,37 @@ createServer(async (req, res) => {
       res.end("forbidden");
       return;
     }
-    let info;
-    try {
-      info = await stat(file);
-      if (!info.isFile()) throw new Error("not a file");
-    } catch {
+    // STREAMED, never buffered, and no body at all for HEAD. This used to
+    // readFile() the whole file on every request, HEAD included, so the
+    // viewer's ~24 parallel `.glb` existence probes each buffered 3-5 MB for
+    // nothing; on a single-threaded server that stalled hard enough for the edge
+    // to return 503s. Production nginx streams via sendfile; planAsset (shared
+    // with the backend) decides the rest exactly as nginx.conf does: ETag and
+    // Last-Modified with 304s, the extractor's `.gz` sibling or on-the-fly gzip
+    // for a client that takes it, and byte ranges, advertised on EVERY file
+    // because `Accept-Ranges` on the first unranged response is a browser's only
+    // signal that seeking is possible.
+    const plan = await planAsset({
+      file,
+      type: MIME[extname(file)] ?? "application/octet-stream",
+      method: req.method,
+      headers: req.headers,
+      cacheControl: cacheControlFor(base, pathname, parsed.searchParams),
+    });
+    if (!plan) {
       // Mount miss on a backend-backed path — hand it to the backend, which
       // serves it and mirrors it so the next request comes off the mount.
+      // /anims and /composites joined the list with nginx.conf's: both of its
+      // blocks fall back to the backend, and the backend answers both.
       if (
         base === paintsDir ||
         base === rendersDir ||
         base === testsDir ||
         base === imagesDir ||
         base === modelsDir ||
-        base === musicDir
+        base === musicDir ||
+        base === animsDir ||
+        base === compositesDir
       ) {
         try {
           // The client's Range rides along, and the upstream's answer is passed
@@ -189,7 +212,10 @@ createServer(async (req, res) => {
       // paths fall back — a missing .js/.glb stays an honest 404.
       if (base === root && !extname(file)) {
         try {
-          data = await readFile(join(root, "index.html"));
+          // `const` matters: this was a bare assignment to an undeclared
+          // `data`, which in a module is a ReferenceError — every deep-link
+          // refresh got the 500 below instead of the app.
+          const data = await readFile(join(root, "index.html"));
           res.writeHead(200, { ...HEADERS, "Content-Type": MIME[".html"] });
           res.end(data);
           return;
@@ -201,47 +227,14 @@ createServer(async (req, res) => {
       res.end("not found");
       return;
     }
-    // STREAM, and never read a body for HEAD. This used to readFile() the whole
-    // file into memory on every request — including HEAD — so the viewer's ~24
-    // parallel `.glb` existence probes each buffered 3-5 MB for nothing. On a
-    // single-threaded server that stalled hard enough for the edge to return
-    // 503s. Production nginx streams via sendfile; this makes dev behave the
-    // same instead of falling over as soon as it fronts a CDN host.
-    const common = {
-      ...HEADERS,
-      "Cache-Control": cacheControlFor(base, pathname, parsed.searchParams),
-      "Content-Type": MIME[extname(file)] ?? "application/octet-stream",
-      // Advertised on EVERY file, not just audio: it is the browser's only
-      // signal that seeking is possible, and it has to be on the first (unranged)
-      // response — by the time a range is asked for it is too late.
-      "Accept-Ranges": "bytes",
-    };
-    const range = parseByteRange(req.headers.range, info.size);
-    if (range === false) {
-      res.writeHead(416, { ...common, "Content-Range": `bytes */${info.size}` });
+    res.writeHead(plan.status, { ...HEADERS, ...plan.headers });
+    if (!plan.body) {
       res.end();
       return;
     }
-    if (range) {
-      const length = range.end - range.start + 1;
-      res.writeHead(206, {
-        ...common,
-        "Content-Range": `bytes ${range.start}-${range.end}/${info.size}`,
-        "Content-Length": length,
-      });
-      if (req.method === "HEAD") {
-        res.end();
-        return;
-      }
-      createReadStream(file, { start: range.start, end: range.end }).on("error", () => res.destroy()).pipe(res);
-      return;
-    }
-    res.writeHead(200, { ...common, "Content-Length": info.size });
-    if (req.method === "HEAD") {
-      res.end();
-      return;
-    }
-    createReadStream(file).on("error", () => res.destroy()).pipe(res);
+    openAssetBody(plan.body)
+      .on("error", () => res.destroy())
+      .pipe(res);
   } catch (error) {
     res.writeHead(500, HEADERS);
     res.end(String(error));

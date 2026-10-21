@@ -51,6 +51,7 @@ import {
   type GameConfigState,
   type CfgTarget,
   type DirStat,
+  type PartStat,
   type ExtractStatus,
   type PriceAdminStatus,
   type PriceSource,
@@ -305,10 +306,16 @@ const PART_META: Record<string, { label: string; hint: string; required?: boolea
   },
   modelTextures: { label: "Model textures", hint: "The shared pool every GLB references", required: true },
   modelMeta: { label: "Anchors & markup", hint: "Attachment points, sticker slots, the version stamp" },
+  // The two kinds of COPY extraction v39 writes beside an original. Their own
+  // rows, so every row above is what the mount holds once, and the group can
+  // say how much of its total is copies.
+  inputs2048: { label: "Lighter input copies", hint: "2048 px copies of the largest composite inputs, fetched instead of the originals" },
+  compressedCopies: { label: "Compressed copies", hint: "gzip copies of models and data, sent instead of the originals" },
   paintMaterials: { label: "Finish definitions", hint: "One document per skin, naming its textures", required: true },
   paintTextures: { label: "Finish textures", hint: "Patterns, masks, sticker and decal art", required: true },
 };
-const ZERO = { files: 0, bytes: 0 };
+const ZERO: PartStat = { files: 0, bytes: 0 };
+const COPY_PARTS = new Set(["inputs2048", "compressedCopies"]);
 const extractedGroups = computed(() => {
   const s = cacheStats.value;
   if (!s) return [];
@@ -320,7 +327,9 @@ const extractedGroups = computed(() => {
       // something. Otherwise an older mount grows empty rows for every type it
       // predates, which reads as breakage rather than as history.
       .filter((r) => r.files > 0 || r.required);
-    return { key, label, hint, total, rows, share: (b: number) => (total.bytes ? b / total.bytes : 0) };
+    // The disk the group would take without the copies: what it really holds.
+    const copies = rows.filter((r) => COPY_PARTS.has(r.key)).reduce((n, r) => n + r.bytes, 0);
+    return { key, label, hint, total, rows, copies, share: (b: number) => (total.bytes ? b / total.bytes : 0) };
   };
   return [
     group(
@@ -328,7 +337,7 @@ const extractedGroups = computed(() => {
       "3D models mount",
       "Meshes, their textures, and the compositor's inputs",
       s.models ?? ZERO,
-      ["meshes", "agents", "charms", "compositeInputs", "modelTextures", "modelMeta"],
+      ["meshes", "agents", "charms", "compositeInputs", "inputs2048", "modelTextures", "modelMeta", "compressedCopies"],
     ),
     group("paints", "Paint chain", "Every skin finish — without these, skins render white", s.paints, [
       "paintMaterials",
@@ -508,6 +517,7 @@ const STEP_LABELS: Record<string, string> = {
   "rename-models": "Mapping models to catalog keys",
   "model-textures": "Compressing model textures",
   "composite-inputs": "Extracting composite inputs",
+  "inputs-2048": "Making 2048 composite inputs",
   "charm-anchors": "Reading charm anchors",
   "sticker-markup": "Reading sticker slots",
   "sticker-masks": "Extracting sticker masks",
@@ -518,6 +528,7 @@ const STEP_LABELS: Record<string, string> = {
   "paint-chain": "Extracting paint chain",
   "sticker-art": "Extracting sticker & decal art",
   "music-audio": "Extracting music kit audio",
+  precompress: "Precompressing models",
   stamp: "Recording the build",
 };
 
@@ -1243,12 +1254,15 @@ const BTN_DANGER =
                         <span class="block text-sm font-medium text-foreground">{{ g.label }}</span>
                         <span class="block text-xs text-muted-foreground">{{ g.hint }}</span>
                       </span>
-                      <span class="whitespace-nowrap font-mono text-sm">
+                      <span class="whitespace-nowrap text-right font-mono text-sm">
                         <span :class="g.total.files ? '' : 'text-destructive'">
                           {{ g.total.files.toLocaleString() }} files
                         </span>
                         <span class="text-muted-foreground">·</span>
                         {{ fmtBytes(g.total.bytes) }}
+                        <span v-if="g.copies" class="block text-xs text-muted-foreground">
+                          {{ fmtBytes(g.total.bytes - g.copies) }} without copies
+                        </span>
                       </span>
                     </div>
                     <!-- Breakdown. The bar is proportion WITHIN the group, which is
@@ -1268,6 +1282,13 @@ const BTN_DANGER =
                             </span>
                             <span class="text-muted-foreground/60">·</span>
                             {{ fmtBytes(row.bytes) }}
+                            <span
+                              v-if="row.sentBytes != null && row.sentBytes < row.bytes"
+                              class="text-muted-foreground"
+                              :title="'What these files cost to download, using their compressed copies'"
+                            >
+                              · sent as {{ fmtBytes(row.sentBytes) }}
+                            </span>
                           </span>
                         </div>
                         <div class="h-1 overflow-hidden rounded-full bg-border">

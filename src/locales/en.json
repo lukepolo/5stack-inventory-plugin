@@ -53,6 +53,7 @@
           "rename-models": "Mapping models to catalog keys",
           "model-textures": "Compressing model textures",
           "composite-inputs": "Extracting composite inputs",
+          "inputs-2048": "Making 2048 composite inputs",
           "charm-anchors": "Reading charm anchors",
           "sticker-markup": "Reading sticker slots",
           "sticker-masks": "Extracting sticker masks",
@@ -61,6 +62,7 @@
           "paint-chain": "Extracting paint chain",
           "sticker-art": "Extracting sticker art",
           "music-audio": "Extracting music kit audio",
+          "precompress": "Precompressing models",
           "stamp": "Recording the build"
         },
         "time_left": "~{duration} left"

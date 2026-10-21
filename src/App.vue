@@ -93,10 +93,12 @@ import {
 // player never reaches. Async so they arrive with the route.
 const AdminConsole = defineAsyncComponent(() => import("./components/AdminConsole.vue"));
 import { activeFlags, flagValue, flagsVersion } from "./devFlags";
-import Armory from "./components/Armory.vue";
+// The catalog browser (its own screen) and the sticker/charm picker (an
+// overlay) are never on screen at load either: async, ~39kB off the boot chunk.
+const Armory = defineAsyncComponent(() => import("./components/Armory.vue"));
 import InventoryScreen from "./components/InventoryScreen.vue";
 import LoadoutGrid from "./components/LoadoutGrid.vue";
-import AttachmentPicker from "./components/AttachmentPicker.vue";
+const AttachmentPicker = defineAsyncComponent(() => import("./components/AttachmentPicker.vue"));
 import ShareMenu from "./components/ShareMenu.vue";
 import Tooltip from "./components/Tooltip.vue";
 import { MDEBUG, mdebug, setMdebugAmbient, traceLayer } from "./mdebug";
@@ -111,14 +113,19 @@ import TileActions from "./components/TileActions.vue";
 import FilterDropdown from "./components/FilterDropdown.vue";
 import InfiniteSentinel from "./components/InfiniteSentinel.vue";
 import SortDirection from "./components/SortDirection.vue";
-import PatternRail from "./components/PatternRail.vue";
+// The pattern rails and the spec/pet panels are async for the same reason as
+// AdminConsole: they import the CPU side of the 3D pipeline (the pattern scan's
+// compositors, charm liquid and material, pet material and pose), ~100kB that
+// the grid and the loadout never render. They only show in the item view and
+// the editor, which open a 3D viewer anyway, so they arrive with its chunks.
+const PatternRail = defineAsyncComponent(() => import("./components/PatternRail.vue"));
 import PriceTag from "./components/PriceTag.vue";
-import ItemSpecs from "./components/ItemSpecs.vue";
-import PetControls from "./components/PetControls.vue";
+const ItemSpecs = defineAsyncComponent(() => import("./components/ItemSpecs.vue"));
+const PetControls = defineAsyncComponent(() => import("./components/PetControls.vue"));
 import TraitBars, { type TraitRow } from "./components/TraitBars.vue";
 import { DEFAULT_PET_CLIP, loadPetClipIndex, petWanderPool } from "./petAnim";
 import ItemBadges from "./components/ItemBadges.vue";
-import PatternScoreRail from "./components/PatternScoreRail.vue";
+const PatternScoreRail = defineAsyncComponent(() => import("./components/PatternScoreRail.vue"));
 import { SCAN_READ_SIZE } from "./patternScan";
 import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
 import ViewerControls from "./components/ViewerControls.vue";
@@ -168,7 +175,8 @@ import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync } from "./modelAvailability";
 import { INCOMPLETE } from "./viewerSentinel";
-import { prefetchViewer3d, snapshotModel, viewersIdle, viewerStats } from "./viewer3dLazy";
+import { snapshotModel, viewersIdle, viewerStats } from "./viewer3dLazy";
+import { prefetchEquipped, prefetchView } from "./prefetch";
 import type { CameraState, ViewerHandle, ViewerKind, StickerPlacement, CharmPlacement } from "./viewer3d";
 import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
@@ -2429,10 +2437,13 @@ async function restoreDraftRoute(skinId: number) {
     fail(e);
   }
 }
-function openEdit(inst: InventoryItem) {
+function openEdit(inst: InventoryItem, warm: "edit" | "open" = "edit") {
   agentPose.value = DEFAULT_AGENT_POSE;
   mdebug("openEdit()", { inst: inst.id, hasItem: !!inst.item });
   if (!inst.item) return;
+  // Start the 3D view's downloads now, all at once, rather than one after
+  // another as the mount reaches each — see src/prefetch.ts.
+  prefetchView(inst, warm);
   craftModel.value = inst.item.model ?? null;
   viewOnly.value = false;
   craftInstId.value = inst.id;
@@ -2526,7 +2537,8 @@ function openView(inst: InventoryItem) {
     viewOnly.value = true;
     return;
   }
-  withRouteSync(() => openEdit(inst));
+  // "open": a view, so nothing is warmed for editing it.
+  withRouteSync(() => openEdit(inst, "open"));
   viewOnly.value = true;
 }
 /**
@@ -7667,6 +7679,8 @@ async function load() {
       void loadPriceStatus().then(() => loadPrices());
       loadSkins(sheetKey.value);
       queueLoadoutRenders();
+      // Idle-time warm of the equipped items' 3D views — see src/prefetch.ts.
+      prefetchEquipped(current, inv, team.value);
       // Off to the side: the nag dot is the least important thing on screen and
       // must never hold up (or fail) the load it rides along with.
       void loadSteamSyncState();
@@ -7784,9 +7798,8 @@ const { staleBuild, reloadPage } = useBuildCheck();
 onMounted(() => {
   window.addEventListener("keydown", onGlobalKey);
   load();
-  // Idle-time fetch of the viewer chunk, so the first item opened doesn't pay
-  // for it — see prefetchViewer3d.
-  prefetchViewer3d();
+  // No idle-time fetch of the viewer chunk: the first 3D view fetches it and
+  // three together instead — see the top of ./viewer3dLazy.
   // Admin app load asks the panel where the invsim cvars stand — that answer is
   // what lights the gear badge before /admin is ever opened. Read-only: this
   // used to write three of the operator's server configs as a side effect.
