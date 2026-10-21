@@ -74,6 +74,11 @@ const FOLDER = {
   knife_butterfly: "knife/knife_butterfly",
   bayonet: "knife/knife_bayonet",
   taser: "pistol/pistol_taser",
+  // Not under any of the three families: the bomb is EQUIPMENT. No rule finds
+  // `equipment/c4`, so it fell to `_default_rifle` and was held like a rifle,
+  // with a rifle's reload and shot. Its own folder has draw, idle, three
+  // inspects and the plant — no shoot, no reload, which is the game's answer.
+  c4: "equipment/c4",
 };
 
 /** Family fallbacks, for a weapon whose own folder has no inspect. */
@@ -452,7 +457,12 @@ function main() {
     .filter((s) => !ONLY || s === ONLY);
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vmanim-"));
-  const index = {};
+  // `--only` re-extracts ONE weapon, so it keeps everyone else's entries: the
+  // viewer reads this file for which buttons to offer, and a one-weapon index
+  // would take Fire and Reload away from every other gun.
+  const indexPath = path.join(OUT, "index.json");
+  const index = ONLY && fs.existsSync(indexPath) ? JSON.parse(fs.readFileSync(indexPath, "utf8")) : {};
+  if (ONLY) delete index[ONLY];
   let ok = 0;
   let failed = 0;
   const soundFiles = vpkAll().filter((p) => p.startsWith("sounds/weapons/") && p.endsWith(".vsnd_c"));
@@ -587,6 +597,14 @@ function main() {
       const e = extractSound(`sounds/weapons/${file}.vsnd_c`, path.join(OUT, "sfx", file), tmp);
       if (e) ext.set(file, e);
     }
+    // An action this run did not produce must not survive from an older one —
+    // the C4's rifle reload outlived the fix that took it away, and the files
+    // are served immutable under their ?v= key. The .gz siblings go too:
+    // lighten-assets only rewrites them for files that still exist.
+    for (const a of ACTIONS) {
+      if (pending.some((p) => p.action === a.key)) continue;
+      for (const f of [`${stem}.${a.key}.json`, `${stem}.${a.key}.json.gz`]) fs.rmSync(path.join(OUT, f), { force: true });
+    }
     for (const p of pending) {
       const sounds = p.cues.filter((c) => ext.has(c.file)).map((c) => ({ t: c.t, file: `${c.file}.${ext.get(c.file)}` }));
       const json = { source: p.clipPath, duration: p.duration, parents: p.parents, bones: p.bones, sounds, ...(p.prop ? { prop: p.prop } : {}) };
@@ -608,7 +626,7 @@ function main() {
       ok++;
     } else failed++;
   }
-  fs.writeFileSync(path.join(OUT, "index.json"), JSON.stringify(index, null, 1));
+  fs.writeFileSync(indexPath, JSON.stringify(index, null, 1));
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\nviewmodel anims: ${ok} extracted, ${failed} without a clip -> ${OUT}`);
 }

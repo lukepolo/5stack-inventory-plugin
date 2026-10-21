@@ -122,6 +122,7 @@ const PatternRail = defineAsyncComponent(() => import("./components/PatternRail.
 import PriceTag from "./components/PriceTag.vue";
 const ItemSpecs = defineAsyncComponent(() => import("./components/ItemSpecs.vue"));
 const PetControls = defineAsyncComponent(() => import("./components/PetControls.vue"));
+const AgentControls = defineAsyncComponent(() => import("./components/AgentControls.vue"));
 import TraitBars, { type TraitRow } from "./components/TraitBars.vue";
 import { DEFAULT_PET_CLIP, loadPetClipIndex, petWanderPool } from "./petAnim";
 import ItemBadges from "./components/ItemBadges.vue";
@@ -158,7 +159,7 @@ import { useSlotLongPress } from "./composables/useSlotLongPress";
 import { useAppHeight } from "./composables/useAppHeight";
 import { useBuildCheck } from "./composables/useBuildCheck";
 import { useViewerMount } from "./composables/useViewerMount";
-import type { ClipAction } from "./viewmodelClip";
+import { viewmodelActions, viewmodelCannot, type ClipAction } from "./viewmodelClip";
 import { useViewerStage, type StageIcon, type StageKey } from "./composables/useViewerStage";
 import { useDebouncedSearch } from "./composables/useDebouncedSearch";
 import { useInventoryView } from "./composables/useInventoryView";
@@ -177,7 +178,7 @@ import { hasModel, hasModelSync } from "./modelAvailability";
 import { INCOMPLETE } from "./viewerSentinel";
 import { snapshotModel, viewersIdle, viewerStats } from "./viewer3dLazy";
 import { prefetchEquipped, prefetchView } from "./prefetch";
-import type { CameraState, ViewerHandle, ViewerKind, StickerPlacement, CharmPlacement } from "./viewer3d";
+import type { AgentMotion, CameraState, ViewerHandle, ViewerKind, StickerPlacement, CharmPlacement } from "./viewer3d";
 import { resolveViewerModel, resolveViewerModelSync, type ViewerTarget } from "./viewerModel";
 import "./style.css";
 
@@ -2324,7 +2325,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onDevHudKey));
 /** The catalog's agent list, kept for its `patchSlots` — see patchSlotCount. */
 const catalogAgents = ref<Skin[]>([]);
 /**
- * Poses offered for an agent in 3D.
+ * Poses offered for an agent in 3D — the list itself is in AgentControls.
  *
  * "Open" exists for PATCHES specifically: at any lifelike arm angle the upper
  * arms cover the side and sleeve positions, so there is no one pose that both
@@ -2332,19 +2333,39 @@ const catalogAgents = ref<Skin[]>([]);
  * user picks. "Ready" is the model's own tools_preview clip — the only real
  * animation an agent ships.
  */
-const AGENT_POSES = [
-  { id: "ready" as const, label: "Ready", hint: "The model's own in-game pose" },
-  { id: "stand" as const, label: "Stand", hint: "Relaxed standing pose" },
-  { id: "open" as const, label: "Open", hint: "Arms out — shows every patch position" },
-];
 /** The model's own pose leads: it is how CS2 presents the agent, so it is what
  *  someone expects to see first. "Open" is a tool, not a default. */
 const DEFAULT_AGENT_POSE = "ready" as const;
 const agentPose = ref<"stand" | "open" | "ready">(DEFAULT_AGENT_POSE);
+/** How the agent moves — see AgentMotion in viewer3d.ts. NOT reset per item
+ *  the way the pose is: someone who picked Still to place patches wants the
+ *  next agent still too. */
+const agentMotion = ref<AgentMotion>("idle");
 function setAgentPose(pose: "stand" | "open" | "ready") {
   agentPose.value = pose;
+  // Picking a pose means "show me THIS one", which a cycle would walk away
+  // from — the viewer drops to idle, and the Motion pills follow.
+  if (agentMotion.value === "cycle") agentMotion.value = "idle";
   modalViewer.current()?.setAgentPose(pose);
 }
+function setAgentMotion(motion: AgentMotion) {
+  agentMotion.value = motion;
+  modalViewer.current()?.setAgentMotion(motion);
+}
+// While cycling, the viewer moves through the poses on its own; follow it so
+// the Pose pills light the one on screen. A poll rather than a callback: it is
+// four times a second for a highlight, and only while a cycle runs.
+let agentPoseFollow: ReturnType<typeof setInterval> | null = null;
+watch(agentMotion, (m) => {
+  if (agentPoseFollow) clearInterval(agentPoseFollow);
+  agentPoseFollow = null;
+  if (m !== "cycle") return;
+  agentPoseFollow = setInterval(() => {
+    const p = modalViewer.current()?.agentPose();
+    if (p && p !== agentPose.value) agentPose.value = p;
+  }, 250);
+});
+onBeforeUnmount(() => agentPoseFollow && clearInterval(agentPoseFollow));
 // Steam-imported items are READ-ONLY (they mirror a real inventory). Editing
 // one opens the same modal as a DUPLICATE: saving creates an editable copy.
 const duplicating = ref(false);
@@ -3192,6 +3213,10 @@ const modal3dAvailable = ref(false);
  */
 const craftHeld = ref(false);
 const craftHeldAvailable = computed(() => craftTarget.value?.kind === "weapon");
+/** Held, for THIS item — `craftHeld` is the sticky choice, which outlives it.
+ *  Opening an agent after holding a rifle left it true, and the agent got the
+ *  weapon's buttons. */
+const craftHolding = computed(() => craftHeld.value && craftHeldAvailable.value);
 const craftStageCmp = ref<InstanceType<typeof ItemStage> | null>(null);
 const craftPanelW = ref(0);
 const modalViewerEl = computed<HTMLElement | null>(() => craftStageCmp.value?.hostEl ?? null);
@@ -3219,10 +3244,13 @@ const craftStage = useViewerStage({
   handle: () => modalViewer.current(),
   // Held: the same weapon actions the focus stage offers, against this viewer.
   // Two screens showing one item should answer the same keys.
-  viewmodel: () => craftHeld.value,
+  //
+  // craftHolding, not the toggle: the agent that inherited a rifle's `held`
+  // got Fire and Reload buttons and lost Reset and Flip.
+  viewmodel: () => craftHolding.value,
   extraKeys: () =>
-    craftHeld.value
-      ? FPV_ACTIONS.map((a) => ({
+    craftHolding.value
+      ? fpvActionsFor(craftTarget.value?.model).map((a) => ({
           key: a.key,
           cap: a.cap,
           label: a.label,
@@ -3748,6 +3776,7 @@ async function craftVisualOpts(target: ViewerTarget) {
     petStyle: target.kind === "pet" ? (c?.style ?? null) : null,
     petClip: target.kind === "pet" ? petClip.value : null,
     petStage: target.kind === "pet" ? (c?.stage ?? null) : null,
+    agentMotion: target.kind === "agent" ? agentMotion.value : undefined,
   };
 }
 async function mountModalViewer() {
@@ -3771,7 +3800,7 @@ async function mountModalViewer() {
       // Held, on the same terms as the focus view: the equipped gloves wear
       // their finish and the equipped agent lends a sleeve.
       firstPerson:
-        craftHeld.value && craftHeldAvailable.value
+        craftHolding.value
           ? {
               arms: fpvArms.value,
               action: "idle" as const,
@@ -3808,7 +3837,12 @@ async function mountModalViewer() {
       // Re-apply the chosen pose: the 2D/3D toggle remounts, and a viewer that
       // came back in the default stance after the user picked "Open" would look
       // like the control had stopped working.
-      if (craftTarget.value?.kind === "agent") handle.setAgentPose(agentPose.value);
+      // Motion goes AFTER the pose: setAgentPose ends a cycle, so the other
+      // order would leave a remounted cycle standing still.
+      if (craftTarget.value?.kind === "agent") {
+        handle.setAgentPose(agentPose.value);
+        handle.setAgentMotion(agentMotion.value);
+      }
       // The charm's authored albedo, for the pattern rail's gradient. Sampled
       // off the model because for most charms that is the only place it exists
       // — see ViewerHandle.charmAlbedoTile. Taken here rather than in the rail
@@ -7056,6 +7090,28 @@ const FPV_ACTIONS: { action: ClipAction; key: string; cap: string; label: string
   { action: "draw", key: "1", cap: "1", label: "Deploy", icon: "deploy" },
 ];
 /**
+ * The actions worth a button for this model — those its clips cover, less what
+ * the game does not allow (see viewmodelActions). A C4 is inspected and drawn,
+ * never fired or reloaded; a knife has no shot; a Zeus fires but recharges.
+ * Until the index answers, everything the rule allows — which is what every
+ * item got before.
+ */
+const fpvActionSets = new Map<string, Set<ClipAction> | null>();
+const fpvActionsVersion = ref(0);
+function fpvActionsFor(model: string | null | undefined) {
+  void fpvActionsVersion.value;
+  if (!model) return FPV_ACTIONS;
+  if (!fpvActionSets.has(model)) {
+    fpvActionSets.set(model, null);
+    void viewmodelActions(model).then((have) => {
+      fpvActionSets.set(model, have);
+      fpvActionsVersion.value++;
+    });
+  }
+  const have = fpvActionSets.get(model);
+  return FPV_ACTIONS.filter((a) => (have ? have.has(a.action) : !viewmodelCannot(model, a.action)));
+}
+/**
  * The arms to wear — the equipped gloves, else the team's stock pair.
  *
  * The glove GLB is where the arm skeleton and the inspect clip live (see
@@ -7124,7 +7180,7 @@ const focusStage = useViewerStage({
     // among them: it is where the weapon RESTS, so pressing an action again
     // returns to it rather than needing a button of its own.
     if (fpvOn.value) {
-      for (const a of FPV_ACTIONS) {
+      for (const a of fpvActionsFor(focusTarget.value?.model)) {
         rows.push({
           key: a.key,
           cap: a.cap,
@@ -10072,7 +10128,7 @@ if (MDEBUG) {
           <!-- THE SAME SCREEN THE FOCUS VIEW IS. Identity, actions, stage,
                footer — in that order, decided by ItemScreen rather than here,
                which is the only way two surfaces stay one surface. -->
-          <ItemScreen class="min-w-[220px]" :inset="!viewOnly" :held="craftHeld && modal3d" @panel-width="(w) => (craftPanelW = w)" :identity="{ ...craftIdentityName, price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
+          <ItemScreen class="min-w-[220px]" :held="craftHolding && modal3d" :inset="!viewOnly" @panel-width="(w) => (craftPanelW = w)" :identity="{ ...craftIdentityName, price: pricesOn && itemQuote ? { total: itemQuote.total, extra: itemQuote.attachmentTotal, approx: !!itemQuote.base.price?.approx, sales: itemSales, standing: itemWearStanding, tip: itemQuoteTip, busy: itemQuoting } : null }">
             <template #actions>
             <!-- Settings, then which picture, then what you can do with the
                  item — broadest question first. Both screens carry the same
@@ -10113,7 +10169,7 @@ if (MDEBUG) {
               ref="craftStageCmp"
               :available="modal3dAvailable"
               :is3d="modal3d"
-              :held="craftHeld"
+              :held="craftHolding"
               :held-available="craftHeldAvailable"
               :busy="modalViewer.busy.value"
               :rarity="craft.skin.rarity"
@@ -10166,26 +10222,8 @@ if (MDEBUG) {
 
                      UNDER the cog (z-[4] vs the row's own stacking) so the cog
                      stays live and its button toggles the panel shut, and OVER
-                     the pose pills so the first click anywhere else dismisses. -->
+                     the stage so the first click anywhere else dismisses. -->
                 <div v-if="modal3d && devHudOpen" class="absolute inset-0 z-[4]" @click="devHudOpen = false"></div>
-                <!-- BELOW the 2D/3D toggle, not beside it: they are different
-                     questions (which renderer vs which pose), and stacking keeps
-                     the top edge free for the model. Not the bottom-left corner
-                     either — that is where the perf HUD draws, and the two
-                     overlapped. top-10 clears the 2D/3D pill's own height. -->
-                <PillTabs
-                  v-if="modal3d && craftTarget?.kind === 'agent'"
-                  :items="AGENT_POSES"
-                  :item-key="(p) => p.id"
-                  :item-title="(p) => p.hint"
-                  :active="agentPose"
-                  position="absolute"
-                  list-class="left-0 top-10 z-[3]"
-                  button-class="relative z-[1] rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
-                  @select="(id) => setAgentPose(id as 'stand' | 'open' | 'ready')"
-                >
-                  <template #default="{ item: p }">{{ p.label }}</template>
-                </PillTabs>
                 <!-- Live cost, stacked under the 2D/3D + cog row so it reads as part
                      of the same top-left column of chrome — the same corner the
                      inventory card puts it in, under the model label. It was up in
@@ -10278,6 +10316,18 @@ if (MDEBUG) {
               @wander="setPetWanderByHand"
               @update:seed="(s) => (craft!.seed = s)"
               @preview-style="previewPetStyle"
+            />
+            <!-- An agent's pose and motion, where the pet keeps its clips: with
+                 the other controls for what is on the stage. They were pills
+                 over the model's top-left corner, on top of the item's name. -->
+            <AgentControls
+              v-if="craftType === 'agent' && modal3d"
+              class="animate-sheet-in"
+              :style="{ '--i': 1 }"
+              :pose="agentPose"
+              :motion="agentMotion"
+              @update:pose="setAgentPose"
+              @update:motion="setAgentMotion"
             />
             <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>

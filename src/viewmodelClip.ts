@@ -139,6 +139,52 @@ export function viewmodelAssetUrl(rel: string): string {
  */
 export type ClipAction = "idle" | "inspect" | "draw" | "reload" | "fire";
 
+/**
+ * What the game lets you do with an item in hand, where that is LESS than the
+ * clips on the mount say.
+ *
+ * The C4 is the case this exists for. Extractions before it had its own entry
+ * in the folder table gave it the generic rifle's clips (`_default_rifle`), so
+ * the mount holds a reload and a shot for a bomb — the files outlive the
+ * mistake, and a viewer that trusted them offered both. The Zeus is
+ * single-shot: it fires, and recharges rather than reloading.
+ */
+const CANNOT: Record<string, ClipAction[]> = {
+  c4: ["fire", "reload"],
+  taser: ["reload"],
+};
+
+let actionIndex: Promise<Record<string, Partial<Record<ClipAction, unknown>>> | null> | null = null;
+/**
+ * The actions this model's clips cover, from the extractor's `index.json`.
+ *
+ * Knives ship no shot and no reload, the Zeus no reload, the C4 neither — and
+ * a button whose press finds no clip does nothing at all, which reads as
+ * broken. Null while the index is unknown (an older mount, a failed fetch):
+ * the caller then offers everything but what CANNOT rules out, as it did
+ * before the index was read.
+ */
+export async function viewmodelActions(model: string): Promise<Set<ClipAction> | null> {
+  actionIndex ??= fetch(viewmodelAssetUrl("index.json"))
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then((v) => {
+      // Not cached as a permanent no — see loadViewmodelClip.
+      if (!v) actionIndex = null;
+      return v;
+    });
+  const index = await actionIndex;
+  const listed = index?.[model];
+  if (!listed) return null;
+  const out = new Set(Object.keys(listed) as ClipAction[]);
+  for (const a of CANNOT[model] ?? []) out.delete(a);
+  return out;
+}
+/** The same rule with nothing fetched — for a button row that has to draw now. */
+export function viewmodelCannot(model: string, action: ClipAction): boolean {
+  return (CANNOT[model] ?? []).includes(action);
+}
+
 function clipUrl(model: string, action: ClipAction): string {
   return viewmodelAssetUrl(`${encodeURIComponent(model)}.${action}.json`);
 }

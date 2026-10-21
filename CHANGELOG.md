@@ -15,6 +15,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - **Reorder stickers**: drag sticker tiles onto each other to change slot order, which decides which sticker is drawn on top. A moved sticker stays where it was on the weapon.
 - **Music kit preview in the editor**: Edit on a music kit plays the full song and, separately, its round-MVP anthem, each with play/pause and seek. One volume control sits above both and shares the level with every other player.
 - **One volume bar per music kit list**: the music kit sheet's Owned and Craft tabs have a single volume control in the toolbar instead of a slider on every card.
+- **Agent pose and motion in the sidebar**: an agent's pose (Ready, Stand, Open) moved from the top-left corner of the 3D view into the right-hand column, like the pet's controls. A new Motion setting makes the agent breathe and look around (Idle), move through all three poses in turn (Cycle), or hold still for placing patches (Still).
 - **Precise sticker dragging**: a sticker picked up in the 3D editor keeps the point where you grabbed it. Small nudges no longer jump the sticker's centre to the pointer.
 
 ### Removed
@@ -30,6 +31,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - A charm's pattern in the details panel's Applied list sat on a line of its own, reading as one more attachment. It now sits under the charm's name.
 - The focus view of a default-finish weapon showed Float and Pattern as "—", with a line across the bottom of the 3D view. A default finish has neither, so the row is gone.
 - The glove Craft list no longer includes ten gloves nobody can own: the eight bare models and the two stock pairs.
+- While editing, the item's name and estimated value sat on the very corner of the 3D view. They now stand clear of the edge, as in the focus view.
 
 ## 3D Viewer & Lighting
 
@@ -54,6 +56,9 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - A charm could be dragged anywhere on a gun, the trigger included. Dragging now keeps it on the surfaces the game allows a charm (its authored charm surfaces, lit up while you drag); pointing elsewhere slides it to the nearest allowed spot.
 - In first person a sticker on a moving part stayed behind when the part moved: the AK-47's magazine sticker hung in the air during a reload. A sticker now moves with the part it is on.
 - The first-person reload threw the magazine around: on the AK-47 it spun 180 degrees and back and flew 20-28 inches from the gun, away from the hand holding it. Guns now take their moving parts from the first-person clip itself, so the magazine stays in the hand from the pull to the insert.
+- The C4 was held like a rifle in first person, with a rifle's reload and shot. It now plays its own draw, idle and inspect, after the next run of the first-person animation step (see Model Extraction).
+- First person offered Fire and Reload for items that can do neither. The buttons now match the item: the C4 is inspected and drawn only, the Zeus fires but has no reload, and knives have no fire or reload. An agent opened after holding a weapon no longer gets the weapon's buttons.
+- In first person the C4's name tag hung in the air off the bomb's end. Name tags and StatTrak modules now sit on the held weapon where they sit in the item view; a Butterfly Knife's plate no longer hangs below its handle either.
 - In Safari, Doppler, Gamma Doppler, Marble Fade and other region-painted finishes showed the bare weapon on 23 models, including the Bayonet, Butterfly Knife, M9 Bayonet and AWP. Safari empties a fully transparent image on its way to the GPU, which is how those models' paint-region masks are stored, so Safari now decodes them byte-exact itself.
 - The Butane Buddy's liquid filled the whole ball once the camera was turned to look down at the gun. It now settles against the same gravity the charm hangs by, so the fill stays level and sloshes as you turn the gun.
 - Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
@@ -113,6 +118,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - **v39, lighter assets**: composite inputs larger than 2048 pixels get a 2048 copy beside the original, and every model and data file gets a gzip copy. No existing file changes, so older clients keep loading what they always did.
 - **v36, StatTrak art and knife data**: the knife digit texture is extracted with its cut-out channel intact. Every knife's attachment points and bone chain are written out as the source for knife counter and name tag placement.
 - **C4 model**: the extraction publishes the C4 model with its sticker slots and charm surfaces.
+- **C4 first-person clips**: the animation step takes the C4's own clips (the game keeps them under equipment, not with the guns). A re-run also removes clips an action no longer has, and a one-weapon run keeps every other weapon's entry in the clip index.
 
 ## Backend & API
 

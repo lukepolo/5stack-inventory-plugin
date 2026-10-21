@@ -1720,6 +1720,18 @@ const ARM_OPEN_DEGREES = 55;
 export type AgentPose = "stand" | "open" | "ready";
 
 /**
+ * How an agent moves on a LIVE stage. A viewing choice, never saved.
+ *
+ *   still  the chosen pose, frozen — what patch placement wants
+ *   idle   the chosen pose, breathing: chest, a weight shift and a slow look
+ *   cycle  idle, while blending ready → stand → open and round again
+ *
+ * Synthesised because nothing else exists to play: an agent GLB's only clips
+ * are `tools_preview` (one frame) and `eye_test` (a face-rig check).
+ */
+export type AgentMotion = "still" | "idle" | "cycle";
+
+/**
  * The pose an agent mounts in.
  *
  * `ready` — the model's own `tools_preview` clip — because that is how CS2
@@ -1799,6 +1811,83 @@ function restArms(THREE: ThreeBundle["THREE"], root: import("three").Object3D, d
   return moved;
 }
 
+/** Per-bone attachment frames off a skeleton as it stands — see PoseBones. */
+function poseBonesOf(THREE: ThreeBundle["THREE"], sm: import("three").SkinnedMesh | undefined): PoseBones {
+  const bones: PoseBones = { byName: new Map(), bind: new Map(), modelQuat: null };
+  if (!sm) return bones;
+  sm.skeleton.bones.forEach((bone, bi) => {
+    if (bones.byName.has(bone.name)) return;
+    bones.byName.set(
+      bone.name,
+      new THREE.Matrix4()
+        .multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[bi])
+        .multiply(sm.bindMatrix)
+        .premultiply(sm.bindMatrixInverse),
+    );
+    bones.bind.set(bone.name, sm.skeleton.boneInverses[bi].clone().invert());
+  });
+  // Walk out of the bone chain to the node the exporter parked the swizzle
+  // (and the inch->metre scale) on. decompose, not setFromRotationMatrix:
+  // that scale is in the upper 3x3 and would be read as part of the
+  // rotation.
+  let top: import("three").Object3D = sm.skeleton.bones[0];
+  while (top?.parent && (top.parent as unknown as { isBone?: boolean }).isBone) top = top.parent;
+  if (top?.parent) {
+    const q = new THREE.Quaternion();
+    top.parent.matrixWorld.decompose(new THREE.Vector3(), q, new THREE.Vector3());
+    bones.modelQuat = q;
+  }
+  return bones;
+}
+
+/**
+ * bakePose's attachment frames — the body's bone and the per-bone table —
+ * measured off a skeleton that is LEFT skinned, as first person leaves it.
+ *
+ * The StatTrak module and the name plate are placed from their attachment's
+ * model-space origin through these frames. In first person bakePose never runs,
+ * so there were none, and placeAttachedModule fell back to the anchor's `pos` —
+ * pre-swizzled for a skeleton-less model and nowhere near a skinned one. The C4
+ * is where it showed: its label hung in the air off the bomb's left end. Same
+ * sandwich and same weight count as bakePose, over the bones as they are now
+ * (bind, with the hidden props at scale zero), so the module lands on the body
+ * the arms are holding.
+ */
+function liveFrames(root: import("three").Object3D, THREE: ThreeBundle["THREE"]) {
+  const skinned: import("three").SkinnedMesh[] = [];
+  root.traverse((n) => {
+    if ((n as unknown as { isSkinnedMesh?: boolean }).isSkinnedMesh) skinned.push(n as import("three").SkinnedMesh);
+  });
+  root.updateMatrixWorld(true);
+  let xform: import("three").Matrix4 | null = null;
+  let best = -1;
+  const s = new THREE.Vector3();
+  for (const sm of skinned) {
+    const si = sm.geometry.getAttribute("skinIndex");
+    const sw = sm.geometry.getAttribute("skinWeight");
+    if (!si || !sw) continue;
+    const weight = new Map<number, number>();
+    for (let i = 0; i < si.count; i++) {
+      for (let k = 0; k < 4; k++) {
+        const w = sw.getComponent(i, k);
+        if (w) weight.set(si.getComponent(i, k), (weight.get(si.getComponent(i, k)) ?? 0) + w);
+      }
+    }
+    for (const [bi, w] of weight) {
+      const bone = sm.skeleton.bones[bi];
+      if (!bone || w <= best) continue;
+      bone.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), s);
+      if (Math.min(Math.abs(s.x), Math.abs(s.y), Math.abs(s.z)) < 1e-4) continue; // a hidden prop
+      best = w;
+      xform = new THREE.Matrix4()
+        .multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[bi])
+        .multiply(sm.bindMatrix)
+        .premultiply(sm.bindMatrixInverse);
+    }
+  }
+  return { xform, bones: poseBonesOf(THREE, skinned[0]) };
+}
+
 function bakePose(
   root: import("three").Object3D,
   THREE: ThreeBundle["THREE"],
@@ -1869,34 +1958,7 @@ function bakePose(
   // Per-bone transforms, for attachments — see PoseBones. Read from the first
   // skinned mesh and NOT cached: it is 16 matrix multiplies on the largest rig,
   // against the per-vertex blend below that the cache actually exists for.
-  const bones: PoseBones = { byName: new Map(), bind: new Map(), modelQuat: null };
-  {
-    const sm = skinned[0];
-    if (sm) {
-      sm.skeleton.bones.forEach((bone, bi) => {
-        if (bones.byName.has(bone.name)) return;
-        bones.byName.set(
-          bone.name,
-          new THREE.Matrix4()
-            .multiplyMatrices(bone.matrixWorld, sm.skeleton.boneInverses[bi])
-            .multiply(sm.bindMatrix)
-            .premultiply(sm.bindMatrixInverse),
-        );
-        bones.bind.set(bone.name, sm.skeleton.boneInverses[bi].clone().invert());
-      });
-      // Walk out of the bone chain to the node the exporter parked the swizzle
-      // (and the inch->metre scale) on. decompose, not setFromRotationMatrix:
-      // that scale is in the upper 3x3 and would be read as part of the
-      // rotation.
-      let top: import("three").Object3D = sm.skeleton.bones[0];
-      while (top?.parent && (top.parent as unknown as { isBone?: boolean }).isBone) top = top.parent;
-      if (top?.parent) {
-        const q = new THREE.Quaternion();
-        top.parent.matrixWorld.decompose(new THREE.Vector3(), q, new THREE.Vector3());
-        bones.modelQuat = q;
-      }
-    }
-  }
+  const bones = poseBonesOf(THREE, skinned[0]);
   const scale = new THREE.Vector3();
   const pos3 = new THREE.Vector3();
   const quat = new THREE.Quaternion();
@@ -2722,8 +2784,10 @@ export interface ViewerHandle {
    * pose never touches them.
    */
   setAgentPose: (pose: AgentPose) => void;
-  /** The pose currently showing. */
+  /** The pose currently showing (while cycling, the one it is nearest). */
   agentPose: () => AgentPose;
+  /** Still, idle or cycling — see AgentMotion. No-op for anything but an agent. */
+  setAgentMotion: (motion: AgentMotion) => void;
   /**
    * Turn placement gestures on/off on a LIVE viewer — see ViewerOpts.interactive
    * for what they are. The craft modal shows one item in two modes (view and
@@ -3410,6 +3474,8 @@ export interface ViewerOpts {
    * dropped — most agents have three and the craft form offers five.
    */
   patches?: (string | null)[];
+  /** How an agent moves on a live stage (default idle) — see AgentMotion. */
+  agentMotion?: AgentMotion;
   charm?: CharmPlacement | null;
   /**
    * StatTrak module. Omit/null for a non-StatTrak item.
@@ -3585,6 +3651,10 @@ async function buildViewer(
   // The same motion per BONE, for attachments that hang off something other
   // than the body — see PoseBones.
   let poseBones: PoseBones = { byName: new Map(), bind: new Map(), modelQuat: null };
+  // First person's stand-in for the two above, for bolted-on modules ONLY —
+  // see liveFrames. Kept apart rather than written into poseXform: stickers and
+  // the charm read that one too, and they are right in first person as it is.
+  let moduleFrames: { xform: import("three").Matrix4 | null; bones: PoseBones } | null = null;
   // Lay a dual-wield pair out parallel rather than in the icon's tent. Off for
   // card bakes (`still`), which want the game's own item art — see the call to
   // bakePose below. Harmless on a single-weapon rig: bakePose finds no `*_l`
@@ -3957,6 +4027,102 @@ async function buildViewer(
     agentPose = pose;
   };
   if (pres.restArms) applyAgentPose(DEFAULT_AGENT_POSE);
+
+  // ---- Agent motion (see AgentMotion) --------------------------------------
+  // Every pose is captured once as each bone's local transform, so motion is a
+  // per-frame write of a snapshot (or a blend of two) plus small offsets, never
+  // a re-solve. The offsets turn about the SCENE's axes, carried into each
+  // bone's own frame, so they mean the same thing whatever way a bone's local
+  // axes point; and nothing below the spine moves, so the feet stay planted.
+  let agentMotion: AgentMotion = opts?.agentMotion ?? "idle";
+  type AgentSnap = { q: import("three").Quaternion[]; p: import("three").Vector3[] };
+  const agentSnaps = new Map<AgentPose, AgentSnap>();
+  const AGENT_CYCLE: AgentPose[] = ["ready", "stand", "open"];
+  /** Seconds each pose holds, and how long the blend into the next takes. */
+  const AGENT_HOLD = 3.5;
+  const AGENT_BLEND = 1.4;
+  let agentMoved = false;
+  let agentCycleT0 = 0;
+  const agentBones = new Map<string, import("three").Object3D>();
+  if (bindPose) for (const b of bindPose) agentBones.set(b.bone.name, b.bone);
+  const snapAgent = (pose: AgentPose): AgentSnap => {
+    let snap = agentSnaps.get(pose);
+    if (snap) return snap;
+    const keep = agentPose;
+    applyAgentPose(pose);
+    snap = { q: bindPose!.map((b) => b.bone.quaternion.clone()), p: bindPose!.map((b) => b.bone.position.clone()) };
+    agentSnaps.set(pose, snap);
+    applyAgentPose(keep);
+    return snap;
+  };
+  const aqTmp = new THREE.Quaternion();
+  const aqParent = new THREE.Quaternion();
+  const aqDelta = new THREE.Quaternion();
+  const AX_UP = new THREE.Vector3(0, 1, 0);
+  const AX_RIGHT = new THREE.Vector3(1, 0, 0);
+  const AX_FWD = new THREE.Vector3(0, 0, 1);
+  /** Turn `name` by `rad` about world `axis`, expressed in its parent's frame. */
+  const nudge = (name: string, axis: import("three").Vector3, rad: number) => {
+    const bone = agentBones.get(name);
+    if (!bone || !rad) return;
+    bone.parent ? bone.parent.getWorldQuaternion(aqParent) : aqParent.identity();
+    aqDelta.setFromAxisAngle(axis, rad);
+    // q' = parent⁻¹ · D · parent · q, i.e. D applied in world space.
+    aqTmp.copy(aqParent).invert().multiply(aqDelta).multiply(aqParent);
+    bone.quaternion.premultiply(aqTmp);
+  };
+  const smooth = (x: number) => x * x * (3 - 2 * x);
+  function stepAgentMotion(now: number) {
+    if (kind !== "agent" || !bindPose || opts?.still) return;
+    // Reduced motion holds the agent still, as it does the inspect sway.
+    const live = motionOn && agentMotion !== "still" && !reducedMotion.value;
+    if (!live) {
+      // Back to the plain pose once, when motion stops.
+      if (agentMoved) {
+        applyAgentPose(agentPose);
+        agentMoved = false;
+      }
+      return;
+    }
+    const t = now / 1000;
+    let from = snapAgent(agentPose);
+    let to = from;
+    let mix = 0;
+    if (agentMotion === "cycle") {
+      if (!agentCycleT0) agentCycleT0 = t - AGENT_CYCLE.indexOf(agentPose) * (AGENT_HOLD + AGENT_BLEND);
+      const step = AGENT_HOLD + AGENT_BLEND;
+      const k = Math.floor((t - agentCycleT0) / step);
+      const into = (t - agentCycleT0) - k * step;
+      const a = AGENT_CYCLE[((k % 3) + 3) % 3];
+      const b = AGENT_CYCLE[(((k + 1) % 3) + 3) % 3];
+      from = snapAgent(a);
+      to = snapAgent(b);
+      mix = into > AGENT_HOLD ? smooth((into - AGENT_HOLD) / AGENT_BLEND) : 0;
+      agentPose = mix < 0.5 ? a : b;
+    }
+    bindPose.forEach((b, i) => {
+      b.bone.quaternion.copy(from.q[i]).slerp(to.q[i], mix);
+      b.bone.position.copy(from.p[i]).lerp(to.p[i], mix);
+    });
+    object.updateMatrixWorld(true);
+    // Breathing (~4.5s), a slow weight shift through the upper body (~7s) and
+    // a look around (~9s). Small: this is a person standing, not a dance.
+    const breath = Math.sin((t * Math.PI * 2) / 4.5);
+    const shift = Math.sin((t * Math.PI * 2) / 7.3);
+    const look = Math.sin((t * Math.PI * 2) / 9.1 + 0.7);
+    const nod = Math.sin((t * Math.PI * 2) / 6.2 + 1.9);
+    const deg = Math.PI / 180;
+    nudge("spine_0", AX_FWD, shift * 1.1 * deg);
+    nudge("spine_2", AX_RIGHT, breath * 0.6 * deg);
+    nudge("spine_3", AX_RIGHT, breath * 0.5 * deg);
+    nudge("clavicle_L", AX_FWD, breath * 0.5 * deg);
+    nudge("clavicle_R", AX_FWD, -breath * 0.5 * deg);
+    nudge("neck_0", AX_FWD, -shift * 0.6 * deg);
+    nudge("head_0", AX_UP, look * 5 * deg);
+    nudge("head_0", AX_RIGHT, nod * 1.5 * deg);
+    object.updateMatrixWorld(true);
+    agentMoved = true;
+  }
   /**
    * A clip to PLAY rather than bake — see Presentation.liveClips.
    *
@@ -4006,6 +4172,8 @@ async function buildViewer(
     liveMixer.update(0);
     twist?.apply();
     object.updateMatrixWorld(true);
+  } else if (poseClip && fpvSpec) {
+    moduleFrames = liveFrames(object, THREE);
   } else if (poseClip && !fpvSpec) {
     object.updateMatrixWorld(true);
     // Drop the props and the skeleton, keeping the bind pose. This also settles
@@ -10767,7 +10935,8 @@ async function buildViewer(
     // Which bone actually carries this attachment. Unnamed means "the body",
     // i.e. exactly what poseXform already is — every gun takes that branch and
     // nothing about them changes. See StatTrakAnchorSet.bone.
-    const bonePose = (bone ? poseBones.byName.get(bone) : null) ?? poseXform;
+    const frames = moduleFrames ?? { xform: poseXform, bones: poseBones };
+    const bonePose = (bone ? frames.bones.byName.get(bone) : null) ?? frames.xform;
     // POSITION and ROTATION both ride the bone's pose, but they take DIFFERENT
     // parts of it — treating them as symmetric is a regression waiting to
     // happen, and it broke every gun once already.
@@ -10786,7 +10955,7 @@ async function buildViewer(
     // which is exact for every gun (their bones sit unrotated) and wrong for
     // the Shadow Daggers, whose `weapon_r` stands at 90 degrees: unrotated, the
     // plate lands an inch out from the handle instead of an inch up the blade.
-    const bind = bone ? poseBones.bind.get(bone) : undefined;
+    const bind = bone ? frames.bones.bind.get(bone) : undefined;
     let bindTurn: import("three").Quaternion | null = null;
     let at = new THREE.Vector3(src[0], src[1], src[2]);
     if (bind) {
@@ -10796,7 +10965,7 @@ async function buildViewer(
       if (Math.abs(bq.w) < 0.9999) {
         at = at.sub(bp).applyQuaternion(bq).add(bp);
         // In the module's glb basis, like the attachment's own angles below.
-        const m = poseBones.modelQuat;
+        const m = frames.bones.modelQuat;
         bindTurn = m ? m.clone().multiply(bq).multiply(m.clone().invert()) : bq;
       }
     }
@@ -10824,7 +10993,7 @@ async function buildViewer(
     // (glb x,y,z = model y,z,x). Every GUN anchor is unrotated, so that half is
     // unconstrained by guns; knives (karambit [-54.1, 0, -170.4]) are what
     // settled it, and they take `sourceAngles`.
-    const clipQuat = clipRotation(THREE, bonePose, poseBones.modelQuat) ?? new THREE.Quaternion();
+    const clipQuat = clipRotation(THREE, bonePose, frames.bones.modelQuat) ?? new THREE.Quaternion();
     if (noRotation) mod.quaternion.identity();
     else mod.quaternion
       .copy(clipQuat)
@@ -14012,6 +14181,7 @@ async function buildViewer(
     stepCharm();
     stepCharmIdle(performance.now());
     stepCharmLiquid();
+    stepAgentMotion(performance.now());
     updateRing();
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
@@ -14124,8 +14294,16 @@ async function buildViewer(
     setNameTag: (text) => void setNameTag(text),
     setPatches: (images) => applyPatches(images),
     patchSlots: () => patchSlotCount,
-    setAgentPose: (pose) => applyAgentPose(pose),
+    setAgentPose: (pose) => {
+      // Picking a pose while cycling means "this one": stop rolling, keep moving.
+      if (agentMotion === "cycle") agentMotion = "idle";
+      applyAgentPose(pose);
+    },
     agentPose: () => agentPose,
+    setAgentMotion: (motion) => {
+      agentMotion = motion;
+      agentCycleT0 = 0;
+    },
     inspect: () => inspectState(),
     setInspectPlaying: (on) => setInspectPlaying(on),
     setInspectTime: (t) => setInspectTime(t),
