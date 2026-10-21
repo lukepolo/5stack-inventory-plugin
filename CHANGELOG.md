@@ -45,6 +45,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 
 ### Bug Fixes
 
+- In Safari, Doppler, Gamma Doppler, Marble Fade and other region-painted finishes showed the bare weapon on 23 models, including the Bayonet, Butterfly Knife, M9 Bayonet and AWP. Safari empties a fully transparent image on its way to the GPU, which is how those models' paint-region masks are stored, so Safari now decodes them byte-exact itself.
 - Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
 - Legacy-body finishes such as AK-47 | Redline dropped the fourth sticker on the handguard.
 - Foil, gold and other metal stickers came out flat grey or the wrong colour; hovering one brought the colour back. They now keep their artwork's colours, and gold stickers turn gold, matching the game's own icons.
@@ -65,7 +66,8 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 ### Bug Fixes
 
 - Editing an item's stickers or charm now re-renders its card. Card files were named only by wear, pattern and StatTrak, so moving, swapping or scratching a sticker kept the old picture until the cache was cleared.
-- A card whose paint failed to load, or which came out black, is retried instead of stored. This caused a Butterfly Knife | Doppler card to show a plain knife and the Driver Gloves card to be black.
+- A card whose paint failed to load, or which came out black, is retried instead of stored. This caused the Driver Gloves card to be black.
+- Paint composites saved to the shared store before the Safari fix are no longer used, since Safari could have stored a bare weapon for a Doppler there.
 
 ## Performance
 
@@ -101,6 +103,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **Dev backend**: `inventory-dev.fulm.eu` runs the fork's backend beside the installed one, sharing its database and models but keeping its own card store. It is installed and updated with `scripts/dev-backend.sh`, from an image built on every backend or script change.
 - **Debugging guide**: `docs/DEBUGGING.md` explains where the ground truth lives and how each class of rendering and placement bug was diagnosed. It also covers the tools below.
 - **Test tools**: `mount.html` renders any item with any options from the URL, `tools/standalone` runs the real UI against a fake inventory, and `glb-info`/`knife-anchors` read and apply the game's model data.
+- **Safari test runner**: `shoot-webkit.mjs` renders the same test pages in Safari's engine (WebKit) headlessly, for bugs that only Safari shows.
 
 ### Removed
 

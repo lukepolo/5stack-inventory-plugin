@@ -87,6 +87,18 @@ It runs headless Chrome (with the WebGL flags it needs) and saves every
 on exit**. Earlier runners didn't, and a day of runs filled the disk (8.8 GB of
 profiles).
 
+### 3.2a `shoot-webkit.mjs`: the same, in Safari's engine
+
+```bash
+npm i --no-save playwright && npx playwright install webkit   # once
+node tools/shadertest/shoot-webkit.mjs '<rig url>' out/prefix_ [--log regex] [--headed]
+```
+
+Same contract as `shoot.mjs`, but in headless WebKit through Playwright, which is
+kept out of `package.json` on purpose. It also lists failed requests and HTTP
+errors. Use it whenever a report comes from Safari or an iPhone and the Chrome
+runners can't reproduce it (see 4.9).
+
 ### 3.3 Reading renders
 
 - **Diff to find the feature.** Shoot with `plain=1`. The bounding box of
@@ -318,9 +330,11 @@ inventory row) and the extraction version. Anything the card draws that is not
 in that name will NOT re-bake when it changes. The viewer reports a failed paint
 (`paintFailed`), and the bake returns null and is retried. A frame with under 2%
 lit pixels (`BLANK_BAKE_LIT`) is refused. Anything already stored needs **Clear
-renders**. Card and composite keys include `EXTRACT_VERSION` and
-`VALVE_RUNTIME_REV`; bump one to force a re-bake after a change that alters
-stored art.
+renders**. Card and composite keys include `EXTRACT_VERSION`, and the
+composite generation also hashes `VALVE_RUNTIME_REV` and `INPUT_DECODE_REV`;
+bump one to force a re-bake after a change that alters stored art. A bad
+picture that the client did not flag as failed (the Safari Doppler cards) is
+already stored under the current key, so it needs **Clear renders** as well.
 
 ### 4.7 Something stutters
 
@@ -350,10 +364,43 @@ Add an extraction step to `scripts/extract-models.sh`:
    then run its functions on a downloaded sample (the C4's attachment dump, a
    generated RGBA PNG). `bash -n scripts/extract-models.sh` checks the shell.
 
+### 4.9 It works in Chrome but not in Safari
+
+Every runner above is Chrome. When the user's screen disagrees with a Chrome
+render of the same item, rule out the data first, then the browser:
+
+1. Same build, same assets, same item in `mount.html` under Chrome. If that is
+   right, the assets and the item data are not the problem.
+2. The shared composite store (`/api/composites/<gen>/<stem>…`) for that stem.
+   Nothing stored means the bad picture is made on the user's machine.
+3. `shoot-webkit.mjs` on the same URL. If WebKit reproduces it, swap things
+   between a failing and a working model until one difference explains it.
+
+The Safari Doppler bug went exactly this way. The Bayonet and Flip Knife use the
+same Doppler material, and in WebKit the Flip painted while the Bayonet came out
+bare. Their composite inputs differed in one way: the Bayonet's `masks.png` has
+alpha 0 on every texel, the Flip's on all but a handful. A 30-line page that
+uploads each file to a WebGL texture and reads it back showed WebKit returns
+all zeros for a fully transparent image, with
+`UNPACK_PREMULTIPLY_ALPHA_WEBGL` off, while Chrome returns the stored bytes.
+`createImageBitmap({premultiplyAlpha: "none"})` was worse in WebKit, not
+better. `src/rawPng.ts` now probes for the behaviour once with a 1×1 PNG and,
+where it is present, decodes the input PNGs itself. Its output was checked
+byte-for-byte against Pillow on every input of four knives.
+
+To check a texture this way, upload it to WebGL with the same `pixelStorei`
+settings three uses, read it back through a framebuffer and compare channel
+means between `webkit` and `chromium` in Playwright. `getImageData` on a 2D
+canvas can't tell you, because 2D canvases are premultiplied in every browser.
+
 ## 5. Gotchas
 
 - **Disk.** Headless Chrome profiles are large; use the runners in this repo,
   which delete theirs.
+- **Alpha is data in the composite inputs.** `masks.png` alpha is unused and 0,
+  `ao.png` alpha is noPaint. Any loader for them must keep RGB under alpha 0,
+  which Safari's image path does not do for a fully transparent file; go
+  through `loadRawPngTexture` (src/rawPng.ts).
 - **Headless WebGL** needs `--use-angle=swiftshader --enable-unsafe-swiftshader`;
   without them every render is blank and looks like a shader bug.
 - **The live path needs an on-screen host.** An off-screen host can be treated

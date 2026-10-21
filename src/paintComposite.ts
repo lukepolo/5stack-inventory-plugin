@@ -31,6 +31,7 @@
 // - pattern & wear & grunge scale all multiply weaponLength/36 for
 //   spray/anodized-air styles, uvScale for everything else
 import { getAssetOrigin, withAssetVersion } from "./api";
+import { loadRawPngTexture } from "./rawPng";
 import {
   buildValveMaterials,
   loadValveCombo,
@@ -1776,7 +1777,10 @@ void main() {
 // suffix is a version suffix nobody bumps.
 // The Valve runtime's epilogue + revision ride along: most composites are now
 // rendered by it, not by FRAG, and a change there must re-bake the store too.
-registerCompositeShader(VERT, FRAG + VALVE_RUNTIME_REV);
+// So does the input decode: before rawPng.ts, Safari composited anodized
+// finishes on fully-transparent masks as the bare weapon and could upload them.
+const INPUT_DECODE_REV = "raw-png-1";
+registerCompositeShader(VERT, FRAG + VALVE_RUNTIME_REV + INPUT_DECODE_REV);
 
 // ---- Texture loading ------------------------------------------------------------
 // One shared cache across composites; colorSpace flags follow the shader's
@@ -1878,8 +1882,10 @@ function loadTex(
   const key = `${url}|${opts.srgb ? "s" : "l"}|${opts.wrap ? "w" : "c"}${akey}`;
   let cached = texCache.get(key);
   if (!cached) {
-    cached = new THREE.TextureLoader()
-      .loadAsync(url)
+    // The weapon inputs are PNGs with data in their alpha, which Safari empties
+    // when the file is fully transparent -- see rawPng.ts.
+    cached = loadRawPngTexture(THREE, url)
+      .then((raw) => raw ?? new THREE.TextureLoader().loadAsync(url))
       .then((t) => {
         t.colorSpace = opts.srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
         if (opts.addr) {

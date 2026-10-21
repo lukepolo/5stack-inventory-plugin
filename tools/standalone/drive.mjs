@@ -10,8 +10,9 @@
 // driver waits `wait` ms (default 1500) and, with `shot`, writes <out>/<shot>.png.
 // DPR=2 in the environment renders at device pixel ratio 2.
 //
-// Console errors and uncaught exceptions are printed at the end. The Chrome
-// profile is a temp directory, deleted on exit.
+// Console errors and uncaught exceptions are printed at the end; LOG=<regex> in
+// the environment also prints every console line matching it as it arrives.
+// The Chrome profile is a temp directory, deleted on exit.
 import { spawn } from "node:child_process";
 import { writeFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -79,6 +80,12 @@ ws.onmessage = (e) => {
   if (m.id && pending.has(m.id)) {
     pending.get(m.id)(m);
     pending.delete(m.id);
+  }
+  if (m.method === "Runtime.consoleAPICalled" && process.env.LOG) {
+    const fmt = (a) =>
+      a.preview?.properties ? `{${a.preview.properties.map((p) => `${p.name}: ${p.value}`).join(", ")}}` : (a.value ?? a.description ?? "");
+    const line = m.params.args.map(fmt).join(" ");
+    if (new RegExp(process.env.LOG).test(line)) console.log(`[console] ${line}`);
   }
   if (m.method === "Runtime.consoleAPICalled" && (m.params.type === "error" || m.params.type === "warning"))
     logs.push(`[${m.params.type}] ` + m.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
