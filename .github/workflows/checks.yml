@@ -49,7 +49,7 @@ jobs:
         with:
           # 24 for `--experimental-strip-types`: every tool here is TypeScript
           # run directly, with no build step. Matches codepier.yaml's node:24.
-          node-version: "24"
+          node-version: "24.22.1"
           cache: npm
           cache-dependency-path: |
             package-lock.json

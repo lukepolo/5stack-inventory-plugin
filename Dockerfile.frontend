@@ -7,7 +7,7 @@
 # QEMU arm64 emulation intermittently crashed vite's native bundler with
 # "qemu: uncaught target signal 4 (Illegal instruction)". Now it builds once,
 # natively, and the arm64 image only runs the COPYs below.
-FROM --platform=$BUILDPLATFORM node:24-alpine AS build
+FROM --platform=$BUILDPLATFORM node:24.22.1-alpine AS build
 WORKDIR /app
 COPY package.json ./
 RUN npm install
