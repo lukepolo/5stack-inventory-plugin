@@ -567,6 +567,16 @@
 .over-art [class*="rounded"] > svg {
   text-shadow: none;
 }
+/* Muted text over a picture goes OPAQUE. The app's muted grey is a mid-grey at
+   50-70% opacity, and over the CS2 haze (#a1aaae at its brightest) a see-through
+   grey of the same lightness is the haze — "est. value" and the sales line
+   read as nothing but their shadow. Lighter and solid, the shadow above has
+   something to outline. One tier rather than three: over art, legible beats
+   the hierarchy the opacities drew. */
+[data-5stack-plugin] .over-art[class*="text-muted-foreground"],
+[data-5stack-plugin] .over-art [class*="text-muted-foreground"] {
+  color: hsl(240 5% 82%);
+}
 
 /* The knife/glove model rail (craftModelList in App.vue). It scrolls sideways
    under its own arrows and edge fades, so a scrollbar would be a second control

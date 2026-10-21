@@ -24,6 +24,8 @@ import PillTabs from "./PillTabs.vue";
 import ViewerControls from "./ViewerControls.vue";
 import { ACTION_ICON, ACTION_ICON_BOX, ACTION_ICON_VIEWBOX } from "../weaponActionIcons";
 import { glowStyle } from "../itemVisuals";
+import { choiceValue, choicesVersion } from "../devFlags";
+import { viewerEnvironment } from "../viewerEnvironments";
 import type { InspectTransport } from "../viewer3d";
 import type { StageKey } from "../composables/useViewerStage";
 
@@ -167,6 +169,29 @@ const chromeBC = computed(() => (props.bleed ? (isCompact.value ? "bottom-3" : "
 
 const REPORT_LINK =
   "text-f9 uppercase tracking-cs2 text-muted-foreground/45 underline decoration-dotted underline-offset-2 transition-colors hover:text-muted-foreground";
+
+/**
+ * The 3D view's backdrop, in CSS, from the first frame.
+ *
+ * The viewer paints its backdrop (the CS2 haze, or a scene photo) on its own
+ * canvas, and the canvas has nothing to show until the model loads. Until then
+ * the pane was the dark card with the rarity glow, and it jumped to a light grey
+ * haze the moment the model landed. This puts the same picture behind the host,
+ * so the canvas paints over what is already there.
+ *
+ * The haze stops are read off the live canvas (top to bottom; it does not vary
+ * across), not taken from the gradient viewer3d paints — that one goes through
+ * the rig's exposure on the way to the screen.
+ */
+const DAYLIGHT_HAZE =
+  "linear-gradient(180deg, #737e85 0%, #7e898f 10%, #8a939a 20%, #949da3 30%, #a1aaae 42%, #9fa5a6 50%, #9d9e9b 60%, #92928d 70%, #87857f 80%, #7a776f 90%, #706b62 100%)";
+const backdropStyle = computed(() => {
+  void choicesVersion.value;
+  const env = viewerEnvironment(choiceValue("env"));
+  if (env.daylight) return { background: DAYLIGHT_HAZE };
+  if (env.backdrop) return { background: `center / cover no-repeat url("${env.backdrop.image}")` };
+  return null;
+});
 </script>
 
 <template>
@@ -194,6 +219,11 @@ const REPORT_LINK =
       style="background-image: linear-gradient(rgba(255,255,255,0.7) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.7) 1px, transparent 1px); background-size: 44px 44px; -webkit-mask-image: radial-gradient(ellipse at center, black 25%, transparent 72%); mask-image: radial-gradient(ellipse at center, black 25%, transparent 72%)"
     ></span>
 
+    <!-- The 3D backdrop, there before the canvas has anything to paint (see
+         backdropStyle). Over the glow and the grid, which the canvas covers
+         anyway once it draws. -->
+    <span v-if="is3d && backdropStyle" class="pointer-events-none absolute inset-0 z-[1]" :style="backdropStyle"></span>
+
     <!-- The flat artwork. Kept mounted under `v-show` so a 2D↔3D flip does not
          re-run its own enter transition every time. -->
     <div v-show="!is3d" class="relative z-[2] flex h-full w-full items-center justify-center">
@@ -208,7 +238,7 @@ const REPORT_LINK =
       <img v-if="is3d && frozen" :src="frozen" alt="" class="pointer-events-none absolute inset-0 z-[3] h-full w-full object-contain" />
     </Transition>
     <div v-if="is3d && busy && !frozen" class="absolute inset-0 z-[3] grid place-items-center">
-      <div class="flex flex-col items-center gap-3 text-muted-foreground">
+      <div class="over-art flex flex-col items-center gap-3 text-muted-foreground">
         <Loader2 class="h-6 w-6 animate-spin text-[color:var(--acc)]" />
         <span class="text-f11 uppercase tracking-cs2">Loading 3D model…</span>
       </div>
