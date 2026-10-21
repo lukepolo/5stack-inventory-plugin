@@ -439,10 +439,16 @@ What decides it, from `groundtruth/sticker.glsl`: the shader takes
 `g_flSticker0Wear` as is (no curve on the GPU side), and the ART'S ALPHA is a
 wear-order map. Bytes 0-20 are the coverage ramp; above that, the higher the
 byte the later it wears, so outlines (255) survive even at 1.0. Per sticker,
-`g_vWearBiasSticker0` and `g_fWearScratchesSticker0` shape it. The 2026-10-21
-check against an AK-47 with five stickers matched at every wear; the one clear
-difference was the Econometer (Lenticular) window, which the game clears at
-0.85 although its art alpha there is 255.
+`g_vWearBiasSticker0` and `g_fWearScratchesSticker0` shape it. Holo and
+lenticular layers only recolour (`sticker.glsl` ~640-680); the wear still reads
+the art's alpha. The 2026-10-21 check against an AK-47 with five stickers
+matched at every wear, the Econometer (Lenticular) window included.
+
+Zoom before calling a difference. At 200px crops of a phone-sized screenshot,
+the Econometer's window looked cleared at 0.85 and its band looked scratched at
+0.15. At 3x on the same frames the window is kept (as its alpha of 255 says)
+and the "scratch" was the handguard seam. Measure mean colours inside the
+sticker against bare paint beside it.
 
 A flat simulation of `WEAR_GLSL` in Python is a quick cross-check, but load the
 scratch map as its R channel BEFORE resizing: its alpha is 0, Pillow
