@@ -5523,11 +5523,12 @@ async function buildViewer(
     const bone = skinned.skeleton.bones[best];
     const mount = bone ? bonesAtMount.get(bone) : undefined;
     if (!bone || !mount) return null;
-    return {
-      bone,
-      pre: skinned.matrixWorld.clone().multiply(skinned.bindMatrixInverse),
-      post: mount.clone().invert().multiply(skinned.bindMatrix).multiply(skinned.matrixWorld.clone().invert()),
-    };
+    // `pre` is M · BI, and `post` must undo exactly that. NOT bindMatrix · M⁻¹:
+    // bindMatrix is the mesh's world matrix when it was BOUND, and the viewer
+    // scales and centres the model after that, so it is no inverse of anything
+    // here — every sticker took a constant offset and flew off the gun.
+    const pre = skinned.matrixWorld.clone().multiply(skinned.bindMatrixInverse);
+    return { bone, pre, post: mount.clone().invert().multiply(pre.clone().invert()) };
   }
   /**
    * The subset that carries TEXCOORD_1 — i.e. the surfaces the game maps
