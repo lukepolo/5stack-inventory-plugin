@@ -16,7 +16,9 @@ const trace = { exr: [], image: [] };
 globalThis.__paintInputTrace = trace;
 const makeTexture = () => ({ image: { width: 2, height: 2, data: new Float32Array([-10, 0, 3, 1, 2, 4, 8, 1, 12, 16, 32, 1, -5, -1, 64, 1]) } });
 const compiled = await build({
-  stdin: { contents: 'const failedUrls = new Set<string>();\n' + loaders + '\nexport {loadTex,loadExr,failedUrls};', loader: 'ts', resolveDir: process.cwd() },
+  // loadTex tries rawPng's exact decoder first (Safari) and falls back to the
+  // browser's loader when it answers null, which is what Chrome always gets.
+  stdin: { contents: 'const failedUrls = new Set<string>();\nconst loadRawPngTexture = async (_THREE: unknown, _url: string) => null;\n' + loaders + '\nexport {loadTex,loadExr,failedUrls};', loader: 'ts', resolveDir: process.cwd() },
   bundle: true, write: false, format: 'esm', platform: 'node',
   plugins: [{ name: 'recording-exr-loader', setup(b) {
     b.onResolve({ filter: /^three\/examples\/jsm\/loaders\/EXRLoader\.js$/ }, () => ({ path: 'exr', namespace: 'fixture' }));
