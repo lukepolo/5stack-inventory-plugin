@@ -5735,6 +5735,16 @@ async function loadStockPrices(key: string) {
     // No prices is the normal state on an instance with the feed off.
   }
 }
+// The sheet can open before the price status has landed — a page opened
+// straight on ?slot=knife loads its finishes first — and loadStockPrices bails
+// while the feed isn't known to be ready, with nothing to ask again. Every
+// craft card then showed "—" until you picked the slot a second time.
+watch(
+  () => priceStatus.value?.ready,
+  (ready) => {
+    if (ready && sheetKey.value) void loadStockPrices(sheetKey.value);
+  },
+);
 
 /** A craft card's cost, and the caption that keeps it honest about which wear
  *  bracket answered — "brand new" is Factory New only where FN exists. */
