@@ -12442,7 +12442,13 @@ async function buildViewer(
   /** Viewmodel clips built on demand, one per action, with their sound cues. */
   const fpvClips = new Map<
     ClipAction,
-    { clip: import("three").AnimationClip; cues: ClipCue[]; prop: import("three").AnimationClip | null }
+    {
+      clip: import("three").AnimationClip;
+      cues: ClipCue[];
+      prop: import("three").AnimationClip | null;
+      /** A gun's moving parts from the viewmodel clip itself — see playFpvAction. */
+      parts: import("three").AnimationAction | null;
+    }
   >();
   /** Cues still to fire for the action playing, in clip order. */
   let fpvCues: ClipCue[] = [];
@@ -12535,6 +12541,7 @@ async function buildViewer(
       arms.rest();
       playProp(null);
       for (const a of weaponActions.values()) a.fadeOut(PARTS_FADE);
+      for (const e of fpvClips.values()) e.parts?.fadeOut(PARTS_FADE);
       onDone?.();
       return;
     }
@@ -12550,10 +12557,41 @@ async function buildViewer(
         return;
       }
       const built = buildViewmodelClip(THREE as unknown as typeof import("three"), raw);
+      /**
+       * A GUN'S PARTS COME FROM THIS CLIP TOO, when it has them.
+       *
+       * They used to come from the weapon GLB's own `reload`/`shoot`, on the
+       * belief that the two are the same animation. They are not. On the AK-47
+       * the GLB's `reload` throws the magazine 20-28" from the gun and turns it
+       * 180 degrees and back between two frames (0.60-0.73s) — the swap, as
+       * the world model plays it — so the held magazine flailed through the
+       * reload nowhere near the hand. The viewmodel clip's own `clip` track
+       * stays within 1.5" of `attachHand_L` from the pull to the insert: it is
+       * authored against these hands, on this clock. Same bone space (the rest
+       * values agree to 0.002"), so it plays on the weapon's skeleton as is.
+       *
+       * `weapon`/`weapon_offset` stay out for the reason the GLB's do: `wpn`
+       * owns the placement.
+       */
+      const vmParts =
+        !fpvKnife && weaponMixer
+          ? buildPropClip(
+              THREE as unknown as typeof import("three"),
+              raw,
+              (b) => !/^(weapon_offset|ag1_hand_[lr])$/i.test(b) && !!object.getObjectByName(b),
+            )
+          : null;
+      let parts: import("three").AnimationAction | null = null;
+      if (vmParts && weaponMixer) {
+        parts = weaponMixer.clipAction(vmParts);
+        parts.setLoop(THREE.LoopOnce, 1);
+        parts.clampWhenFinished = true;
+      }
       entry = {
         clip: built.clip,
         cues: [...(raw.sounds ?? [])].sort((a, b) => a.t - b.t),
         prop: fpvKnife ? buildPropClip(THREE as unknown as typeof import("three"), raw, (b) => !!object.getObjectByName(b)) : null,
+        parts,
       };
       fpvClips.set(action, entry);
       // The fire clip carries the weapon's rate of fire — see the extractor.
@@ -12563,7 +12601,11 @@ async function buildViewer(
       }
     }
     if (!arms) return;
-    const parts = weaponActions.get(action);
+    // The viewmodel's own parts when the clip has them; the GLB's otherwise.
+    const glbParts = weaponActions.get(action);
+    const parts = entry.parts ?? glbParts;
+    // Never both: two actions on the same bones blend into a third motion.
+    if (entry.parts && glbParts) glbParts.stop();
     arms.play(entry.clip, () => {
       parts?.fadeOut(PARTS_FADE);
       playProp(null);
