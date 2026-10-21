@@ -29,7 +29,7 @@ const HINT: Record<string, string> = { "2D": "The flat artwork", "3D": "The mode
     :item-key="(s) => s"
     :item-title="(s) => HINT[s]"
     :active="is3d ? '3D' : '2D'"
-    :list-class="listClass ?? ''"
+    :list-class="listClass ?? 'h-8'"
     button-class="relative z-[1] flex h-full items-center gap-1.5 rounded-md px-2.5 py-1 text-f10 uppercase tracking-wider transition-colors"
     @select="(s) => emit('update:is3d', s === '3D')"
   >

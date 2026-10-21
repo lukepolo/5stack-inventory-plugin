@@ -69,7 +69,7 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
             ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground'
             : props.btnClass
               ? [props.btnClass, 'text-muted-foreground']
-              : 'flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-f10 uppercase tracking-wider text-muted-foreground',
+              : 'flex h-8 items-center gap-1.5 rounded-md border px-3 text-f10 uppercase tracking-wider text-muted-foreground',
           open ? 'tac-on' : 'border-border',
         ]"
         @click.stop="open = !open"

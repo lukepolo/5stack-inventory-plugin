@@ -45,7 +45,7 @@ const emit = defineEmits<{
     <button
       v-if="canInspect"
       class="flex flex-none items-center justify-center gap-1.5 rounded-md border border-border uppercase tracking-wider text-muted-foreground tac-action"
-      :class="isCompact ? 'h-10 w-10' : 'px-2.5 py-1 text-f10'"
+      :class="isCompact ? 'h-10 w-10' : 'h-8 px-3 text-f10'"
       :title="viewOnly
         ? 'Launch CS2 and inspect this item in-game'
         : 'Launch CS2 and inspect exactly what\'s in the editor right now — saving not required'"
@@ -56,14 +56,16 @@ const emit = defineEmits<{
       <ExternalLink :class="isCompact ? 'h-[18px] w-[18px]' : 'h-3 w-3'" />
       <template v-if="!isCompact">{{ linkOpening ? "Opening…" : "Inspect in game" }}</template>
     </button>
-    <ShareMenu :links="shareLinks" :note="shareNote" :btn-class="isCompact ? compactBtnClass : undefined" />
+    <!-- Nothing to share, no button: focus on a default weapon, or a visitor
+         whose item has no public link. -->
+    <ShareMenu v-if="shareLinks.length" :links="shareLinks" :note="shareNote" :btn-class="isCompact ? compactBtnClass : undefined" />
     <!-- Also in the footer, deliberately. This row is where the eye goes for
          "what can I do with this item", and on a tall details panel the footer
          copy can be a scroll away. -->
     <button
       v-if="viewOnly && canEditItem"
       class="grid place-items-center rounded-md border border-border text-muted-foreground tac-action"
-      :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
+      :class="isCompact ? 'h-10 w-10' : 'h-8 w-8'"
       :title="readOnly ? 'Synced from Steam and read-only — craft your own copy of it' : 'Edit this item'"
       @click="emit('edit')"
     >
@@ -75,7 +77,7 @@ const emit = defineEmits<{
     <button
       v-if="viewOnly && canDelete"
       class="grid place-items-center rounded-md border border-border text-muted-foreground transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
-      :class="isCompact ? 'h-10 w-10' : 'h-7 w-7'"
+      :class="isCompact ? 'h-10 w-10' : 'h-8 w-8'"
       title="Delete from inventory"
       @click="emit('delete')"
     >
@@ -84,7 +86,7 @@ const emit = defineEmits<{
     <button
       v-if="!viewOnly"
       class="flex items-center gap-1.5 rounded-md border border-border text-muted-foreground tac-action"
-      :class="isCompact ? 'h-10 px-3 text-f11 uppercase tracking-wider' : 'px-2.5 py-1 text-f10 uppercase tracking-wider'"
+      :class="isCompact ? 'h-10 px-3 text-f11 uppercase tracking-wider' : 'h-8 px-3 text-f10 uppercase tracking-wider'"
       title="Reset all options"
       @click="emit('reset')"
     >

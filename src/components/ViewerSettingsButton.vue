@@ -120,8 +120,9 @@ onBeforeUnmount(stop);
 
 <template>
   <!-- The same `bg-muted p-1` shell the pill tabs use, so the two sit on one
-       baseline at one height. A bare button here was 2px shorter and read as
-       misaligned. -->
+       baseline at one height: 24px inside, 32px out, the h-8 every header
+       control is. A bare button here was 2px shorter and read as misaligned,
+       and so was a 22px one. -->
   <div ref="root" class="relative inline-flex items-center rounded-lg bg-muted p-1">
     <!-- OPEN gets the same amber indicator an active pill tab gets, because it
          sits in the same shell and "this one is engaged" should look the same in
@@ -130,7 +131,7 @@ onBeforeUnmount(stop);
          1px border would grow the button and shift the badge pinned to its
          corner. -->
     <button
-      class="relative grid h-[22px] w-[26px] place-items-center rounded-md transition-all active:scale-95"
+      class="relative grid h-6 w-7 place-items-center rounded-md transition-all active:scale-95"
       :class="open ? 'text-foreground' : changed ? 'text-[#f2c14e]' : 'text-muted-foreground hover:text-foreground'"
       :style="open
         ? {

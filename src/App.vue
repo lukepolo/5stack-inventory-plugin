@@ -8892,48 +8892,31 @@ if (MDEBUG) {
                      screen you land on to look at a weapon. -->
                 <ViewerSettingsButton v-if="focus3d" v-model:open="devHudOpen" :changed="devFlagCount" />
                 <StageTabs v-if="focus3dAvailable" :is3d="focus3d" list-class="h-8" @update:is3d="setFocus3d" />
-                <!-- Edit + Inspect + Share live top right, same corner as every
-                     other surface (3D overlay, craft modal, item detail).
-                     Edit leads: focus is where you land on a slot, and until now
-                     the only way into the editor from here was the context menu
-                     or a trip back to the grid. -->
-                <button
-                  v-if="isSkinned(focusRow) && canEdit && focusInstance && isCustomizable(focusRow?.item)"
-                  :class="[FOCUS_STAGE, 'tac-action border-border text-muted-foreground']"
-                  title="Edit this item — wear, pattern, stickers, charm"
-                  @click="openEdit(focusInstance)"
-                >
-                  <Pencil class="h-3.5 w-3.5" /> Edit
-                </button>
-                <!-- Same rule as the item modal: a stage showing a weapon
-                     offers to open it in game. Deliberately none of the three
-                     gates the Edit button above needs — `canEdit` (inspecting
-                     is not editing, and a loadout you are VISITING is exactly
-                     the one you most want to see in game), `isSkinned` (a
-                     default weapon inspects fine — it's paintindex 0) and
-                     `focusInstance` (a cell with no instance behind it is
-                     precisely those two cases; inspectLoadoutRow sends the row
-                     as a draft instead). -->
-                <button
-                  v-if="canInspect(focusRow?.item)"
-                  :class="[FOCUS_STAGE, 'tac-action border-border text-muted-foreground']"
-                  title="Launch CS2 and inspect this item in-game"
-                  @click="inspectLoadoutRow(focusRow)"
-                >
-                  <ExternalLink class="h-3.5 w-3.5" /> {{ linkOpening ? 'Opening…' : 'Inspect' }}
-                </button>
-                <ShareMenu
-                  v-if="isSkinned(focusRow) && canEdit"
-                  :links="instanceShareLinks(focusInstance?.id)"
-                  :note="ITEM_LINK_NOTE"
-                  :btn-class="FOCUS_STAGE"
-                />
-                <!-- Someone else's item: their link and a craftable copy,
-                     instead of item links that would name YOUR inventory. -->
-                <ShareMenu
-                  v-else-if="visitorShareLinks.length"
-                  :links="visitorShareLinks"
-                  :btn-class="FOCUS_STAGE"
+                <!-- The item modal's own row, not a copy of it: Inspect in game,
+                     Share, then edit as an icon — what you can do with the item,
+                     after the two that change the picture. Focus kept a row of
+                     its own for a while (an "Edit" with a label, a shorter
+                     "Inspect"), and the two screens drifted into looking like
+                     different screens.
+                     Inspect skips the gates edit needs: `canEdit` (a loadout you
+                     are VISITING is exactly the one you most want to see in
+                     game), `isSkinned` (a default weapon inspects fine — it's
+                     paintindex 0) and `focusInstance` (a cell with no instance
+                     behind it is precisely those two cases; inspectLoadoutRow
+                     sends the row as a draft instead). Someone else's item
+                     shares their link and a craftable copy, not item links that
+                     would name YOUR inventory. -->
+                <CraftActions
+                  view-only
+                  :can-inspect="canInspect(focusRow?.item)"
+                  :link-opening="linkOpening"
+                  :share-links="isSkinned(focusRow) && canEdit ? instanceShareLinks(focusInstance?.id) : visitorShareLinks"
+                  :share-note="isSkinned(focusRow) && canEdit ? ITEM_LINK_NOTE : undefined"
+                  :can-edit-item="isSkinned(focusRow) && canEdit && !!focusInstance && isCustomizable(focusRow?.item)"
+                  :read-only="!!focusInstance && isReadOnly(focusInstance)"
+                  :compact-btn-class="MODAL_HEAD_BTN"
+                  @inspect="inspectLoadoutRow(focusRow)"
+                  @edit="focusInstance && openEdit(focusInstance)"
                 />
                 <button
                   v-if="viewerId && !viewingSelf && isSkinned(focusRow)"
