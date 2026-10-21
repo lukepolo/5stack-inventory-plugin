@@ -38,6 +38,10 @@ from your machine (`https://inventory.5stack.gg/...`).
 | `models/sticker-masks.json`, `models/<key>.stickermask.{hd,legacy}.webp` | where a sticker may show, per body (R channel, UV0) | open the webp; the R channel is the mask |
 | `models/stattrak-art.json`, `models/stattrak/knife_digits_color.webp` | the knife digit atlas with its real alpha cut-out | the alpha channel is the scratch shape |
 | `models/extract-version.json` | pipeline version, CS2 build, per-step durations | `curl` |
+| `models/keychain-anchors.json` | every gun's and the C4's attachments with their parent bone, parsed (the Dual Berettas' `keychain`, `stattrak` and `nametag` hang off `weapon_r`) | `curl` |
+| `anims/<stem>.<action>.json` | one first-person clip: `source` (the `.vnmclip_c` it was decoded from), duration, the arm tracks, the weapon's own `prop` tracks and the sound cues | `curl … \| jq .source`; a `_default_*` folder means the weapon fell back to its family's generic clip |
+| `anims/index.json` | which actions each weapon has a clip for; first person offers a button only for these | `curl` |
+| [`pak01_dir.txt`](https://github.com/SteamDatabase/GameTracking-CS2/blob/master/game/csgo/pak01_dir.txt) (SteamDatabase) | every file in the game's main VPK, by path | `grep`; finds a clip folder without a CS2 install (the C4's is `animation/anims/viewmodel/equipment/c4/`) |
 | `models/<key>.inputs[.hd]/meta.json` | a weapon's composite inputs; `textures2048` names the 2048 copies of the ones over 2048 (v39+, HD guns only) | `curl` |
 | `models/**/*.{glb,json}.gz` | gzip copies the servers send instead (v39+); deleted at the start of every extraction, rewritten by its last step | `curl -H 'Accept-Encoding: gzip' -I` |
 | `paints/materials/<name>.vmat.json` | a sticker's, charm's or paint's compiled material (`m_shaderName`, `m_intParams`, `m_floatParams`, `m_textureParams`, dynamic expressions) | `curl` + `python3 -m json.tool` |
@@ -149,6 +153,9 @@ registry is `src/devFlags.ts`.
 | `charmmap` | paints the model's authored charm surfaces on the weapon |
 | `charmquads` | on by default: the authored charm surfaces seat the default charm and bound a drag |
 | `pivotdot` | a dot at the point an orbit drag rotates around |
+| `dualside` | the Dual Berettas laid out parallel instead of in the icon's tent (the layout the viewer had before 2026-10-21) |
+| `notwist` | first-person arms without the forearm twist solver, to tell whether the solver is what is wringing an arm |
+| `fpvfov` | first-person field of view in degrees (default 54, CS2's viewmodel_fov 68 converted); a wide one finds what is just off screen |
 | `perf` | per-frame timing HUD |
 | `inspectanim` | the idle inspect motion (also gates the holo drift) |
 | `compositelog` | every composite store lookup: generation, stem, `HIT`/`MISS`, uploads (not in the HUD) |
@@ -739,6 +746,83 @@ load of a taken file the same blob: URL for a minute.
 the yield to a building viewer by sampling `window.__prefetch.stats()`
 (`activeBackground`, `peakBackground`, `viewerBusy`) every 50ms.
 
+### 4.17 First person: the wrong clip, the wrong buttons, or an attachment off the gun
+
+**Which clip played.** Every action is one file, `anims/<stem>.<action>.json`,
+and its `source` names the game clip it came from. The extractor finds a
+weapon's folder from its family (`rifle/rifle_<stem>`, `pistol/pistol_<stem>`,
+`knife/knife_<stem>`) or the `FOLDER` table in
+`scripts/extract-viewmodel-anims.mjs`, and falls back to the family's
+`_default_*` folder. That fallback is silent and wrong: the C4 sat under
+`_default_rifle` and was held like a rifle, with a rifle's reload and shot,
+until `c4: "equipment/c4"` went in the table. To check every weapon at once,
+run the extractor's own `folderFor` over `pak01_dir.txt` (§2) and list the
+ones that land on a `_default_*` folder; today only the C4 did (the default CT
+knife's real folder is `_default_knife`). A re-run deletes the action files a
+weapon no longer has, so the C4's old reload and shot go too.
+
+**Which buttons show.** First person offers Fire, Reload, Inspect and Deploy
+only where `anims/index.json` lists the action, less what `CANNOT` in
+`src/viewmodelClip.ts` rules out: the C4 neither fires nor reloads, and the
+Zeus fires but recharges. Knives have no fire or reload clip, so they get
+neither. The edit view decides "held" from `craftHolding`, the sticky toggle
+AND an item that can be held; an agent opened after a rifle used to inherit
+the rifle's buttons.
+
+**Rare inspects.** `lookat02_*` and `lookat03_*` are extracted as `inspect2`
+and `inspect3`. Pressing Inspect during an inspect steps to the weapon's next
+one (`requestFpvAction`); a weapon with only the plain inspect keeps the old
+rule, where an inspect never interrupts itself. These have them:
+
+| Weapon | Extra inspects |
+| --- | --- |
+| AK-47 | `inspect3` |
+| Desert Eagle | `inspect2` |
+| C4, Butterfly Knife | `inspect2`, `inspect3` |
+| Survival (`canis`), Paracord (`cord`), Classic (`css`), Falchion, Nomad (`outdoor`), Skeleton, Stiletto, Ursus, Talon (`widowmaker`) | `inspect2` |
+
+They appear after the first-person animation step (`viewmodel-anims`) has
+run and `CLIP_SCHEMA` in `src/viewmodelClip.ts` has been bumped, so browsers
+fetch the new clips instead of their cached ones.
+
+**What moves the weapon's parts.** A gun's magazine, bolt and trigger come from
+its GLB's own `reload`, `shoot` and `draw` clips (`PART_CLIP`). Knives and
+dual-wield rigs take the viewmodel clip's `prop` tracks instead (`fpvProps`):
+a knife has no part clips, and the Dual Berettas' pistols are carried into the
+hands by `weapon_hand_l`/`weapon_hand_r`, which only the prop tracks pose. Before
+that, both pistols stayed at bind, 20 inches apart and out of frame, and showed
+only during a reload or a shot. A dual rig's GLB clips keep only their scale
+tracks (the magazine hidden for the swap), so two clips never average on one
+bone. Turning off frustum culling was tried first and changed nothing.
+
+**Attachments on a held weapon.** Everything is placed once against the weapon
+at mount (see the gotcha "The weapon never moves"), and each kind has its own
+bridge from the item view's pose to the held one:
+
+| Attachment | How it reaches the held weapon |
+| --- | --- |
+| stickers | cut against skinned twins of the meshes (`weaponMeshes`) |
+| charm | its icon-pose anchor through `charmPoseFix` |
+| StatTrak module, name tag | `liveFrames`: bakePose's attachment frames, measured off the live skeleton (`moduleFrames`); without them `placeAttachedModule` fell back to `anchor.pos` and the C4's label hung in the air |
+| a dual rig's stickers and charm hook | `followDualParts`: each takes its pistol's motion since the twins, every frame |
+
+To check a module, compare `window.__mount.probeNameplate()` in the item view
+and held (`mount.html?…&nametag=x` with and without `arms=`). Matching `flat`
+and `gapMm` mean it sits on the body the same way; on 2026-10-21 the C4, AK-47,
+Deagle and Karambit matched exactly. A plate riding a bone (the Butterfly's)
+reports bone-local numbers, so check that one by eye.
+
+**Driving it.** `drive.mjs` with steps that call
+`window.__mount.setFpvAction("inspect")` and take a shot every second shows a
+clip frame by frame. `&fpvfov=95` widens the view to find something just off
+screen; `&nameplateprobe=1` draws the plate's anchor.
+
+**Known and left alone:** on a few inspects (the AWP's) bare upper arm shows
+beside an agent's sleeve. The sleeve is weighted almost entirely to
+`arm_lower_*_TWIST1` and the skin across the upper-arm bones, so the two part
+company at a hard bend. Fading the skin to match the sleeve, and cutting it
+beyond the sleeve's end, changed nothing visible.
+
 ## 5. Gotchas
 
 - **Disk.** Headless Chrome profiles are large; use the runners in this repo,
@@ -756,6 +840,16 @@ the yield to a building viewer by sampling `window.__prefetch.stats()`
   its meshes (`weaponMeshes`) and the charm's icon-pose anchor goes through
   `charmPoseFix`. `window.__mount` on mount.html is the live handle, so
   drive.mjs can call `setFpvAction("reload")` between shots.
+- **The Dual Berettas show the icon's tent**, live and on the card, as the
+  game's inspect and Apply Sticker screens do. `?dualside=1` brings back the
+  synthesised parallel layout.
+- **Glove cards turn the right hand over.** `tools_preview_pose` shows the
+  right glove's palm; `backOfRightHand` gives `arm_lower_R` a half turn about
+  the hand's own axis before the bake. Card bakes only: the live viewer plays
+  `inspect_loop`.
+- **A debug switch has to be in the registry.** `debugFlag` stores `?name=1`
+  but answers from `src/devFlags.ts`, so a name missing there reads its
+  default however the URL is set. `dualside` shipped that way for an hour.
 - **An attached charm's gravity is the camera's down**, not world −Y. Anything
   physical on a charm (cloth, liquid) must use `charmGravity`'s axis.
 - **Safari's canvas can't encode WebP.** `toBlob(cb, "image/webp")` returns a

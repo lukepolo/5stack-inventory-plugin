@@ -111,6 +111,13 @@ const NOT_THE_LOOP = /_(draw|transfix|lgcy)_|_lgcy\./;
 const ACTIONS = [
   { key: "idle", match: (f) => /\/idle1?_/.test(f) },
   { key: "inspect", match: (f) => f.includes("/lookat01_") && !NOT_THE_LOOP.test(f) },
+  // THE RARE INSPECTS. The game rolls these now and then in place of the plain
+  // one — the Deagle's spin (lookat02), the AK's (lookat03), most knives' second
+  // trick, the C4's and the Butterfly's third. Filed by their own number, so a
+  // weapon with only a lookat03 (the AK) has an inspect3 and no inspect2; the
+  // viewer steps through whichever exist on a second press.
+  { key: "inspect2", match: (f) => f.includes("/lookat02_") && !NOT_THE_LOOP.test(f) },
+  { key: "inspect3", match: (f) => f.includes("/lookat03_") && !NOT_THE_LOOP.test(f) },
   { key: "draw", match: (f) => /\/draw_/.test(f) },
   { key: "reload", match: (f) => /\/reload_/.test(f) },
   { key: "fire", match: (f) => /\/shoot1?_/.test(f) },

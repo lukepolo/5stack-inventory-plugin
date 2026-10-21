@@ -13,6 +13,8 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - **Knife and glove Craft tab by model**: every finish is still one scroll, now grouped by model with a header per model that stays pinned while you're in it. A rail of model silhouettes above the grid scrolls sideways, follows where you are, and jumps to a model on a click; a Jump menu beside it lists every model with a filter. Cards carry the grey model label and the price, like owned cards.
 - **Leaner Replace list**: Replace lists only the base weapons that can take the slot on that side and aren't already in the loadout.
 - **Reorder stickers**: drag sticker tiles onto each other to change slot order, which decides which sticker is drawn on top. A moved sticker stays where it was on the weapon.
+- **Music kit preview in the focus view**: the focus view plays both tracks, labelled Full song and MVP, with one volume control above them, the same way the editor does. It showed one unlabelled player and no MVP anthem.
+- **Full song or MVP on the music kit Craft tab**: a Full song | MVP switch beside the volume control sets which track every card plays, so the round-MVP anthems can be compared without opening each kit. A kit with no anthem shows no player under MVP.
 - **Music kit preview in the editor**: Edit on a music kit plays the full song and, separately, its round-MVP anthem, each with play/pause and seek. One volume control sits above both and shares the level with every other player.
 - **One volume bar per music kit list**: the music kit sheet's Owned and Craft tabs have a single volume control in the toolbar instead of a slider on every card.
 - **Agent pose and motion in the sidebar**: an agent's pose (Ready, Stand, Open) moved from the top-left corner of the 3D view into the right-hand column, like the pet's controls. A new Motion setting makes the agent breathe and look around (Idle), move through all three poses in turn (Cycle), or hold still for placing patches (Still).
@@ -37,6 +39,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Features
 
+- **Rare inspects**: in first person, pressing Inspect again while a weapon is being inspected plays its rarer inspect, the one the game rolls now and then: the Deagle's spin, the AK-47's, a second trick on most knives, and the C4's and the Butterfly Knife's third. Weapons with only one inspect behave as before. Needs the next run of the first-person animation step.
 - **CS2 lighting preset (new default)**: neutral daylight and the main menu's blue-grey haze, measured against in-game inspect screenshots. Items no longer come out pink-tinted and dull.
 - **CS2 scene presets**: Ancient (night), Italy and Italy (alley) place the item in front of a blurred in-game screenshot of the map. The same image lights the item's reflections.
 - **Knife StatTrak counter**: the kill count is scratched into the blade as in game, at each knife's exact spot from the game's own attachment data. The digits use the game's own cut-out texture and stay sharp however close you zoom.
@@ -58,6 +61,8 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - The first-person reload threw the magazine around: on the AK-47 it spun 180 degrees and back and flew 20-28 inches from the gun, away from the hand holding it. Guns now take their moving parts from the first-person clip itself, so the magazine stays in the hand from the pull to the insert.
 - The C4 was held like a rifle in first person, with a rifle's reload and shot. It now plays its own draw, idle and inspect, after the next run of the first-person animation step (see Model Extraction).
 - First person offered Fire and Reload for items that can do neither. The buttons now match the item: the C4 is inspected and drawn only, the Zeus fires but has no reload, and knives have no fire or reload. An agent opened after holding a weapon no longer gets the weapon's buttons.
+- The Dual Berettas came up empty-handed in first person: the pistols showed only during a reload or a shot. They now sit in the hands through idle, inspect and draw too, with their stickers, StatTrak module, name tag and charm riding each pistol.
+- The Dual Berettas' 3D view showed the two pistols parallel, one above the other, with the left pistol's sticker side facing away. It now shows them leaning together, barrels up, as the game's inspect and Apply Sticker screens do, with the sticker sides facing you.
 - In first person the C4's name tag hung in the air off the bomb's end. Name tags and StatTrak modules now sit on the held weapon where they sit in the item view; a Butterfly Knife's plate no longer hangs below its handle either.
 - In Safari, Doppler, Gamma Doppler, Marble Fade and other region-painted finishes showed the bare weapon on 23 models, including the Bayonet, Butterfly Knife, M9 Bayonet and AWP. Safari empties a fully transparent image on its way to the GPU, which is how those models' paint-region masks are stored, so Safari now decodes them byte-exact itself.
 - The Butane Buddy's liquid filled the whole ball once the camera was turned to look down at the gun. It now settles against the same gravity the charm hangs by, so the fill stays level and sloshes as you turn the gun.
@@ -83,6 +88,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 ### Bug Fixes
 
 - Switching "Verify composites" off in the Developer tab left it on, so that browser compared paint composites with the shared store but never saved any. Off now means off.
+- Glove cards showed the right glove palm-up: the pose the card is baked from turns the left hand's back to the camera and the right hand's palm. Both gloves now show their backs, thumbs inward, as the game's glove icons do. Stored glove cards keep the old picture until ⚙ → Asset Cache → Clear renders.
 - Editing an item's stickers or charm now re-renders its card. Card files were named only by wear, pattern and StatTrak, so moving, swapping or scratching a sticker kept the old picture until the cache was cleared.
 - A card whose paint failed to load, or which came out black, is retried instead of stored.
 - A tab left open while a model extraction finished showed "Render SAVED (backend OK) but /renders/ doesn't serve it back" and went on baking cards from the previous models under the new version's name. The server now refuses those cards, and the tab stops baking and asks for a reload. This caused the Driver Gloves card to be black.
@@ -118,6 +124,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - **v39, lighter assets**: composite inputs larger than 2048 pixels get a 2048 copy beside the original, and every model and data file gets a gzip copy. No existing file changes, so older clients keep loading what they always did.
 - **v36, StatTrak art and knife data**: the knife digit texture is extracted with its cut-out channel intact. Every knife's attachment points and bone chain are written out as the source for knife counter and name tag placement.
 - **C4 model**: the extraction publishes the C4 model with its sticker slots and charm surfaces.
+- **Rare inspect clips**: the animation step also extracts each weapon's second and third inspects (`lookat02`/`lookat03`) where the game has them.
 - **C4 first-person clips**: the animation step takes the C4's own clips (the game keeps them under equipment, not with the guns). A re-run also removes clips an action no longer has, and a one-weapon run keeps every other weapon's entry in the clip index.
 
 ## Backend & API

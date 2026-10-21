@@ -1269,6 +1269,20 @@ const craftGroups = computed(() => {
   });
   return groups;
 });
+/**
+ * Which track every card on the music kit CRAFT grid plays: the menu theme or
+ * the round-MVP anthem. One switch beside the grid's one volume, so comparing
+ * anthems is not a trip through each kit's editor. A viewing choice only —
+ * nothing is saved, and a kit with no anthem simply has no player under MVP
+ * rather than quietly playing its menu theme instead.
+ */
+const MUSIC_TRACKS = [{ id: "full" as const }, { id: "mvp" as const }];
+const sheetMusicTrack = ref<"full" | "mvp">("full");
+const cardTrack = (c: { audio?: string | null; mvpAudio?: string | null }) =>
+  (sheetMusicTrack.value === "mvp" ? c.mvpAudio : c.audio) ?? null;
+/** Offered only where some kit has an anthem to switch to — an instance that
+ *  has not run the MVP extraction would get a switch that empties the grid. */
+const sheetHasMvp = computed(() => craftStacks.value.some((st) => !!st.card.mvpAudio));
 // Sheet: replace mode — the base weapons that can take this position: eligible
 // for it, on this side, and not already somewhere else in the loadout — or in
 // it. That is the whole of the choice. Owned skins of those weapons used to
@@ -9095,23 +9109,48 @@ if (MDEBUG) {
                   leave-active-class="transition duration-100 ease-in"
                   leave-to-class="opacity-0 scale-105"
                 >
-                  <div :key="selected" class="grid h-full w-full min-h-0 place-items-center">
+                  <!-- With the music kit's players under it, the art takes the row
+                       that is LEFT (minmax(0,1fr)) and shrinks to it: at its own
+                       height it pushed the players off the bottom of the stage
+                       whenever the sheet was open. -->
+                  <div
+                    :key="selected"
+                    class="grid h-full w-full min-h-0 place-items-center"
+                    :class="(focusRow?.item?.audio || focusRow?.item?.mvpAudio) && 'grid-rows-[minmax(0,1fr)_auto] gap-3'"
+                  >
                     <ItemArt
                       :inst="isSpecial(selected) ? null : cellInstance(selected)"
                       :image="isSpecial(selected) ? specialImage(selected) : cellImage(selected)"
-                      :class="cn('w-[min(64%,520px)] object-contain animate-float motion-reduce:animate-none', !isSkinned(focusRow) && 'opacity-50')"
+                      :class="cn('max-h-full min-h-0 w-[min(64%,520px)] object-contain animate-float motion-reduce:animate-none', !isSkinned(focusRow) && 'opacity-50')"
                       style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
                     />
                     <!-- A second grid row under the art, and only for a music kit.
                          This stage has no 3D for one (isNo3d), so the flat icon was
                          the entire focus view of an item whose whole content is a
                          sound. Wider than the tile's copy because there is room:
-                         this is the screen you land on to study one item. -->
-                    <MusicPlayer
-                      v-if="focusRow?.item?.audio"
-                      :src="focusRow.item.audio"
-                      class="w-[min(80%,420px)]"
-                    />
+                         this is the screen you land on to study one item.
+                         Both tracks, labelled, the way the editor lays them out:
+                         one bare bar left the round-MVP anthem out entirely and
+                         said nothing about which song was playing. -->
+                    <!-- mb-8: clear of the card's bottom edge, which the last row
+                         otherwise sat right on. -->
+                    <div
+                      v-if="focusRow?.item?.audio || focusRow?.item?.mvpAudio"
+                      class="mb-8 flex w-[min(80%,420px)] flex-col gap-2"
+                    >
+                      <div class="flex items-center justify-between">
+                        <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.preview', 'Preview') }}</span>
+                        <MusicVolume wide />
+                      </div>
+                      <div v-if="focusRow.item.audio" class="flex items-center gap-2">
+                        <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.full_song', 'Full song') }}</span>
+                        <MusicPlayer :src="focusRow.item.audio" :volume="false" class="min-w-0 flex-1" />
+                      </div>
+                      <div v-if="focusRow.item.mvpAudio" class="flex items-center gap-2">
+                        <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.mvp', 'MVP') }}</span>
+                        <MusicPlayer :src="focusRow.item.mvpAudio" :volume="false" class="min-w-0 flex-1" />
+                      </div>
+                    </div>
                   </div>
                 </Transition>
               </template>
@@ -9297,6 +9336,18 @@ if (MDEBUG) {
                slider on every card — on Owned and Craft alike. The level is
                shared, so every player follows it. -->
           <MusicVolume v-if="sheetMode !== 'replace' && sheetKey === 'musickit'" wide class="px-1" />
+          <!-- Beside the volume: what every card on the Craft grid plays. -->
+          <PillTabs
+            v-if="sheetMode === 'craft' && sheetKey === 'musickit' && sheetHasMvp"
+            :items="MUSIC_TRACKS"
+            :item-key="(t) => t.id"
+            :active="sheetMusicTrack"
+            list-class="flex-none"
+            button-class="relative z-[1] flex h-6 items-center rounded-md px-2.5 text-f10 uppercase tracking-wider transition-colors"
+            @select="(v) => (sheetMusicTrack = v as 'full' | 'mvp')"
+          >
+            <template #default="{ item: t }">{{ t.id === 'mvp' ? tr('inventory.music.mvp', 'MVP') : tr('inventory.music.full_song', 'Full song') }}</template>
+          </PillTabs>
           <!-- Owned only: same Synced/Crafted filter as the Inventory grid, so
                read-only Steam imports can be kept out of the equip picker. -->
           <PillTabs
@@ -9944,7 +9995,16 @@ if (MDEBUG) {
                        a music kit from, and until now every card on it was a
                        name and a disc. The player is a <span> tree precisely so
                        it can live inside this <button> — see MusicPlayer. -->
-                  <MusicPlayer v-if="st.card.audio" :src="st.card.audio" :volume="false" class="relative z-[2] mt-1.5" />
+                  <!-- Keyed on the track, so the switch above remounts it: the old
+                       player's teardown stops its track rather than leaving it
+                       playing with no button on screen that owns it. -->
+                  <MusicPlayer
+                    v-if="cardTrack(st.card)"
+                    :key="cardTrack(st.card)!"
+                    :src="cardTrack(st.card)!"
+                    :volume="false"
+                    class="relative z-[2] mt-1.5"
+                  />
                 </button>
               </div>
               </div>

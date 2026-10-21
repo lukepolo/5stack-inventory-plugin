@@ -151,6 +151,14 @@ export const FLAGS: DevFlag[] = [
     group: "Diagnostics",
   },
   {
+    name: "dualside",
+    label: "Dual Berettas side by side",
+    hint: "Lay the two pistols out parallel, one above the other, instead of the icon's tent the game's inspect and Apply Sticker screens show. The old layout, kept for comparison; cards always bake the tent.",
+    dflt: false,
+    remount: true,
+    group: "Diagnostics",
+  },
+  {
     name: "pivotdot",
     label: "Show the orbit pivot",
     hint: "Draw a dot at the point a drag rotates around, through the model. If it is not sitting on the item, that is why dragging feels like it is swinging the model rather than turning it.",

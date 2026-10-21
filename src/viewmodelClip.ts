@@ -109,8 +109,14 @@ const cache = new Map<string, Promise<RawClip | null>>();
  *     pinned the OLD shape under the NEW key, and its inspect played with the
  *     knife frozen while a fresh fetch of the same URL had the tracks. Bump this
  *     only once the data it describes is already on the mount.
+ * 8 — a RE-KEY again, for the C4's own clips (equipment/c4, no reload or
+ *     shot) and the rare inspects (inspect2/inspect3) with the index.json
+ *     that lists them. A scoped `step viewmodel-anims` changes those files
+ *     without changing the extraction stamp, so the version half of the key
+ *     stayed put and browsers kept the rifle-held C4 they had cached. Bumped
+ *     after the step had run (2026-10-21).
  */
-const CLIP_SCHEMA = 7;
+const CLIP_SCHEMA = 8;
 
 /**
  * A URL under the viewmodel asset tree — clips, their sounds, the effect
@@ -137,7 +143,14 @@ export function viewmodelAssetUrl(rel: string): string {
  * holds the gun up and turned, filling the frame, which reads as broken
  * framing rather than as a pose.
  */
-export type ClipAction = "idle" | "inspect" | "draw" | "reload" | "fire";
+export type ClipAction = "idle" | "inspect" | "inspect2" | "inspect3" | "draw" | "reload" | "fire";
+/**
+ * The inspect and its rarer variants, in the order a repeated press steps
+ * through them. `inspect2`/`inspect3` are the game's lookat02/lookat03 — the
+ * Deagle's spin, the AK's, a knife's second trick — and most weapons have
+ * neither; the clip index says which (see viewmodelActions).
+ */
+export const INSPECTS: readonly ClipAction[] = ["inspect", "inspect2", "inspect3"];
 
 /**
  * What the game lets you do with an item in hand, where that is LESS than the
