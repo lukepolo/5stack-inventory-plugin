@@ -2777,7 +2777,7 @@ async function saveCraft(andEquip = false) {
     if (editingId.value != null) {
       const updated = await updateInstance(editingId.value, body);
       renderedIds.delete(updated.id);
-      void generateRender(updated).then((ok) => {
+      void generateRender(updated, { force: true }).then((ok) => {
         if (ok) bakeStamp.value = { ...bakeStamp.value, [updated.id]: Date.now() };
       });
       // Patch in place rather than refetching. refreshAll() swaps the whole
@@ -2882,11 +2882,19 @@ const TOUCH_BAKE_COOLDOWN_MS = 400;
 const bakeCooldown = () =>
   isCoarse.value ? new Promise((r) => setTimeout(r, TOUCH_BAKE_COOLDOWN_MS)) : Promise.resolve();
 
-function generateRender(inst: InventoryItem): Promise<boolean> {
-  if (renderedIds.has(inst.id) || queuedIds.value.has(inst.id)) return Promise.resolve(false);
-  if (isCoarse.value && queuedIds.value.size >= TOUCH_BAKE_BACKLOG) return Promise.resolve(false);
+/**
+ * `force`: bake even though a card may already be stored, and even if a bake
+ * for this item is already queued. For SAVE, which is the one moment we know
+ * the stored card is out of date — the item was just changed. Without it, a
+ * save whose change the card's filename does not capture (stickers or a charm,
+ * on a backend that predates card_look) found the old card, called it done and
+ * reloaded it; and an older queued bake still held the PRE-edit item.
+ */
+function generateRender(inst: InventoryItem, opts: { force?: boolean } = {}): Promise<boolean> {
+  if (!opts.force && (renderedIds.has(inst.id) || queuedIds.value.has(inst.id))) return Promise.resolve(false);
+  if (!opts.force && isCoarse.value && queuedIds.value.size >= TOUCH_BAKE_BACKLOG) return Promise.resolve(false);
   queuedIds.value = new Set([...queuedIds.value, inst.id]);
-  const run = renderQueue.then(() => generateRenderNow(inst));
+  const run = renderQueue.then(() => generateRenderNow(inst, !!opts.force));
   // The cooldown rides the QUEUE, not the returned promise: the next bake waits
   // for it, the caller doesn't.
   renderQueue = run.catch(() => false).then(bakeCooldown);
@@ -2946,8 +2954,8 @@ const renderServes = (url: string) =>
 // game ships no icon at all, and none of them can show a coat, a stage or the
 // body a pattern draws. Coat and stage are in the render key (renderKeyFor).
 const CARD_BAKE_KINDS = new Set<ViewerKind>(["weapon", "charm", "glove", "pet"]);
-async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
-  if (renderedIds.has(inst.id)) return false;
+async function generateRenderNow(inst: InventoryItem, force = false): Promise<boolean> {
+  if (!force && renderedIds.has(inst.id)) return false;
   // Resolved, not read off `item.model`. A charm names no model of its own —
   // the econ schema names its mesh and 23 of them share one blank — so the sync
   // answer is `undefined` ("ask the backend"), and the old `item.model` gate
@@ -2961,7 +2969,7 @@ async function generateRenderNow(inst: InventoryItem): Promise<boolean> {
   // cache clear the browser still holds the deleted image, so an un-busted
   // probe loads it, concludes the server is fine and skips the re-bake — which
   // is exactly why clearing renders used to leave every stale card in place.
-  if (await renderServes(renderUrlFor(inst) + renderBust(inst))) {
+  if (!force && (await renderServes(renderUrlFor(inst) + renderBust(inst)))) {
     renderedIds.add(inst.id);
     return true;
   }
