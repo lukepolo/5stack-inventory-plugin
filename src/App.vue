@@ -7344,6 +7344,12 @@ const focusPrice = computed(() => {
 const focusSpecs = computed<AttachSource | null>(() =>
   focusInstance.value ?? (viewerId.value && isSkinned(focusRow.value) ? focusRow.value ?? null : null),
 );
+/** Float and pattern for focus's own row (compact, or no spec column). Only a
+ *  skinned slot has either: a default finish is still a type that TAKES both,
+ *  so asking the type alone printed "—" under each heading, and the row's top
+ *  border then ran across the bottom of the stage with nothing under it. */
+const focusShowsFloat = computed(() => isSkinned(focusRow.value) && hasWear(focusRow.value?.item));
+const focusShowsPattern = computed(() => isSkinned(focusRow.value) && hasSeed(focusRow.value?.item));
 // InventoryItem → viewer placement shapes (Focus + loadout 3D overlay).
 /**
  * "Applied to AK-47 | Redline", for an attachment that is currently on a gun.
@@ -9049,7 +9055,7 @@ if (MDEBUG) {
                  nothing left in it but its own top border and 14px of padding
                  taken off the model. -->
             <div
-              v-if="isCompact || !focusSpecs"
+              v-if="(isCompact || !focusSpecs) && (focusShowsFloat || focusShowsPattern)"
               class="relative z-[2] flex flex-wrap items-center gap-6 border-t border-border pt-3.5"
             >
               <!-- Float and pattern used to be spelled out here by hand, and
@@ -9068,14 +9074,14 @@ if (MDEBUG) {
                    printed the float and the pattern a second time three inches
                    away. -->
               <template v-if="isCompact || !focusSpecs">
-                <div v-if="hasWear(focusRow?.item)" class="flex flex-col gap-1">
+                <div v-if="focusShowsFloat" class="flex flex-col gap-1">
                   <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Float</span>
                   <span class="font-mono text-f13">{{ focusRow?.wear != null ? focusRow.wear.toFixed(4) : '—' }}</span>
                   <!-- WearBar is THE way wear renders — bare drops its numbers,
                        since "Float" above already prints the value. -->
                   <WearBar v-if="focusRow?.wear != null" :item="focusRow?.item" :wear="focusRow.wear" bare class="mt-1.5 w-[180px]" />
                 </div>
-                <div v-if="hasSeed(focusRow?.item)" class="flex flex-col gap-1">
+                <div v-if="focusShowsPattern" class="flex flex-col gap-1">
                   <span class="text-f10 uppercase tracking-cs4 text-muted-foreground">Pattern</span>
                   <span class="font-mono text-f13">{{ focusRow?.seed != null ? '#' + focusRow.seed : '—' }}</span>
                 </div>

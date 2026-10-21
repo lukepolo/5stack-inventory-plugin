@@ -26,6 +26,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 - Editing or duplicating an owned item keeps its finish's float range. Owned Dopplers could be dragged to 1.00, and the save then failed.
 - Craft & Equip defaults to the team you are crafting from instead of "Both teams".
+- The focus view of a default-finish weapon showed Float and Pattern as "—", with a line across the bottom of the 3D view. A default finish has neither, so the row is gone.
 - The glove Craft list no longer includes ten gloves nobody can own: the eight bare models and the two stock pairs.
 
 ## 3D Viewer & Lighting
