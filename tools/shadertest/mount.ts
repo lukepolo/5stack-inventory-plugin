@@ -18,6 +18,7 @@
 //   wear=0.1 seed=1       float and pattern
 //   st=/images/a.webp,…   stickers, slot 0, 1, … in order
 //   xy=x,y,r;x,y,r;…      per-sticker offsets/rotation (game offset units)
+//   sw=0.5 or sw=0,0.5,…  sticker wear (scratch), one for all or per slot
 //   nomask=1              draw stickers without the weapon's sticker mask
 //   stattrak=1337         StatTrak count ("dark" = the card's unlit module)
 //   nametag=Some%20Name   name tag
@@ -55,8 +56,10 @@ const settle = num("settle", 3000);
 const angles = list("va", "0").map(Number);
 const times = list("t", "0").map(Number);
 const images = list("st", "");
-const offsets = (q.get("xy") ?? "").split(";").map((p) => p.split(",").map(Number));
+// An empty field is "default", not 0: Number("") is 0, which pinned a sticker at the slot origin.
+const offsets = (q.get("xy") ?? "").split(";").map((p) => p.split(",").map((v) => (v.trim() === "" ? NaN : Number(v))));
 const stattrak = q.get("stattrak");
+const stickerWear = list("sw", "").map(Number);
 const note = (s: string) => {
   const d = document.createElement("div");
   d.textContent = s;
@@ -116,7 +119,7 @@ async function shoot(va: number, plain: boolean) {
             x: Number.isFinite(offsets[i]?.[0]) ? offsets[i][0] : null,
             y: Number.isFinite(offsets[i]?.[1]) ? offsets[i][1] : null,
             r: Number.isFinite(offsets[i]?.[2]) ? offsets[i][2] : null,
-            w: null,
+            w: stickerWear[i] ?? stickerWear[0] ?? null,
           })),
       stickerSlots: bounds.slots,
       stickerBounds: bounds.bounds,
