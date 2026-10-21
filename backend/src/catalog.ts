@@ -103,9 +103,9 @@ export interface CatalogSkin {
   design?: number;
   /**
    * KNIVES and GLOVES only: the bare model every finish of the kind is painted
-   * onto — "Butterfly Knife", "Bloodhound Gloves". The craft sheet folds the
-   * finishes under it, wearing the model's own icon, which for gloves is not an
-   * item on the list (see getGloves) and so has to be named here.
+   * onto — "Butterfly Knife", "Bloodhound Gloves". The craft sheet sections its
+   * finishes by it. For gloves that model is not an item on the list (see
+   * getGloves), so it has to be named here.
    */
   baseId?: number;
   baseName?: string;

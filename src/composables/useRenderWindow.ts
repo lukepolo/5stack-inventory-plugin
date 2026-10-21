@@ -47,5 +47,9 @@ export function useRenderWindow<T>(
     grow: () => {
       shown.value += step;
     },
+    /** Mount at least the first `n` — for a jump to something further down. */
+    reveal: (n: number) => {
+      if (shown.value < n) shown.value = n;
+    },
   };
 }

@@ -96,7 +96,7 @@ export interface Skin {
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
   /** KNIVES and GLOVES only: the bare model the finish is painted onto
-   *  ("Butterfly Knife"), with its own icon — what the craft sheet groups under. */
+   *  ("Butterfly Knife"), with its own icon — what the craft sheet sections by. */
   baseId?: number;
   baseName?: string;
   baseImage?: string | null;

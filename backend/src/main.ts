@@ -403,9 +403,10 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
 // have no `image_inventory` (CS2 renders them live from their model), so a
 // catalog tile for the chick or a breed had nothing to show and no instance to
 // bake for. The vanilla-glove-icons note asked for exactly this store; pets were
-// its first customer and those eight gloves its second — the craft sheet shows
-// them as the face of each glove model. A painted glove has its icon and never
-// reaches the upload: the client bakes only on a 404.
+// its first customer and those eight gloves its second, from when the craft
+// sheet showed them as the face of each glove model (it shows a finish there
+// now). A painted glove has its icon and never reaches the upload: the client
+// bakes only on a 404.
 //
 // SHARED art — every visitor's tile — so it is guarded harder than an
 // instance card, which only its owner ever sees:

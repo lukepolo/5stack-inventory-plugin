@@ -5,7 +5,7 @@ import { useI18n } from "./composables/useI18n";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Palette, Link2,
   Layers,
 } from "lucide-vue-next";
 import {
@@ -1126,19 +1126,92 @@ const craftList = computed(() =>
   ),
 );
 
+/** Knife and glove craft cards carry the model label an owned card has — a
+ *  finish name alone ("Fade") does not say which of twenty knives it is. */
+const craftLabels = computed(() => sheetKey.value === "knife" || sheetKey.value === "gloves");
+
+/**
+ * The models a knife or glove craft sheet is sectioned by.
+ *
+ * One scroll over every finish, on purpose: browsing all of them is how people
+ * find a good-looking knife, and a click per model hid them. So the grid stays
+ * whole, gets a header per model that pins while you're in it, and a rail of
+ * model silhouettes above it follows the scroll and jumps on a click.
+ *
+ * A model is the backend's `base*` facts — the one unpainted item that shares a
+ * finish's modelKey (baseFacts in backend/src/catalog.ts), not its first
+ * finish. Catalog order, so the rail holds still when the sort changes.
+ */
+interface CraftModel {
+  key: string;
+  name: string;
+  /** Rail label: "Butterfly", not "Butterfly Knife" — the shape says knife. */
+  short: string;
+  /** What the rail and the header show for the model (see craftModelArt). */
+  art: Skin;
+}
+const craftModelList = computed<CraftModel[]>(() => {
+  if (!craftLabels.value) return [];
+  const byModel = new Map<string, Skin[]>();
+  for (const s of sheetSkins.value) {
+    const key = s.model ?? "";
+    const list = byModel.get(key);
+    if (list) list.push(s);
+    else byModel.set(key, [s]);
+  }
+  return [...byModel].map(([key, finishes]) => {
+    const name = finishes[0].baseName ?? weaponName(finishes[0]);
+    return { key, name, short: name.replace(/ (Knife|Gloves)$/, ""), art: craftModelArt(finishes, name) };
+  });
+});
+/**
+ * A model's face in the rail and on its header.
+ *
+ * A knife wears its own vanilla icon. A bare glove has none in the game, and
+ * the catalog render of one is an unlit dark pair that reads as a blank tile,
+ * so a glove model shows one of its own finishes instead — a different one each
+ * time the sheet loads.
+ */
+function craftModelArt(finishes: Skin[], name: string): Skin {
+  if (sheetKey.value === "gloves") return finishes[Math.floor(Math.random() * finishes.length)];
+  const s = finishes[0];
+  return s.baseId != null ? { ...s, id: s.baseId, name, altName: null, image: s.baseImage ?? s.image, paintMaterial: null } : s;
+}
+
 /** Craft grid stacks, plus the name a deck shows: the face's, minus the
- *  "(Colour)" that only distinguishes it from its own siblings. */
-const craftStacks = computed(() =>
-  stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id, tintColors.value).map((st) => ({
+ *  "(Colour)" that only distinguishes it from its own siblings. Knives and
+ *  gloves come out grouped by model. */
+const craftStacks = computed(() => {
+  const stacks = stackByDesign(craftList.value, sheetDesign.value, (s) => s, (s) => s.id, tintColors.value).map((st) => ({
     ...st,
     card: st.variants.length > 1 ? { ...st.face, name: st.face.name.replace(TINT_SUFFIX, "") } : st.face,
-  })),
-);
-/** Knife and glove craft cards carry the model label an owned card has — a
- *  finish name alone ("Fade") does not say which of twenty knives it is. The
- *  grid stays flat on purpose: scrolling every finish is how people browse for
- *  a good-looking knife, and a click per model hides them. */
-const craftLabels = computed(() => sheetKey.value === "knife" || sheetKey.value === "gloves");
+  }));
+  if (!craftLabels.value) return stacks;
+  // A stable sort, so the order you picked still holds inside each model.
+  const order = new Map(craftModelList.value.map((m, i) => [m.key, i]));
+  return stacks.sort((a, b) => (order.get(a.card.model ?? "") ?? 0) - (order.get(b.card.model ?? "") ?? 0));
+});
+/** Each model with how many of its finishes pass the filters. The rail dims a
+ *  model a search emptied rather than reshuffling under you. */
+const craftModels = computed(() => {
+  const n = new Map<string, number>();
+  for (const st of craftStacks.value) n.set(st.card.model ?? "", (n.get(st.card.model ?? "") ?? 0) + 1);
+  return craftModelList.value.map((m) => ({ ...m, count: n.get(m.key) ?? 0 }));
+});
+/** Stack key -> the model whose section that card opens. */
+const craftSectionAt = computed(() => {
+  const out = new Map<string | number, (typeof craftModels.value)[number]>();
+  if (!craftLabels.value) return out;
+  const byKey = new Map(craftModels.value.map((m) => [m.key, m]));
+  let prev: string | null = null;
+  for (const st of craftStacks.value) {
+    const k = st.card.model ?? "";
+    const m = k !== prev ? byKey.get(k) : undefined;
+    if (m) out.set(st.key, m);
+    prev = k;
+  }
+  return out;
+});
 
 /** The design being drilled into, for the back chip's label. */
 const sheetDesignName = computed(() =>
@@ -1166,6 +1239,27 @@ const sheetResetKey = () =>
 // Both windows count CARDS, not items — a stack is one thing to scroll past.
 const ownedWindow = useRenderWindow(ownedStacks, sheetResetKey);
 const craftWindow = useRenderWindow(craftStacks, sheetResetKey);
+/**
+ * The craft window as drawn, in sections: one per model on the knife and glove
+ * sheets, each opening with its header, and one unheaded section everywhere
+ * else. A section is its own block because a sticky header can't leave its
+ * containing block, and a grid item's is its own row — a header placed straight
+ * in the card grid never pinned.
+ */
+const craftGroups = computed(() => {
+  type Group = {
+    key: string;
+    sec: (typeof craftModels.value)[number] | null;
+    rows: { st: (typeof craftStacks.value)[number]; idx: number }[];
+  };
+  const groups: Group[] = [];
+  craftWindow.items.value.forEach((st, idx) => {
+    const sec = craftSectionAt.value.get(st.key) ?? null;
+    if (sec || !groups.length) groups.push({ key: sec?.key ?? "", sec, rows: [] });
+    groups[groups.length - 1].rows.push({ st, idx });
+  });
+  return groups;
+});
 // Sheet: replace mode — the base weapons that can take this position: eligible
 // for it, on this side, and not already somewhere else in the loadout — or in
 // it. That is the whole of the choice. Owned skins of those weapons used to
@@ -4253,10 +4347,10 @@ const advancedPlacement = ref(false);
  * published for everybody (the store is shared art, so the backend takes writes
  * from admins only), and a later visitor's 404 on the icon tries that stored
  * copy before spending a GL context. Anyone else's bake stays in their session —
- * the upload is refused and that is fine. The gloves joined once the craft
- * sheet started wearing those eight as the face of each glove model's deck —
- * eight bakes on every visit to the gloves sheet, for every visitor, was the
- * cost the store exists to pay once.
+ * the upload is refused and that is fine. The gloves joined when the craft
+ * sheet showed those eight as the face of each glove model — eight bakes on
+ * every visit to the gloves sheet, for every visitor. It shows a finish there
+ * now (craftModelArt), so a bare glove only gets here if something asks.
  */
 const catalogArtTried = new Set<number>();
 /** Must match CATALOG_RENDER_TYPES in backend/src/main.ts — the server refuses
@@ -5427,18 +5521,27 @@ const COMPACT_CRAFT_TILE = 108;
 const COMPACT_CRAFT_CHROME = 56;
 /** Rows, not cards. Compact + a mode you pick from rather than browse. */
 const sheetRows = computed(() => isCompact.value && sheetMode.value !== "craft");
+const pickerCardTracks = computed(() => {
+  const tile = isCompact.value ? COMPACT_CRAFT_TILE : sheetCardSize.value;
+  const chrome = isCompact.value ? COMPACT_CRAFT_CHROME : CARD_CHROME_PX;
+  return { columns: `repeat(auto-fill, minmax(${tile}px, 1fr))`, row: `${tile + chrome}px` };
+});
 const pickerGridStyle = computed(() => {
   if (sheetRows.value) {
     return { display: "grid", gridTemplateColumns: "1fr", gridAutoRows: `${COMPACT_ROW_H}px` };
   }
-  const tile = isCompact.value ? COMPACT_CRAFT_TILE : sheetCardSize.value;
-  const chrome = isCompact.value ? COMPACT_CRAFT_CHROME : CARD_CHROME_PX;
-  return {
-    display: "grid",
-    gridTemplateColumns: `repeat(auto-fill, minmax(${tile}px, 1fr))`,
-    gridAutoRows: `${tile + chrome}px`,
-  };
+  const t = pickerCardTracks.value;
+  // Craft draws its cards inside sections (craftGroups), each a grid of its own
+  // on these same tracks, so the scroller's rows just fit whatever they hold.
+  return { display: "grid", gridTemplateColumns: t.columns, gridAutoRows: sheetMode.value === "craft" ? "auto" : t.row };
 });
+/** A craft section's card grid: the picker's own tracks, so sections line up
+ *  with each other and with every other sheet. */
+const craftCardGrid = computed(() => ({
+  display: "grid",
+  gridTemplateColumns: pickerCardTracks.value.columns,
+  gridAutoRows: pickerCardTracks.value.row,
+}));
 
 // The picker holds entries that aren't ItemTiles — the craft prompt, the stock
 // default, the Replace candidates. They have to follow the same card/row switch
@@ -5484,6 +5587,7 @@ const onSheetScroll = (e: Event) => {
   requestAnimationFrame(() => {
     sheetScrollPending = false;
     measureSheetScroll(el);
+    spyCraftSection(el);
   });
 };
 // Function ref rather than a plain one: the scroller is keyed on
@@ -5493,8 +5597,14 @@ const onSheetScroll = (e: Event) => {
 let sheetScrollEl: HTMLElement | null = null;
 function setSheetScrollEl(el: unknown) {
   sheetScrollEl = (el as HTMLElement) ?? null;
-  if (sheetScrollEl) requestAnimationFrame(() => measureSheetScroll(sheetScrollEl));
-  else sheetHasMore.value = false;
+  if (sheetScrollEl) {
+    requestAnimationFrame(() => {
+      measureSheetScroll(sheetScrollEl);
+      spyCraftSection(sheetScrollEl);
+    });
+  } else {
+    sheetHasMore.value = false;
+  }
 }
 // A settled search term means a new list, so the panel goes back to the top.
 // Lives HERE, beside sheetScrollEl, not next to the debounce that produces the
@@ -5532,6 +5642,143 @@ watch(
  *  staggering every appended row — the `sheet-settled` gate only covers the
  *  options column. */
 const sheetCellClass = (i: number) => (i < WINDOW_FIRST ? "animate-sheet-in" : "");
+
+// ---- knife and glove model rail ---------------------------------------------
+// See craftModelList. The rail sits above the scroller rather than inside it, so
+// it is pinned for free and its Jump menu isn't clipped by the scroller; only
+// the model headers are sticky, inside the grid.
+const craftCurrent = ref("");
+watch(craftModelList, (list) => {
+  if (!list.some((m) => m.key === craftCurrent.value)) craftCurrent.value = list[0]?.key ?? "";
+});
+/** Set while a jump's smooth scroll is in flight, so the rail stays on the
+ *  target instead of flicking through every model on the way there. */
+let craftJumping = 0;
+let craftJumpSeq = 0;
+/**
+ * Which model you're in: the last one whose header is at least halfway into the
+ * pinned slot, which is the moment it visibly takes over from the one before.
+ * The headers are sticky, so where they ARE says nothing; the section block a
+ * header opens still starts where the layout put it.
+ */
+function spyCraftSection(el: HTMLElement | null) {
+  if (!el || craftJumping || !craftSectionAt.value.size) return;
+  const secs = el.querySelectorAll<HTMLElement>("[data-craft-group]");
+  if (!secs.length) return;
+  const hh = el.querySelector<HTMLElement>("[data-craft-sec]")?.offsetHeight ?? 0;
+  const top = el.getBoundingClientRect().top;
+  let cur = secs[0].dataset.craftGroup ?? "";
+  for (const s of secs) {
+    if (s.getBoundingClientRect().top - top <= hh / 2) cur = s.dataset.craftGroup ?? cur;
+  }
+  craftCurrent.value = cur;
+}
+// A new list (search, a filter, the window growing) moves every section.
+watch([craftStacks, () => craftWindow.items.value.length], () => nextTick(() => spyCraftSection(sheetScrollEl)));
+const prefersReducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+/** Resolves once a smooth scroll has stopped moving, or after ~2s if something
+ *  keeps it going. */
+function scrollSettled(el: HTMLElement) {
+  return new Promise<void>((done) => {
+    let last = -1;
+    let still = 0;
+    let frames = 0;
+    const tick = () => {
+      still = Math.abs(el.scrollTop - last) < 0.5 ? still + 1 : 0;
+      last = el.scrollTop;
+      if (still > 4 || ++frames > 120) done();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+async function jumpToCraftModel(key: string) {
+  const el = sheetScrollEl;
+  const i = craftStacks.value.findIndex((st) => (st.card.model ?? "") === key);
+  if (!el || i < 0) return;
+  // The grid is windowed: a section has to be mounted before it can be
+  // scrolled to. A far jump mounts everything up to it in one go.
+  craftWindow.reveal(i + (craftModels.value.find((m) => m.key === key)?.count ?? 1));
+  const mine = (craftJumping = ++craftJumpSeq);
+  craftCurrent.value = key;
+  await nextTick();
+  const sec = el.querySelector<HTMLElement>(`[data-craft-group="${CSS.escape(key)}"]`);
+  if (sec) {
+    const to = i === 0 ? 0 : el.scrollTop + sec.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    el.scrollTo({ top: to, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+    await scrollSettled(el);
+  }
+  if (craftJumping !== mine) return;
+  craftJumping = 0;
+  spyCraftSection(el);
+}
+
+const craftRailEdge = ref({ l: false, r: false });
+let craftRailEl: HTMLElement | null = null;
+const craftRailRo = new ResizeObserver(() => measureCraftRail());
+onBeforeUnmount(() => craftRailRo.disconnect());
+/** Fades and arrows only on a side that has more models past it. */
+function measureCraftRail() {
+  const r = craftRailEl;
+  if (!r) return;
+  const l = r.scrollLeft > 4;
+  const right = r.scrollLeft < r.scrollWidth - r.clientWidth - 4;
+  if (l !== craftRailEdge.value.l || right !== craftRailEdge.value.r) craftRailEdge.value = { l, r: right };
+}
+function centerCraftRail(smooth = true) {
+  const r = craftRailEl;
+  const b = r?.querySelector<HTMLElement>(`[data-model="${CSS.escape(craftCurrent.value)}"]`);
+  if (!r || !b) return;
+  r.scrollTo({ left: b.offsetLeft - (r.clientWidth - b.offsetWidth) / 2, behavior: smooth && !prefersReducedMotion() ? "smooth" : "auto" });
+}
+// Function ref, called on every render: only a NEW element is set up, or each
+// re-render would yank the rail back to centre while you're browsing it.
+function setCraftRailEl(el: unknown) {
+  const next = (el as HTMLElement) ?? null;
+  if (next === craftRailEl) return;
+  if (craftRailEl) craftRailRo.unobserve(craftRailEl);
+  craftRailEl = next;
+  if (!next) return;
+  craftRailRo.observe(next);
+  nextTick(() => {
+    centerCraftRail(false);
+    measureCraftRail();
+  });
+}
+watch(craftCurrent, () => centerCraftRail());
+watch(craftModels, () => nextTick(measureCraftRail));
+function nudgeCraftRail(dir: -1 | 1) {
+  craftRailEl?.scrollBy({ left: dir * craftRailEl.clientWidth * 0.8, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+}
+// Mouse drag scrolls the rail (touch already does, natively).
+let railDrag: { x: number; left: number } | null = null;
+let railDragged = false;
+function onCraftRailDown(e: PointerEvent) {
+  if (e.pointerType !== "mouse" || e.button !== 0 || !craftRailEl) return;
+  railDrag = { x: e.clientX, left: craftRailEl.scrollLeft };
+  railDragged = false;
+  window.addEventListener("pointermove", onCraftRailMove);
+  window.addEventListener("pointerup", onCraftRailUp);
+  window.addEventListener("pointercancel", onCraftRailUp);
+}
+function onCraftRailMove(e: PointerEvent) {
+  if (!railDrag || !craftRailEl) return;
+  const dx = e.clientX - railDrag.x;
+  if (Math.abs(dx) > 5) railDragged = true;
+  if (railDragged) craftRailEl.scrollLeft = railDrag.left - dx;
+}
+function onCraftRailUp() {
+  window.removeEventListener("pointermove", onCraftRailMove);
+  window.removeEventListener("pointerup", onCraftRailUp);
+  window.removeEventListener("pointercancel", onCraftRailUp);
+  railDrag = null;
+  // The click that ends a drag lands on whatever silhouette is under the
+  // pointer; it isn't a pick.
+  setTimeout(() => (railDragged = false));
+}
+function pickCraftModel(key: string) {
+  if (!railDragged) void jumpToCraftModel(key);
+}
 
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
 // pulls the rail to the category that actually contains it — otherwise the
@@ -9192,11 +9439,113 @@ if (MDEBUG) {
           leave-active-class="transition duration-100"
           leave-to-class="opacity-0"
         >
+        <!-- One unit per mode and sheet, the knife/glove rail included: the
+             rail fades with the grid it belongs to, instead of popping in over
+             the old grid while that one is still fading out. -->
+        <div :key="sheetMode + '|' + sheetKey" class="flex min-h-0 flex-1 flex-col">
+        <!-- Knives and gloves: the model rail (see craftModelList). Above the
+             scroller, not in it: pinned for free, and the Jump menu opens over
+             the grid instead of being clipped by it. Its height is held while
+             a sheet's models load, so the grid under it doesn't jump when they
+             arrive. -->
         <div
-          :key="sheetMode + '|' + sheetKey"
+          v-if="sheetMode === 'craft' && craftLabels && sheetDesign === null"
+          class="flex flex-none items-center gap-2 border-b border-border py-1"
+          :class="isCompact ? 'min-h-[62px] px-3' : 'min-h-[66px] px-6'"
+        >
+          <!-- A fixed label, not the current model: the pinned header right
+               below already names it, and a button that grew and shrank with
+               the name shoved the whole rail sideways as you scrolled. -->
+          <FilterDropdown
+            class="flex-none"
+            label="Jump to"
+            :model-value="craftCurrent"
+            :options="craftModels.map((m) => ({ value: m.key, label: m.name, disabled: !m.count }))"
+            @update:model-value="jumpToCraftModel"
+          />
+          <span class="h-9 w-px flex-none bg-border" aria-hidden="true"></span>
+          <div class="relative min-w-0 flex-1">
+            <div
+              :ref="setCraftRailEl"
+              class="craft-rail relative flex gap-1 overflow-x-auto overscroll-x-contain"
+              @scroll.passive="measureCraftRail"
+              @pointerdown="onCraftRailDown"
+            >
+              <button
+                v-for="m in craftModels"
+                :key="m.key"
+                type="button"
+                :data-model="m.key"
+                class="flex flex-none flex-col items-center gap-[3px] rounded-md border px-1 py-1 transition-colors disabled:cursor-default disabled:opacity-30"
+                :class="[
+                  isCompact ? 'w-[80px]' : 'w-[92px]',
+                  craftCurrent === m.key ? 'border-[color:var(--acc)]' : 'border-transparent',
+                ]"
+                :style="craftCurrent === m.key ? { background: accentSoft } : {}"
+                :title="m.name"
+                :aria-label="m.name"
+                :aria-current="craftCurrent === m.key || undefined"
+                :disabled="!m.count"
+                @click="pickCraftModel(m.key)"
+              >
+                <!-- Fixed tracks: with an auto row the art's height:100% has
+                     nothing to resolve against and it draws at its natural
+                     height, straight over the label.
+                     Small on purpose. The sheet under the loadout is ~430px
+                     tall, and at 62px of art the rail and the pinned header
+                     left less than one 218px row of knives. -->
+                <span class="grid w-full place-items-center" :class="isCompact ? 'h-[30px]' : 'h-[34px]'" style="grid-template: 100% / 100%">
+                  <img
+                    :src="catalogArt[m.art.id] ?? m.art.image ?? undefined"
+                    alt=""
+                    draggable="false"
+                    class="h-full w-full select-none object-contain"
+                    @error="onCatalogArtError($event, m.art)"
+                    @load="onCatalogArtLoad"
+                  />
+                </span>
+                <span
+                  class="max-w-full truncate text-f8 uppercase leading-tight tracking-wider"
+                  :class="craftCurrent === m.key ? 'text-foreground' : 'text-muted-foreground/60'"
+                >{{ m.short }}</span>
+              </button>
+            </div>
+            <div
+              v-show="craftRailEdge.l"
+              class="pointer-events-none absolute inset-y-0 left-0 flex w-14 items-center"
+              style="background: linear-gradient(90deg, hsl(var(--background)) 30%, transparent)"
+            >
+              <button
+                type="button"
+                class="pointer-events-auto grid h-8 w-6 place-items-center rounded-md border border-border bg-card text-foreground transition-colors hover:border-muted-foreground"
+                aria-label="Scroll models left"
+                @click="nudgeCraftRail(-1)"
+              ><ChevronLeft class="h-3.5 w-3.5" /></button>
+            </div>
+            <div
+              v-show="craftRailEdge.r"
+              class="pointer-events-none absolute inset-y-0 right-0 flex w-14 items-center justify-end"
+              style="background: linear-gradient(270deg, hsl(var(--background)) 30%, transparent)"
+            >
+              <button
+                type="button"
+                class="pointer-events-auto grid h-8 w-6 place-items-center rounded-md border border-border bg-card text-foreground transition-colors hover:border-muted-foreground"
+                aria-label="Scroll models right"
+                @click="nudgeCraftRail(1)"
+              ><ChevronRight class="h-3.5 w-3.5" /></button>
+            </div>
+          </div>
+        </div>
+
+        <div
           :ref="setSheetScrollEl"
-          class="flex-1 auto-rows-min content-start overflow-y-auto overscroll-contain"
-          :class="isCompact ? 'gap-1.5 px-3 pb-8 pt-2' : 'gap-2.5 px-6 pb-6 pt-3.5'"
+          class="min-h-0 flex-1 auto-rows-min content-start overflow-y-auto overscroll-contain"
+          :class="[
+            isCompact ? 'gap-1.5 px-3 pb-8' : 'gap-2.5 px-6 pb-6',
+            // A sectioned sheet opens on a model header that sits flush under
+            // the rail; the usual top padding was a dead band above it.
+            sheetMode === 'craft' && craftLabels ? 'pt-0' : isCompact ? 'pt-2' : 'pt-3.5',
+          ]"
           :style="pickerGridStyle"
           @scroll.passive="onSheetScroll"
         >
@@ -9317,8 +9666,39 @@ if (MDEBUG) {
               <!-- The wrapper exists so the "deck" layers can sit OUTSIDE the
                    card: the card itself is overflow-hidden (the art scales on
                    hover) and would clip them. -->
+              <section
+                v-for="g in craftGroups"
+                :key="g.key"
+                class="col-span-full flex flex-col"
+                :class="isCompact ? 'gap-1.5' : 'gap-2.5'"
+                :data-craft-group="g.sec?.key"
+              >
+              <!-- A model's header: pins to the top of the scroller while you're
+                   in that model, until the end of its section pushes it off.
+                   Out into the scroller's side padding so cards don't peek past
+                   it. Sticky offsets start below any top padding, which is why a
+                   sectioned scroller has none (see its pt-0). -->
               <div
-                v-for="(st, idx) in craftWindow.items.value"
+                v-if="g.sec"
+                :data-craft-sec="g.sec.key"
+                class="sticky top-0 z-[5] flex items-center gap-3 border-b border-border bg-background py-1.5"
+                :class="isCompact ? '-mx-3 px-3' : '-mx-6 px-6'"
+              >
+                <img
+                  :src="catalogArt[g.sec.art.id] ?? g.sec.art.image ?? undefined"
+                  alt=""
+                  class="h-5 w-9 flex-none object-contain"
+                  @error="onCatalogArtError($event, g.sec.art)"
+                  @load="onCatalogArtLoad"
+                />
+                <span class="truncate text-f13 uppercase tracking-cs1">{{ g.sec.name }}</span>
+                <span class="flex-none font-mono text-f10 text-muted-foreground">
+                  {{ g.sec.count }} {{ g.sec.count === 1 ? 'finish' : 'finishes' }}
+                </span>
+              </div>
+              <div :class="isCompact ? 'gap-1.5' : 'gap-2.5'" :style="craftCardGrid">
+              <div
+                v-for="{ st, idx } in g.rows"
                 :key="st.key"
                 class="relative h-full"
                 :class="sheetCellClass(idx)"
@@ -9402,6 +9782,8 @@ if (MDEBUG) {
                   <MusicPlayer v-if="st.card.audio" :src="st.card.audio" :volume="false" class="relative z-[2] mt-1.5" />
                 </button>
               </div>
+              </div>
+              </section>
               <InfiniteSentinel
                 :count="craftWindow.items.value.length"
                 :done="craftWindow.done.value"
@@ -9439,6 +9821,7 @@ if (MDEBUG) {
               Every eligible weapon is already in this loadout.
             </div>
           </template>
+        </div>
         </div>
         </Transition>
 

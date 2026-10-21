@@ -20,6 +20,10 @@ const props = defineProps<{
   options: Option[];
   /** Static prefix on the closed button, e.g. "Sort" -> "Sort · Name". */
   prefix?: string;
+  /** Fixed text on the closed button in place of the current option, for a
+   *  menu that acts rather than holds a setting (the craft sheet's Jump to).
+   *  The open menu still checks the current one. */
+  label?: string;
   /** Rarity mode: color dots on the rows and the closed button. */
   dots?: boolean;
   /** Open above the button — for a footer, where below is off the card. */
@@ -118,7 +122,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey, true));
       @click="open = !open"
     >
       <span v-if="dots" class="h-2 w-2 flex-none rounded-full" :style="dotStyle(current)"></span>
-      <span class="truncate">{{ prefix ? prefix + ' · ' : '' }}{{ current?.label ?? '—' }}</span>
+      <span class="truncate">{{ label ?? `${prefix ? prefix + ' · ' : ''}${current?.label ?? '—'}` }}</span>
       <ChevronDown class="h-3 w-3 flex-none opacity-60 transition-transform" :class="open && 'rotate-180'" />
     </button>
     <div v-if="open" class="fixed inset-0 z-[90]" @click="open = false"></div>

@@ -567,3 +567,27 @@
 .over-art [class*="rounded"] > svg {
   text-shadow: none;
 }
+
+/* The knife/glove model rail (craftModelList in App.vue). It scrolls sideways
+   under its own arrows and edge fades, so a scrollbar would be a second control
+   for the same thing. Shapes rest grey and come up in colour on hover and on
+   the model you're in — the silhouette is what you scan for, the colour says
+   where you are. */
+.craft-rail {
+  scrollbar-width: none;
+}
+.craft-rail::-webkit-scrollbar {
+  display: none;
+}
+.craft-rail img {
+  filter: grayscale(1) brightness(1.35);
+  opacity: 0.72;
+  transition:
+    filter 150ms,
+    opacity 150ms;
+}
+.craft-rail button:hover:not(:disabled) img,
+.craft-rail [aria-current] img {
+  filter: none;
+  opacity: 1;
+}
