@@ -384,13 +384,28 @@ async function pruneRenders(): Promise<number> {
   }
   return removed;
 }
+/**
+ * The current card version when an upload was baked for a different one, else
+ * null. That is a tab loaded before the last extraction finished: its pixels
+ * come from the previous extraction's assets, so storing them under the current
+ * version's name would keep an old picture as the new card for good, and the
+ * tab would then look for it under the old name and report the store as broken.
+ * The client sends the version it baked for as `?v=`; a client too old to send
+ * one is taken at its word, as before.
+ */
+async function staleCardVersion(v: string | undefined): Promise<number | null> {
+  if (v === undefined || v === "") return null;
+  const current = await renderVersion();
+  return Number(v) === current ? null : current;
+}
+
 // The size check below allows 3MB, but Fastify's 1MB default would have
 // rejected anything over 1MB before the handler saw it — so that ceiling was
 // never real. Card PNGs are 0.2-1MB (measured on 16 bakes), WebPs a tenth of it.
 //
 // PNG or WebP, told apart by their magic bytes (cardStore.ts), and stored as
 // whichever it is, a PNG transcoded to WebP when cwebp is there.
-app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
+app.post<{ Params: { id: string }; Querystring: { v?: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
     return reply.status(401).send({ error: "not signed in" });
@@ -399,6 +414,8 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
   if (!Buffer.isBuffer(body) || body.length === 0 || body.length > 3_000_000 || !cardFormatOf(body)) {
     return reply.status(400).send({ error: "bad render" });
   }
+  const stale = await staleCardVersion(request.query.v);
+  if (stale !== null) return reply.status(409).send({ error: "stale", version: stale });
   const { rows } = await pool.query(
     // stattrak is part of the render key (the card draws the module), so it has
     // to be selected here — without it the stored name loses the -st marker
@@ -443,9 +460,11 @@ app.post<{ Params: { id: string } }>("/api/render/:id", { bodyLimit: 3_000_000 }
 //    start with the magic bytes (plausibleCard in cardStore.ts).
 const CATALOG_RENDER_TYPES = new Set(["pet", "glove"]);
 export const catalogRenderKey = (itemId: number, version: number) => `cat-${itemId}-v${version}.png`;
-app.post<{ Params: { id: string } }>("/api/render/catalog/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
+app.post<{ Params: { id: string }; Querystring: { v?: string } }>("/api/render/catalog/:id", { bodyLimit: 3_000_000 }, async (request, reply) => {
   const denied = await requireAdmin(request);
   if (denied) return reply.status(denied.code).send({ error: denied.error });
+  const stale = await staleCardVersion(request.query.v);
+  if (stale !== null) return reply.status(409).send({ error: "stale", version: stale });
   const id = Number(request.params.id);
   const item = Number.isInteger(id) ? getItem(id) : null;
   if (!item || !CATALOG_RENDER_TYPES.has(item.type as string)) {

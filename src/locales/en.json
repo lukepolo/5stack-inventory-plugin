@@ -16,6 +16,7 @@
       "synced_partial": "Synced with Steam — {summary}. Inventory too large to read fully.",
       "synced_no_changes": "Synced with Steam — everything was already up to date.",
       "render_upload_failed": "Render made locally, but saving it failed: {error}. Check backend deploy/mount.",
+      "cards_stale": "The 3D models were just updated on the server. Reload the page to see the new cards.",
       "render_not_served": "Render SAVED (backend OK) but /renders/ doesn't serve it back — frontend + backend pods aren't sharing the mount, or a cache is serving a stale 404."
     },
     "admin": {

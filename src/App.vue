@@ -2907,6 +2907,11 @@ const queuedIds = ref<Set<number>>(new Set());
 // So on touch devices: keep a short backlog, and leave a gap between bakes for
 // the browser to actually reclaim the last one. Cards that lose their turn show
 // catalog art and ask again next time they scroll into view.
+/** Set once the server says an extraction finished after this tab loaded (see
+ *  uploadRender's `stale`). No card is baked after that until a reload. */
+// Declared above generateRender, which an immediate watcher can call during
+// setup.
+let cardsStale = false;
 const TOUCH_BAKE_BACKLOG = 3;
 const TOUCH_BAKE_COOLDOWN_MS = 400;
 const bakeCooldown = () =>
@@ -2921,6 +2926,7 @@ const bakeCooldown = () =>
  * reloaded it; and an older queued bake still held the PRE-edit item.
  */
 function generateRender(inst: InventoryItem, opts: { force?: boolean } = {}): Promise<boolean> {
+  if (cardsStale) return Promise.resolve(false);
   if (!opts.force && (renderedIds.has(inst.id) || queuedIds.value.has(inst.id))) return Promise.resolve(false);
   if (!opts.force && isCoarse.value && queuedIds.value.size >= TOUCH_BAKE_BACKLOG) return Promise.resolve(false);
   queuedIds.value = new Set([...queuedIds.value, inst.id]);
@@ -2985,6 +2991,7 @@ const renderServes = (url: string) =>
 // body a pattern draws. Coat and stage are in the render key (renderKeyFor).
 const CARD_BAKE_KINDS = new Set<ViewerKind>(["weapon", "charm", "glove", "pet"]);
 async function generateRenderNow(inst: InventoryItem, force = false): Promise<boolean> {
+  if (cardsStale) return false;
   if (!force && renderedIds.has(inst.id)) return false;
   // Resolved, not read off `item.model`. A charm names no model of its own —
   // the econ schema names its mesh and 23 of them share one blank — so the sync
@@ -3079,6 +3086,19 @@ async function generateRenderNow(inst: InventoryItem, force = false): Promise<bo
     if (prev) URL.revokeObjectURL(prev);
     localRenders.value = { ...localRenders.value, [inst.id]: URL.createObjectURL(blob) };
     const up = await uploadRender(inst.id, blob);
+    if (up.stale) {
+      // An extraction finished after this tab loaded, so every card it bakes
+      // from here is the previous assets under the previous name. Stop baking
+      // and say why once, rather than reporting a store that is fine as broken.
+      if (!cardsStale) {
+        cardsStale = true;
+        notify(
+          tr("inventory.notify.cards_stale", "The 3D models were just updated on the server. Reload the page to see the new cards."),
+          "success",
+        );
+      }
+      return true;
+    }
     if (!up.ok && !uploadWarned) {
       uploadWarned = true;
       notify(tr("inventory.notify.render_upload_failed",

@@ -72,7 +72,8 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 - Switching "Verify composites" off in the Developer tab left it on, so that browser compared paint composites with the shared store but never saved any. Off now means off.
 - Editing an item's stickers or charm now re-renders its card. Card files were named only by wear, pattern and StatTrak, so moving, swapping or scratching a sticker kept the old picture until the cache was cleared.
-- A card whose paint failed to load, or which came out black, is retried instead of stored. This caused the Driver Gloves card to be black.
+- A card whose paint failed to load, or which came out black, is retried instead of stored.
+- A tab left open while a model extraction finished showed "Render SAVED (backend OK) but /renders/ doesn't serve it back" and went on baking cards from the previous models under the new version's name. The server now refuses those cards, and the tab stops baking and asks for a reload. This caused the Driver Gloves card to be black.
 - Paint composites saved to the shared store before the Safari fix are no longer used, since Safari could have stored a bare weapon for a Doppler there.
 
 ## Performance

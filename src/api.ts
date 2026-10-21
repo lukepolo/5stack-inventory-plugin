@@ -497,21 +497,34 @@ export const catalogRenderUrl = (itemId: number) => `${API_ORIGIN}/api/renders/c
 // Both card uploads take the snapshot's PNG and send it as a WebP where the
 // server and the browser allow (postCard in cardEncode.ts); the key and every
 // URL above stay the same either way.
+/** The version a card was baked for, for the server to check against its own
+ *  (staleCardVersion in main.ts). Nothing until the catalog has said: 0 is
+ *  "not loaded yet" here, and would read as stale against any extraction. */
+const bakedFor = () => (renderVersion ? `?v=${renderVersion}` : "");
 export async function uploadCatalogRender(itemId: number, blob: Blob): Promise<boolean> {
   try {
-    const res = await postCard(`${API_BASE}/api/render/catalog/${itemId}`, blob, cardsTakeWebp);
+    const res = await postCard(`${API_BASE}/api/render/catalog/${itemId}${bakedFor()}`, blob, cardsTakeWebp);
     return res.ok;
   } catch {
     return false;
   }
 }
-export async function uploadRender(instanceId: number, blob: Blob): Promise<{ ok: boolean; error?: string }> {
+/**
+ * `stale`: the server refused the card because an extraction finished after
+ * this tab loaded its catalog, so the card was baked from the previous assets
+ * under the previous version's name. Only a reload fixes that.
+ */
+export async function uploadRender(
+  instanceId: number,
+  blob: Blob,
+): Promise<{ ok: boolean; error?: string; stale?: boolean }> {
   try {
-    const res = await postCard(`${API_BASE}/api/render/${instanceId}`, blob, cardsTakeWebp);
+    const res = await postCard(`${API_BASE}/api/render/${instanceId}${bakedFor()}`, blob, cardsTakeWebp);
     if (res.ok) return { ok: true };
     let error = `HTTP ${res.status}`;
     try {
       const data = (await res.json()) as { error?: string };
+      if (res.status === 409 && data?.error === "stale") return { ok: false, stale: true };
       if (data?.error) error = `${error} — ${data.error}`;
     } catch { /* non-JSON */ }
     return { ok: false, error };
