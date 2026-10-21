@@ -1417,6 +1417,10 @@ export interface ExtractStatus {
     memAvailableMb: number | null;
     memoryScope?: "host" | "container";
   };
+  /** Owned items with a card at the current version, against those whose kind
+   *  gets one. Browsers bake cards, so after an extraction this drains as people
+   *  look. Absent on an older backend. */
+  cards?: { version: number; baked: number; total: number; equippedBaked: number; equippedTotal: number } | null;
 }
 // Plain <a download> hits this: same cookie-auth path the render <img> tags
 // use, so no token juggling.

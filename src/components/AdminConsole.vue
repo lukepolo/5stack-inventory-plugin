@@ -435,8 +435,16 @@ async function refreshExtractStatus() {
     extractStatus.value = null; // older backend — the section says so
   }
   // Slowly while the backend waits on the CS2 install, so the card flips to the
-  // run when it starts instead of still claiming the install is missing.
-  const every = extractLive.value ? 5000 : extractStatus.value?.autoExtractWaiting ? 30000 : 0;
+  // run when it starts instead of still claiming the install is missing. And
+  // while cards are still re-baking after a run, so that count visibly moves.
+  const cards = extractStatus.value?.cards;
+  const every = extractLive.value
+    ? 5000
+    : extractStatus.value?.autoExtractWaiting
+      ? 30000
+      : cards && cards.baked < cards.total
+        ? 10000
+        : 0;
   if (every !== extractPollMs) {
     stopPoll();
     if (every) {
@@ -462,6 +470,22 @@ async function pollTick() {
   // as the node has none, and the walk would repeat for nothing.
   if (extractLive.value && cacheTick++ % 3 === 0) await refreshCacheStats();
 }
+
+// Card art at the current version (see cardArtProgress in the backend), plus
+// what THIS browser is baking right now: the same queue the cards' "baking" /
+// "queued" badges read. An item stays queued while it bakes, so "waiting" is
+// the queue minus the ones baking.
+const art = inject<{ renderingIds: { value: Set<number> }; queuedIds: { value: Set<number> } } | null>("itemArt", null);
+const cardArt = computed(() => {
+  const c = extractStatus.value?.cards;
+  if (!c || !c.total) return null;
+  const baking = art?.renderingIds.value.size ?? 0;
+  const waiting = Math.max(0, (art?.queuedIds.value.size ?? 0) - baking);
+  const parts = [`equipped ${c.equippedBaked.toLocaleString()} of ${c.equippedTotal.toLocaleString()}`];
+  if (baking || waiting) parts.push(`this browser baking ${baking}${waiting ? `, ${waiting} waiting` : ""}`);
+  else if (c.baked < c.total) parts.push("the rest bake as they're shown");
+  return { ...c, pct: Math.round((c.baked / c.total) * 100), done: c.baked >= c.total, caption: parts.join(" · ") };
+});
 
 // Presentation of the run state, hoisted out of the template: three ternary
 // chains inline made the markup unreadable and kept drifting apart.
@@ -1777,6 +1801,34 @@ const BTN_DANGER =
                       </template>
                     </span>
                     <span v-if="slowestSteps" class="mt-0.5 block text-xs text-muted-foreground">{{ slowestSteps }}</span>
+                  </dd>
+                </div>
+                <!-- The cards a run invalidates, re-baking. Browsers bake them —
+                     a loadout's when its owner opens it, any other card the first
+                     time it is shown — so this drains as people look rather than
+                     as a job the server runs. -->
+                <div v-if="cardArt" class="flex items-start justify-between gap-4 px-4 py-3">
+                  <dt
+                    class="text-sm text-muted-foreground"
+                    title="Browsers bake cards: a loadout's when its owner opens it, any other card the first time it's shown."
+                  >
+                    Card art
+                  </dt>
+                  <dd class="min-w-0 text-right">
+                    <span class="font-mono text-sm">
+                      {{ cardArt.baked.toLocaleString() }} of {{ cardArt.total.toLocaleString() }}
+                      <span class="text-muted-foreground">· v{{ cardArt.version }}</span>
+                    </span>
+                    <span class="ml-auto mt-1.5 block h-1 w-40 overflow-hidden rounded-full bg-muted">
+                      <span
+                        class="block h-full transition-[width] duration-500"
+                        :style="{
+                          width: cardArt.pct + '%',
+                          background: cardArt.done ? 'hsl(var(--success, 142 70% 55%))' : 'hsl(var(--tac-amber, 33 94% 58%))',
+                        }"
+                      ></span>
+                    </span>
+                    <span class="mt-0.5 block text-xs text-muted-foreground">{{ cardArt.caption }}</span>
                   </dd>
                 </div>
                 <!-- Which CS2 build the assets were extracted against, and what

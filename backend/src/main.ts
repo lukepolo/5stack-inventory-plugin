@@ -364,6 +364,44 @@ async function pruneRenders(): Promise<number> {
   }
   return removed;
 }
+
+/**
+ * How far the cards have got at the current version, for the extraction panel.
+ *
+ * The server never bakes a card: browsers do, a loadout's when its owner opens
+ * it and any other card the first time it is shown. So after an extraction this
+ * is a queue that drains as people look, measured as the owned items that have
+ * a card at this version against the ones whose kind gets one (the client's
+ * CARD_BAKE_KINDS: weapons and knives, gloves, charms, pets).
+ */
+const CARD_ART_TYPES = new Set(["weapon", "melee", "glove", "keychain", "pet"]);
+async function cardArtProgress() {
+  const version = await renderVersion();
+  if (!version) return null;
+  const suffix = `-v${version}.png`;
+  const baked = new Set<string>();
+  for (const name of await fs.readdir(RENDERS_DIR).catch(() => [] as string[])) {
+    const m = name.endsWith(suffix) ? /^inst-(\d+)-/.exec(name) : null;
+    if (m) baked.add(m[1]);
+  }
+  const { rows } = await pool.query<{ id: string; item_id: number; equipped: boolean }>(
+    `SELECT o.id::text AS id, o.item_id, (l.item_instance_id IS NOT NULL) AS equipped
+       FROM inventory.owned_items o
+       LEFT JOIN (SELECT DISTINCT item_instance_id FROM inventory.loadout) l ON l.item_instance_id = o.id`,
+  );
+  const out = { version, baked: 0, total: 0, equippedBaked: 0, equippedTotal: 0 };
+  for (const r of rows) {
+    if (!CARD_ART_TYPES.has(getItem(r.item_id)?.type as string)) continue;
+    const has = baked.has(r.id);
+    out.total++;
+    if (has) out.baked++;
+    if (r.equipped) {
+      out.equippedTotal++;
+      if (has) out.equippedBaked++;
+    }
+  }
+  return out;
+}
 // The size check below allows 3MB, but Fastify's 1MB default would have
 // rejected anything over 1MB before the handler saw it — so that ceiling was
 // never real. Card PNGs are ~100KB, which is why it never surfaced.
@@ -6277,6 +6315,7 @@ app.get("/api/admin/extract-models", async (request, reply) => {
     blocked: live ? null : await cs2InstallProblem(),
     autoExtractWaiting: autoExtract.waiting(),
     workers: await extractWorkerInfo(),
+    cards: await cardArtProgress().catch(() => null),
     ...(await extractVersionInfo()),
   };
 });
