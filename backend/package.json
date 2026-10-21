@@ -10,11 +10,11 @@
     "migrate": "node --experimental-strip-types src/migrate.ts"
   },
   "dependencies": {
-    "@fastify/cors": "^11.3.0",
-    "@ianlucas/cs2-lib": "^9.5.0",
+    "@fastify/cors": "^11.3.1",
+    "@ianlucas/cs2-lib": "^9.8.0",
     "@ianlucas/cs2-lib-inspect": "^9.5.0",
-    "fastify": "^5.12.5",
-    "pg": "^8.23.0"
+    "fastify": "^5.12.7",
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "@types/node": "^24.19.0",

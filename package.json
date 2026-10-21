@@ -34,21 +34,21 @@
     "reka-ui": "^2.10.5",
     "tailwind-merge": "^3.7.0",
     "three": "^0.186.1",
-    "vue": "^3.5.43"
+    "vue": "^3.5.44"
   },
   "devDependencies": {
     "@originjs/vite-plugin-federation": "^1.4.1",
     "@types/three": "^0.186.0",
-    "@vitejs/plugin-vue": "^6.0.9",
+    "@vitejs/plugin-vue": "^6.0.10",
     "autoprefixer": "^10.6.1",
     "esbuild": "^0.28.2",
-    "postcss": "^8.5.28",
-    "postcss-nesting": "^14.0.2",
+    "postcss": "^8.5.31",
+    "postcss-nesting": "^14.0.3",
     "tailwindcss": "^3.4.19",
     "typescript": "^6.0.3",
-    "vite": "^8.3.1",
+    "vite": "^8.3.4",
     "vite-plugin-css-injected-by-js": "^5.0.2",
-    "vue-tsc": "^3.3.11"
+    "vue-tsc": "^3.3.13"
   },
   "overrides": {
     "@5stack/ui": {
