@@ -48,6 +48,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 - In first person the agent's sleeve wore the equipped glove's finish up to the elbow. Only the gloves take the finish now, and the sleeve keeps the agent's own look.
 - Stickers and charms disappeared in first person. They stay on the gun now, hidden only where the hand covers them, and a charm swings as the gun moves through reloads and shots.
+- A placed charm hung about a centimetre from where the game draws it. On the AK-47 a charm the game hangs in the hole under the receiver hung from the receiver's edge. Charm offsets are now mapped exactly like the game's own charm surfaces, so the 3D view shows the charm where the game will.
 - In first person a sticker on a moving part stayed behind when the part moved: the AK-47's magazine sticker hung in the air during a reload. A sticker now moves with the part it is on.
 - The first-person reload threw the magazine around: on the AK-47 it spun 180 degrees and back and flew 20-28 inches from the gun, away from the hand holding it. Guns now take their moving parts from the first-person clip itself, so the magazine stays in the hand from the pull to the insert.
 - In Safari, Doppler, Gamma Doppler, Marble Fade and other region-painted finishes showed the bare weapon on 23 models, including the Bayonet, Butterfly Knife, M9 Bayonet and AWP. Safari empties a fully transparent image on its way to the GPU, which is how those models' paint-region masks are stored, so Safari now decodes them byte-exact itself.
