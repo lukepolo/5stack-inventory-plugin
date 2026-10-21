@@ -99,6 +99,18 @@ kept out of `package.json` on purpose. It also lists failed requests and HTTP
 errors. Use it whenever a report comes from Safari or an iPhone and the Chrome
 runners can't reproduce it (see 4.9).
 
+### 3.2b `drag.mjs`: move the camera after load
+
+```bash
+node tools/shadertest/drag.mjs '<mount.html …&still=0&interactive=1&t=0,60>' out/orb_ \
+  --drags '0,120;0,120;0,120' --after 300,3000 [--browser webkit]
+```
+
+`ve`/`va` place the camera before the first frame, so anything that settles on
+its first frames (charm cloth, liquid) has already adapted to that view. This
+mounts a live viewer, drags with the real mouse, and screenshots each step at
+each `--after` delay. Same Playwright setup as 3.2a.
+
 ### 3.3 Reading renders
 
 - **Diff to find the feature.** Shoot with `plain=1`. The bounding box of
@@ -393,10 +405,35 @@ settings three uses, read it back through a framebuffer and compare channel
 means between `webkit` and `chromium` in Playwright. `getImageData` on a 2D
 canvas can't tell you, because 2D canvases are premultiplied in every browser.
 
+### 4.10 It only goes wrong after the camera moves
+
+The Butane Buddy flooded when the user turned the view over the gun, and shots
+with `ve` at the same angle looked fine. Two separate faults, found in order:
+
+1. Shots at `ve=0…1.3` (static camera) flooded from 0.5 up. The back-wall term
+   (`s.back`, `g_flLiquidBackOffset` × `sat(vdg)²`) reached past the whole
+   vessel. It is now capped by an exact ray test: a texel counts as liquid only
+   if its view ray meets the surface plane inside the vessel.
+2. That fixed static shots, but a live drag (`drag.mjs`) still tilted the fill
+   and then flooded it. Cause: an attached charm hangs along the **camera's**
+   down (`charmGravity`, the game's inspect: the gun turns, gravity doesn't),
+   while the liquid measured height along world +Y on the un-skinned bind pose.
+   Once the cloth swung the ball, the two disagreed. The liquid now takes the
+   same gravity (`stepCharmLiquid` passes the camera's up) and measures height
+   in world space on the skinned vessel (`vLqRw`, `vLqHeight`).
+
+Two lessons: test motion with motion, and when one system already models a
+physical quantity (here gravity, in the cloth), make the others read it from
+there rather than keep their own. The world-space height first flooded the
+ball because the charm's ~4cm scale lives in its bones, not `modelMatrix`;
+read the scale off a skinned vector.
+
 ## 5. Gotchas
 
 - **Disk.** Headless Chrome profiles are large; use the runners in this repo,
   which delete theirs.
+- **An attached charm's gravity is the camera's down**, not world −Y. Anything
+  physical on a charm (cloth, liquid) must use `charmGravity`'s axis.
 - **Alpha is data in the composite inputs.** `masks.png` alpha is unused and 0,
   `ao.png` alpha is noPaint. Any loader for them must keep RGB under alpha 0,
   which Safari's image path does not do for a fully transparent file; go

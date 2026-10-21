@@ -427,13 +427,14 @@ export function liquidSwatch(lq: ResolvedLiquid): [number, number, number] {
 export const CHARM_LIQUID_VERTEX_PARS = `
 uniform vec3 uLqCenter;
 uniform vec3 uLqUp;
-uniform vec3 uLqUpObj;
 varying vec3 vLqWorld;
 varying vec3 vLqObj;
 varying float vLqHeight;
 varying float vLqUpright;
 varying vec3 vLqDiag;
-varying vec3 vLqViewOff;`;
+varying vec3 vLqViewOff;
+varying vec3 vLqRw;
+varying vec3 vLqAxisW;`;
 
 export const CHARM_LIQUID_VERTEX = `
 	vec3 lqCenter = uLqCenter;
@@ -455,50 +456,37 @@ export const CHARM_LIQUID_VERTEX = `
 	// for the back-wall thickness, where the bind pose is the right shape.
 	vLqObj = position - uLqCenter;
 	vLqWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;
-	// THE LEVEL TEST IS IN OBJECT UNITS, and that is not a detail.
+	// THE LEVEL TEST: the fragment's height above the liquid centre along the
+	// LIVE gravity, measured on the vessel as it actually hangs, in MODEL units.
 	//
-	// Every constant it compares against — the three MinMidMax triples, the
-	// centre offset, the surface tension, the back offset — is authored in the
-	// MODEL's own units, where this charm's body is ~1.2 across. The game can
-	// measure the fragment's height in world space because there the model sits
-	// at its authored scale; our viewer scales a charm to about 4cm (~0.022x),
-	// so a world-space height put every fragment ~0.45 BELOW a surface sitting
-	// at 0.465. The whole body read as submerged, with no waterline anywhere —
-	// a charm uniformly flooded with its liquid colour.
+	// Model units because every constant it is compared against (the three
+	// MinMidMax triples, the centre offset, the surface tension, the back offset)
+	// is authored in them, where this charm's body is ~1.2 across; the viewer
+	// scales a charm to ~4cm, so a raw world-space height put every fragment
+	// ~0.45 below a surface at 0.465 and flooded the body. Dividing the model
+	// scale back out (lqScale) is what makes a world-space height usable.
 	//
-	// So bring WORLD UP into object space instead. v * mat3(M) is
-	// transpose(mat3(M)) * v; for a rotation-and-uniform-scale model matrix that
-	// is the inverse rotation times the scale, and normalize drops the scale.
-	// THE VESSEL'S OWN AXIS, not a world axis brought into object space.
+	// World space, skinned, against uLqUp (which tickCharmLiquid keeps on the
+	// caller's gravity) because the cloth solver SWINGS the vessel: an attached
+	// charm hangs along the camera's down, wherever the camera is. This used to be
+	// measured on the un-skinned bind pose against an up carried into the charm
+	// root's frame. That holds only while the cloth never moves the body. Orbit
+	// the camera and the cloth swings the ball to hang down the screen while the
+	// level, still in the bind pose, tilted against it, then filled the ball to
+	// the brim as the view went over the top.
 	//
-	// Deriving it as transpose(mat3(modelMatrix)) * worldUp was wrong twice over:
-	// it assumes the viewer orients this GLB a particular way, and probe 1 showed
-	// the result — a VERTICAL red/blue split across the body, i.e. the height was
-	// being measured along a sideways axis. The game's vertex program takes the
-	// model's own +Z (vec4(0,0,1,0) * boneTransform), and that is the axis the
-	// level constants were authored against.
+	// upright = the vessel's own +Z (the axis the game's vertex program takes,
+	// vec4(0,0,1,0) * boneTransform) against gravity: +1 hanging straight, -1
+	// inverted, 0 on its side. It picks between the Up/Side/Down level triples.
 	//
-	// How the liquid responds to the charm TILTING is a separate mechanism and
-	// already modelled: upright picks between the Up/Side/Down triples below.
-	// THE VESSEL'S OWN AXIS, on the BIND pose, in MODEL units.
-	//
-	// Not world up, and that is the counter-intuitive part. The level constants
-	// are authored along the model's +Z, and this viewer does NOT hang a charm
-	// with its model axis aligned to world up — measuring along world up put the
-	// waterline VERTICAL across the body (probe 1), and scaling a world-space
-	// height back into model units flooded it instead. The model's own axis is
-	// the only frame the authored numbers mean anything in.
-	//
-	// Bind pose deliberately: transformed follows the cloth solver, which
-	// hangs the charm SETTLED rather than at bind, and the vessel is one rigid
-	// ball whose level is a property of its own geometry. How the liquid should
-	// answer the charm TILTING is the Up/Side/Down triples' job, below.
-	// Along the EFFECTIVE up, expressed in object space and calibrated so a charm
-	// at rest reads exactly the model's own +Z — see tickCharmLiquid. That is what
-	// makes the surface stay level while the charm swings instead of tipping with
-	// it, which is the whole of the liquid's animation.
-	vLqHeight = dot( position - uLqCenter, uLqUpObj );
-	vLqUpright = dot( uLqUpObj, vec3( 0.0, 0.0, 1.0 ) );
+	// The scale is read off the skinned axis, not modelMatrix: on the attached
+	// charm the shrink to ~4cm can sit in the bones, which modelMatrix never sees.
+	vLqAxisW = mat3( modelMatrix ) * lqUp;
+	float lqScale = max( length( vLqAxisW ), 1e-6 );
+	vLqRw = ( vLqWorld - ( modelMatrix * vec4( lqCenter, 1.0 ) ).xyz ) / lqScale;
+	vec3 lqG = normalize( uLqUp );
+	vLqHeight = dot( vLqRw, lqG );
+	vLqUpright = dot( normalize( vLqAxisW ), lqG );
 	// The wobble's frame is SCREEN-ALIGNED in the game (it works in view space),
 	// so carry the offset from the liquid centre into view space — but divide the
 	// model scale back out, or the noise frequency stretches by ~35x on a charm
@@ -526,7 +514,6 @@ export const CHARM_LIQUID_VERTEX = `
  */
 export const CHARM_LIQUID_GLSL = `
 uniform vec3 uLqUp;
-uniform vec3 uLqUpObj;
 uniform vec3 uLqLevelUp;
 uniform vec3 uLqLevelDown;
 uniform vec3 uLqLevelSide;
@@ -552,6 +539,8 @@ varying vec3 vLqObj;
 varying float vLqHeight;
 varying float vLqUpright;
 varying vec3 vLqDiag;
+varying vec3 vLqRw;
+varying vec3 vLqAxisW;
 
 /**
  * _23968 / _3143 — the WOBBLE, transcribed.
@@ -806,6 +795,29 @@ LqSample csLiquidSample( vec3 N, float rough ) {
 	// scaling the object-space radius' own up axis before measuring it.
 	vec3 r = vec3( vLqObj.xy, vLqObj.z * uLqC.z );
 	s.back = 1.5 * uLqC.x * pow( clamp( vdg, 0.0, 1.0 ), 2.0 ) * s.ndv * length( r );
+
+	// ...but never further than the view ray can actually reach liquid. NOT in
+	// the decompile, and the reason it has to be here: the term above grows as
+	// vdg^2, so looking DOWN at the Butane Buddy (back offset 1.8) it reaches
+	// ~2.7x the radius, more than the whole vessel is tall. Every texel above the
+	// surface then counted as "seeing liquid through the far wall" and the ball
+	// filled to the brim with the waterline left floating across it.
+	//
+	// Exact for the same cylinder/sphere backShape picks. Follow the view ray on
+	// from this texel: it drops vdg per unit and meets the surface plane after
+	// d / vdg. Liquid is seen only if that point is still inside the vessel,
+	// |S q| < |S r| with S scaling the axis by backShape, which solves to
+	// d < -2 vdg (Sr.Sv) / (Sv.Sv). Seen side-on vdg is ~0 and this never binds;
+	// seen from above, the fill shows as the disc of liquid it is, ringed by
+	// empty glass.
+	vec3 lqAx = normalize( vLqAxisW );
+	float lqK = 1.0 - uLqC.z;
+	vec3 sr = vLqRw - lqK * dot( vLqRw, lqAx ) * lqAx;
+	vec3 sv = Vd - lqK * dot( Vd, lqAx ) * lqAx;
+	float svv = dot( sv, sv );
+	// Straight down a cylinder the ray never leaves it.
+	float reach = svv < 1e-6 ? 1e6 : max( 0.0, -2.0 * vdg * dot( sr, sv ) / svv );
+	s.back = min( s.back, reach );
 	return s;
 }
 
@@ -851,15 +863,14 @@ vec3 csLiquidColor( float waterline ) {
  * Two effects, both the game's:
  *
  *  · the surface stays LEVEL while the charm tips. `g_vTestGravityDir` is a
- *    world vector, so in the model's own frame it rotates as the charm does.
- *  · it AGITATES with the motion, which drives the wobble amplitude.
- *
- * CALIBRATED TO REST. The authored level constants are written along the model's
- * +Z, and this viewer does not hang a charm with +Z on world up — so the naive
- * "world up in object space" is not (0,0,1) at rest and tilts the waterline on a
- * charm that is not moving at all. The rest orientation is captured on first
- * tick and divided out, which keeps the settled render exactly as measured while
- * letting any deviation from it tilt the surface.
+ *    world vector; `worldUp` is ours, written to the shader's uLqUp, which the
+ *    vertex half measures every fragment's height along (in world space, on the
+ *    skinned vessel). The caller picks it: the camera's up for a charm hanging
+ *    on a gun, since that is the gravity the cloth hangs it by.
+ *  · it AGITATES with the motion, which drives the wobble amplitude. The motion
+ *    is the charm's own rotation OR gravity turning around it: orbiting the
+ *    camera is the viewer's version of turning the gun in the game's inspect,
+ *    and it moves no object.
  */
 /** Reused across frames — this runs in the render loop. */
 let scratchQuat: ThreeNS.Quaternion;
@@ -885,7 +896,7 @@ export function tickCharmLiquid(
   const mats: ThreeNS.MeshStandardMaterial[] = [];
   model.traverse((n) => {
     const m = (n as ThreeNS.Mesh).material as ThreeNS.MeshStandardMaterial | undefined;
-    if (m?.userData?.lqUpObj) mats.push(m);
+    if (m?.userData?.lqUp) mats.push(m);
   });
   if (liquidProbe.mode) {
     const g = globalThis as { __lqTick?: number; __lqFound?: number };
@@ -894,30 +905,23 @@ export function tickCharmLiquid(
   }
   if (!mats.length) return;
   const q = model.getWorldQuaternion(scratchQuat);
-  let rest = ud.lqRestQuat as ThreeNS.Quaternion | undefined;
-  if (!rest) {
-    rest = q.clone();
-    ud.lqRestQuat = rest;
-  }
-  // World up carried into the CURRENT object frame, then through the fixed
-  // rotation that took the REST frame's answer onto the model's +Z.
-  const cur = worldUp.clone().applyQuaternion(q.clone().invert());
-  const ref = worldUp.clone().applyQuaternion(rest.clone().invert()).normalize();
-  const cal = ud.lqCal as ThreeNS.Quaternion | undefined
-    ?? (ud.lqCal = new THREE.Quaternion().setFromUnitVectors(ref, new THREE.Vector3(0, 0, 1)));
-  const upObj = cur.applyQuaternion(cal as ThreeNS.Quaternion).normalize();
+  const up = worldUp.clone().normalize();
 
   // Angular speed as the agitation signal — the physical analogue of what the
   // game feeds, and it needs no hook into the solver's internals. Decays rather
   // than tracking instantaneously so a charm that stops still sloshes for a beat.
   const prev = ud.lqPrevQuat as ThreeNS.Quaternion | undefined;
+  const prevUp = ud.lqPrevUp as ThreeNS.Vector3 | undefined;
   let spin = 0;
-  if (prev && dt > 0) {
+  if (prev && prevUp && dt > 0) {
     // Angle between successive orientations; 2*acos|dot| is the quaternion metric.
     const d = Math.min(1, Math.abs(prev.dot(q)));
-    spin = (2 * Math.acos(d)) / dt;
+    // ...or between successive gravities, whichever turned more.
+    const g = Math.min(1, Math.max(-1, prevUp.dot(up)));
+    spin = Math.max(2 * Math.acos(d), Math.acos(g)) / dt;
   }
   (ud.lqPrevQuat as ThreeNS.Quaternion | undefined)?.copy(q) ?? (ud.lqPrevQuat = q.clone());
+  (ud.lqPrevUp as ThreeNS.Vector3 | undefined)?.copy(up) ?? (ud.lqPrevUp = up.clone());
   // MAPPING SPIN -> AGITATION, and the divisor is not arbitrary.
   //
   // The shader scales its wobble by `agit^2` where `agit = agitation^2 + 0.01` —
@@ -960,7 +964,7 @@ export function tickCharmLiquid(
 
   for (const mat of mats) {
     const u = mat.userData as Record<string, unknown>;
-    (u.lqUpObj as ThreeNS.Vector3).copy(upObj);
+    (u.lqUp as ThreeNS.Vector3).copy(up);
     // Live agitation feeds csLiquidWobble's amplitude — this is what turns the
     // transcribed noise from a flat constant into a moving surface.
     const d4 = u.lqD as ThreeNS.Vector4 | undefined;
@@ -995,9 +999,9 @@ export function setCharmLiquidUniforms(
     if (cur) cur.set(v[0], v[1], v[2], v[3]);
     else u[key] = new THREE.Vector4(v[0], v[1], v[2], v[3]);
   };
+  // The authored gravity, as a starting value: tickCharmLiquid rewrites it in
+  // place every frame with the caller's.
   v3("lqUp", lq.up);
-  // Rest value; tickCharmLiquid rewrites it in place every frame the charm moves.
-  if (!u.lqUpObj) u.lqUpObj = new THREE.Vector3(0, 0, 1);
   u.lqAgitBase = lq.agitation;
   v3("lqLevelUp", lq.levelUp);
   v3("lqLevelDown", lq.levelDown);
@@ -1048,7 +1052,6 @@ export function patchCharmLiquidShader(
   }
   shader.uniforms.uLqCenter = { value: u.lqCenter };
   shader.uniforms.uLqUp = { value: u.lqUp };
-  shader.uniforms.uLqUpObj = { value: u.lqUpObj };
   shader.uniforms.uLqLevelUp = { value: u.lqLevelUp };
   shader.uniforms.uLqLevelDown = { value: u.lqLevelDown };
   shader.uniforms.uLqLevelSide = { value: u.lqLevelSide };

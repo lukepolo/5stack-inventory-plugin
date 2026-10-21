@@ -46,6 +46,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 ### Bug Fixes
 
 - In Safari, Doppler, Gamma Doppler, Marble Fade and other region-painted finishes showed the bare weapon on 23 models, including the Bayonet, Butterfly Knife, M9 Bayonet and AWP. Safari empties a fully transparent image on its way to the GPU, which is how those models' paint-region masks are stored, so Safari now decodes them byte-exact itself.
+- The Butane Buddy's liquid filled the whole ball once the camera was turned to look down at the gun. It now settles against the same gravity the charm hangs by, so the fill stays level and sloshes as you turn the gun.
 - Holo and lenticular stickers had their effect layers upside down and offset, and holo colour was stuck on a single band. Lenticular stickers such as Econometer now show the right frame.
 - Legacy-body finishes such as AK-47 | Redline dropped the fourth sticker on the handguard.
 - Foil, gold and other metal stickers came out flat grey or the wrong colour; hovering one brought the colour back. They now keep their artwork's colours, and gold stickers turn gold, matching the game's own icons.
@@ -104,6 +105,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **Debugging guide**: `docs/DEBUGGING.md` explains where the ground truth lives and how each class of rendering and placement bug was diagnosed. It also covers the tools below.
 - **Test tools**: `mount.html` renders any item with any options from the URL, `tools/standalone` runs the real UI against a fake inventory, and `glb-info`/`knife-anchors` read and apply the game's model data.
 - **Safari test runner**: `shoot-webkit.mjs` renders the same test pages in Safari's engine (WebKit) headlessly, for bugs that only Safari shows.
+- **Live camera drags**: `drag.mjs` turns the camera with the mouse after a viewer has loaded and screenshots each step, for bugs that only appear once the view moves.
 
 ### Removed
 

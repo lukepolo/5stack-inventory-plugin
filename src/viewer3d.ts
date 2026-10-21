@@ -9325,13 +9325,21 @@ async function buildViewer(
   }
 
   let lqLast = 0;
+  const lqCameraUp = new THREE.Vector3();
   function stepCharmLiquid() {
     const root = kind === "charm" ? object : charm?.sprite;
     if (!root) return;
     const now = performance.now();
     const dt = lqLast ? Math.min(0.1, (now - lqLast) / 1000) : 1 / 60;
     lqLast = now;
-    tickCharmLiquid(THREE, root, WORLD_Y, dt);
+    // An ATTACHED charm hangs along the camera's down (charmGravity: the gun
+    // turns under fixed gravity, as in the game's inspect), so its liquid has
+    // to settle against that same axis. With world +Y here, orbiting the camera
+    // above the gun left the charm hanging down the screen while its liquid
+    // thought it was being looked at from above, and the Butane Buddy flooded
+    // to the brim. A charm shown on its own does not hang, and keeps world up.
+    const up = kind === "charm" ? WORLD_Y : lqCameraUp.set(0, 1, 0).applyQuaternion(camera.quaternion);
+    tickCharmLiquid(THREE, root, up, dt);
   }
 
   function updateCharmVisuals() {
