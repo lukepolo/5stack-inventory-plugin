@@ -2054,6 +2054,18 @@ const gunTraits = computed<TraitRow[]>(() => {
   const at = gunPlacement(def, Number(c.seed ?? 1));
   return gunPlacementTraits(def).map((t) => ({ key: t.key, label: t.label, value: at[t.key], display: formatGunTrait(t, at[t.key]) }));
 });
+/**
+ * Whether a gun's pattern gets the scored rail, or just a number under its
+ * Placement bars.
+ *
+ * The rail scrubs pattern NUMBERS, and neighbouring numbers put the artwork in
+ * unrelated places, so dragging it made the gun jump about. Where the finish has
+ * placement bars they are the smooth way through the same patterns (one bar IS
+ * the scrubber; with two or three you drag them or type the number), so the
+ * rail goes. Case Hardened keeps it: its rail measures how blue or gold every
+ * pattern lands, and hunting those peaks is a job no bar does.
+ */
+const gunPatternRail = computed(() => !gunTraits.value.length || !!craftPaintDef.value?.caseHardening);
 /** A gun's patterns are 1..1000 (randomizeCraft draws the same range). */
 const gunTable = () => (craftPaintDef.value ? gunPlacementTable(craftPaintDef.value, 1, 1000) : null);
 /** The open GLOVE's Gen2 def — null for the 73 older finishes, which roll only
@@ -2636,9 +2648,15 @@ watch(
 );
 function randomSeed() {
   if (!craft.value) return;
-  // A pet's pattern runs 1..100,000, not a finish's 1..1000.
+  // A pet's pattern runs 1..100,000, not a finish's 1..1000, and a glove's is
+  // whatever its own range says.
   const pet = craftPet.value;
-  craft.value.seed = pet ? Math.floor(rand(pet.seedMin, pet.seedMax + 1)) : Math.floor(rand(1, 1001));
+  const glove = craftType.value === "glove" && craftGloveSeedRange.value.known ? craftGloveSeedRange.value : null;
+  craft.value.seed = pet
+    ? Math.floor(rand(pet.seedMin, pet.seedMax + 1))
+    : glove
+      ? Math.floor(rand(glove.min, glove.max + 1))
+      : Math.floor(rand(1, 1001));
 }
 // Charm patterns run to 100000, an order of magnitude past a weapon's 1000 —
 // they are their own attribute with their own range, not the weapon's reused.
@@ -10455,7 +10473,11 @@ if (MDEBUG) {
                 </div>
                 <TraitBars :traits="gunTraits" :table="gunTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
               </div>
+              <!-- The rail where it measures something or nothing else moves
+                   the pattern smoothly; otherwise the bars above are the way
+                   through and this is the number they land on (gunPatternRail). -->
               <PatternScoreRail
+                v-if="gunPatternRail"
                 :model-value="craft.seed"
                 :paint-material="craft.skin.paintMaterial"
                 :model="craftTarget?.model ?? craftModel"
@@ -10464,6 +10486,15 @@ if (MDEBUG) {
                 @update:model-value="craft!.seed = $event"
                 @preview="previewPattern"
               />
+              <div v-else class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                <input
+                  v-model.number="craft.seed"
+                  type="number" :min="1" :max="1000" step="1"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                />
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+              </div>
             </div>
             <!-- A PET's pattern. Neither rail fits: there is no paint to score
                  and no colour band to aim at, and neighbouring numbers are
@@ -10481,14 +10512,15 @@ if (MDEBUG) {
                 <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
               </div>
             </div>
-            <!-- A GLOVE's pattern: the gun's own controls — Placement bars over
-                 the scored rail — so the two read as the same tool. On the 22
-                 Gen2 finishes the pattern rolls the artwork's placement and the
-                 rail previews it live (one composite dresses both hands, though
-                 CS2 rolls the second from a seed derived in game code). The older
-                 73 roll nothing the data spells out: the rail still sets the
-                 number the equipped feed sends, but there is nothing to compare,
-                 and the line under it says the look is not previewed. -->
+            <!-- A GLOVE's pattern: the gun's own controls, so the two read as the
+                 same tool. On the 22 Gen2 finishes the pattern rolls the
+                 artwork's placement: Placement bars, with the pattern number
+                 under them, preview it live (one composite dresses both hands,
+                 though CS2 rolls the second from a seed derived in game code).
+                 The older 73 roll nothing the data spells out: the scored rail
+                 still sets the number the equipped feed sends, but there is
+                 nothing to compare, and the line under it says the look is not
+                 previewed. -->
             <div v-else-if="craftHasSeed && craftType === 'glove' && craftGloveSeedRange.known" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
               <div v-if="gloveTraits.length" class="mb-3">
                 <div class="mb-1 flex items-baseline gap-2">
@@ -10497,7 +10529,11 @@ if (MDEBUG) {
                 </div>
                 <TraitBars :traits="gloveTraits" :table="gloveTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
               </div>
+              <!-- Same rule as the gun's (gunPatternRail): with placement bars
+                   to drag, the pattern is a number under them, not a rail of
+                   numbers that jumps the artwork around. -->
               <PatternScoreRail
+                v-if="!gloveTraits.length"
                 glove
                 :compare="gloveSeedLive"
                 :model-value="craft.seed"
@@ -10508,6 +10544,15 @@ if (MDEBUG) {
                 @update:model-value="craft!.seed = $event"
                 @preview="previewPattern"
               />
+              <div v-else class="flex items-center gap-2">
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                <input
+                  v-model.number="craft.seed"
+                  type="number" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                />
+                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+              </div>
               <div v-if="!gloveSeedLive" class="mt-1 text-right font-mono text-f8 text-muted-foreground/60">Applies in game · not previewed here</div>
             </div>
             <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
