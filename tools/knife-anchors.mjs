@@ -7,7 +7,7 @@
 // angles. That is the ground truth. Run this after an extraction on a new CS2
 // build, or whenever a knife's counter sits in the wrong place:
 //
-//   node tools/knife-anchors.mjs https://inventory-dev.fulm.eu/models/knife-attachments.json
+//   node tools/knife-anchors.mjs https://inventory.5stack.gg/models/knife-attachments.json
 //   node tools/knife-anchors.mjs knife-attachments.json --dry-run
 //
 // THE CONVENTION, which placeAttachedModule (src/viewer3d.ts) depends on:

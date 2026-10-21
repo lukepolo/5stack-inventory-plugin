@@ -47,11 +47,6 @@ function federationCssPlaceholder() {
 // mounts. Colors still track the host's live branding via the shared CSS-var
 // tokens from @5stack/ui.
 export default defineConfig({
-  // A second, side-by-side copy (the GitHub Pages dev build, see
-  // docs/DEV-PLUGIN.md) is served from a subpath of another host. An absolute
-  // base keeps every emitted URL — preloads, `?url` assets — on that host
-  // instead of resolving against the panel's. Unset, this is the normal build.
-  base: process.env.PLUGIN_BASE || "/",
   plugins: [
     buildStamp(),
     sharedGlobals(),
@@ -67,10 +62,7 @@ export default defineConfig({
         chunk.isEntry && (chunk.name === "__federation_expose_App" || chunk.name === "index"),
     }),
     federation({
-      // Federation scopes are one flat namespace across every plugin the panel
-      // loads, so a side-by-side copy needs its own (PLUGIN_SCOPE, which must
-      // equal the "scope" in its manifest).
-      name: process.env.PLUGIN_SCOPE || "inventory",
+      name: "inventory",
       filename: "remoteEntry.js",
       exposes: {
         "./App": "./src/App.vue",

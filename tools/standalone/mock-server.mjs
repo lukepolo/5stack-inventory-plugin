@@ -9,7 +9,7 @@
 // catalog — to a real backend. Drive it with drive.mjs.
 //
 //   VITE_INVENTORY_API=http://127.0.0.1:8787 npx vite build --outDir /tmp/inv-dist --emptyOutDir
-//   ASSET_HOST=https://inventory-dev.fulm.eu MOCK_INVENTORY=tools/standalone/inventory.example.json \
+//   ASSET_HOST=https://inventory.5stack.gg MOCK_INVENTORY=tools/standalone/inventory.example.json \
 //     node --experimental-strip-types tools/standalone/mock-server.mjs /tmp/inv-dist
 //   open http://127.0.0.1:8787/
 //

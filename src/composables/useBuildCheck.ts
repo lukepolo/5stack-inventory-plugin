@@ -10,14 +10,6 @@ import { API_ORIGIN } from "../api";
 
 const POLL_MS = 30_000;
 
-// The stamp lives beside the bundle, which is normally the API host too. A build
-// with an absolute `base` (PLUGIN_BASE, the GitHub Pages dev copy) is served from
-// somewhere else while VITE_INVENTORY_API points at the live backend — reading
-// the stamp from there would report the LIVE plugin's build, not this one.
-const BUILD_INFO_URL = /^https?:\/\//.test(import.meta.env.BASE_URL)
-  ? `${import.meta.env.BASE_URL}build-info.json`
-  : `${API_ORIGIN}/build-info.json`;
-
 export function useBuildCheck() {
   const serverBuild = ref("");
   const staleBuild = ref(false);
@@ -25,7 +17,7 @@ export function useBuildCheck() {
 
   async function check() {
     try {
-      const res = await fetch(BUILD_INFO_URL, { cache: "no-store" });
+      const res = await fetch(`${API_ORIGIN}/build-info.json`, { cache: "no-store" });
       const { builtAt } = (await res.json()) as { builtAt?: string };
       if (!builtAt) return;
       if (!serverBuild.value) {

@@ -17,13 +17,10 @@ the real viewer, or comparing a ratio against an in-game screenshot.
 
 | You changed | To see it | Notes |
 | --- | --- | --- |
-| `src/**` (frontend) | push to `main`, wait for **dev-plugin** (~2 min), Cmd+Shift+R on `/apps/inventory-dev` | the ⚙ dialog shows the build time; `curl https://lcrew.github.io/5stack-inventory-plugin/build-info.json` too |
-| `backend/**` or `scripts/**` | wait for **dev-backend**, then on the server `sudo /home/laukis/5stack-panel/dev-inventory/scripts/dev-backend.sh update` | the image also carries `extract-models.sh`, so an extraction change needs this first |
-| `scripts/extract-models.sh` | update the backend (above), then ⚙ → **3D Models → Run extraction** in the dev copy | a full run, ~18 min; `models/extract-version.json` says what ran and for how long |
+| `src/**` (frontend) | the codepier swap rebuilds in ~6s; reload `/apps/inventory` | the ⚙ dialog shows the build time; an open tab keeps its old bundle until it is reloaded |
+| `backend/**` | `node --watch` restarts the API in the swap | a synced edit can miss the watcher: `codepier exec --deployment inventory-backend -- touch /app/backend/src/server.ts` |
+| `scripts/extract-models.sh` | ⚙ → **3D Models → Run extraction** | a full run, ~25 min; `models/extract-version.json` says what ran and for how long |
 | anything that changes a stored card | ⚙ → **Asset Cache → Clear renders** | cards are baked once and kept |
-
-`gh run list -R LCrew/5stack-inventory-plugin` shows the workflows (the bare
-`gh` default resolves to upstream).
 
 Before you push, run `npm run check` and make sure no temporary code is left (see
 [§3.4](#34-temporary-code-and-pages)).
@@ -31,7 +28,7 @@ Before you push, run `npm run check` and make sure no temporary code is left (se
 ## 2. Where the truth is
 
 Everything below is served by the backend, so it's reachable with plain `curl`
-from your machine (`https://inventory-dev.fulm.eu/...` for the dev copy).
+from your machine (`https://inventory.5stack.gg/...`).
 
 | Source | What it holds | Read it with |
 | --- | --- | --- |
@@ -61,7 +58,7 @@ attachment data showed why it was still wrong.
 The rig serves the real viewer from source and proxies assets to a backend:
 
 ```bash
-ASSET_HOST=https://inventory-dev.fulm.eu npx vite --config tools/shadertest/vite.config.ts --host 127.0.0.1
+ASSET_HOST=https://inventory.5stack.gg npx vite --config tools/shadertest/vite.config.ts --host 127.0.0.1
 ```
 
 `tools/shadertest/mount.html` mounts **any item with any options from the URL**:
@@ -166,7 +163,7 @@ the real UI against a fake inventory:
 
 ```bash
 VITE_INVENTORY_API=http://127.0.0.1:8787 npx vite build --outDir /tmp/inv-dist --emptyOutDir
-ASSET_HOST=https://inventory-dev.fulm.eu MOCK_INVENTORY=tools/standalone/inventory.example.json \
+ASSET_HOST=https://inventory.5stack.gg MOCK_INVENTORY=tools/standalone/inventory.example.json \
   node --experimental-strip-types tools/standalone/mock-server.mjs /tmp/inv-dist
 node tools/standalone/drive.mjs http://127.0.0.1:8787/ tools/standalone/steps.example.json out/ 1400 900
 ```

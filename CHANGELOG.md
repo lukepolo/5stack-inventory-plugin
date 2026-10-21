@@ -100,8 +100,6 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 
 ### Features
 
-- **Dev copy of the plugin**: a separate admin-only "Inventory (dev)" plugin is built and published to GitHub Pages on every push. It runs beside the installed plugin without touching it.
-- **Dev backend**: `inventory-dev.fulm.eu` runs the fork's backend beside the installed one, sharing its database and models but keeping its own card store. It is installed and updated with `scripts/dev-backend.sh`, from an image built on every backend or script change.
 - **Debugging guide**: `docs/DEBUGGING.md` explains where the ground truth lives and how each class of rendering and placement bug was diagnosed. It also covers the tools below.
 - **Test tools**: `mount.html` renders any item with any options from the URL, `tools/standalone` runs the real UI against a fake inventory, and `glb-info`/`knife-anchors` read and apply the game's model data.
 - **Safari test runner**: `shoot-webkit.mjs` renders the same test pages in Safari's engine (WebKit) headlessly, for bugs that only Safari shows.

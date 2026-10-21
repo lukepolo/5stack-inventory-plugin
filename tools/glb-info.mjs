@@ -7,7 +7,7 @@
 // knife bones turned at bind, the legacy AK's UV0 running to -4..3.4, the C4's
 // panorama panel quad. Works on a local file or a URL.
 //
-//   node tools/glb-info.mjs https://inventory-dev.fulm.eu/models/ak47.glb
+//   node tools/glb-info.mjs https://inventory.5stack.gg/models/ak47.glb
 //   node tools/glb-info.mjs ak47.glb --uv          # per-primitive UV ranges
 //   node tools/glb-info.mjs ak47.glb --vmat=ak47   # one material's full vmat
 import { readFile } from "node:fs/promises";
