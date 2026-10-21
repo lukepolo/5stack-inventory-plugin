@@ -5,7 +5,7 @@ import { useI18n } from "./composables/useI18n";
 import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
-  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Palette, Link2,
+  Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, Palette, Link2,
   Layers,
 } from "lucide-vue-next";
 import {
@@ -9908,22 +9908,6 @@ if (MDEBUG) {
                   @input="setStickerWear(idx, ($event.target as HTMLInputElement).valueAsNumber)"
                 />
                 <span class="w-8 flex-none text-right font-mono text-f9 text-muted-foreground">{{ (st?.w ?? 0).toFixed(2) }}</span>
-                <!-- The reorder without a drag, for touch: one slot earlier or
-                     later, which is one step down or up in draw order. -->
-                <span class="flex flex-none items-center">
-                  <button
-                    class="grid h-5 w-4 place-items-center text-muted-foreground transition-colors hover:text-foreground disabled:opacity-25"
-                    :disabled="idx === 0"
-                    :title="'Move to slot ' + idx + ' — drawn under the stickers after it'"
-                    @click="moveSticker(idx, idx - 1)"
-                  ><ChevronLeft class="h-3 w-3" /></button>
-                  <button
-                    class="grid h-5 w-4 place-items-center text-muted-foreground transition-colors hover:text-foreground disabled:opacity-25"
-                    :disabled="idx >= stickerSlotCount - 1"
-                    :title="'Move to slot ' + (idx + 2) + ' — drawn over the stickers before it'"
-                    @click="moveSticker(idx, idx + 1)"
-                  ><ChevronRight class="h-3 w-3" /></button>
-                </span>
               </div>
               <!-- Placement per applied sticker: offsets + rotation flow straight
                    to the game server (equipped v5 x/y/rotation). Dragging in 3D

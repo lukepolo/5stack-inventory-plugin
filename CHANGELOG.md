@@ -12,7 +12,7 @@ The 3D model extraction is now at pipeline version 37; run it once to get every 
 - **Glove pattern control**: every painted glove gets the same pattern tools as weapons: type a number, roll the dice, scrub the rail with a live 3D preview, and "Compare with another". Newer (Gen2) finishes whose artwork moves with the pattern also get Placement bars (Shift X, Shift Y, Rotation).
 - **Knives and gloves grouped by model**: the knife and glove Craft tabs open on one card per model, such as Butterfly Knife or Bloodhound Gloves, with a finish count. Finish cards carry the grey model label and the price, like owned cards.
 - **Leaner Replace list**: Replace lists only the base weapons that can take the slot on that side and aren't already in the loadout.
-- **Reorder stickers**: drag sticker tiles onto each other, or use the ‹ › buttons, to change slot order, which decides which sticker is drawn on top. A moved sticker stays where it was on the weapon.
+- **Reorder stickers**: drag sticker tiles onto each other to change slot order, which decides which sticker is drawn on top. A moved sticker stays where it was on the weapon.
 - **Music kit preview in the editor**: Edit on a music kit plays the full song and, separately, its round-MVP anthem, each with play/pause and seek. One volume control sits above both and shares the level with every other player.
 - **One volume bar per music kit list**: the music kit sheet's Owned and Craft tabs have a single volume control in the toolbar instead of a slider on every card.
 - **Precise sticker dragging**: a sticker picked up in the 3D editor keeps the point where you grabbed it. Small nudges no longer jump the sticker's centre to the pointer.
