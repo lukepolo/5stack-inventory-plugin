@@ -74,13 +74,16 @@ const props = withDefaults(
      * still worth stating — just without a colour beside it.
      */
     readonly?: boolean;
+    /** Read-only only: sized to sit as a second line inside a list row (the
+     *  charm's row in the details panel) rather than as a row of its own. */
+    dense?: boolean;
     min?: number;
     max?: number;
     /** Chunk width. 1000 over a 100000 space is 100 bands, which is as many
      *  ticks as a rail this size can show without becoming a hatch pattern. */
     chunk?: number;
   }>(),
-  { modelValue: null, image: null, albedo: null, loading: false, readonly: false, min: 1, max: 100000, chunk: 1000 },
+  { modelValue: null, image: null, albedo: null, loading: false, readonly: false, dense: false, min: 1, max: 100000, chunk: 1000 },
 );
 
 const emit = defineEmits<{
@@ -654,18 +657,20 @@ watch(
          The swatch is skipped rather than drawn empty when the colour cannot be
          computed — an inert charm, or one whose albedo never arrived — because a
          blank square beside a number reads as a colour that failed to load. -->
-    <div v-if="readonly" class="flex items-center gap-2">
+    <div v-if="readonly" class="flex items-center" :class="dense ? 'gap-1.5' : 'gap-2'">
       <span
         v-if="shown === 'loading'"
-        class="animate-skeleton h-5 w-5 flex-none rounded-sm bg-muted-foreground/20"
+        class="animate-skeleton flex-none rounded-sm bg-muted-foreground/20"
+        :class="dense ? 'h-3 w-3' : 'h-5 w-5'"
       ></span>
       <span
         v-else-if="swatch"
-        class="h-5 w-5 flex-none rounded-sm ring-1 ring-inset ring-white/15"
-        :style="{ background: swatch, boxShadow: `0 0 10px -2px ${swatch}` }"
+        class="flex-none rounded-sm ring-1 ring-inset ring-white/15"
+        :class="dense ? 'h-3 w-3' : 'h-5 w-5'"
+        :style="{ background: swatch, boxShadow: dense ? undefined : `0 0 10px -2px ${swatch}` }"
       ></span>
-      <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
-      <span class="font-mono text-f13 tabular-nums">#{{ seed.toLocaleString() }}</span>
+      <span class="uppercase tracking-cs1 text-muted-foreground" :class="dense ? 'text-f9' : 'text-f10'">{{ tr('inventory.pattern.pattern', 'Pattern') }}</span>
+      <span class="font-mono tabular-nums" :class="dense ? 'text-f10' : 'text-f13'">#{{ seed.toLocaleString() }}</span>
     </div>
 
     <!-- Holds the row's height while the econ lookup lands. Collapsing to

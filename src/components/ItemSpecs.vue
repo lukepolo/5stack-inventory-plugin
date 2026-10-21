@@ -139,23 +139,25 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
       <div class="flex flex-col gap-1.5">
         <span v-for="(a, k) in attachments" :key="k" class="flex items-center gap-2" :title="a.name ?? undefined">
           <img :src="a.image ?? undefined" alt="" class="h-7 w-7 flex-none object-contain" />
-          <span class="min-w-0 flex-1 truncate text-f10 text-foreground/85">{{ a.name }}</span>
+          <!-- The charm's own pattern, as a second line under its name. It is
+               the only attachment with an attribute of its own, and that
+               attribute is a colour: the name says "Semi-Precious", the swatch
+               says which one you have. On a line of its own below the row it
+               read as one more attachment. Read off `inst.charm` rather than
+               `a` because only the charm arm of that union has a seed. -->
+          <span v-if="a.kind === 'charm' && inst.charm?.seed != null" class="flex min-w-0 flex-1 flex-col gap-0.5">
+            <span class="truncate text-f10 text-foreground/85">{{ a.name }}</span>
+            <PatternRail
+              readonly
+              dense
+              :model-value="inst.charm.seed"
+              :image="inst.charm.image"
+              :albedo="charmAlbedo"
+              :loading="charmLoading"
+            />
+          </span>
+          <span v-else class="min-w-0 flex-1 truncate text-f10 text-foreground/85">{{ a.name }}</span>
         </span>
-        <!-- The charm's own pattern, under the charm's own row — attachmentsOf
-             lists the charm LAST, which is what puts it there. It is the only
-             attachment carrying an attribute of its own, and that attribute is a
-             colour: the name says "Semi-Precious", the swatch says which one you
-             have. Read off `inst.charm` rather than the loop's `a` because only
-             the charm arm of that union has a seed. -->
-        <PatternRail
-          v-if="inst.charm?.seed != null"
-          readonly
-          class="pl-9"
-          :model-value="inst.charm.seed"
-          :image="inst.charm.image"
-          :albedo="charmAlbedo"
-          :loading="charmLoading"
-        />
       </div>
     </div>
 

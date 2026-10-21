@@ -132,11 +132,16 @@ onBeforeUnmount(() => panelRO?.disconnect());
     </button>
     <!-- `pointer-events-none` on the rail, restored on the panel: the empty
          space under a short list is stage, and dragging the model there should
-         turn it. -->
+         turn it.
+         `bottom-12`, not `bottom-0`: the stage's own bottom-right controls (the
+         first-person toggle and the screenshot button) sit in this same column,
+         and on a short window a long panel ran down over them — StatTrak under
+         the toggle. Ending the panel above them costs nothing on a tall screen,
+         where the list never reaches that far, and it scrolls on a short one. -->
     <div
       v-if="$slots.panel && panelOpen"
       ref="panelEl"
-      class="pointer-events-none absolute bottom-0 right-0 top-12 z-[5] flex w-[308px] flex-col overflow-y-auto pb-2 pl-2"
+      class="pointer-events-none absolute bottom-12 right-0 top-12 z-[5] flex w-[308px] flex-col overflow-y-auto pb-2 pl-2"
     >
       <div class="pointer-events-auto flex flex-col gap-2.5">
         <!-- The way back out, on the panel's own top edge rather than as a
