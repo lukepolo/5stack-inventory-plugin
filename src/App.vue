@@ -7884,12 +7884,11 @@ function onGlobalKey(e: KeyboardEvent) {
 // The sheet's "/"-shortcut target (see onGlobalKey). The inventory grid's own
 // search box is a ref inside useInventoryView, with the rest of that screen.
 const sheetSearchEl = ref<HTMLInputElement | null>(null);
-// `serverBuild` is intentionally not destructured: it was only ever passed to
-// AdminConsole as `:server-build`, which never declared the prop, so the value
-// has never been displayed anywhere. The composable still logs the stamp and
-// still drives `staleBuild`. Surfacing it in the admin gear dialog would be a
-// small follow-up, not a refactor.
-const { staleBuild, reloadPage } = useBuildCheck();
+// Both build times go to the settings page: which build this page is running
+// (bundleBuild, stamped into the bundle) and the newest the server has
+// (serverBuild, from build-info.json). Telling "reload to get the fix" from
+// "the fix is not out" used to take a look at the deployed files.
+const { staleBuild, reloadPage, serverBuild, bundleBuild } = useBuildCheck();
 
 onMounted(() => {
   window.addEventListener("keydown", onGlobalKey);
@@ -10073,6 +10072,8 @@ if (MDEBUG) {
       class="min-h-0 flex-1"
       :user="user"
       :section="adminSection"
+      :bundle-build="bundleBuild"
+      :server-build="serverBuild"
       @notify="notify"
       @navigate="(section: string) => go(section ? `/admin/${section}` : '/admin')"
       @game-config="onGameConfig"

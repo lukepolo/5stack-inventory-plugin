@@ -19,7 +19,14 @@ function buildStamp() {
         fileName: "build-info.json",
         source: JSON.stringify({ builtAt }),
       });
-      void bundle;
+      // The same time INTO the bundle, so a page can say which build it is
+      // running — build-info.json only says what the server has now. See
+      // BUNDLE_BUILT_AT in src/composables/useBuildCheck.ts.
+      for (const chunk of Object.values(bundle) as { type?: string; code?: string }[]) {
+        if (chunk.type === "chunk" && chunk.code?.includes("__CS2INV_BUILT_AT__")) {
+          chunk.code = chunk.code.split("__CS2INV_BUILT_AT__").join(builtAt);
+        }
+      }
     },
   };
 }

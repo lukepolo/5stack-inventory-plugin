@@ -143,7 +143,7 @@ export function viewmodelAssetUrl(rel: string): string {
  * holds the gun up and turned, filling the frame, which reads as broken
  * framing rather than as a pose.
  */
-export type ClipAction = "idle" | "inspect" | "inspect2" | "inspect3" | "draw" | "reload" | "fire";
+export type ClipAction = "idle" | "inspect" | "inspect2" | "inspect3" | "draw" | "reload" | "fire" | "fire2";
 /**
  * The inspect and its rarer variants, in the order a repeated press steps
  * through them. `inspect2`/`inspect3` are the game's lookat02/lookat03 — the
@@ -167,7 +167,28 @@ const CANNOT: Record<string, ClipAction[]> = {
   taser: ["reload"],
 };
 
-let actionIndex: Promise<Record<string, Partial<Record<ClipAction, unknown>>> | null> | null = null;
+let actionIndex: Promise<(Record<string, Partial<Record<ClipAction, unknown>>> & { _built?: string }) | null> | null = null;
+/**
+ * The clip index, revalidated rather than trusted from cache.
+ *
+ * Every other /anims/ URL is served immutable, keyed on the extraction stamp
+ * and CLIP_SCHEMA — and a scoped `step viewmodel-anims` changes clips without
+ * changing either, so browsers kept the C4's rifle clips until CLIP_SCHEMA was
+ * bumped by hand. The index is small and says when it was written (`_built`),
+ * so it is asked for with `no-cache` (a conditional request, a 304 when
+ * nothing changed) and the clips are keyed on that time.
+ */
+function loadActionIndex() {
+  actionIndex ??= fetch(viewmodelAssetUrl("index.json"), { cache: "no-cache" })
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then((v) => {
+      // Not cached as a permanent no — see loadViewmodelClip.
+      if (!v) actionIndex = null;
+      return v;
+    });
+  return actionIndex;
+}
 /**
  * The actions this model's clips cover, from the extractor's `index.json`.
  *
@@ -178,16 +199,8 @@ let actionIndex: Promise<Record<string, Partial<Record<ClipAction, unknown>>> | 
  * before the index was read.
  */
 export async function viewmodelActions(model: string): Promise<Set<ClipAction> | null> {
-  actionIndex ??= fetch(viewmodelAssetUrl("index.json"))
-    .then((r) => (r.ok ? r.json() : null))
-    .catch(() => null)
-    .then((v) => {
-      // Not cached as a permanent no — see loadViewmodelClip.
-      if (!v) actionIndex = null;
-      return v;
-    });
-  const index = await actionIndex;
-  const listed = index?.[model];
+  const index = await loadActionIndex();
+  const listed = model === "_built" ? undefined : index?.[model];
   if (!listed) return null;
   const out = new Set(Object.keys(listed) as ClipAction[]);
   for (const a of CANNOT[model] ?? []) out.delete(a);
@@ -198,8 +211,9 @@ export function viewmodelCannot(model: string, action: ClipAction): boolean {
   return (CANNOT[model] ?? []).includes(action);
 }
 
-function clipUrl(model: string, action: ClipAction): string {
-  return viewmodelAssetUrl(`${encodeURIComponent(model)}.${action}.json`);
+function clipUrl(model: string, action: ClipAction, built: string | null): string {
+  const url = viewmodelAssetUrl(`${encodeURIComponent(model)}.${action}.json`);
+  return built ? `${url}&a=${encodeURIComponent(built)}` : url;
 }
 
 /**
@@ -214,7 +228,8 @@ export function loadViewmodelClip(model: string, action: ClipAction = "idle"): P
   const key = `${model}.${action}`;
   const hit = cache.get(key);
   if (hit) return hit;
-  const p = fetch(clipUrl(model, action))
+  const p = loadActionIndex()
+    .then((index) => fetch(clipUrl(model, action, typeof index?._built === "string" ? index._built : null)))
     .then((r) => (r.ok ? (r.json() as Promise<RawClip>) : null))
     .catch(() => null)
     // NO IDLE IS NOT NO FIRST PERSON. Idle is what the mount asks for, so a

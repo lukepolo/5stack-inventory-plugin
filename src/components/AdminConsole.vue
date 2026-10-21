@@ -61,7 +61,18 @@ const props = defineProps<{
   user?: { steam_id: string; name: string; role: string } | null;
   /** Sub-route below /admin: "", "assets" or "models". */
   section?: string;
+  /** When the bundle this page is running was built (null on the dev server). */
+  bundleBuild?: string | null;
+  /** When the newest bundle the server has was built (empty until known). */
+  serverBuild?: string;
 }>();
+/** Local date and time of a build stamp, as the panel's own clock reads it. */
+const fmtBuild = (iso: string | null | undefined) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+};
+const buildBehind = computed(() => !!props.bundleBuild && !!props.serverBuild && props.serverBuild !== props.bundleBuild);
 
 const emit = defineEmits<{
   (e: "notify", message: string, kind: "error" | "success"): void;
@@ -958,6 +969,15 @@ const BTN_DANGER =
         <h1 class="truncate text-xl font-semibold tracking-tight">Plugin Settings</h1>
         <p class="text-sm text-muted-foreground">
           Game-server integration, cached assets and 3D model extraction.
+        </p>
+        <!-- Which build this page runs, and whether the server has a newer one:
+             the question every "is the fix live?" comes down to. -->
+        <p v-if="fmtBuild(bundleBuild)" class="text-xs text-muted-foreground">
+          This page: build of <span class="font-mono text-foreground">{{ fmtBuild(bundleBuild) }}</span>
+          <template v-if="buildBehind">
+            · <span class="text-[hsl(var(--tac-amber))]">newer build of {{ fmtBuild(serverBuild) }} is out — reload the page</span>
+          </template>
+          <template v-else-if="serverBuild"> · up to date</template>
         </p>
       </div>
     </header>

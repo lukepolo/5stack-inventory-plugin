@@ -10,6 +10,17 @@ import { API_ORIGIN } from "../api";
 
 const POLL_MS = 30_000;
 
+/**
+ * When THIS bundle was built — the placeholder is replaced by the build-stamp
+ * plugin (vite.config.ts) with the same time it writes to build-info.json.
+ * Null on the dev server, where nothing builds a bundle. build-info.json alone
+ * answers "what does the server have", which is not "what is this page
+ * running": a page still on an old bundle saw the NEW time there, and there was
+ * no way to tell from the panel that it needed a reload.
+ */
+const STAMP = "__CS2INV_BUILT_AT__";
+export const BUNDLE_BUILT_AT: string | null = STAMP.startsWith("__") ? null : STAMP;
+
 export function useBuildCheck() {
   const serverBuild = ref("");
   const staleBuild = ref(false);
@@ -37,5 +48,5 @@ export function useBuildCheck() {
   });
   onBeforeUnmount(() => clearInterval(timer));
 
-  return { serverBuild, staleBuild, reloadPage: () => window.location.reload() };
+  return { serverBuild, staleBuild, bundleBuild: BUNDLE_BUILT_AT, reloadPage: () => window.location.reload() };
 }

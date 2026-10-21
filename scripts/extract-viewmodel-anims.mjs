@@ -121,6 +121,12 @@ const ACTIONS = [
   { key: "draw", match: (f) => /\/draw_/.test(f) },
   { key: "reload", match: (f) => /\/reload_/.test(f) },
   { key: "fire", match: (f) => /\/shoot1?_/.test(f) },
+  // A KNIFE'S FIRE is its left-click slash. Knives have no shoot clip, so
+  // without this they had no Fire at all; the game alternates two slashes,
+  // light_miss1 and light_miss2, and the viewer does the same (fire, fire2).
+  // Never a gun's: no gun folder has a light_miss clip.
+  { key: "fire", match: (f) => /\/light_miss1_/.test(f) },
+  { key: "fire2", match: (f) => /\/light_miss2_/.test(f) },
 ];
 
 let VPK_ALL = null;
@@ -633,6 +639,10 @@ function main() {
       ok++;
     } else failed++;
   }
+  // When this index was written. The viewer keys every clip URL on it, so a
+  // run that changes clips — a scoped `step viewmodel-anims` included, which
+  // stamps no extraction version — reaches browsers without a code change.
+  index._built = new Date().toISOString();
   fs.writeFileSync(indexPath, JSON.stringify(index, null, 1));
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log(`\nviewmodel anims: ${ok} extracted, ${failed} without a clip -> ${OUT}`);

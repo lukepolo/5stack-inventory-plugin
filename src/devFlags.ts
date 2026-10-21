@@ -313,14 +313,14 @@ export const NUMBERS: DevNumber[] = [
   {
     name: "fpvx",
     label: "Viewmodel offset X",
-    hint: "Moves the eye right (+) or left (-), in metres, along the camera's own axis.",
+    hint: "Moves the eye right (+) or left (-), in metres, along the camera's own axis. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
     dflt: 0.06, min: -1, max: 1, step: 0.01,
     group: "3D viewer", audience: "developer",
   },
   {
     name: "fpvy",
     label: "Viewmodel offset Y",
-    hint: "Raises (+) or lowers (-) the eye, in metres, along the camera's own up axis.",
+    hint: "Raises (+) or lowers (-) the eye, in metres, along the camera's own up axis. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
     dflt: 0.01, min: -1, max: 1, step: 0.01,
     group: "3D viewer", audience: "developer",
   },
@@ -334,14 +334,14 @@ export const NUMBERS: DevNumber[] = [
   {
     name: "fpvyaw",
     label: "Viewmodel yaw",
-    hint: "Turns the first-person view left or right, in degrees, FROM the framing the viewer works out for itself. Zero is that framing — these dials trim it, they no longer have to find it.",
+    hint: "Turns the first-person view left or right, in degrees, FROM the framing the viewer works out for itself. Zero is that framing — these dials trim it, they no longer have to find it. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
     dflt: -7, min: -180, max: 180, step: 1,
     group: "3D viewer", audience: "developer",
   },
   {
     name: "fpvpitch",
     label: "Viewmodel pitch",
-    hint: "Tilts the first-person camera up (+) or down (-), in degrees.",
+    hint: "Tilts the first-person camera up (+) or down (-), in degrees. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
     dflt: -12, min: -90, max: 90, step: 1,
     group: "3D viewer", audience: "developer",
   },
