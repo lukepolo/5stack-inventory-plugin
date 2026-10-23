@@ -8,6 +8,7 @@
   "module": "./App",
   "requiredRole": "verified_user",
   "profileTabLabel": "Inventory",
+  "featured": true,
   "deployments": ["inventory-frontend", "inventory-backend"],
   "install": {
     "overlays": {
