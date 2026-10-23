@@ -41,6 +41,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 - **Rare inspects**: in first person, pressing Inspect again while a weapon is being inspected plays its rarer inspect, the one the game rolls now and then: the Deagle's spin, the AK-47's, a second trick on most knives, and the C4's and the Butterfly Knife's third. Weapons with only one inspect behave as before. Needs the next run of the first-person animation step.
 - **CS2 lighting preset (new default)**: neutral daylight and the main menu's blue-grey haze, measured against in-game inspect screenshots. Items no longer come out pink-tinted and dull.
+- **Item cards in CS2 lighting**: the 2D card art for weapons, knives, gloves and charms is rendered under the CS2 preset instead of Studio, so cards show neutral colours like the game's own inspect instead of pink-tinted whites and maroon blacks. Existing cards re-render the next time they are shown.
 - **CS2 scene presets**: Ancient (night), Italy and Italy (alley) place the item in front of a blurred in-game screenshot of the map. The same image lights the item's reflections.
 - **Knife StatTrak counter**: the kill count is scratched into the blade as in game, at each knife's exact spot from the game's own attachment data. The digits use the game's own cut-out texture and stay sharp however close you zoom.
 - **C4 name tag**: the name label sits over the top of the C4's LCD, on top of any stickers, as in game.
