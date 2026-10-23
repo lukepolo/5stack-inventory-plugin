@@ -238,9 +238,9 @@ function loadThree(): Promise<ThreeBundle> {
  * It used to ride inside loadThree, so every first 3D view waited for 1.4MB of
  * HDRI after three itself had arrived, and only then started on its GLB. The
  * CS2 daylight rig lights by its own painted sky and never looks at it; the
- * photographed CS2 scenes light by their photograph, and card bakes are CS2-lit
- * too. Only the studio rigs (Studio, Showcase, which is the default, Warm, Dark)
- * reflect it. So it is asked for by the mount that needs it (rigUsesStudioEnv),
+ * photographed CS2 scenes light by their photograph. Only the studio rigs
+ * (Studio, Showcase, which is the default, Warm, Dark), and with them every
+ * card bake, reflect it. So it is asked for by the mount that needs it (rigUsesStudioEnv),
  * BEFORE that mount awaits three, and downloads alongside three and the GLB.
  *
  * The bytes are fetched directly so the download does not wait for three's
@@ -3625,7 +3625,7 @@ async function buildViewer(
   mounted: { view?: HTMLCanvasElement } = {},
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
-  // A studio rig starts its HDRI download now, so
+  // A studio rig (every card bake among them) starts its HDRI download now, so
   // it arrives alongside three and the GLB instead of after them.
   if (rigUsesStudioEnv(mountRig(opts))) void loadStudioHdr();
   const { THREE, OrbitControls, DecalGeometry, RoomEnvironment, cloneSkeleton,
@@ -3781,9 +3781,8 @@ async function buildViewer(
   // WHICH RIG. Precedence, widest to narrowest:
   //   1. `opts.lighting` — explicit numbers from tools/shadertest, sweeping a
   //      value to MEASURE it. Still wins over everything, unchanged.
-  //   2. the bake rig (BAKE_ENVIRONMENT, CS2), for a card bake or the
-  //      /admin/tests sweep, whatever the user picked. This is the
-  //      load-bearing one: a baked card is cached forever
+  //   2. Studio, for a card bake or the /admin/tests sweep, whatever the user
+  //      picked. This is the load-bearing one: a baked card is cached forever
   //      against its render key, so a preset baked into one is indistinguishable
   //      from a bug — the same argument that already forces bloom off for bakes.
   //   3. the rig the user chose.

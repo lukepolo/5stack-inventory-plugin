@@ -156,20 +156,15 @@ const mapEnvironment = ({ map, label, hint }: (typeof MAP_SCENES)[number]): View
  * differently with no way to tell why. Exactly the argument that already forces
  * bloom off for bakes.
  *
- * CS2: the game's own neutral daylight. Studio, the pin before it, reflects a
- * warm sunset with peach and pink lamps, so every card came out with maroon
- * blacks and pink-cast whites next to the game's own inspect. The haze the rig
- * draws behind live viewers never reaches a bake; a card stays transparent.
- *
- * SEPARATE from DEFAULT_ENVIRONMENT below, and it has to stay that way: the
- * render key carries the extraction version, not the rig, so moving this pin
- * leaves every card already on disk lit the old way while new ones bake the new
- * way. The grid would be permanently half-lit one way and half the other, which
- * reads as a rendering bug rather than a settings change. A change here ships
- * with a clear of the stored cards (Clear renders in the admin panel, or
- * DELETE /api/admin/cache?scope=renders) so the whole grid re-bakes under one rig.
+ * SEPARATE from DEFAULT_ENVIRONMENT below, and it has to stay that way. These
+ * were one constant until the viewer default moved to Showcase; moving the pin
+ * with it would have re-baked new cards under Showcase while every card already
+ * on disk kept its Studio lighting — and the render key carries the extraction
+ * version, not the rig, so nothing would ever invalidate the old ones. The grid
+ * would be permanently half-lit one way and half the other, which reads as a
+ * rendering bug rather than a settings change.
  */
-export const BAKE_ENVIRONMENT = "cs2";
+export const BAKE_ENVIRONMENT = "studio";
 
 /**
  * What a LIVE viewer opens under when the user has not picked. Showcase: the
@@ -218,7 +213,7 @@ export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
   {
     key: "cs2",
     label: "CS2",
-    hint: "Bright, neutral daylight with the main-menu haze behind — how the game's own inspect shows an item, and the rig every card is baked under.",
+    hint: "Bright, neutral daylight with the main-menu haze behind — how the game's own inspect shows an item.",
     ...CS2_LIGHT,
     daylight: true,
   },
@@ -258,7 +253,7 @@ export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
   {
     key: "studio",
     label: "Studio",
-    hint: "The rig calibrated against csgoskins' viewer. Warm sunset reflections, soft fill.",
+    hint: "The calibrated rig every card is baked under. Neutral, and the one to judge a finish by.",
     lighting: { env: 0.8, key: 1.15, rim: 0.35, ambient: 0.12, spot: 1.2 },
     envRotation: 3.8,
   },
@@ -297,8 +292,8 @@ void mapEnvironment;
  * Resolve a stored key, falling back to the canonical rig.
  *
  * Total on purpose: the value comes out of localStorage, so a key from a build
- * that offered a preset this one does not must degrade to the bake rig rather
- * than render an unlit model.
+ * that offered a preset this one does not must degrade to Studio rather than
+ * render an unlit model.
  */
 export function viewerEnvironment(key: string | null | undefined): ViewerEnvironment {
   return (

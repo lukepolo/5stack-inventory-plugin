@@ -3,7 +3,7 @@
 ## `venice_sunset_512.hdr`
 
 The 3D viewer's studio lighting environment (the Studio, Showcase, Warm and
-Dark rigs). **CC0** (public domain) from Poly Haven —
+Dark rigs, and every card bake). **CC0** (public domain) from Poly Haven —
 <https://polyhaven.com/a/venice_sunset> — fetched from `dl.polyhaven.org`, not
 from anyone's site who happens to also use it.
 
@@ -17,8 +17,8 @@ bakes against the 1k file, 99% of the item's pixels moved by at most 1 level
 (of 255) and at most 0.02% by more than 2. Re-measure any change to it the same
 way (docs/DEBUGGING.md, §4.15).
 
-It is fetched only by a viewer whose rig reflects it. The CS2 rig, which every
-card bake uses, lights by its own painted sky and never downloads it.
+It is fetched only by a viewer whose rig reflects it. The default CS2 rig lights
+by its own painted sky and never downloads it.
 
 **Why this one specifically.** It is the environment csgoskins.gg light their
 viewer with (read out of their bundle's scenery table alongside

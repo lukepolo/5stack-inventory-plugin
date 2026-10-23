@@ -274,7 +274,7 @@ app.get("/api/catalog", async () => {
     // before anything asks for a card.
     renderVersion: await renderVersion(),
     // Which lighting rig this server's cards are baked under. Unset is the
-    // client's own canonical rig (CS2). It belongs to the SERVER because the
+    // client's own canonical rig (Studio). It belongs to the SERVER because the
     // cards live in its RENDERS_DIR: a backend with a store of its own (the dev
     // copy's) can bake under another rig without a single card in a shared store
     // ending up lit two different ways.
