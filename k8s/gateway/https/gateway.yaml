@@ -1,0 +1,19 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: inventory
+  namespace: 5stack
+spec:
+  gatewayClassName: traefik
+  listeners:
+    - name: https
+      hostname: ${INVENTORY_DOMAIN}
+      protocol: HTTPS
+      port: 8443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: inventory-ssl
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# For panels that route through Traefik and the Gateway API, behind a reverse
+# proxy: the base without its Ingresses, served by HTTPRoutes on the panel's
+# shared Gateway. k8s/overlays stays the install for panels on ingress-nginx.
+resources:
+  - ../../base
+  - httproute.yaml
+
+patches:
+  - patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: inventory-api
+        namespace: 5stack
+  - patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: inventory-frontend
+        namespace: 5stack
+
+replacements:
+  - source:
+      kind: ConfigMap
+      name: inventory-config
+      fieldPath: data.INVENTORY_DOMAIN
+    targets:
+      - select:
+          kind: HTTPRoute
+          name: inventory-api
+        fieldPaths:
+          - spec.hostnames.0
+      - select:
+          kind: HTTPRoute
+          name: inventory-frontend
+        fieldPaths:
+          - spec.hostnames.0

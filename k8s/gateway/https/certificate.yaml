@@ -1,0 +1,32 @@
+# A cert of its own, for the inventory host only.
+#
+# The panel's shared cert (5stack-ssl, from the panel repo's overlays/cert-manager)
+# lists the panel's own domains and is rebuilt by ./update.sh — adding the
+# inventory host there would be overwritten on the next panel update, and the
+# plugin is deployed separately (./custom.sh) anyway. So it gets its own
+# Certificate/Secret pair, issued by the Issuer the panel already installed.
+#
+# The Issuer is a namespaced Issuer (not a ClusterIssuer) named 5stack-issuer in
+# the 5stack namespace — it is created by the panel install when PROTOCOL=https.
+# If cert-manager was set up some other way, point issuerRef at that issuer
+# instead; nothing else here changes.
+#
+# ${INVENTORY_DOMAIN} is substituted by the kustomize replacement in
+# kustomization.yaml, from the same inventory.env value the Ingresses use, so
+# the cert and the hosts it covers can never drift apart.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: inventory-ssl
+  namespace: 5stack
+spec:
+  # The Ingresses below reference this secret by name; cert-manager writes it.
+  secretName: inventory-ssl
+  # Matches the panel's cert cadence: 90d lifetime, renew with 10d to spare.
+  duration: 2160h
+  renewBefore: 240h
+  dnsNames:
+    - ${INVENTORY_DOMAIN}
+  issuerRef:
+    name: 5stack-issuer
+    kind: Issuer
