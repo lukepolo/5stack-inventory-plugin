@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import { extractWorkerLimit } from "./extractWorkers.ts";
 import { machineMemoryMb } from "./machineMemory.ts";
+import { createSteamCooldown, steamRateLimitedMessage } from "./steamCooldown.ts";
 import path from "node:path";
 import Fastify, { LogController } from "fastify";
 // Type-only, so node's type stripping erases it — "pg" is CJS and has no such
@@ -3868,10 +3869,18 @@ const STEAM_MAX_PAGES = 10;
 // `this.status = status` a parameter property relies on.
 class SteamFetchError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  retryAfterMs?: number;
+  constructor(status: number, message: string, retryAfterMs?: number) {
     super(message);
     this.status = status;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+const steamCooldown = createSteamCooldown();
+
+function steamRateLimited(ms: number) {
+  return new SteamFetchError(429, steamRateLimitedMessage(ms), ms);
 }
 
 async function fetchSteamInventory(steamId: string) {
@@ -3879,6 +3888,8 @@ async function fetchSteamInventory(steamId: string) {
   const byClass = new Map<string, SteamDescription>();
   let start: string | undefined;
   let complete = false;
+  const waiting = steamCooldown.remainingMs(Date.now());
+  if (waiting > 0) throw steamRateLimited(waiting);
   for (let page = 0; page < STEAM_MAX_PAGES; page++) {
     const url =
       `https://steamcommunity.com/inventory/${steamId}/730/2?l=english&count=${STEAM_PAGE}` +
@@ -3894,6 +3905,9 @@ async function fetchSteamInventory(steamId: string) {
           400,
           "Your Steam inventory is private. Set it to Public in Steam privacy settings and retry — we only ever read public data.",
         );
+      }
+      if (res.status === 429) {
+        throw steamRateLimited(steamCooldown.trip(res.headers.get("retry-after"), Date.now()));
       }
       if (!res.ok) {
         throw new SteamFetchError(502, `Steam responded ${res.status} — try again in a minute.`);
@@ -3998,6 +4012,7 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     // with request logging off a failed sync would otherwise produce NO output
     // at all — the one case where silence is most misleading.
     app.log.warn(`[steam-sync] ${identity.steamId}: FAILED (${e.status ?? 502}) — ${e.message}`);
+    if (e.retryAfterMs) reply.header("Retry-After", String(Math.ceil(e.retryAfterMs / 1000)));
     return reply.status(e.status ?? 502).send({ error: e.message });
   }
   const { assets, byClass, complete } = inventory;
