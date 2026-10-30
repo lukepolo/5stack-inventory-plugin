@@ -1,0 +1,97 @@
+# Optional. A cluster-internal reverse proxy that sends only the backend's Steam
+# inventory fetch out through another node's IP, for when Steam keeps answering
+# the backend node with 429. Serves GET /inventory/<steamid>/730/2 only; every
+# other path is 404. ClusterIP, no ingress. See docs/steam-community-url.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: steam-egress-nginx
+  labels:
+    app: steam-egress
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      # k3s's cluster DNS service; re-resolves Steam's addresses every minute.
+      resolver 10.43.0.10 valid=60s ipv6=off;
+      # The path carries Steam IDs; the backend already logs each sync.
+      access_log off;
+      # Only the one request the backend makes, without cookies either way.
+      location ~ "^/inventory/\d{17}/730/2$" {
+        limit_except GET { deny all; }
+        proxy_set_header Cookie "";
+        proxy_hide_header Set-Cookie;
+        set $steam https://steamcommunity.com;
+        proxy_pass $steam;
+        proxy_set_header Host steamcommunity.com;
+        proxy_ssl_server_name on;
+        proxy_ssl_name steamcommunity.com;
+        proxy_ssl_verify on;
+        # The default depth of 1 rejects Steam's certificate chain.
+        proxy_ssl_verify_depth 3;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 30s;
+      }
+      location / { return 404; }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steam-egress
+  labels:
+    app: steam-egress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steam-egress
+  template:
+    metadata:
+      labels:
+        app: steam-egress
+    spec:
+      # The node whose IP Steam still answers: label it
+      # `kubectl label node <node> 5stack-steam-egress=true`. Until a node
+      # carries the label the pod stays Pending, so the proxy never quietly
+      # lands on the node Steam refuses.
+      nodeSelector:
+        5stack-steam-egress: "true"
+      automountServiceAccountToken: false
+      containers:
+        - name: nginx
+          image: nginx:1.28.1-alpine
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+      volumes:
+        - name: conf
+          configMap:
+            name: steam-egress-nginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steam-egress
+  labels:
+    app: steam-egress
+spec:
+  selector:
+    app: steam-egress
+  ports:
+    - port: 8080
+      targetPort: 8080

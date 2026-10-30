@@ -1,0 +1,9 @@
+# Optional, not part of the overlays: apply it on its own with
+# `kubectl apply -k k8s/steam-egress`. See docs/steam-community-url.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: 5stack
+
+resources:
+  - steam-egress.yaml
