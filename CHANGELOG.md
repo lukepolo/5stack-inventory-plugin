@@ -113,6 +113,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Features
 
+- **Cards baked under the CS2 lighting**: item cards (weapons, knives, gloves, charms) are rendered under the CS2 preset, the game's neutral inspect daylight, instead of Studio, whose warm sunset gave them maroon blacks and pink-tinted whites. Cards keep their transparent background. Cards already stored keep the old look until Asset Cache → Clear renders is run once after the update; they re-bake the next time they are shown.
 - **True sizes on the models mount**: Asset Cache lists the compressed copies and the 2048 px input copies in their own rows and gives the mount's size without them. Rows whose files have a compressed copy also say what they cost to download, such as the models' "sent as" size.
 - **Glove model cards**: the eight bare glove models get cards baked from their 3D model, kept in the shared card store.
 - **Smaller cards**: new cards are stored as WebP, about a tenth of the size of the PNG they replace, so the inventory grid loads much faster with no visible difference. Cards already stored keep showing as they are, and cards baked in Safari are converted by the server.

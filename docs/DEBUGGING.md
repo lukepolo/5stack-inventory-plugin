@@ -880,12 +880,13 @@ beyond the sleeve's end, changed nothing visible.
   (`drive.mjs` passes it); without it every preview reads "Preview unavailable".
 - **`src/viewer3d.ts.tmp.12606.f232a5218f7d` is an upstream file**, committed by
   accident upstream. Leave it alone so merges stay clean.
-- **`BAKE_ENVIRONMENT`** in `src/viewerEnvironments.ts` must stay `"studio"` in
-  commits; switch it only for local bake experiments.
+- **`BAKE_ENVIRONMENT`** in `src/viewerEnvironments.ts` is `"cs2"`; switch it
+  only for local bake experiments. A committed change needs Clear renders once
+  it is deployed: card filenames carry the extraction version, not the rig.
 - **The default live rig never touches the studio HDRI.** CS2 lights by its own
   painted sky, so a live `mount.html` shot tests the HDRI only with `&env=studio`
   (or another studio rig). A still (`still=1`, the default) always uses the
-  bake rig, and the bake rig is Studio.
+  bake rig, and the bake rig is CS2, so it does not touch the HDRI either.
 - **Nothing 3D loads at startup.** `viewer3d`, three and GLTFLoader are fetched
   together by the first `viewer3d()` call (`src/viewer3dLazy.ts`), which is a 3D
   view or a card bake. Code that wants them earlier has to call

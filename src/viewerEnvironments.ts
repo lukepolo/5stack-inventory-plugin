@@ -156,6 +156,17 @@ const mapEnvironment = ({ map, label, hint }: (typeof MAP_SCENES)[number]): View
  * differently with no way to tell why. Exactly the argument that already forces
  * bloom off for bakes.
  *
+ * CS2: the game's neutral inspect daylight. Studio reflects a warm sunset, and
+ * its peach and pink lamps gave cards maroon blacks and pink-tinted whites.
+ * The CS2 rig's haze is drawn only behind LIVE viewers (a `still` mount skips
+ * setBackdrop), so a card keeps its transparent background; and the daylight
+ * rig never fetches the studio HDRI, so a bake has one download fewer.
+ *
+ * Changing this does not reach cards already stored — their filenames carry the
+ * extraction version, not the rig — so after deploying a change, clear them
+ * once (admin → Asset Cache → Clear renders, AFTER the new frontend is live, or
+ * the old one re-bakes the old look under the same names).
+ *
  * SEPARATE from DEFAULT_ENVIRONMENT below, and it has to stay that way. These
  * were one constant until the viewer default moved to Showcase; moving the pin
  * with it would have re-baked new cards under Showcase while every card already
@@ -164,7 +175,7 @@ const mapEnvironment = ({ map, label, hint }: (typeof MAP_SCENES)[number]): View
  * would be permanently half-lit one way and half the other, which reads as a
  * rendering bug rather than a settings change.
  */
-export const BAKE_ENVIRONMENT = "studio";
+export const BAKE_ENVIRONMENT = "cs2";
 
 /**
  * What a LIVE viewer opens under when the user has not picked. Showcase: the
@@ -213,7 +224,7 @@ export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
   {
     key: "cs2",
     label: "CS2",
-    hint: "Bright, neutral daylight with the main-menu haze behind — how the game's own inspect shows an item.",
+    hint: "Bright, neutral daylight with the main-menu haze behind — how the game's own inspect shows an item. Item cards are baked under it too.",
     ...CS2_LIGHT,
     daylight: true,
   },
@@ -253,7 +264,7 @@ export const VIEWER_ENVIRONMENTS: ViewerEnvironment[] = [
   {
     key: "studio",
     label: "Studio",
-    hint: "The calibrated rig every card is baked under. Neutral, and the one to judge a finish by.",
+    hint: "The calibrated studio rig. Neutral, and a good one to judge a finish by.",
     lighting: { env: 0.8, key: 1.15, rim: 0.35, ambient: 0.12, spot: 1.2 },
     envRotation: 3.8,
   },
