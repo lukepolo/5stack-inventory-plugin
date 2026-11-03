@@ -14,6 +14,7 @@ import { pool } from "./db.ts";
 // Shared with scripts/serve.mjs — see the module header for why it is .mjs.
 import { IMMUTABLE, openAssetBody, planAsset } from "./assetResponse.mjs";
 import { getIdentity } from "./identity.ts";
+import { registerStickerCraftRoutes } from "./stickerCrafts.ts";
 import { isAllowedOrigin, originPolicyFromEnv, refuseCrossSite, requestHost } from "./originGuard.ts";
 import { autoExtractor, installProblem } from "./autoExtract.ts";
 import { readSavedExtractState, IDLE_STATE, type ExtractState } from "./extractState.ts";
@@ -2928,6 +2929,9 @@ app.post<{ Body: { item_id?: number; want?: boolean } }>(
     return { want: true };
   },
 );
+
+// Sticker Crafts (the sticker board) — see stickerCrafts.ts.
+registerStickerCraftRoutes(app);
 
 // ---- Loadout (per-user; slots reference owned instances) ----
 

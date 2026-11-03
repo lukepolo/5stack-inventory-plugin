@@ -94,6 +94,10 @@ export interface Skin {
    *  with the skin, and the classic knife pool is the special of eleven cases at
    *  once, so no single one is true. */
   collection?: string;
+  /** STICKERS, PATCHES and sticker slabs: the capsule it came in — the label
+   *  over each attachment-picker tile. Not `collection`, which is the inventory
+   *  grid's facet. */
+  capsule?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
   /** KNIVES and GLOVES only: the bare model the finish is painted onto
@@ -177,6 +181,8 @@ export interface CatalogItem {
    *  too (the backend resolver fills it), which is what lets the inventory grid
    *  and the loadout sheet sort by collection. */
   collection?: string;
+  /** See `Skin.capsule` — filled on an owned sticker, patch or slab too. */
+  capsule?: string;
   /**
    * MUSIC KITS only: the kit's menu theme, as a fully resolved, playable URL.
    *
@@ -1629,3 +1635,79 @@ export const activatePreset = (id: string) =>
     method: "POST",
     body: "{}",
   });
+
+// ---- Sticker Crafts (the sticker board) -------------------------------------
+// Stored per account (backend/src/stickerCrafts.ts), so the mat, the saved
+// crafts and the crafts placed on items follow you across browsers. The
+// documents' shapes belong to src/stickerCraftsModel.ts, which also decides
+// what to do with a backend that predates this storage.
+
+/**
+ * The board and the saved crafts. Null when this backend has no Sticker Crafts
+ * storage yet (an older image answers 404); a network or sign-in failure throws.
+ * Read through the asset walk like every other response, so a sticker image
+ * stored as `/images/…` comes back on this deployment's origin and version.
+ */
+export async function fetchStickerCrafts(): Promise<{ board: unknown; crafts: unknown[]; published?: string[] } | null> {
+  const response = await fetch(`${API_BASE}/api/sticker-crafts`, { credentials: "include" });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Sticker Crafts didn't load (${response.status}).`);
+  return resolveAssetPaths(await response.json()) as { board: unknown; crafts: unknown[]; published?: string[] };
+}
+export const saveStickerBoard = (board: object) =>
+  request<{ ok: true }>("/sticker-crafts/board", { method: "PUT", body: JSON.stringify(board) });
+export const saveStickerCraft = (craft: { id: string }) =>
+  request<{ ok: true }>(`/sticker-crafts/crafts/${encodeURIComponent(craft.id)}`, {
+    method: "PUT",
+    body: JSON.stringify(craft),
+  });
+export const deleteStickerCraft = (id: string) =>
+  request<{ ok: true }>(`/sticker-crafts/crafts/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+/** The craft placed on one owned item: its body, null for none, or undefined
+ *  when this backend has no Sticker Crafts storage. */
+export async function fetchItemCraftGroup(itemId: number | string): Promise<unknown | null | undefined> {
+  const response = await fetch(`${API_BASE}/api/sticker-crafts/groups/${encodeURIComponent(String(itemId))}`, {
+    credentials: "include",
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw new Error(`Sticker Crafts didn't load (${response.status}).`);
+  return ((await response.json()) as { group: unknown }).group ?? null;
+}
+export const saveItemCraftGroup = (itemId: number | string, group: object) =>
+  request<{ ok: true }>(`/sticker-crafts/groups/${encodeURIComponent(String(itemId))}`, {
+    method: "PUT",
+    body: JSON.stringify(group),
+  });
+export const deleteItemCraftGroup = (itemId: number | string) =>
+  request<{ ok: true }>(`/sticker-crafts/groups/${encodeURIComponent(String(itemId))}`, { method: "DELETE" });
+
+/**
+ * The Craft Store: crafts their authors published, best or newest first. `max`
+ * keeps to crafts of at most that many stickers, `count` to exactly that many.
+ * Null when this backend has no store (an older image answers 404).
+ */
+export async function fetchCraftStore(params: {
+  sort?: "top" | "new";
+  max?: number;
+  count?: number;
+  q?: string;
+  offset?: number;
+  limit?: number;
+}): Promise<{ items: unknown[] } | null> {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== "" && v !== 0) qs.set(k, String(v));
+  const response = await fetch(`${API_BASE}/api/sticker-crafts/store?${qs}`, { credentials: "include" });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`The Craft Store didn't load (${response.status}).`);
+  return resolveAssetPaths(await response.json()) as { items: unknown[] };
+}
+export const publishCraft = (id: string) =>
+  request<{ ok: true }>(`/sticker-crafts/store/${encodeURIComponent(id)}`, { method: "PUT", body: "{}" });
+export const unpublishCraft = (id: string) =>
+  request<{ ok: true }>(`/sticker-crafts/store/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const voteCraft = (id: string, vote: -1 | 0 | 1) =>
+  request<{ ups: number; downs: number; score: number; myVote: -1 | 0 | 1 }>(
+    `/sticker-crafts/store/${encodeURIComponent(id)}/vote`,
+    { method: "POST", body: JSON.stringify({ vote }) },
+  );

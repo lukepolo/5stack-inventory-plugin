@@ -41,6 +41,7 @@ import {
   worldToCharmDir,
 } from "./charmPhysics";
 import { applyStickerMask, applyStickerSfx, type StickerHoloLive, type StickerSfx } from "./stickerShader";
+import { createStickerGlow } from "./stickerGlow";
 import { compositeGlove, gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { compositeGloveModern, gloveSeedMoves, loadGloveModernDef } from "./gloveCompositeModern";
 import { isQuadModel } from "./viewerModel";
@@ -87,6 +88,10 @@ export { loadPaintDef, type PaintDef } from "./paintComposite";
 // lazy import it already pays for (viewer3dLazy) rather than its own imports.
 export { compositeSizeCap, loadWeaponInputs, paintTextureUrl, weaponInputsAt } from "./paintComposite";
 export { compositeKey, storedCompositeUrls } from "./compositeStore";
+// The sticker board (stickerBoard.ts) draws its stickers through the same art
+// and material path as the weapon decals, so it borrows these rather than
+// keeping copies that could drift from them.
+export { loadThree, loadStickerTexture, stickerArtInfo };
 
 export type ThreeBundle = {
   THREE: typeof import("three");
@@ -660,6 +665,9 @@ export interface GltfVariant {
   legacy: boolean;
   /** A paint will be composited over the body, replacing its base colour. */
   painted: boolean;
+  /** Shape only — every image skipped. For a mount that is measured, never
+   *  looked at (weaponOutline). */
+  bare?: boolean;
 }
 
 /** 1x1 transparent PNG. Stands in for an image we have decided not to fetch. */
@@ -817,7 +825,7 @@ const gltfCache = new Map<string, Promise<import("three/examples/jsm/loaders/GLT
 // occupy two entries (hd painted for the viewer, hd unpainted for the default).
 const GLTF_CACHE_MAX = 12;
 async function loadGltf(model: string, variant: GltfVariant) {
-  const key = `${model}|${variant.legacy ? "legacy" : "hd"}|${variant.painted ? "p" : "u"}`;
+  const key = `${model}|${variant.legacy ? "legacy" : "hd"}|${variant.painted ? "p" : "u"}${variant.bare ? "|bare" : ""}`;
   // Hit or miss, this parse is in use — src/prefetch.ts won't warm it again.
   notePrefetchUse(gltfUseKey(modelUrlFor(model), variant));
   const existing = gltfCache.get(key);
@@ -839,7 +847,11 @@ async function loadGltf(model: string, variant: GltfVariant) {
       return r.arrayBuffer();
     });
     const json = glbJson(buf);
-    const drop = json ? discardableImages(json, variant) : new Set<string>();
+    const drop = !json
+      ? new Set<string>()
+      : variant.bare
+        ? new Set(((json as { images?: { uri?: string }[] }).images ?? []).flatMap((i) => (i.uri ? [i.uri] : [])))
+        : discardableImages(json, variant);
     // Textures a warm is still downloading are waited for rather than asked
     // for a second time — the modifier below can only hand over what is
     // already held. Free when nothing was warmed.
@@ -1396,6 +1408,60 @@ function loadPlainTexture(url: string): Promise<import("three").Texture | null> 
   return hit;
 }
 
+/** A throwaway WebGL context for reading a bitmap's bytes back exactly. Its own,
+ *  never three's: binding anything on three's context desyncs its state cache
+ *  (see rawPng). Made once, on first use; null when the browser will not. */
+let readbackGl: WebGLRenderingContext | null | undefined;
+
+/**
+ * `crop` laid into a transparent `side`-square at (dx, dy), as RGBA bytes in
+ * upload order — bottom row first, which is the flip the ImageBitmap path bakes
+ * with imageOrientation. The bytes are the crop's own, read back through WebGL
+ * exactly as the texture upload would see them; null if there is no context.
+ */
+function paddedSquare(crop: ImageBitmap, side: number, dx: number, dy: number): Uint8Array | null {
+  if (readbackGl === undefined) {
+    try {
+      const c = typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(1, 1) : document.createElement("canvas");
+      readbackGl = (c.getContext("webgl") as WebGLRenderingContext | null) ?? null;
+    } catch {
+      readbackGl = null;
+    }
+  }
+  const gl = readbackGl;
+  if (!gl || gl.isContextLost()) return null;
+  const t = gl.createTexture();
+  const fb = gl.createFramebuffer();
+  try {
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, crop);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) return null;
+    const w = crop.width;
+    const h = crop.height;
+    const px = new Uint8Array(w * h * 4);
+    // Row 0 here is the crop's TOP row: uploaded unflipped, read from texel row 0.
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const out = new Uint8Array(side * side * 4);
+    for (let r = 0; r < h; r++) {
+      out.set(px.subarray(r * w * 4, (r + 1) * w * 4), ((side - 1 - (dy + r)) * side + dx) * 4);
+    }
+    return out;
+  } catch {
+    return null;
+  } finally {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+    gl.deleteTexture(t);
+  }
+}
+
 const stickerTexCache = new Map<
   string,
   Promise<{ tex: import("three").Texture; aspect: number; realStickerArt: boolean } | null>
@@ -1466,27 +1532,48 @@ function loadStickerTexture(url: string) {
         const h = maxY - minY + 1;
         // Re-centre the ink in a SQUARE image, letterboxed with real
         // transparency. Doing it in the image rather than in the uv mapping
-        // keeps every caller on a plain [0,1] square. The crop rect may hang
-        // past the source; createImageBitmap pads those pixels transparent
-        // black, which IS the letterbox.
+        // keeps every caller on a plain [0,1] square. The square may hang past
+        // the source (about one sticker in five): those pixels are the
+        // letterbox.
         const side = Math.max(w, h);
         const sx = minX - (((side - w) / 2) | 0);
         const sy = minY - (((side - h) / 2) | 0);
+        // The part of the square the source has pixels for.
+        const cx0 = Math.max(0, sx);
+        const cy0 = Math.max(0, sy);
+        const cw = Math.min(img.width, sx + side) - cx0;
+        const ch = Math.min(img.height, sy + side) - cy0;
         let tex: import("three").Texture;
         try {
-          // imageOrientation "flipY" bakes the flip the old CanvasTexture got
-          // from its default flipY=true — three IGNORES texture.flipY for
-          // ImageBitmap uploads, so omitting this renders every sticker
-          // upside down.
-          const square = await createImageBitmap(img, sx, sy, side, side, {
-            ...bmpOpts,
-            imageOrientation: "flipY",
-          });
-          tex = new THREE.Texture(square);
+          // CROP, THEN FLIP, in two calls. The flip (imageOrientation "flipY")
+          // bakes what the old CanvasTexture got from its default flipY=true —
+          // three IGNORES texture.flipY for ImageBitmap uploads. In ONE call
+          // WebKit flips the whole source before it crops, so the crop rect
+          // was read from the bottom: Safari cut every sticker's art from the
+          // wrong rows (Econometer's 35px off its own lenticular mask), and a
+          // square hanging past the source came back clipped, not padded, and
+          // was stretched. Measured against Chromium, which crops first; two
+          // calls give the same bytes in both.
+          const crop = await createImageBitmap(img, cx0, cy0, cw, ch, bmpOpts);
+          if (cw === side && ch === side) {
+            tex = new THREE.Texture(await createImageBitmap(crop, { ...bmpOpts, imageOrientation: "flipY" }));
+          } else {
+            // The letterbox has to be made, and every way through the browser
+            // (a canvas, ImageData to ImageBitmap) premultiplies in WebKit and
+            // grinds the low-alpha art: the exact bytes, laid out by hand.
+            const square = paddedSquare(crop, side, cx0 - sx, cy0 - sy);
+            if (!square) throw new Error("no readback");
+            tex = new THREE.DataTexture(square, side, side, THREE.RGBAFormat, THREE.UnsignedByteType);
+            // A DataTexture's defaults are a lookup table's; this is an image.
+            tex.magFilter = THREE.LinearFilter;
+            tex.minFilter = THREE.LinearMipmapLinearFilter;
+            tex.generateMipmaps = true;
+          }
           tex.needsUpdate = true;
         } catch {
-          // Browsers without cropping ImageBitmapOptions: the old canvas path,
-          // premultiply loss and all.
+          // Browsers without cropping ImageBitmapOptions, or no readback
+          // context for a letterbox: the old canvas path, premultiply loss and
+          // all.
           const square = document.createElement("canvas");
           square.width = side;
           square.height = side;
@@ -2280,6 +2367,27 @@ let snapshotLane: Promise<unknown> = Promise.resolve();
 // its own modal is open.
 let liveViewers = 0;
 let idleWaiters: (() => void)[] = [];
+/** A live viewer's handle on the screen, for the `directgl` path — see drawFrame. */
+type ScreenSlot = {
+  container: HTMLElement;
+  /** Mounted with `directgl` on. */
+  direct: boolean;
+  /** Draw a fresh frame into its own 2D canvas, so a viewer that loses the
+   *  shared canvas to another keeps a still picture, not a hole. */
+  keep: () => void;
+  /** Draw its frame again — after another viewer drew through the canvas it shows. */
+  redraw: () => void;
+};
+/**
+ * The live viewers that are drawing — mounted and not suspended — oldest first.
+ * Every viewer that opens while another is up opens over it (the item editor
+ * over the focus view, a sticker's or a craft's preview over the editor), so
+ * the last one is the one on top. With `directgl` that one shows the shared
+ * canvas itself, and the ones under it hold a still frame instead of drawing.
+ */
+const drawingViewers: ScreenSlot[] = [];
+/** The viewer showing the shared canvas ITSELF, when `directgl` is on. */
+let directOwner: ScreenSlot | null = null;
 /** Resolves once no 3D viewer is onscreen. Lets a queue park work that would
  *  otherwise compete with a viewer for the GPU, and show it as queued rather
  *  than pretending it is already underway. */
@@ -2420,6 +2528,60 @@ export async function withSharedRenderer<T>(
   } finally {
     renderer.setRenderTarget(null);
   }
+}
+
+/** A weapon seen square from its sticker side, measured — the viewer's
+ *  sideOutline, for the Sticker Crafts mat's chalk outline. */
+export interface SideOutline {
+  /** The silhouette, top row first: 1 inside the weapon, 0 outside. */
+  width: number;
+  height: number;
+  mask: Uint8Array;
+  /** World units across one pixel of it. */
+  worldPerPx: number;
+  /** One sticker's width on this weapon, in world units. */
+  stickerWorld: number;
+  /** Where each slot's anchor falls on it, in pixels. */
+  anchors: { index: number; x: number; y: number }[];
+}
+const outlineCache = new Map<string, Promise<SideOutline | null>>();
+/**
+ * A weapon's side outline: mounted offscreen like a card bake, the shape only
+ * (no textures fetched — see GltfVariant.bare), measured and thrown away.
+ * Cached for the session; a failure is not, so it can be asked again.
+ */
+export function weaponOutline(model: string, slots: StickerSlot[]): Promise<SideOutline | null> {
+  let hit = outlineCache.get(model);
+  if (!hit) {
+    hit = (async () => {
+      const holder = document.createElement("div");
+      holder.style.cssText = "position:fixed;left:-10000px;top:0;width:640px;height:480px;pointer-events:none;";
+      document.body.appendChild(holder);
+      let handle: ViewerHandle | null = null;
+      try {
+        handle = await mountViewer(holder, model, {
+          kind: "weapon",
+          interactive: false,
+          still: true,
+          bloom: false,
+          frame: "fit",
+          outline: true,
+          stickerSlots: slots,
+        });
+        return handle.sideOutline();
+      } catch {
+        return null;
+      } finally {
+        handle?.dispose();
+        holder.remove();
+      }
+    })();
+    outlineCache.set(model, hit);
+    void hit.then((r) => {
+      if (!r) outlineCache.delete(model);
+    });
+  }
+  return hit;
 }
 
 export const viewerStats = () => ({
@@ -2615,6 +2777,9 @@ export interface ViewerHandle {
   setStickers: (stickers: StickerPlacement[]) => void;
   /** Pulse a decal so the user can find it — no effect on the saved placement. */
   flashSticker: (slot: number) => void;
+  /** The sticker surface under a screen point, in offset space (uv1 - 0.5);
+   *  null off the gun or without sticker markup. */
+  stickerSpotAt: (clientX: number, clientY: number) => { u: number; v: number } | null;
   /** Resolves once the charm is actually on the model — a caller that needs to
    *  read something off it (charmAlbedoTile) has to know when it landed. */
   setCharm: (charm: CharmPlacement | null) => Promise<void>;
@@ -2699,6 +2864,17 @@ export interface ViewerHandle {
    * framing, not whatever pose was handed in at mount. See the implementation.
    */
   resetCamera: (side?: "home" | "front" | "back") => void;
+  /**
+   * The camera onto the gun's sticker surface, for a Sticker Craft waiting to
+   * be dragged on — at the whole-gun view a craft over the gun was a few
+   * pixels across. "in" eases there from wherever the camera is (once; again
+   * is a no-op), "back" eases back to where it was (the craft was put back),
+   * "stay" keeps the close view (it was placed, and is adjusted from there).
+   * `slots` (0-based) narrows "in" to the slots the craft will take.
+   */
+  frameStickers: (mode: "in" | "back" | "stay", slots?: number[]) => void;
+  /** The weapon seen square from its sticker side, measured — see sideOutline. */
+  sideOutline: () => SideOutline | null;
   /**
    * Stop drawing without unmounting — for a viewer that is still on the page but
    * behind something. See the note on `suspended`: a modal over the focus view
@@ -3231,6 +3407,131 @@ const PRESENTATION: Record<ViewerKind, Presentation> = {
  */
 const NEVER_POSE = /^(bindpose|ref|a_.*)$/i;
 
+/** One sticker of a craft on its sheet — see ViewerOpts.decalGroup. */
+export type DecalGroupItem = { image: string; wear?: number; x: number; y: number; rot: number };
+/** The board's sticker footprint, in its cm, and the standalone quad's, in ours. */
+const CRAFT_FOOTPRINT_CM = 5;
+const QUAD_SIZE = 0.1;
+
+/**
+ * The stand-in for a whole Sticker Craft: one sheet of backing, rounded like a
+ * die-cut sheet, with every sticker quad laid on it where the craft has it.
+ *
+ * Each sticker is the single quad's 10cm square, on the sheet's plane and a
+ * hair in front of the one before (draw order, as on the board and on a gun).
+ * The sheet is sized to the craft's footprint plus a margin and shows plain
+ * paper until dressDecalGroup binds the backing art. Same depth trick as the
+ * single quad: the stickers stand slightly proud, so "fit" has a box to frame.
+ */
+function buildDecalGroup(THREE: typeof import("three"), items: DecalGroupItem[]) {
+  const group = new THREE.Group();
+  const k = QUAD_SIZE / CRAFT_FOOTPRINT_CM;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  items.forEach((it, i) => {
+    const geom = new THREE.PlaneGeometry(QUAD_SIZE, QUAD_SIZE);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      roughness: 0.55,
+      metalness: 0,
+    });
+    mat.name = "sticker_quad";
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.name = "sticker_quad";
+    mesh.userData.decalIndex = i;
+    // Board y runs down the mat; the sheet's y runs up the screen.
+    mesh.position.set(it.x * k, -it.y * k, 0.0004 * (i + 1));
+    mesh.rotation.z = (-it.rot * Math.PI) / 180;
+    mesh.renderOrder = i + 1;
+    group.add(mesh);
+    // The footprint's turned extent, for the sheet's size.
+    const a = (it.rot * Math.PI) / 180;
+    const e = (QUAD_SIZE / 2) * (Math.abs(Math.cos(a)) + Math.abs(Math.sin(a)));
+    minX = Math.min(minX, mesh.position.x - e);
+    maxX = Math.max(maxX, mesh.position.x + e);
+    minY = Math.min(minY, mesh.position.y - e);
+    maxY = Math.max(maxY, mesh.position.y + e);
+  });
+  const margin = QUAD_SIZE * 0.2;
+  const w = maxX - minX + margin * 2;
+  const h = maxY - minY + margin * 2;
+  const r = Math.min(QUAD_SIZE * 0.15, w / 4, h / 4);
+  const shape = new THREE.Shape();
+  shape.moveTo(-w / 2 + r, -h / 2);
+  shape.lineTo(w / 2 - r, -h / 2);
+  shape.quadraticCurveTo(w / 2, -h / 2, w / 2, -h / 2 + r);
+  shape.lineTo(w / 2, h / 2 - r);
+  shape.quadraticCurveTo(w / 2, h / 2, w / 2 - r, h / 2);
+  shape.lineTo(-w / 2 + r, h / 2);
+  shape.quadraticCurveTo(-w / 2, h / 2, -w / 2, h / 2 - r);
+  shape.lineTo(-w / 2, -h / 2 + r);
+  shape.quadraticCurveTo(-w / 2, -h / 2, -w / 2 + r, -h / 2);
+  const backGeom = new THREE.ShapeGeometry(shape, 6);
+  const backMat = new THREE.MeshStandardMaterial({ color: 0xe4e6e8, side: THREE.DoubleSide, roughness: 0.9, metalness: 0 });
+  backMat.name = "sticker_backing";
+  const back = new THREE.Mesh(backGeom, backMat);
+  back.name = "sticker_backing";
+  back.userData.decalBacking = { w, h };
+  back.position.set((minX + maxX) / 2, (minY + maxY) / 2, -0.0006);
+  group.add(back);
+  return group;
+}
+
+/**
+ * Dress a craft's sheet: every sticker with its art and real shading, the sheet
+ * with the backing art of the first sticker that names one.
+ *
+ * The backing is ONE image over the whole sheet, scaled to cover it with its
+ * proportions kept (the overflow is cropped), the way a single sticker's square
+ * backing sits behind it — not tiled, which repeated its print across a long
+ * sheet. A clone of the cached texture carries the mapping, so the single
+ * preview that shares the cache keeps its own.
+ */
+async function dressDecalGroup(THREE: typeof import("three"), object: import("three").Object3D, items: DecalGroupItem[]) {
+  let backingPath: string | null = null;
+  await Promise.all(
+    items.map(async (it, i) => {
+      const mesh = object.children.find((c) => c.userData.decalIndex === i) as import("three").Mesh | undefined;
+      if (!mesh) return;
+      const [info, loaded] = await Promise.all([stickerArtInfo(it.image), loadStickerTexture(it.image)]);
+      if (!loaded) {
+        mesh.visible = false;
+        return;
+      }
+      if (!backingPath && info.sfx?.backing) backingPath = info.sfx.backing;
+      const mat = mesh.material as import("three").MeshStandardMaterial;
+      mat.map = loaded.tex;
+      mat.needsUpdate = true;
+      await applyStickerSfx(THREE, mat, info.sfx, it.wear ?? 0, paintTextureUrl, { expandAlpha: loaded.realStickerArt });
+    }),
+  );
+  const back = object.children.find((c) => c.userData.decalBacking) as import("three").Mesh | undefined;
+  if (!back || !backingPath) return;
+  const tex = await loadTexture(paintTextureUrl(backingPath)).catch(() => null);
+  if (!tex) return;
+  const { w, h } = back.userData.decalBacking as { w: number; h: number };
+  const img = tex.image as { width?: number; height?: number } | undefined;
+  const aspect = img?.width && img?.height ? img.width / img.height : 1;
+  // ShapeGeometry's uv is the shape's own coordinates, centred on the sheet.
+  // Cover: the image's span is the sheet's along the tighter axis.
+  const spanX = w / h > aspect ? w : h * aspect;
+  const spanY = spanX / aspect;
+  const mine = tex.clone();
+  mine.wrapS = mine.wrapT = THREE.ClampToEdgeWrapping;
+  mine.repeat.set(1 / spanX, 1 / spanY);
+  mine.offset.set(0.5, 0.5);
+  mine.needsUpdate = true;
+  const bm = back.material as import("three").MeshStandardMaterial;
+  bm.map = mine;
+  bm.color.set(0xffffff);
+  bm.needsUpdate = true;
+}
+
 /**
  * The stand-in mesh for a sticker or a patch.
  *
@@ -3412,6 +3713,14 @@ export interface ViewerOpts {
    */
   decal?: { image: string; wear?: number } | null;
   /**
+   * A STICKER CRAFT on one sheet of backing — `kind: "sticker"`, in place of
+   * `decal`. Laid out as the Sticker Crafts board has it: x/y in cm from the
+   * craft's centre (y running down), rot in degrees clockwise, and one sticker
+   * footprint is the standalone quad's 10cm. Everything else about the preview
+   * (framing, light, turn) is the single sticker's. See buildDecalGroup.
+   */
+  decalGroup?: DecalGroupItem[] | null;
+  /**
    * Show the FOREARMS a glove is modelled on — `kind: "glove"` only.
    *
    * The mesh is an arm, not a pair of gloves: CS2 models them as the player's
@@ -3492,6 +3801,9 @@ export interface ViewerOpts {
   /** Per-slot UV anchors from the model. Without them placement falls back to
    *  the old silhouette guess, which does NOT match the game. */
   stickerSlots?: StickerSlot[];
+  /** Mounted to be MEASURED (weaponOutline): the model's shape only, no
+   *  textures fetched. Never shown. */
+  outline?: boolean;
   /** The weapon's sticker mask per body (bare filenames under /models) — where
    *  a sticker may SHOW. See applyStickerMask. */
   stickerMasks?: Partial<Record<"body_hd" | "body_legacy", string>>;
@@ -3689,10 +4001,14 @@ async function buildViewer(
   // material the weapon decals use. `gltf` is faked rather than special-cased
   // downstream so the rest of buildViewer sees an ordinary scene.
   const gltf = isQuadModel(model)
-    ? { scene: buildDecalQuad(THREE, kind), animations: [] as import("three").AnimationClip[] }
+    ? {
+        scene: opts?.decalGroup?.length ? buildDecalGroup(THREE, opts.decalGroup) : buildDecalQuad(THREE, kind),
+        animations: [] as import("three").AnimationClip[],
+      }
     : await loadGltf(model, {
         legacy: !!opts?.legacyPaint,
         painted: !!weaponPaint,
+        bare: !!opts?.outline,
       });
   mt.mark("glb");
   // The last checkpoint before a GL context exists, and so the one that matters:
@@ -4470,7 +4786,10 @@ async function buildViewer(
   // csgo_weapon_sticker shading — the same material path the weapon decals take,
   // so a sticker previewed on its own and the same sticker on a gun cannot drift
   // apart. Wear comes through as the slot's own scratch amount.
-  if (isQuadModel(model) && opts?.decal?.image) {
+  if (isQuadModel(model) && opts?.decalGroup?.length) {
+    await dressDecalGroup(THREE, object, opts.decalGroup);
+    object.updateMatrixWorld(true);
+  } else if (isQuadModel(model) && opts?.decal?.image) {
     const { image, wear } = opts.decal;
     const info = await stickerArtInfo(image);
     const loaded = await loadStickerTexture(image);
@@ -4481,17 +4800,26 @@ async function buildViewer(
       const mat = mesh.material as import("three").MeshStandardMaterial;
       mat.map = loaded.tex;
       mat.needsUpdate = true;
-      // The art is square but its INK is not — loadStickerTexture returns the
-      // aspect of the cropped content, and squashing it to the quad is the exact
-      // bug the sticker-art extraction was done to fix. Scale the mesh instead.
-      if (loaded.aspect > 1) mesh.scale.y = 1 / loaded.aspect;
-      else if (loaded.aspect > 0) mesh.scale.x = loaded.aspect;
-      backing.scale.copy(mesh.scale);
+      // The art stays SQUARE. loadStickerTexture centres the ink in a square
+      // image, so the quad shows it in its own proportions as it is; scaling
+      // the quad to the ink's aspect (as when the texture was the bare ink box)
+      // squashed the square and stretched every wide sticker — the Sticker
+      // Crafts mat had the same bug. Only the backing card hugs the ink.
     }
+    const inkX = loaded.aspect >= 1 ? 1 : Math.max(loaded.aspect, 0.01);
+    const inkY = loaded.aspect >= 1 ? 1 / loaded.aspect : 1;
+    backing.scale.set(inkX, inkY, 1);
     if (info.sfx?.backing) {
-      const tex = await loadTexture(paintTextureUrl(info.sfx.backing)).catch(() => null);
-      if (tex) {
+      const cached = await loadTexture(paintTextureUrl(info.sfx.backing)).catch(() => null);
+      if (cached) {
+        // The card is cut from the print, not the print squeezed to the card:
+        // the middle of it at its own proportions. A clone carries the mapping,
+        // as in dressDecalGroup, so the cached texture is left as it was.
+        const tex = cached.clone();
         tex.colorSpace = THREE.SRGBColorSpace;
+        tex.repeat.set(inkX, inkY);
+        tex.offset.set((1 - inkX) / 2, (1 - inkY) / 2);
+        tex.needsUpdate = true;
         const bm = backing.material as import("three").MeshStandardMaterial;
         bm.map = tex;
         bm.needsUpdate = true;
@@ -6184,6 +6512,270 @@ async function buildViewer(
     return { mk: firstAnchor, shared: !!firstAnchor };
   };
 
+  // ---- framing the sticker surface ---------------------------------------------
+  /**
+   * The world box of the gun's sticker surface: every vertex whose UV1 lies
+   * within a sticker of any slot's anchor. Measured once per mount — the same
+   * offset space the drags place in (uv - 0.5), so it is where a craft lands.
+   */
+  let stickerBox: import("three").Box3 | null | undefined;
+  const stickerArea = () => {
+    if (stickerBox !== undefined) return stickerBox;
+    if (!anchors.length || !uv1Meshes.length) return (stickerBox = null);
+    const box = new THREE.Box3();
+    const p = new THREE.Vector3();
+    for (const mesh of uv1Meshes) {
+      const geom = mesh.geometry as import("three").BufferGeometry;
+      const uv = geom.getAttribute("uv1") ?? geom.getAttribute("uv2");
+      const pos = geom.getAttribute("position");
+      if (!uv || !pos) continue;
+      mesh.updateMatrixWorld();
+      for (let i = 0; i < uv.count; i++) {
+        const du = uv.getX(i) - 0.5;
+        const dv = uv.getY(i) - 0.5;
+        const near = anchors.some((a) => {
+          const r = 1 / Math.max(a.scale, 1e-6);
+          return Math.abs(du - a.offset[0]) < r && Math.abs(dv - a.offset[1]) < r;
+        });
+        if (!near) continue;
+        box.expandByPoint(p.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld));
+      }
+    }
+    return (stickerBox = box.isEmpty() ? null : box);
+  };
+  /**
+   * Each anchor's point on the gun, in world space: where its UV1 position lies
+   * on the surface — the triangle whose UV1 holds it, read back through the
+   * same barycentric weights. A UV1 point can sit in more than one triangle
+   * (islands overlap, a part is mirrored, a stock reuses the receiver's space),
+   * so the one facing the home camera — the side the stickers are on — wins.
+   * Measured once per mount.
+   */
+  let anchorWorld: { index: number; p: import("three").Vector3; scale: number }[] | undefined;
+  const anchorPoints = () => {
+    if (anchorWorld) return anchorWorld;
+    const out: { index: number; p: import("three").Vector3; scale: number }[] = [];
+    const toHome = homeCamPos.clone().sub(homeTarget).normalize();
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const n = new THREE.Vector3();
+    const e = new THREE.Vector3();
+    for (const mk of anchors) {
+      const u = mk.offset[0] + 0.5;
+      const v = mk.offset[1] + 0.5;
+      let best: import("three").Vector3 | null = null;
+      let bestFacing = -Infinity;
+      for (const mesh of uv1Meshes) {
+        const geom = mesh.geometry as import("three").BufferGeometry;
+        const uv = geom.getAttribute("uv1") ?? geom.getAttribute("uv2");
+        const pos = geom.getAttribute("position");
+        if (!uv || !pos) continue;
+        mesh.updateMatrixWorld();
+        const idx = geom.getIndex();
+        const tris = idx ? idx.count / 3 : pos.count / 3;
+        for (let t = 0; t < tris; t++) {
+          const i0 = idx ? idx.getX(t * 3) : t * 3;
+          const i1 = idx ? idx.getX(t * 3 + 1) : t * 3 + 1;
+          const i2 = idx ? idx.getX(t * 3 + 2) : t * 3 + 2;
+          const u0 = uv.getX(i0), v0 = uv.getY(i0);
+          const u1 = uv.getX(i1), v1 = uv.getY(i1);
+          const u2 = uv.getX(i2), v2 = uv.getY(i2);
+          const d = (v1 - v2) * (u0 - u2) + (u2 - u1) * (v0 - v2);
+          if (Math.abs(d) < 1e-14) continue;
+          const l0 = ((v1 - v2) * (u - u2) + (u2 - u1) * (v - v2)) / d;
+          const l1 = ((v2 - v0) * (u - u2) + (u0 - u2) * (v - v2)) / d;
+          const l2 = 1 - l0 - l1;
+          if (l0 < -1e-6 || l1 < -1e-6 || l2 < -1e-6) continue;
+          a.fromBufferAttribute(pos, i0).applyMatrix4(mesh.matrixWorld);
+          b.fromBufferAttribute(pos, i1).applyMatrix4(mesh.matrixWorld);
+          c.fromBufferAttribute(pos, i2).applyMatrix4(mesh.matrixWorld);
+          n.subVectors(b, a).cross(e.subVectors(c, a)).normalize();
+          const facing = n.dot(toHome);
+          if (facing <= bestFacing) continue;
+          bestFacing = facing;
+          best = new THREE.Vector3().addScaledVector(a, l0).addScaledVector(b, l1).addScaledVector(c, l2);
+        }
+      }
+      if (best) out.push({ index: mk.index, p: best, scale: mk.scale });
+    }
+    return (anchorWorld = out);
+  };
+  /** One sticker's width on this gun, in world units: its UV1 square over the
+   *  unwrap's density, at the anchors' own scale. */
+  const stickerWorld = () => {
+    const sc = anchors.map((a) => a.scale).filter((x) => x > 0).sort((x, y) => x - y);
+    const mid = sc.length ? sc[Math.floor(sc.length / 2)] : 0;
+    return uv1Density && mid ? uv1Density / mid : DECAL_SIZE;
+  };
+  /**
+   * Where the stickers go, as a world box: the anchors' points with a sticker's
+   * width round each. Every vertex near an anchor's UV1 (the first try) also
+   * took in parts that share the receiver's UV1 space, and framed the M4A4 on
+   * its stock.
+   */
+  const stickerZone = (slots?: number[]) => {
+    const all = anchorPoints();
+    if (!all.length) return stickerArea();
+    // The slots the craft will take, when it is known which: framing every
+    // anchor took in the M4A4's stock slot and sat the view on the back half.
+    const some = slots?.length ? all.filter((a) => slots.includes(a.index)) : [];
+    const pts = some.length ? some : all;
+    const box = new THREE.Box3();
+    for (const a of pts) box.expandByPoint(a.p);
+    return box.expandByScalar(stickerWorld() * 1.25);
+  };
+  type CamPose = { pos: import("three").Vector3; target: import("three").Vector3; zoom: number; pan: import("three").Vector2 };
+  const poseNow = (): CamPose => ({
+    pos: camera.position.clone(),
+    target: controls.target.clone(),
+    zoom: camera.zoom,
+    pan: panPx.clone(),
+  });
+  /** An eased camera move, stepped by the render loop; a grab ends it. */
+  let camFlight: { t0: number; ms: number; from: CamPose; to: CamPose } | null = null;
+  /** Where the camera was before frameStickers("in"), for "back". */
+  let stickerReturn: CamPose | null = null;
+  const stepCamFlight = () => {
+    const f = camFlight;
+    if (!f) return;
+    const t = Math.min(1, (performance.now() - f.t0) / f.ms);
+    const k = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    controls.target.lerpVectors(f.from.target, f.to.target, k);
+    // Round the target, not through it: the direction turns, the standoff eases.
+    const d0 = f.from.pos.clone().sub(f.from.target);
+    const d1 = f.to.pos.clone().sub(f.to.target);
+    const len = d0.length() + (d1.length() - d0.length()) * k;
+    const dir = d0.normalize().lerp(d1.normalize(), k);
+    if (dir.lengthSq() < 1e-8) dir.copy(d1);
+    camera.position.copy(controls.target).addScaledVector(dir.normalize(), len);
+    camera.zoom = f.from.zoom + (f.to.zoom - f.from.zoom) * k;
+    camera.updateProjectionMatrix();
+    panPx.lerpVectors(f.from.pan, f.to.pan, k);
+    applyPan();
+    if (t >= 1) camFlight = null;
+  };
+  controls.addEventListener("start", () => (camFlight = null));
+  /**
+   * The weapon seen square from its sticker side, for the Sticker Crafts mat's
+   * chalk outline: its silhouette as a mask, how big a pixel of it is, one
+   * sticker's width in the same units, and where the anchors fall on it.
+   *
+   * Looked at along the third axis (neither length nor height) from the side
+   * the home camera is on, the way up the editor shows it, so the barrel points
+   * the same way as it does there. Drawn in one flat colour into a target of
+   * its own and read back: the shape, not the look.
+   */
+  function sideOutline(): SideOutline | null {
+    if (disposed) return null;
+    const box = new THREE.Box3().setFromObject(object, true);
+    if (box.isEmpty()) return null;
+    const centre = box.getCenter(new THREE.Vector3());
+    const dims = box.getSize(new THREE.Vector3()).toArray();
+    const lenW = dims[AXIS_L];
+    const lenH = dims[AXIS_H];
+    const side = new THREE.Vector3().setComponent(AXIS_S, 1);
+    if (homeCamPos.getComponent(AXIS_S) - homeTarget.getComponent(AXIS_S) < 0) side.negate();
+    const up = new THREE.Vector3().setComponent(AXIS_H, 1);
+    const W = 1600;
+    const H = Math.max(8, Math.round((W * lenH) / lenW));
+    const pad = 1.03;
+    const cam = new THREE.OrthographicCamera((-lenW / 2) * pad, (lenW / 2) * pad, (lenH / 2) * pad, (-lenH / 2) * pad, 0.001, radius * 40);
+    cam.up.copy(up);
+    cam.position.copy(centre).addScaledVector(side, radius * 10);
+    cam.lookAt(centre);
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+    // The weapon alone, in white, on nothing.
+    const flat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    const stage = new THREE.Scene();
+    stage.overrideMaterial = flat;
+    const parent = object.parent;
+    const rt = new THREE.WebGLRenderTarget(W, H);
+    const clear = renderer.getClearColor(new THREE.Color());
+    const clearA = renderer.getClearAlpha();
+    const px = new Uint8Array(W * H * 4);
+    try {
+      stage.add(object);
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear();
+      renderer.render(stage, cam);
+      renderer.readRenderTargetPixels(rt, 0, 0, W, H, px);
+    } finally {
+      renderer.setRenderTarget(null);
+      renderer.setClearColor(clear, clearA);
+      if (parent) parent.add(object);
+      rt.dispose();
+      flat.dispose();
+    }
+    // Top row first, as an image is.
+    const mask = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+      const src = (H - 1 - y) * W * 4;
+      for (let x = 0; x < W; x++) mask[y * W + x] = px[src + x * 4] > 127 ? 1 : 0;
+    }
+    const at = new THREE.Vector3();
+    const pts = anchorPoints().map((a) => {
+      at.copy(a.p).project(cam);
+      return { index: a.index, x: ((at.x + 1) / 2) * W, y: ((1 - at.y) / 2) * H };
+    });
+    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts };
+  }
+  function frameStickers(mode: "in" | "back" | "stay", slots?: number[]) {
+    if (disposed) return;
+    if (mode === "stay") {
+      stickerReturn = null;
+      return;
+    }
+    if (mode === "back") {
+      if (stickerReturn) camFlight = { t0: performance.now(), ms: 550, from: poseNow(), to: stickerReturn };
+      stickerReturn = null;
+      return;
+    }
+    if (stickerReturn) return;
+    const box = stickerZone(slots);
+    if (!box) return;
+    stickerReturn = poseNow();
+    // From the home side — the side the slots are on — measured in that
+    // camera's own frame: the box's extent across the view, and its centre's
+    // offset from the target.
+    const look = camera.clone();
+    look.position.copy(homeCamPos);
+    look.lookAt(homeTarget);
+    look.updateMatrixWorld();
+    const t = homeTarget.clone().applyMatrix4(look.matrixWorldInverse);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    const c = new THREE.Vector3();
+    for (let i = 0; i < 8; i++) {
+      c.set(i & 1 ? box.max.x : box.min.x, i & 2 ? box.max.y : box.min.y, i & 4 ? box.max.z : box.min.z);
+      c.applyMatrix4(look.matrixWorldInverse);
+      minX = Math.min(minX, c.x);
+      maxX = Math.max(maxX, c.x);
+      minY = Math.min(minY, c.y);
+      maxY = Math.max(maxY, c.y);
+    }
+    const halfH = (camera.top - camera.bottom) / 2;
+    const aspect = (camera.right - camera.left) / Math.max(1e-6, camera.top - camera.bottom);
+    // The sticker surface across about 60% of the pane.
+    const need = Math.max((maxY - minY) / 2, (maxX - minX) / 2 / aspect) / 0.6;
+    const zoom = clamp(halfH / Math.max(need, 1e-6), controls.minZoom, controls.maxZoom);
+    // Pan is the picture's own move in CSS pixels (x right, y down): bring the
+    // box's centre to the middle.
+    const wpp = (camera.top - camera.bottom) / zoom / Math.max(1, cssH);
+    const cx = (minX + maxX) / 2 - t.x;
+    const cy = (minY + maxY) / 2 - t.y;
+    camFlight = {
+      t0: performance.now(),
+      ms: 650,
+      from: poseNow(),
+      to: { pos: homeCamPos.clone(), target: homeTarget.clone(), zoom, pan: new THREE.Vector2(-cx / wpp, cy / wpp) },
+    };
+  }
+
   // ---- Sticker decals ----------------------------------------------------------
   // How many world units one TEXCOORD_1 unit spans, taken as the median over
   // triangle edges (median, not mean: degenerate slivers would drag an average
@@ -6244,8 +6836,7 @@ async function buildViewer(
     }
     // A flash outlives its mesh otherwise, and would then re-target whatever
     // mesh next lands in this slot.
-    flashing.delete(slot);
-    glowLevel.delete(slot);
+    decalGlow.forget(slot);
   }
   function removeDecal(slot: number) {
     disposeSlotMesh(slot);
@@ -6770,7 +7361,12 @@ async function buildViewer(
     const abort = (why: string): BuildResult => {
       const cur = decals.get(st.slot);
       if (cur?.seq === seq) {
-        if (prev) decals.set(st.slot, prev);
+        // Back to what is DRAWN, which is not always `prev`: prev may itself
+        // have been a build that was overtaken and thrown away before it drew
+        // (see "STILL WANTED?" below), and pointing at it would let a later
+        // request for that placement pass as "unchanged" with nothing on screen.
+        const drawn = liveMesh.get(st.slot)?.userData.decalKey as string | undefined;
+        if (drawn) decals.set(st.slot, { key: drawn, seq: prev?.seq ?? seq });
         else decals.delete(st.slot);
       }
       if (STICKER_LOG) {
@@ -6969,6 +7565,20 @@ async function buildViewer(
       // Through the weapon's sticker mask — only on the UV path, the one whose
       // geometry carries the body UV1 the mask is sampled at.
       const wepMask = uvCut ? await stickerMask() : null;
+      // STILL WANTED? The two awaits above are a new material's first build, and
+      // the slot can move on while they run: a newer build for it starts (the
+      // pointer kept moving), or it is removed outright. Adding this mesh anyway
+      // left it in the scene with nothing holding it — liveMesh only knows the
+      // newest — so a fast first drag (a Sticker Craft dropped onto the gun)
+      // strewed copies along the pointer's path that stayed until a remount.
+      const now = decals.get(st.slot);
+      if (disposed || !now || now.seq !== seq) {
+        geom.dispose();
+        mat.dispose();
+        return { status: "aborted" };
+      }
+      // And whatever a build that finished in the meantime put up is replaced.
+      disposeSlotMesh(st.slot);
       if (wepMask) applyStickerMask(mat, wepMask);
       mesh = new THREE.Mesh(geom, mat);
       mesh.userData.stickerSlot = st.slot;
@@ -6978,6 +7588,8 @@ async function buildViewer(
       scene.add(mesh);
       liveMesh.set(st.slot, mesh);
     }
+    // Which placement this mesh shows — what an abort falls back to.
+    mesh.userData.decalKey = key;
     // Anchor point, facing and on-screen size, kept for the grab test — see
     // pickSticker. The radius is what makes a big zoomed-in sticker grabbable
     // across its whole face instead of only near its centre.
@@ -7016,29 +7628,13 @@ async function buildViewer(
   }
 
   // ---- Decal glow: "it's over here" flash + grabbable pulse ---------------------
-  // Two effects on one channel (the decal's emissive, tinted by the sticker's own
-  // art via emissiveMap), because they are the same pixel and must never fight
-  // over it: the FLASH announces a newly placed sticker against a loud paint, and
-  // the PULSE breathes under the pointer so you can see what a press would grab
-  // before you press it. Purely visual — neither touches the saved placement, and
-  // the level always returns to 0 so a decal cannot be left glowing.
-  const FLASH_MS = 1100;
-  const flashing = new Map<number, number>(); // slot -> start timestamp
-  // Peak of the hover breath. Reads as a light source on the sticker rather than
-  // a tint on it — a subtler version was there first and got lost against a
-  // bright finish, which is exactly when you most need to know what you're about
-  // to grab. The trough is deliberately well below the peak (see below) so it
-  // pulses instead of just sitting bright.
-  const HOVER_GLOW = 1.15;
-  const HOVER_PERIOD_MS = 900;
-  /** Seconds to close the gap to the target level — a fade, so moving the
-   *  pointer across a row of stickers reads as a sweep rather than a strobe. */
-  const GLOW_FADE = 0.11;
-  const glowLevel = new Map<number, number>(); // slot -> current emissive intensity
-  let glowLast = 0;
+  // The flash on a newly placed sticker and the breath under the pointer, shared
+  // with the Sticker Crafts mat so a sticker you can grab looks the same in both
+  // (stickerGlow.ts).
+  const decalGlow = createStickerGlow<number>();
   function flashSticker(slot: number) {
     if (!liveMesh.has(slot)) return;
-    flashing.set(slot, performance.now());
+    decalGlow.flash(slot);
   }
   /**
    * Holo and lenticular stickers, live: the game's view term, from the camera.
@@ -7097,41 +7693,10 @@ async function buildViewer(
   }
 
   function stepDecalGlow(now: number) {
-    const dt = glowLast ? Math.min((now - glowLast) / 1000, 0.1) : 0;
-    glowLast = now;
     // A held sticker keeps the glow (it reads as "you have this"); everything
     // else is lit only while the pointer is actually over it.
     const litSlot = drag?.type === "sticker" ? drag.slot : hoverSlot;
-    for (const [slot, mesh] of liveMesh) {
-      const mat = mesh.material as import("three").MeshStandardMaterial | undefined;
-      if (!mat?.emissive) continue;
-      let target = 0;
-      const start = flashing.get(slot);
-      if (start != null) {
-        const t = (now - start) / FLASH_MS;
-        if (t >= 1) flashing.delete(slot);
-        // Three quick pulses that fade out over the flash's life.
-        else target = Math.abs(Math.sin(t * Math.PI * 3)) * (1 - t) * 0.9;
-      }
-      if (slot === litSlot) {
-        target = Math.max(target, HOVER_GLOW * (0.45 + 0.55 * (0.5 - 0.5 * Math.cos((now / HOVER_PERIOD_MS) * Math.PI * 2))));
-      }
-      const cur = glowLevel.get(slot) ?? 0;
-      // Exponential approach, frame-rate independent: the same fade at 30fps and
-      // at 144fps.
-      const next = dt > 0 ? cur + (target - cur) * (1 - Math.exp(-dt / GLOW_FADE)) : target;
-      if (next < 0.002 && cur < 0.002) {
-        if (cur !== 0) {
-          glowLevel.set(slot, 0);
-          mat.emissive.setScalar(0);
-          mat.emissiveIntensity = 1;
-        }
-        continue;
-      }
-      glowLevel.set(slot, next);
-      mat.emissive.setScalar(1);
-      mat.emissiveIntensity = next;
-    }
+    decalGlow.step(now, liveMesh, (slot) => slot === litSlot);
   }
 
   /**
@@ -10354,6 +10919,25 @@ async function buildViewer(
       y: (hit.point.getComponent(AXIS_H) - baseH) / OFFSET_SCALE,
     };
   }
+  /**
+   * The point of the sticker surface under a screen position, in offset space
+   * (uv1 - 0.5) — what a slot's x/y measure once its anchor is subtracted.
+   * Null off the gun, or on a model with no sticker markup (no unwrap to measure
+   * in). For dropping a Sticker Craft, which seats several slots around one
+   * point; see the craft drop in App.vue.
+   */
+  function stickerSpotAt(clientX: number, clientY: number): { u: number; v: number } | null {
+    if (disposed || !uv1Meshes.length) return null;
+    const rect = el.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
+    const ndc = new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+    raycaster.far = Infinity;
+    raycaster.setFromCamera(ndc, camera);
+    const hit = raycaster.intersectObjects(uv1Meshes, false)[0];
+    const uv = hit ? surfaceUv1(hit) : null;
+    return uv ? { u: round(uv.u - 0.5, 4), v: round(uv.v - 0.5, 4) } : null;
+  }
+
   /** Measure dragGrab for a slot from a hit under the pointer. */
   function takeStickerGrab(slot: number, hit: import("three").Intersection) {
     const at = liveMesh.get(slot)?.userData.stickerXY as [number, number] | undefined;
@@ -14291,7 +14875,73 @@ async function buildViewer(
     else fpvCamera.setViewOffset(w, h, -w * fx, -h * fy, w, h);
   };
 
-  const drawFrame = () => {
+  /**
+   * DIRECT (the `directgl` switch, on by default in Safari): while this is the
+   * viewer on top (drawingViewers), the shared WebGL canvas sits in this pane
+   * itself and the per-frame copy into the 2D canvas below is skipped.
+   *
+   * The copy is what lets one context serve every viewer, and it is free where
+   * the browser keeps it on the GPU (Chrome). Safari copies a WebGL canvas into
+   * a 2D one through its GPU process, a full-resolution frame each time: on an
+   * M3 Pro that drew a frame in under 2ms, the copy held the view to 12-20fps
+   * and stuttering; drawn directly it ran at a steady 60. When a frame has to be
+   * READ (snapshot, the stage's held frame — see the "cs2-hold-frame"
+   * listener), it is copied as well. Read at mount: switch it, then reopen the
+   * item.
+   *
+   * ON TOP, not ALONE. It used to need this to be the only live viewer, and the
+   * item editor never is: the focus view stays mounted (suspended) under it, so
+   * the editor, and a sticker's preview over the editor, always took the copy.
+   * The viewers under the top one stop drawing instead — they are behind a
+   * modal — and show the frame `keep` left in their own 2D canvas.
+   */
+  const directWanted = !opts?.still && debugFlag("directgl");
+  const screen: ScreenSlot = {
+    container,
+    direct: directWanted,
+    keep: () => {
+      // The frame as the loop draws it: the inspect turn is only applied
+      // between applyInspect and clearInspect (see snapshot).
+      applyInspect();
+      drawFrame(true);
+      clearInspect();
+    },
+    redraw: () => drawFrame(),
+  };
+  const takeSharedCanvas = () => {
+    const c = renderer.domElement;
+    if (directOwner && directOwner !== screen) directOwner.keep();
+    c.remove();
+    // Over the 2D canvas (which keeps the pointer handlers) and under the
+    // overlays appended after it; pointer-events off so input still lands there.
+    c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none";
+    container.insertBefore(c, view);
+    container.addEventListener("cs2-hold-frame", holdFrame);
+    directOwner = screen;
+  };
+  const dropSharedCanvas = () => {
+    if (renderer.domElement.parentElement === container) renderer.domElement.remove();
+    if (directOwner === screen) directOwner = null;
+    container.removeEventListener("cs2-hold-frame", holdFrame);
+  };
+  /**
+   * The stage asks for this frame in the 2D canvas before it copies it out to
+   * hold over a remount (ItemStage). Drawn straight to the screen, the 2D canvas
+   * holds nothing and the shared one reads back blank between frames, so draw
+   * one now and copy it — synchronously, inside the stage's own dispatch.
+   */
+  const holdFrame = () => {
+    if (!disposed && renderer.domElement.parentElement === container) drawFrame(true);
+  };
+  const drawFrame = (forceBlit = false) => {
+    const top = drawingViewers[drawingViewers.length - 1];
+    const direct = directWanted && !released && top === screen;
+    // Under a viewer that is on the screen itself: hold the frame `keep` left
+    // and leave the GPU to the one on top. A frame someone asked for (snapshot,
+    // held frame) is still drawn.
+    if (!direct && !forceBlit && top?.direct && top !== screen) return;
+    if (direct && renderer.domElement.parentElement !== container) takeSharedCanvas();
+    else if (!direct) dropSharedCanvas();
     renderer.setSize(cssW, cssH, false);
     // Per frame, because the renderer is shared: the last viewer to draw would
     // otherwise decide every other viewer's exposure.
@@ -14331,9 +14981,14 @@ async function buildViewer(
     } else {
       renderer.render(scene, activeCamera());
     }
-    if (!viewCtx) return;
+    if (!viewCtx || (direct && !forceBlit)) return;
     viewCtx.clearRect(0, 0, view.width, view.height);
     viewCtx.drawImage(renderer.domElement, 0, 0, view.width, view.height);
+    // Drawn through the canvas the viewer on top is showing (a snapshot from
+    // under it): put that one's frame back before the browser paints this one.
+    if (!direct && directOwner && directOwner !== screen && directOwner === drawingViewers[drawingViewers.length - 1]) {
+      directOwner.redraw();
+    }
   };
   /**
    * Pick up settings changed while this viewer is on screen.
@@ -14393,6 +15048,7 @@ async function buildViewer(
     // Before anything reads the rig or the clip this frame — a preset applied
     // between applyInspect and clearInspect would be reverted by the latter.
     syncLiveSettings();
+    stepCamFlight();
     controls.update();
     // The arms, if there are any. BEFORE stepInspect and the charm: the weapon
     // is parented to a hand bone in this mode, so its world transform for this
@@ -14545,6 +15201,7 @@ async function buildViewer(
   // consequence of sharing: they were all drawing through the same context.
   const onContextLost = () => {
     disposed = true;
+    dropSharedCanvas();
     // This viewer is dead whether or not the caller ever disposes it — stop
     // holding the bake queue hostage on a context that will never draw again.
     release();
@@ -14562,15 +15219,21 @@ async function buildViewer(
   let released = !!opts?.still;
   if (!released) {
     liveViewers++;
+    drawingViewers.push(screen);
     // Cancel any in-flight settle: the user came back inside the window, so the
     // wait restarts rather than expiring under a viewer that is now onscreen.
     clearTimeout(idleTimer);
     idleTimer = undefined;
   }
+  const leaveScreen = () => {
+    const i = drawingViewers.indexOf(screen);
+    if (i >= 0) drawingViewers.splice(i, 1);
+  };
   // dispose() can follow a context-loss teardown, so the release must latch.
   const release = () => {
     if (released) return;
     released = true;
+    leaveScreen();
     releaseViewer();
   };
 
@@ -14594,6 +15257,7 @@ async function buildViewer(
     setInspectTime: (t) => setInspectTime(t),
     setStickers,
     flashSticker,
+    stickerSpotAt,
     setCharm: (c) => (charmWork = setCharm(c)),
     charmReady: () => charmWork,
     setPaintVariant: (wear, seed, proxy) => setPaintVariant(wear, seed, proxy),
@@ -14603,13 +15267,18 @@ async function buildViewer(
       target: controls.target.toArray() as [number, number, number],
     }),
     resetCamera: (side) => resetCamera(side),
+    frameStickers: (mode, slots) => frameStickers(mode, slots),
+    sideOutline: () => sideOutline(),
     setSuspended: (on) => {
       if (on === suspended || disposed) return;
       suspended = on;
       if (on) {
         cancelAnimationFrame(raf);
+        leaveScreen();
         return;
       }
+      // Back on top: whatever opened over it has gone.
+      if (!released && !drawingViewers.includes(screen)) drawingViewers.push(screen);
       // Drop the gap rather than banking it: the clocks report time since they
       // were last READ, so a resume would otherwise advance every animation by
       // the length of the pause in a single frame.
@@ -15306,8 +15975,9 @@ async function buildViewer(
       stepCharm();
       // Through the same blit the screen sees, so a snapshot is exactly the
       // frame a user would get — and reading from the 2D canvas sidesteps the
-      // shared drawing buffer being cleared before toBlob can run.
-      drawFrame();
+      // shared drawing buffer being cleared before toBlob can run. Copied even
+      // when the pane shows the shared canvas directly (`directgl`).
+      drawFrame(true);
       // Before the await, never after: OrbitControls re-derives its orbit from
       // camera.position at the top of every update(), so a camera left rotated
       // across a frame boundary is one whose next update treats the clip's turn
@@ -15319,6 +15989,7 @@ async function buildViewer(
       disposed = true;
       release();
       cancelAnimationFrame(raf);
+      dropSharedCanvas();
       freeLookOff?.();
       freeLookOff = null;
       flash?.dispose();

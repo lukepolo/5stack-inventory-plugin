@@ -123,6 +123,10 @@ watch(
     clearTimeout(freezeTimer);
     if (busy) {
       if (frozen.value) return;
+      // A viewer drawing straight to the screen (`directgl`, Safari's default)
+      // keeps nothing in its 2D canvas; this asks it to copy one frame there
+      // first. Synchronous, so the frame is in place for the read below.
+      hostEl.value?.dispatchEvent(new Event("cs2-hold-frame"));
       for (const c of hostEl.value?.querySelectorAll("canvas") ?? []) {
         try {
           const url = (c as HTMLCanvasElement).toDataURL("image/png");

@@ -50,6 +50,7 @@ Then open one of:
 |---|---|
 | `http://localhost:5199/batch.html` | runs every fixture + a wear sweep, prints a PASS/FAIL table |
 | `http://localhost:5199/fpv.html?model=aug` | mounts the REAL viewer in first person, fires, and captures consecutive frames off the visible canvas — for anything that only goes wrong while a weapon is being held |
+| `http://localhost:5199/outlines.html` | bakes `src/weaponOutlines.json`: mounts every sticker-taking weapon through the REAL viewer (shape only), traces its side outline with `src/outlineTrace.ts`, draws each as a card to check, and prints the table as JSON (`?only=ak47` for one) — rerun it when a CS2 update changes a weapon's model or sticker slots |
 | `http://localhost:5199/flash.html` | the muzzle flash alone, plain and through the bloom composer, with each sprite's blend state printed |
 | `http://localhost:5199/?model=famas&pm=/materials/<file>.vcompmat.json&wear=0.4&seed=821` | one skin, full resolved detail as JSON |
 | `http://localhost:5199/mount.html?model=knife_flip&stattrak=1337&va=0,3.1416&plain=1` | the REAL viewer with any item and options from the URL — stickers + offsets, StatTrak, name tag, view angles, timed live shots, a `plain` twin for diffing (parameters in `mount.ts`'s header); collect with `shoot.mjs` |

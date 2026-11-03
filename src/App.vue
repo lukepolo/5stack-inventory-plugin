@@ -6,7 +6,7 @@ import {
   Loader2, Search, LayoutGrid, Crosshair,
   Package, Hammer, Trash2, Copy, RotateCcw, Sparkles, Replace, RefreshCw, Pencil, Plus, X, Settings, Box, Clock, CircleDollarSign,
   Image as ImageIcon, Check, ExternalLink, SlidersHorizontal, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, Palette, Link2,
-  Layers,
+  Layers, Sticker as StickerIcon, Group as GroupIcon, Ungroup as UngroupIcon, Move as MoveIcon,
 } from "lucide-vue-next";
 import {
   fetchCatalog,
@@ -96,6 +96,7 @@ import { activeFlags, flagValue, flagsVersion } from "./devFlags";
 // The catalog browser (its own screen) and the sticker/charm picker (an
 // overlay) are never on screen at load either: async, ~39kB off the boot chunk.
 const Armory = defineAsyncComponent(() => import("./components/Armory.vue"));
+const StickerCrafts = defineAsyncComponent(() => import("./components/StickerCrafts.vue"));
 import InventoryScreen from "./components/InventoryScreen.vue";
 import LoadoutGrid from "./components/LoadoutGrid.vue";
 const AttachmentPicker = defineAsyncComponent(() => import("./components/AttachmentPicker.vue"));
@@ -110,6 +111,7 @@ import ItemTile from "./components/ItemTile.vue";
 import MusicPlayer from "./components/MusicPlayer.vue";
 import MusicVolume from "./components/MusicVolume.vue";
 import TileActions from "./components/TileActions.vue";
+import ModelRail from "./components/ModelRail.vue";
 import FilterDropdown from "./components/FilterDropdown.vue";
 import InfiniteSentinel from "./components/InfiniteSentinel.vue";
 import SortDirection from "./components/SortDirection.vue";
@@ -164,15 +166,19 @@ import { useViewerStage, type StageIcon, type StageKey } from "./composables/use
 import { useDebouncedSearch } from "./composables/useDebouncedSearch";
 import { useInventoryView } from "./composables/useInventoryView";
 import { useAttachmentPicker, type PickerRow } from "./composables/useAttachmentPicker";
+import type { SavedCraft } from "./stickerCraftsModel";
+import { useStickerCraftPlacement } from "./composables/useStickerCraftPlacement";
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
 import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, weaponName, wearTier, wearPositionInTier } from "./itemVisuals";
 import { stackByDesign, TINT_SUFFIX } from "./decks";
-import { loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
+import { evictPaintTextures, loadPaintDef, seedMovesPattern, type PaintDef } from "./paintComposite";
 import { formatGunTrait, gunPlacement, gunPlacementTable, gunPlacementTraits } from "./gunPattern";
 import { gloveSeedMoves, loadGloveModernDef, type GloveModernDef } from "./gloveCompositeModern";
 import { gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { glovePlacementAt, glovePlacementTable, glovePlacementTraits } from "./glovePattern";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
+import { CTA_CLASS, CTA_STYLE } from "./ctaButton";
+import { slotsText } from "./craftPlanText";
 import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync } from "./modelAvailability";
 import { INCOMPLETE } from "./viewerSentinel";
@@ -270,6 +276,7 @@ const team = ref<Team>("CT");
 //   /focus               focus view       /items/<id>/craft  craft editor
 //   /items               inventory        /items/<id>/3d     3D viewer
 //   /admin[/section]     admin            /craft/<skinId>    unsaved draft
+//   /sticker-crafts      sticker board
 const route = computed(() => parsePath(router.path.value));
 
 // Paths a modal was opened from, so closing it can go back. Declared up here
@@ -321,6 +328,7 @@ const SCREEN_ROUTE: Record<ReturnType<typeof screenFor>, Route> = {
   focus: { name: "focus" },
   inventory: { name: "inventory" },
   armory: { name: "armory" },
+  stickers: { name: "stickerCrafts" },
   admin: { name: "admin", section: "" },
 };
 const adminSection = computed(() => (route.value.name === "admin" ? route.value.section : ""));
@@ -380,11 +388,12 @@ const go = (to: string, options: { replace?: boolean; query?: Record<string, str
 // Loadout in the tab bar — so it slides in from the right and pushes Loadout
 // out to the left. Direction is read at transition time, when `view` already
 // holds the incoming screen, so enter/leave stay on the same axis.
-// Screens are ordered left-to-right: loadout, inventory, armory. Sliding by
+// Screens are ordered left-to-right: loadout, inventory, armory, then the
+// sticker board. Sliding by
 // that order is what makes the swap read as travel rather than a redraw — the
 // armory sits PAST the inventory (you get to it from there), so it arrives from
 // the right the way the inventory does from the loadout.
-const VIEW_ORDER: Record<string, number> = { grid: 0, focus: 0, inventory: 1, armory: 2, admin: 3 };
+const VIEW_ORDER: Record<string, number> = { grid: 0, focus: 0, inventory: 1, armory: 2, stickers: 3, admin: 4 };
 const viewDeeper = computed(() => (VIEW_ORDER[view.value] ?? 0) > 0);
 const viewEnterFrom = computed(() =>
   viewDeeper.value ? "opacity-0 translate-x-4" : "opacity-0 -translate-x-4",
@@ -2841,6 +2850,8 @@ async function saveCraft(andEquip = false) {
     const body = craftBody();
     if (editingId.value != null) {
       const updated = await updateInstance(editingId.value, body);
+      // A Sticker Craft placed on it stays a group the next time it is opened.
+      craftDrop.persist(updated.id);
       renderedIds.delete(updated.id);
       void generateRender(updated, { force: true }).then((ok) => {
         if (ok) bakeStamp.value = { ...bakeStamp.value, [updated.id]: Date.now() };
@@ -2875,6 +2886,7 @@ async function saveCraft(andEquip = false) {
       );
     } else {
       const inst = await craftItem({ item_id: craft.value.skin.id, ...body });
+      craftDrop.persist(inst.id);
       void generateRender(inst).then((ok) => {
         if (ok) bakeStamp.value = { ...bakeStamp.value, [inst.id]: Date.now() };
       });
@@ -2949,8 +2961,45 @@ const queuedIds = ref<Set<number>>(new Set());
 let cardsStale = false;
 const TOUCH_BAKE_BACKLOG = 3;
 const TOUCH_BAKE_COOLDOWN_MS = 400;
-const bakeCooldown = () =>
-  isCoarse.value ? new Promise((r) => setTimeout(r, TOUCH_BAKE_COOLDOWN_MS)) : Promise.resolve();
+// ---- desktop pacing ---------------------------------------------------------
+// A computer bakes every card that has none stored, back to back, which on a
+// 400-item inventory is minutes of a second WebGL context compositing 2K paints
+// — the Mac stays busy and the page stutters while it runs. It keeps its whole
+// queue (unlike a phone, nothing is dropped: a card already on screen would not
+// ask again), but bakes in BATCHES: a short gap between bakes and a rest after
+// every few, so the page in front of you gets the machine back in between.
+const DESK_BAKE_BATCH = 4;
+const DESK_BAKE_GAP_MS = 250;
+const DESK_BAKE_REST_MS = 2000;
+let deskBakesInBatch = 0;
+/** The last queued run actually baked (a card already stored is no bake). */
+let bakedSinceCooldown = false;
+const bakeCooldown = () => {
+  // Nothing was drawn — a stored card, a kind that isn't baked — so there is
+  // nothing for the browser to reclaim and no reason to make the next one wait.
+  if (!bakedSinceCooldown) return Promise.resolve();
+  bakedSinceCooldown = false;
+  if (isCoarse.value) return new Promise((r) => setTimeout(r, TOUCH_BAKE_COOLDOWN_MS));
+  deskBakesInBatch = (deskBakesInBatch + 1) % DESK_BAKE_BATCH;
+  return new Promise((r) => setTimeout(r, deskBakesInBatch === 0 ? DESK_BAKE_REST_MS : DESK_BAKE_GAP_MS));
+};
+/**
+ * Free the paint textures a background bake loaded.
+ *
+ * The paint compositor caches its input textures for the session (2K masks
+ * and patterns, a few to tens of MB per finish), which suits a viewer reopening
+ * the same skin but not a backfill walking a whole inventory: every finish it
+ * baked stayed in memory, and on a Mac that memory is the GPU's AND everything
+ * else's. Background bakes only ever run with no 3D viewer on screen (see
+ * viewersIdle), so nothing live needs what this one loaded; the two shared
+ * sheets every finish reads stay. The same trim the admin pre-bake does between
+ * skins (compositePrebake.ts).
+ */
+function trimPaintCache() {
+  const s = viewerStats();
+  if (s.live || s.building) return;
+  void evictPaintTextures((url) => /paint_wear|gun_grunge/.test(url));
+}
 
 /**
  * `force`: bake even though a card may already be stored, and even if a bake
@@ -3053,6 +3102,7 @@ async function generateRenderNow(inst: InventoryItem, force = false): Promise<bo
   // queued, because that is what it is.
   await viewersIdle();
   renderingIds.value = new Set([...renderingIds.value, inst.id]);
+  bakedSinceCooldown = true;
   try {
     // Gated by KIND, not by "did the lookup come back empty" — the same split
     // craftVisualOpts makes. Sticker slots, a hanging charm and a StatTrak
@@ -3102,6 +3152,7 @@ async function generateRenderNow(inst: InventoryItem, force = false): Promise<bo
       // while a 3D viewer is onscreen instead of fighting it for the GPU.
       true,
     );
+    trimPaintCache();
     if (blob === INCOMPLETE) {
       // Paint assets aren't extracted yet — this would bake a white gun, and
       // render keys never change, so it would be served forever. Leave the id
@@ -3653,6 +3704,9 @@ async function moveSticker(from: number, to: number) {
   const c = craft.value;
   const model = craftTarget.value?.model;
   if (!c || from === to || !c.stickers[from]) return;
+  // A placed Sticker Craft moves as one block, and is never broken up by a
+  // reorder — see useStickerCraftPlacement.
+  if (craftDrop.moveWithGroup(from, to)) return;
   const geo = model ? await fetchStickerGeometry(model) : null;
   if (craft.value !== c) return;
   const body = c.skin.legacyPaint && c.skin.paintMaterial ? "body_legacy" : "body_hd";
@@ -3675,6 +3729,53 @@ async function moveSticker(from: number, to: number) {
   const b = c.stickers[to];
   c.stickers[to] = a ? reanchor(a, from, to) : null;
   c.stickers[from] = b ? reanchor(b, to, from) : null;
+}
+/**
+ * A saved Sticker Craft, from the sticker picker's Sticker Crafts tab. It floats
+ * over the gun until it is dragged on, and stays a group once it is down — see
+ * useStickerCraftPlacement for the drop, the group and the board-to-unwrap units.
+ */
+const craftDrop = useStickerCraftPlacement({
+  craft,
+  instanceId: () => craftInstId.value,
+  model: () => craftTarget.value?.model,
+  viewer: () => modalViewer.current(),
+  placements: craftStickerPlacements,
+  slotCount: stickerSlotCount,
+  show3d: () => {
+    if (modal3dAvailable.value) modal3d.value = true;
+  },
+  // Close in on the sticker surface while it waits; back out if it is put
+  // back. A viewer still mounting picks it up in its ready callback below.
+  onWait: () => modalViewer.current()?.frameStickers("in", craftPending.value?.slots),
+  onSettle: (placed) => {
+    modalViewer.current()?.frameStickers(placed ? "stay" : "back");
+    if (placed) showCraftPlacedTip();
+  },
+});
+/** "Placed — drag any of its stickers…": after a craft lands, until the first
+ *  drag or a few seconds. */
+const craftPlacedTip = ref(false);
+let craftPlacedTipTimer: ReturnType<typeof setTimeout> | undefined;
+function showCraftPlacedTip() {
+  craftPlacedTip.value = true;
+  clearTimeout(craftPlacedTipTimer);
+  craftPlacedTipTimer = setTimeout(() => (craftPlacedTip.value = false), 6000);
+}
+// Top-level for the template, which only unwraps refs it can see directly.
+const {
+  pending: craftPending,
+  group: craftGroup,
+  ghost: craftGhost,
+  dragging: craftDragging,
+  pendingSlots: craftPendingSlots,
+  groupSlots: craftGroupSlots,
+} = craftDrop;
+function applyStickerCraft(entry: SavedCraft) {
+  const p = picker.value;
+  if (!p || p.kind !== "sticker") return;
+  picker.value = null;
+  void craftDrop.pickCraft(entry, p.slot);
 }
 /** The sticker tile being dragged onto another, for the reorder. */
 const stickerDragFrom = ref<number | null>(null);
@@ -3829,7 +3930,10 @@ async function mountModalViewer() {
       // Drags write straight into the craft form — the numeric inputs follow
       // live, and confirm sends the same offsets to the game server.
       onStickerPlaced(slot: number, x: number, y: number) {
+        craftPlacedTip.value = false;
         const st = craft.value?.stickers[slot];
+        // A craft's stickers move together; the rest follow this one.
+        if (st) craftDrop.followMove(slot, x, y);
         if (st) {
           st.x = x;
           st.y = y;
@@ -3837,6 +3941,7 @@ async function mountModalViewer() {
       },
       onStickerRotated(slot: number, r: number) {
         const st = craft.value?.stickers[slot];
+        if (st) craftDrop.followTurn(slot, r);
         if (st) st.r = r;
       },
       onCharmPlaced(x: number, y: number, z: number) {
@@ -3848,6 +3953,9 @@ async function mountModalViewer() {
       },
     }),
     (handle) => {
+      // A craft picked while this was mounting (the picker switches the editor
+      // to 3D for it) still gets the close look at the sticker surface.
+      if (craftPending.value) handle.frameStickers("in", craftPending.value.slots);
       // Re-apply the chosen pose: the 2D/3D toggle remounts, and a viewer that
       // came back in the default stance after the user picked "Open" would look
       // like the control had stopped working.
@@ -4418,7 +4526,29 @@ watch(
 // across this file: the Escape chain unwinds through it, the craft modal's
 // backdrop click closes back to the editor rather than discarding the edit, the
 // deep-link reader opens it, and the 3D editor checks it before mounting.
-const pickerView = useAttachmentPicker({ inventory, attachedName, fail });
+const pickerView = useAttachmentPicker({
+  inventory,
+  attachedName,
+  fail,
+  // How many stickers a Sticker Craft may bring: the gun's EMPTY slots. A craft
+  // never goes over a sticker already on the gun: picked from a full slot it
+  // goes in front of that sticker and moves it along (planRun in
+  // useStickerCraftPlacement).
+  craftRoom: () => {
+    const st = (craft.value?.stickers ?? []).slice(0, stickerSlotCount);
+    return stickerSlotCount - st.filter(Boolean).length;
+  },
+  // Said on each craft tile before Use: its run and who moves along for it.
+  craftPlan: (slot, n) => {
+    const c = craft.value;
+    const plan = c ? craftDrop.planFor(slot, n) : null;
+    if (!c || !plan) return null;
+    return {
+      slots: plan.slots,
+      moved: plan.moves.map(([from, to]) => ({ name: (c.stickers[from]?.name ?? "Sticker").replace(/^Sticker \| /, ""), to })),
+    };
+  },
+});
 const { picker, openPicker } = pickerView;
 
 // "1.2k" over "1204" — the compact count badge. It sat beside the attachment
@@ -4903,9 +5033,17 @@ const viewTabs = computed(() => [
     ? [
         { key: "inventory", label: "Inventory", icon: Package, to: "/items" },
         { key: "armory", label: "Craft", icon: Hammer, to: "/craft" },
+        { key: "stickers", label: "Sticker Crafts", icon: StickerIcon, to: "/sticker-crafts" },
       ]
     : []),
 ]);
+
+/**
+ * The Sticker Crafts tab's "NEW" thought bubble: up until Sticker Crafts has
+ * been opened once in this browser — by its tab, a link or the back button.
+ */
+const stickerCraftsSeen = usePersistedBool("cs2inv.stickerCrafts.seen", false);
+watch(view, (v) => v === "stickers" && (stickerCraftsSeen.value = true), { immediate: true });
 
 /** Owned only exists when signed in; Replace only on a weapon slot. */
 const sheetModeTabs = computed(() => [
@@ -5825,72 +5963,9 @@ async function jumpToCraftModel(key: string) {
   spyCraftSection(el);
 }
 
-const craftRailEdge = ref({ l: false, r: false });
-let craftRailEl: HTMLElement | null = null;
-const craftRailRo = new ResizeObserver(() => measureCraftRail());
-onBeforeUnmount(() => craftRailRo.disconnect());
-/** Fades and arrows only on a side that has more models past it. */
-function measureCraftRail() {
-  const r = craftRailEl;
-  if (!r) return;
-  const l = r.scrollLeft > 4;
-  const right = r.scrollLeft < r.scrollWidth - r.clientWidth - 4;
-  if (l !== craftRailEdge.value.l || right !== craftRailEdge.value.r) craftRailEdge.value = { l, r: right };
-}
-function centerCraftRail(smooth = true) {
-  const r = craftRailEl;
-  const b = r?.querySelector<HTMLElement>(`[data-model="${CSS.escape(craftCurrent.value)}"]`);
-  if (!r || !b) return;
-  r.scrollTo({ left: b.offsetLeft - (r.clientWidth - b.offsetWidth) / 2, behavior: smooth && !prefersReducedMotion() ? "smooth" : "auto" });
-}
-// Function ref, called on every render: only a NEW element is set up, or each
-// re-render would yank the rail back to centre while you're browsing it.
-function setCraftRailEl(el: unknown) {
-  const next = (el as HTMLElement) ?? null;
-  if (next === craftRailEl) return;
-  if (craftRailEl) craftRailRo.unobserve(craftRailEl);
-  craftRailEl = next;
-  if (!next) return;
-  craftRailRo.observe(next);
-  nextTick(() => {
-    centerCraftRail(false);
-    measureCraftRail();
-  });
-}
-watch(craftCurrent, () => centerCraftRail());
-watch(craftModels, () => nextTick(measureCraftRail));
-function nudgeCraftRail(dir: -1 | 1) {
-  craftRailEl?.scrollBy({ left: dir * craftRailEl.clientWidth * 0.8, behavior: prefersReducedMotion() ? "auto" : "smooth" });
-}
-// Mouse drag scrolls the rail (touch already does, natively).
-let railDrag: { x: number; left: number } | null = null;
-let railDragged = false;
-function onCraftRailDown(e: PointerEvent) {
-  if (e.pointerType !== "mouse" || e.button !== 0 || !craftRailEl) return;
-  railDrag = { x: e.clientX, left: craftRailEl.scrollLeft };
-  railDragged = false;
-  window.addEventListener("pointermove", onCraftRailMove);
-  window.addEventListener("pointerup", onCraftRailUp);
-  window.addEventListener("pointercancel", onCraftRailUp);
-}
-function onCraftRailMove(e: PointerEvent) {
-  if (!railDrag || !craftRailEl) return;
-  const dx = e.clientX - railDrag.x;
-  if (Math.abs(dx) > 5) railDragged = true;
-  if (railDragged) craftRailEl.scrollLeft = railDrag.left - dx;
-}
-function onCraftRailUp() {
-  window.removeEventListener("pointermove", onCraftRailMove);
-  window.removeEventListener("pointerup", onCraftRailUp);
-  window.removeEventListener("pointercancel", onCraftRailUp);
-  railDrag = null;
-  // The click that ends a drag lands on whatever silhouette is under the
-  // pointer; it isn't a pick.
-  setTimeout(() => (railDragged = false));
-}
-function pickCraftModel(key: string) {
-  if (!railDragged) void jumpToCraftModel(key);
-}
+// The rail itself — scrolling, fades, drag, centring — is ModelRail's.
+/** Each model's card art, by key, for the rail's art slot. */
+const railArtByKey = computed(() => new Map(craftModels.value.map((m) => [m.key, m.art])));
 
 // Selecting a slot from anywhere else (focus rail, a menu action, equipping)
 // pulls the rail to the category that actually contains it — otherwise the
@@ -7838,8 +7913,14 @@ function onGlobalKey(e: KeyboardEvent) {
       dismissLoadout3d();
       e.stopPropagation();
     } else if (picker.value) {
-      // Nested inside the craft sheet — closes back to it, not out of it.
-      picker.value = null;
+      // Nested inside the craft sheet — closes back to it, not out of it. A
+      // Sticker Craft's 3D look, over the picker, goes first.
+      if (pickerView.previewCraft.value) pickerView.previewCraft.value = null;
+      else picker.value = null;
+      e.stopPropagation();
+    } else if (craftPending.value) {
+      // A Sticker Craft waiting over the gun: put it back, keep the edit.
+      craftDrop.cancel();
       e.stopPropagation();
     } else if (craft.value) {
       closeCraft();
@@ -8750,6 +8831,15 @@ if (MDEBUG) {
           <component :is="t.icon" class="h-3.5 w-3.5" />
           <span v-if="!isCompact">{{ t.label }}</span>
           <span v-if="t.key === 'inventory' && inventory.length" class="font-mono text-f10 text-muted-foreground">{{ inventory.length }}</span>
+          <!-- Sticker Crafts is new: a thought bubble over its tab until it
+               has been opened once (stickerCraftsSeen). -->
+          <Transition name="new-bubble">
+            <span
+              v-if="t.key === 'stickers' && !stickerCraftsSeen"
+              class="new-bubble"
+              :class="isCompact ? 'is-compact' : ''"
+            >{{ tr("inventory.stickerCrafts.newBadge", "New") }}</span>
+          </Transition>
         </template>
       </PillTabs>
     </header>
@@ -8856,6 +8946,16 @@ if (MDEBUG) {
         :owned="ownedItemIds"
         :compact="isCompact"
         @pick="armoryPick"
+      />
+
+      <!-- ============ STICKER CRAFTS (sticker board) ============ -->
+      <StickerCrafts
+        v-else-if="view === 'stickers'"
+        key="stickers"
+        :inventory="inventory"
+        :attached-name="attachedName"
+        :compact="isCompact"
+        :weapons="weapons"
       />
 
       <!-- ============ INVENTORY VIEW ============ -->
@@ -9668,88 +9768,30 @@ if (MDEBUG) {
           class="flex flex-none items-center gap-2 border-b border-border py-1"
           :class="isCompact ? 'min-h-[62px] px-3' : 'min-h-[66px] px-6'"
         >
-          <!-- A fixed label, not the current model: the pinned header right
-               below already names it, and a button that grew and shrank with
-               the name shoved the whole rail sideways as you scrolled. -->
-          <FilterDropdown
-            class="flex-none"
+          <!-- The model rail (ModelRail): the pinned header right below
+               already names the model, so the menu keeps a fixed label. -->
+          <ModelRail
             label="Jump to"
-            :model-value="craftCurrent"
-            :options="craftModels.map((m) => ({ value: m.key, label: m.name, disabled: !m.count }))"
-            @update:model-value="jumpToCraftModel"
-          />
-          <span class="h-9 w-px flex-none bg-border" aria-hidden="true"></span>
-          <div class="relative min-w-0 flex-1">
-            <div
-              :ref="setCraftRailEl"
-              class="craft-rail relative flex gap-1 overflow-x-auto overscroll-x-contain"
-              @scroll.passive="measureCraftRail"
-              @pointerdown="onCraftRailDown"
-            >
-              <button
-                v-for="m in craftModels"
-                :key="m.key"
-                type="button"
-                :data-model="m.key"
-                class="flex flex-none flex-col items-center gap-[3px] rounded-md border px-1 py-1 transition-colors disabled:cursor-default disabled:opacity-30"
-                :class="[
-                  isCompact ? 'w-[80px]' : 'w-[92px]',
-                  craftCurrent === m.key ? 'border-[color:var(--acc)]' : 'border-transparent',
-                ]"
-                :style="craftCurrent === m.key ? { background: accentSoft } : {}"
-                :title="m.name"
-                :aria-label="m.name"
-                :aria-current="craftCurrent === m.key || undefined"
-                :disabled="!m.count"
-                @click="pickCraftModel(m.key)"
-              >
-                <!-- Fixed tracks: with an auto row the art's height:100% has
-                     nothing to resolve against and it draws at its natural
-                     height, straight over the label.
-                     Small on purpose. The sheet under the loadout is ~430px
-                     tall, and at 62px of art the rail and the pinned header
-                     left less than one 218px row of knives. -->
-                <span class="grid w-full place-items-center" :class="isCompact ? 'h-[30px]' : 'h-[34px]'" style="grid-template: 100% / 100%">
-                  <img
-                    :src="catalogArt[m.art.id] ?? m.art.image ?? undefined"
-                    alt=""
-                    draggable="false"
-                    class="h-full w-full select-none object-contain"
-                    @error="onCatalogArtError($event, m.art)"
-                    @load="onCatalogArtLoad"
-                  />
-                </span>
-                <span
-                  class="max-w-full truncate text-f8 uppercase leading-tight tracking-wider"
-                  :class="craftCurrent === m.key ? 'text-foreground' : 'text-muted-foreground/60'"
-                >{{ m.short }}</span>
-              </button>
-            </div>
-            <div
-              v-show="craftRailEdge.l"
-              class="pointer-events-none absolute inset-y-0 left-0 flex w-14 items-center"
-              style="background: linear-gradient(90deg, hsl(var(--background)) 30%, transparent)"
-            >
-              <button
-                type="button"
-                class="pointer-events-auto grid h-8 w-6 place-items-center rounded-md border border-border bg-card text-foreground transition-colors hover:border-muted-foreground"
-                aria-label="Scroll models left"
-                @click="nudgeCraftRail(-1)"
-              ><ChevronLeft class="h-3.5 w-3.5" /></button>
-            </div>
-            <div
-              v-show="craftRailEdge.r"
-              class="pointer-events-none absolute inset-y-0 right-0 flex w-14 items-center justify-end"
-              style="background: linear-gradient(270deg, hsl(var(--background)) 30%, transparent)"
-            >
-              <button
-                type="button"
-                class="pointer-events-auto grid h-8 w-6 place-items-center rounded-md border border-border bg-card text-foreground transition-colors hover:border-muted-foreground"
-                aria-label="Scroll models right"
-                @click="nudgeCraftRail(1)"
-              ><ChevronRight class="h-3.5 w-3.5" /></button>
-            </div>
-          </div>
+            :items="craftModels.map((m) => ({ key: m.key, name: m.name, short: m.short, disabled: !m.count }))"
+            :current="craftCurrent"
+            :compact="isCompact"
+            :active-bg="accentSoft"
+            @select="jumpToCraftModel"
+          >
+            <!-- Small on purpose. The sheet under the loadout is ~430px tall,
+                 and at 62px of art the rail and the pinned header left less
+                 than one 218px row of knives. -->
+            <template #art="{ item }">
+              <img
+                :src="catalogArt[railArtByKey.get(item.key)!.id] ?? railArtByKey.get(item.key)!.image ?? undefined"
+                alt=""
+                draggable="false"
+                class="h-full w-full select-none object-contain"
+                @error="onCatalogArtError($event, railArtByKey.get(item.key)!)"
+                @load="onCatalogArtLoad"
+              />
+            </template>
+          </ModelRail>
         </div>
 
         <div
@@ -10285,6 +10327,49 @@ if (MDEBUG) {
                      stays live and its button toggles the panel shut, and OVER
                      the stage so the first click anywhere else dismisses. -->
                 <div v-if="modal3d && devHudOpen" class="absolute inset-0 z-[4]" @click="devHudOpen = false"></div>
+                <!-- A picked Sticker Craft, held up over the gun until it is
+                     dragged on (useStickerCraftPlacement). Floating where the
+                     gun is not, so the first thing it says is "drag me". Made
+                     transparent rather than removed while dragging: the drag
+                     holds its pointer capture on this element. -->
+                <!-- On a phone it is small and up out of the way: a big card over
+                     the stage covered the gun it is meant to be dropped on. -->
+                <div
+                  v-if="modal3d && craftPending"
+                  class="pointer-events-none absolute inset-x-0 z-[6] flex justify-center"
+                  :class="isCompact ? 'top-12' : 'top-[13%]'"
+                >
+                  <div
+                    class="animate-craft-float pointer-events-auto flex cursor-grab flex-col items-center gap-1.5 rounded-lg border border-dashed border-[color:var(--acc)] bg-card/75 shadow-lg backdrop-blur transition-opacity"
+                    :class="[craftDragging ? 'opacity-0' : '', isCompact ? 'p-1.5' : 'p-2']"
+                    style="touch-action: none"
+                    :title="'Drag onto the gun to place ' + craftPending.entry.name + ', or tap to put it on its slots'"
+                    @pointerdown="craftDrop.startDrag"
+                  >
+                    <div class="grid place-items-center overflow-hidden rounded bg-[#183a31]/70" :class="isCompact ? 'h-12 w-24' : 'h-20 w-40'">
+                      <img v-if="craftPending.entry.preview" :src="craftPending.entry.preview" alt="" class="h-full w-full object-cover" draggable="false" />
+                      <div v-else class="flex flex-wrap items-center justify-center gap-1 p-1">
+                        <img v-for="(cs, ci) in craftPending.entry.stickers" :key="ci" :src="cs.image" alt="" class="object-contain" :class="isCompact ? 'h-5 w-5' : 'h-8 w-8'" draggable="false" />
+                      </div>
+                    </div>
+                    <span class="flex items-center gap-1.5 text-f10 uppercase tracking-cs1 text-foreground">
+                      <MoveIcon class="h-3.5 w-3.5 text-[color:var(--acc)]" /> Drag onto the gun
+                    </span>
+                    <button
+                      :class="CTA_CLASS"
+                      :style="CTA_STYLE"
+                      class="!h-8 !px-3 !text-f10"
+                      @pointerdown.stop
+                      @click="craftDrop.placeHere()"
+                    >{{ tr("inventory.stickerCrafts.placeOn", "Place on") }} {{ slotsText(craftPending.slots) }}</button>
+                  </div>
+                </div>
+                <!-- Placed: how to move it from here, until the first drag. -->
+                <div v-if="modal3d && craftPlacedTip" class="pointer-events-none absolute inset-x-0 bottom-20 z-[6] flex justify-center px-4">
+                  <span class="rounded-md border border-border bg-card/85 px-3 py-1.5 text-center text-f11 text-foreground shadow-lg backdrop-blur">
+                    {{ isCompact ? "Placed — drag a sticker to move the whole craft · twist with two fingers to turn" : "Placed — drag any of its stickers to move the whole craft · Shift + drag to turn" }}
+                  </span>
+                </div>
                 <!-- Live cost, stacked under the 2D/3D + cog row so it reads as part
                      of the same top-left column of chrome — the same corner the
                      inventory card puts it in, under the model label. It was up in
@@ -10427,6 +10512,64 @@ if (MDEBUG) {
                   @click="advancedPlacement = !advancedPlacement"
                 >{{ advancedPlacement ? 'Hide' : 'Advanced' }}</button>
               </div>
+              <!-- A picked Sticker Craft, waiting to be dragged onto the gun —
+                   see useStickerCraftPlacement. The whole card is the handle. -->
+              <div
+                v-if="craftPending"
+                class="mb-2 flex cursor-grab flex-col gap-1.5 rounded-md border border-dashed border-[color:var(--acc)] bg-background/70 p-1.5"
+                style="touch-action: none"
+                :title="'Drag onto the gun to place ' + craftPending.entry.name"
+                @pointerdown="craftDrop.startDrag"
+              >
+                <div class="flex items-center gap-2">
+                  <div class="grid h-10 w-20 flex-none place-items-center overflow-hidden rounded bg-[#183a31]">
+                    <img v-if="craftPending.entry.preview" :src="craftPending.entry.preview" alt="" class="h-full w-full object-cover" draggable="false" />
+                    <div v-else class="flex items-center justify-center gap-0.5 p-0.5">
+                      <img v-for="(cs, ci) in craftPending.entry.stickers" :key="ci" :src="cs.image" alt="" class="h-5 w-5 object-contain" draggable="false" />
+                    </div>
+                  </div>
+                  <div class="min-w-0 flex-1 truncate text-f11 text-foreground">{{ craftPending.entry.name }}</div>
+                  <button
+                    class="grid h-7 w-7 flex-none place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                    title="Put it back — nothing is placed (Esc)"
+                    @pointerdown.stop
+                    @click="craftDrop.cancel()"
+                  ><X class="h-3.5 w-3.5" /></button>
+                </div>
+                <div class="flex items-center gap-2">
+                  <span class="min-w-0 flex-1 text-f10 uppercase tracking-cs1 text-[color:var(--acc)]">Drag onto the gun</span>
+                  <!-- No drag needed: it goes where its slots put a sticker, and
+                       can be dragged on from there. -->
+                  <button
+                    class="flex h-7 flex-none items-center gap-1 rounded-md border border-border px-2 text-f10 uppercase tracking-cs1 text-foreground tac-action"
+                    title="Put it on its slots without dragging — move it on the gun afterwards"
+                    @pointerdown.stop
+                    @click="craftDrop.placeHere()"
+                  >{{ tr("inventory.stickerCrafts.placeOn", "Place on") }} {{ slotsText(craftPending.slots) }}</button>
+                </div>
+              </div>
+              <!-- A placed craft. Grouped, its stickers move and turn as one in
+                   3D; Ungroup lets each move on its own for fine adjustments,
+                   and Group binds them again as they then stand. -->
+              <div
+                v-else-if="craftGroup"
+                class="mb-1.5 flex items-center gap-1.5 text-f9 uppercase tracking-cs1"
+                :class="craftGroup.linked ? 'text-[color:var(--acc)]' : 'text-muted-foreground'"
+              >
+                <Link2 v-if="craftGroup.linked" class="h-3 w-3 flex-none" />
+                <UngroupIcon v-else class="h-3 w-3 flex-none" />
+                <span class="min-w-0 truncate text-f11 normal-case tracking-normal text-foreground">{{ craftGroup.name }}</span>
+                <span class="flex-none">{{ craftGroup.linked ? 'moves as one' : 'moving singly' }}</span>
+                <button
+                  class="ml-auto flex flex-none items-center gap-1 rounded border border-border px-1.5 py-0.5 uppercase tracking-cs1 text-muted-foreground tac-action"
+                  :title="craftGroup.linked ? 'Ungroup — move the stickers one at a time for fine adjustments' : 'Group again — the stickers move and turn as one from where they are now'"
+                  @click="craftGroup.linked ? craftDrop.ungroup() : craftDrop.regroup()"
+                >
+                  <UngroupIcon v-if="craftGroup.linked" class="h-3 w-3" />
+                  <GroupIcon v-else class="h-3 w-3" />
+                  {{ craftGroup.linked ? 'Ungroup' : 'Group' }}
+                </button>
+              </div>
               <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
                 <!-- Draggable onto each other: slot order is draw order, so this is
                      how one overlapping sticker goes over another — see
@@ -10439,14 +10582,16 @@ if (MDEBUG) {
                     st ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]',
                     stickerDropOn === idx && stickerDragFrom !== idx && '!border-solid !border-[color:var(--acc)]',
                     stickerDragFrom === idx && 'opacity-40',
+                    craftPendingSlots.has(idx) && '!border-dashed !border-[color:var(--acc)]',
+                    craftGroupSlots.has(idx) && (craftGroup?.linked ? 'shadow-[inset_0_-2px_0_var(--acc)]' : 'shadow-[inset_0_-2px_0_color-mix(in_srgb,var(--acc)_35%,transparent)]'),
                   ]"
-                  :title="st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
-                  :draggable="!!st"
-                  @click="openPicker('sticker', idx)"
+                  :title="craftPendingSlots.has(idx) ? 'Kept for ' + craftPending!.entry.name + ' — place it or put it back first' : st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
+                  :draggable="!!st && !craftPending"
+                  @click="!craftPendingSlots.has(idx) && openPicker('sticker', idx)"
                   @dragstart="stickerDragFrom = idx; $event.dataTransfer?.setData('text/plain', String(idx))"
-                  @dragover.prevent="stickerDragFrom != null && (stickerDropOn = idx)"
+                  @dragover.prevent="!craftPending && stickerDragFrom != null && (stickerDropOn = idx)"
                   @dragleave="stickerDropOn === idx && (stickerDropOn = null)"
-                  @drop.prevent="onStickerTileDrop(idx)"
+                  @drop.prevent="!craftPending && onStickerTileDrop(idx)"
                   @dragend="stickerDragFrom = null; stickerDropOn = null"
                 >
                   <span class="absolute bottom-0 right-0.5 z-[1] font-mono text-f8 text-muted-foreground/40">{{ idx + 1 }}</span>
@@ -11102,8 +11247,19 @@ if (MDEBUG) {
          enter/leave off its child mounting and unmounting, and a component that
          is always mounted with the v-if inside it would toggle the panel with
          no fade at all. -->
-    <AttachmentPicker v-if="picker" :view="pickerView" @pick="pickAttachment" @preview="openPreview3d" />
+    <AttachmentPicker v-if="picker" :view="pickerView" @pick="pickAttachment" @preview="openPreview3d" @pick-craft="applyStickerCraft" />
     </Transition>
+    <!-- A Sticker Craft being dragged while it is off the gun: its card follows
+         the pointer. Over the gun the stickers themselves are the preview.
+         Above everything, the way a dragged thing is. A SIBLING of the picker's
+         Transition, for the same one-child reason as the preview below. -->
+    <img
+      v-if="craftGhost?.image"
+      :src="craftGhost.image"
+      alt=""
+      class="pointer-events-none fixed h-12 w-24 -translate-x-1/2 -translate-y-1/2 rounded object-cover opacity-80 shadow-lg"
+      :style="{ left: craftGhost.x + 'px', top: craftGhost.y + 'px', zIndex: Z.confirm + 1 }"
+    />
 
     <!-- Attachment preview — a SIBLING of the picker's Transition, not a
          child of it: <Transition> takes exactly one child, and nesting this

@@ -212,6 +212,16 @@
   [data-cs2-inventory] .animate-grid-in {
     animation: cs2FadeIn 220ms ease-out both;
   }
+  /* A picked Sticker Craft floating over the 3D view until it is dragged onto
+     the gun: a slow bob, so it reads as held up and waiting rather than as part
+     of the picture. Reduced motion stops it (see the rule further down). */
+  [data-cs2-inventory] .animate-craft-float {
+    animation: cs2CraftFloat 2.4s ease-in-out infinite;
+  }
+}
+@keyframes cs2CraftFloat {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-6px); }
 }
 @keyframes cs2ViewIn {
   from { opacity: 0; transform: translateY(10px) scale(0.985); }
@@ -578,6 +588,98 @@
   color: hsl(240 5% 82%);
 }
 
+/* The Sticker Crafts tab's "NEW" thought bubble (App.vue), until the tab has
+   been opened once: an amber pill hanging under the tab's icon, floating
+   gently, with two small circles trailing up to the icon. Under the tab, not
+   over it: the app frame clips right above the header, and boxed into that
+   strip it was too small to read. */
+[data-cs2-inventory] .new-bubble {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 2px;
+  z-index: 5;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: hsl(var(--tac-amber, 33 94% 58%));
+  color: hsl(var(--background));
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 19px;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
+  text-transform: uppercase;
+  box-shadow: 0 2px 12px hsl(var(--tac-amber, 33 94% 58%) / 0.45);
+  pointer-events: none;
+  animation: new-bubble-float 2.6s ease-in-out infinite;
+}
+[data-cs2-inventory] .new-bubble::before,
+[data-cs2-inventory] .new-bubble::after {
+  content: "";
+  position: absolute;
+  border-radius: 50%;
+  background: inherit;
+}
+/* The trail, stepping up to the icon's middle (the tab's px-3 + half of 14px). */
+[data-cs2-inventory] .new-bubble::before {
+  width: 6px;
+  height: 6px;
+  left: 12px;
+  top: -5px;
+}
+[data-cs2-inventory] .new-bubble::after {
+  width: 4px;
+  height: 4px;
+  left: 15px;
+  top: -10px;
+}
+/* A phone's tab is the icon alone, with the header's buttons right under it:
+   the bubble sits across the tab's bottom edge, centred under the icon. */
+[data-cs2-inventory] .new-bubble.is-compact {
+  top: calc(100% - 4px);
+  left: 50%;
+  margin-left: -19px;
+  width: 38px;
+  padding: 0;
+  text-align: center;
+  font-size: 9px;
+  line-height: 15px;
+  letter-spacing: 0.08em;
+}
+[data-cs2-inventory] .new-bubble.is-compact::before {
+  left: calc(50% - 2.5px);
+  width: 5px;
+  height: 5px;
+  top: -3px;
+}
+[data-cs2-inventory] .new-bubble.is-compact::after {
+  display: none;
+}
+@keyframes new-bubble-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(2px);
+  }
+}
+/* Opened: it pops away. */
+[data-cs2-inventory] .new-bubble-leave-active {
+  animation: none;
+  transition:
+    opacity 220ms ease,
+    transform 220ms ease;
+}
+[data-cs2-inventory] .new-bubble-leave-to {
+  opacity: 0;
+  transform: scale(0.5) translateY(-6px);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-cs2-inventory] .new-bubble {
+    animation: none;
+  }
+}
+
 /* The knife/glove model rail (craftModelList in App.vue). It scrolls sideways
    under its own arrows and edge fades, so a scrollbar would be a second control
    for the same thing. Shapes rest grey and come up in colour on hover and on
@@ -599,5 +701,19 @@
 .craft-rail button:hover:not(:disabled) img,
 .craft-rail [aria-current] img {
   filter: none;
+  opacity: 1;
+}
+/* Sticker Crafts' outline cards are line drawings: grey at rest, bright on
+   hover and on the one chalked. */
+.craft-rail svg {
+  color: hsl(var(--muted-foreground));
+  opacity: 0.8;
+  transition:
+    color 150ms,
+    opacity 150ms;
+}
+.craft-rail button:hover:not(:disabled) svg,
+.craft-rail [aria-current] svg {
+  color: hsl(var(--foreground));
   opacity: 1;
 }
