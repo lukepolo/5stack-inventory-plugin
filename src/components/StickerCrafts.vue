@@ -75,6 +75,7 @@ import {
 } from "../stickerCraftsModel";
 import type { StickerBoard } from "../stickerBoard";
 import type { WeaponOutline } from "../outlineTrace";
+import type { OutlineSpot } from "../composables/useStickerCraftPlacement";
 import AttachmentPicker from "./AttachmentPicker.vue";
 import ModelRail, { type RailItem } from "./ModelRail.vue";
 import CraftUseCase from "./CraftUseCase.vue";
@@ -102,7 +103,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "notify", message: string, kind: "error" | "success"): void;
   /** Put this saved craft on a gun of this model (App opens the editor). */
-  (e: "put-on-gun", craftId: string, model: string): void;
+  (e: "put-on-gun", craftId: string, model: string, at: OutlineSpot | null): void;
 }>();
 
 const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
@@ -806,7 +807,12 @@ async function putOnGun() {
     say("Couldn't save the craft — try again", true);
     return;
   }
-  emit("put-on-gun", id, model);
+  // Where it sits on that gun's chalk, so the editor puts it there rather than
+  // on its slots' default spots. The chalk's box is centred on the home grid.
+  const o = outline.value?.model === model ? outline.value : null;
+  const c = centroid(keep.value);
+  const at = o ? { x: c.x - (GRID_W / 2 - o.w / 2), y: c.y - (GRID_H / 2 - o.h / 2), anchors: o.anchors } : null;
+  emit("put-on-gun", id, model, at);
 }
 /** Enter in the name field: Update when the mat is a saved craft, else Save. */
 function saveOrUpdate() {
@@ -1091,18 +1097,26 @@ const outlineError = ref(false);
 /** Outlines fetched or traced this visit, by model. */
 const outlines = shallowRef<Map<string, WeaponOutline>>(new Map());
 const outline = computed<WeaponOutline | null>(() => outlines.value.get(outlineModel.value) ?? null);
-/** The stored outline, or a fresh trace of the model, which is then stored. */
+/**
+ * The stored outline, or a fresh trace of the model, which is then stored —
+ * calibrated against the gun's own slots on the way in (calibrateOutline), so
+ * a layout on the chalk lands on the gun where it was laid out. The stored
+ * copy stays as traced.
+ */
 async function outlineFor(model: string): Promise<WeaponOutline | null> {
-  const stored = await fetchWeaponOutline(model);
-  if (stored) return stored;
-  const geo = await fetchStickerGeometry(model);
+  const [stored, geo, trace] = await Promise.all([
+    fetchWeaponOutline(model),
+    fetchStickerGeometry(model),
+    import("../outlineTrace"),
+  ]);
+  if (stored) return trace.calibrateOutline(stored, geo.slots);
   // Through the lazy edge, so three comes down alongside the viewer's chunk.
-  const [{ weaponOutline }, { traceOutline }] = await Promise.all([viewer3d(), import("../outlineTrace")]);
+  const { weaponOutline } = await viewer3d();
   const side = await weaponOutline(model, geo.slots);
-  const traced = side ? traceOutline(model, side) : null;
+  const traced = side ? trace.traceOutline(model, side) : null;
   // Kept for the next player; this one has it either way.
   if (traced) void saveWeaponOutline(traced).catch(() => {});
-  return traced;
+  return traced ? trace.calibrateOutline(traced, geo.slots) : null;
 }
 let outlineToken = 0;
 /** The first outline's load, which the board waits for (see onMounted). */

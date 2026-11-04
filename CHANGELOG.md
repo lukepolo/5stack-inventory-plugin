@@ -38,6 +38,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Bug Fixes
 
+- **Sticker Crafts landed off where they were laid out**: "Put on your …" put a craft centred on its slots' default spots, wherever it sat on the gun's outline on the mat; it now lands where it was, matched to the gun's own slots. The chalked outline was also drawn 5–9% too small against the stickers (it was sized by the texture density of the whole gun rather than where the stickers go), so a layout spread wider on the gun than on the mat; outlines are now scaled by the gun's slots, and a craft's stickers convert at one scale per gun instead of each slot's own, which pulled layouts apart on the FAMAS, P90, MAC-10 and Desert Eagle.
 - **The craft close-up looked at the wrong part of some guns**: while a Sticker Craft waited over the gun, the camera framed everything near any sticker slot's position in the gun's texture space, which on the M4A4 took in its stock and sat the view on the back half. It now finds each slot's point on the gun's surface (the side facing the camera) and frames the slots the craft will take.
 - Editing or duplicating an owned item keeps its finish's float range. Owned Dopplers could be dragged to 1.00, and the save then failed.
 - Craft & Equip defaults to the team you are crafting from instead of "Both teams".
@@ -67,6 +68,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Bug Fixes
 
+- **Stickers drew over the StatTrak counter and the name tag**: a sticker under the StatTrak module could cover its digits, because stickers sit about a millimetre off the gun and the module's readout can sit closer to it than that. The module and the name plate now always draw over stickers, as in the game.
 - **Stretched stickers in the 3D sticker preview**: the preview squeezed its card to the ink's proportions while the art is a square with the ink centred in it, so every wide sticker came out stretched (Ruby Stream by 1.8 times). The art keeps its square now, and only the backing card is cut to the ink, from the middle of the backing print rather than by squeezing it.
 - **Sticker art in Safari cut from the wrong rows**: Safari flips an image before it crops it, the other way round from Chrome, so every sticker's art was cut from a window shifted by the difference between its top and bottom margins. Its effect masks no longer lined up: Econometer's lenticular light sat 35px above its letters and gauge. About one sticker in five, whose square runs past the edge of its texture, came out squashed instead of padded. The art is now cropped and flipped in two steps, and the padded ones are laid out from their exact pixels, so Safari and Chrome draw the same sticker.
 - In first person the agent's sleeve wore the equipped glove's finish up to the elbow. Only the gloves take the finish now, and the sleeve keeps the agent's own look.

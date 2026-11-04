@@ -9,6 +9,7 @@
 // (tools/shadertest/outlines.html makes it) and a card shows at once; this same
 // code traces one live when the table doesn't have it.
 import type { SideOutline } from "./viewer3d";
+import type { StickerSlot } from "./api";
 import { STICKER_CM } from "./stickerCraftsModel";
 
 export interface WeaponOutline {
@@ -135,4 +136,96 @@ export function traceOutline(model: string, o: SideOutline): WeaponOutline | nul
     // The anchors are in pixel-EDGE coordinates, the loops in pixel centres.
     anchors: o.anchors.map((a) => ({ index: a.index, x: round((a.x - 0.5 - minX) * unit), y: round((a.y - 0.5 - minY) * unit) })),
   };
+}
+
+// ---- the outline against the gun's own slots -------------------------------------
+
+/** The slots of the body an outline is traced on: body_hd's, when it has any. */
+export function bodySlots(slots: StickerSlot[], body = "body_hd"): StickerSlot[] {
+  const mine = slots.filter((s) => s.mesh === body);
+  return mine.length ? mine : slots;
+}
+
+/**
+ * One sticker's size on a gun, in the unwrap: the median of its slots' scales
+ * (a sticker spans 1/scale). The mat draws every sticker STICKER_CM across, so
+ * this is also how mat centimetres turn into the gun's sticker offsets — ONE
+ * factor for the whole gun. A place on the gun is a property of its surface,
+ * not of the slot a sticker happens to be in: converting each sticker at its
+ * own slot's scale (FAMAS 13.6–17.3, P90, MAC-10, Desert Eagle) pulled a
+ * craft's layout apart.
+ */
+export function slotScale(slots: StickerSlot[]): number {
+  const sc = slots.map((s) => s.scale).filter((x) => x > 0).sort((a, b) => a - b);
+  return sc.length ? sc[Math.floor(sc.length / 2)] : 1;
+}
+
+/**
+ * The outline at the scale the gun's own slots set.
+ *
+ * A trace is sized by the unwrap's density over the WHOLE gun (uv1Density, a
+ * median over every triangle edge — scope, magazine and all), while stickers
+ * are placed in the unwrap where they actually sit, which is 5–9% less dense
+ * on every gun measured: a craft laid out on the chalk landed that much wider
+ * on the gun, the slots' dashed squares out of step with the gun's own. Each
+ * slot's spot on the outline and its offset on the gun are the same point, so
+ * the outline is scaled until they agree (least squares about their centres).
+ * The real length stays the same — only what one sticker measures on it
+ * (stickerCm) changes. Stored outlines stay raw; this runs on the way in.
+ * Fewer than two slots, or slots all on one spot (the Desert Eagle's), leave
+ * nothing to measure by, and the outline is used as traced.
+ */
+export function calibrateOutline(o: WeaponOutline, slots: StickerSlot[]): WeaponOutline {
+  const body = bodySlots(slots);
+  const k = STICKER_CM * slotScale(body);
+  const pairs = o.anchors.flatMap((a) => {
+    const s = body.find((x) => x.index === a.index);
+    return s ? [{ x: a.x, y: a.y, u: s.offset[0] * k, v: s.offset[1] * k }] : [];
+  });
+  if (pairs.length < 2) return o;
+  const mean = (f: (p: (typeof pairs)[number]) => number) => pairs.reduce((sum, p) => sum + f(p), 0) / pairs.length;
+  const ax = mean((p) => p.x);
+  const ay = mean((p) => p.y);
+  const au = mean((p) => p.u);
+  const av = mean((p) => p.v);
+  let num = 0;
+  let den = 0;
+  for (const p of pairs) {
+    num += (p.x - ax) * (p.u - au) + (p.y - ay) * (p.v - av);
+    den += (p.x - ax) ** 2 + (p.y - ay) ** 2;
+  }
+  if (den < 4) return o;
+  const f = num / den;
+  if (!(f > 0.8 && f < 1.25)) return o;
+  const round = (v: number) => Math.round(v * 100) / 100;
+  return {
+    ...o,
+    stickerCm: round(o.stickerCm / f),
+    w: round(o.w * f),
+    h: round(o.h * f),
+    paths: o.paths.map((p) => p.map((v) => round(v * f))),
+    anchors: o.anchors.map((a) => ({ index: a.index, x: round(a.x * f), y: round(a.y * f) })),
+  };
+}
+
+/**
+ * Where a point of an outline (mat units from its top-left corner) is on the
+ * gun, in sticker-offset space: the outline's slot spots matched to the same
+ * slots' offsets, by index, at slotScale. Null without a slot to match.
+ */
+export function outlineToOffset(
+  at: { x: number; y: number },
+  anchors: { index: number; x: number; y: number }[],
+  slotOf: (index: number) => StickerSlot | undefined,
+  scale: number,
+): { u: number; v: number } | null {
+  const k = 1 / (STICKER_CM * scale);
+  const pairs = anchors.flatMap((a) => {
+    const s = slotOf(a.index);
+    return s ? [{ a, s }] : [];
+  });
+  if (!pairs.length) return null;
+  const u = pairs.reduce((sum, { a, s }) => sum + s.offset[0] - a.x * k, 0) / pairs.length + at.x * k;
+  const v = pairs.reduce((sum, { a, s }) => sum + s.offset[1] - a.y * k, 0) / pairs.length + at.y * k;
+  return { u, v };
 }
