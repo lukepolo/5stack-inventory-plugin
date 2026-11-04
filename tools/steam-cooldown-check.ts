@@ -86,11 +86,13 @@ await check("a sync already paging stops at the next page once another sync is r
   assert.equal(urls.length, 2);
 });
 
-await check("a 429 on a later page returns nothing", async () => {
+await check("a 429 on a later page returns nothing and starts the cooldown", async () => {
   const { fetchSteamInventory, urls } = steam(json({ ...lastPage, more_items: 1, last_assetid: "10" }), json({}, 429));
   const error = await refused(fetchSteamInventory("76561198000000001"));
   assert.equal(error.status, 429);
   assert.match(urls[1], /&start_assetid=10$/);
+  assert.equal((await refused(fetchSteamInventory("76561198000000002"))).status, 429);
+  assert.equal(urls.length, 2);
 });
 
 await check("any other refusal starts no cooldown", async () => {
