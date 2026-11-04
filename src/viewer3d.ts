@@ -11562,6 +11562,35 @@ async function buildViewer(
    * Returns false when the anchor is unusable, which callers treat as "render
    * the weapon without this module".
    */
+  /**
+   * The StatTrak module and the name plate draw OVER the stickers — never the
+   * other way round. In the game a sticker is part of the gun's own surface and
+   * these are separate pieces bolted on in front of it, so a sticker under one
+   * is hidden by it. Here a sticker is a decal lifted ~1mm off the surface
+   * (DECAL_LIFT, so it never z-fights the gun) while a module's readout may
+   * clear that surface by less (clearReadout pushes it out only until it
+   * clears): wherever it did, the sticker won the depth test and was drawn
+   * across the digits.
+   *
+   * So the module joins the TRANSPARENT pass (fully opaque still: transparent
+   * only moves it to after the opaque pass) at a renderOrder above every
+   * sticker (10 + slot). It is then drawn after them, tested against the gun's
+   * depth alone — stickers write none — and covers a sticker wherever it is in
+   * front of the gun, whatever the lift or the depth buffer's precision.
+   */
+  const OVER_STICKERS = 20;
+  function drawOverStickers(root: import("three").Object3D) {
+    root.traverse((child) => {
+      const mesh = child as import("three").Mesh;
+      if (!mesh.isMesh) return;
+      mesh.renderOrder = OVER_STICKERS;
+      for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+        if (!m || m.transparent) continue;
+        m.transparent = true;
+        m.needsUpdate = true;
+      }
+    });
+  }
   function placeAttachedModule(
     mod: import("three").Object3D,
     anchor: import("./stattrakModule").StatTrakAnchor,
@@ -12215,6 +12244,7 @@ async function buildViewer(
     // perpendicular to its blade. As a QAngle all 22 lie flat on the blade,
     // front face outward, within 0.2mm of the surface on most.
     if (!placeAttachedModule(mod, anchor, bone, knife, false, "none")) return;
+    drawOverStickers(mod);
     object.add(mod);
     stattrakMod = mod;
     object.updateMatrixWorld(true);
@@ -12463,6 +12493,7 @@ async function buildViewer(
     // diagonally across the handle or stood it on edge.
     const asAuthored = model === "c4" || picked.knife;
     if (!placeAttachedModule(mod, picked.anchor, picked.bone, asAuthored, !asAuthored, asAuthored ? "none" : "posed")) return;
+    drawOverStickers(mod);
     object.add(mod);
     if (asAuthored) seatPlateOnSurface(mod);
     /**

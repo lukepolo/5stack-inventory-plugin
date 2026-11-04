@@ -20,6 +20,9 @@
 //   xy=x,y,r;x,y,r;…      per-sticker offsets/rotation (game offset units)
 //   sw=0.5 or sw=0,0.5,…  sticker wear (scratch), one for all or per slot
 //   nomask=1              draw stickers without the weapon's sticker mask
+//   ontop=1               stickers drawn with no depth test (debugStickerOnTop):
+//                         the worst case for what may cover them, e.g. the
+//                         StatTrak module and name plate must still win
 //   stattrak=1337         StatTrak count ("dark" = the card's unlit module)
 //   nametag=Some%20Name   name tag
 //   decal=/images/….webp  a STANDALONE sticker (model=__sticker&kind=sticker)
@@ -130,6 +133,7 @@ async function shoot(va: number, plain: boolean) {
       stickerSlots: bounds.slots,
       stickerBounds: bounds.bounds,
       stickerMasks: q.get("nomask") ? undefined : bounds.masks,
+      debugStickerOnTop: q.get("ontop") === "1",
       stattrak: plain || stattrak == null ? null : { count: stattrak === "dark" ? null : Number(stattrak) },
       nametag: plain ? null : q.get("nametag"),
       charm: plain || !q.get("charm") ? null : { image: q.get("charm")!, x: null, y: null, z: null, seed: num("charmseed", 1) },
