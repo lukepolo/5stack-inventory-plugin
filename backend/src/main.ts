@@ -23,6 +23,7 @@ import {
   normCraftStickers,
   normOutline,
   normStickerGroup,
+  takedownMarks,
   type CraftSticker,
   type StickerGroup,
 } from "./stickerCrafts.ts";
@@ -3056,6 +3057,15 @@ app.put<{ Body: unknown }>("/api/sticker-crafts/board", { bodyLimit: 64_000 }, a
   return { ok: true };
 });
 
+/** Whether an administrator took down a craft of this author's with any of these marks (takedownMarks). */
+async function takenDownBefore(steamId: string, marks: string[]): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM inventory.sticker_craft_takedowns WHERE steam_id = $1 AND mark = ANY($2::text[]) LIMIT 1`,
+    [steamId, marks],
+  );
+  return !!rowCount;
+}
+
 /**
  * Save one craft — new, or the caller's own under the same id. The id is the
  * client's (see DOC_ID_RE); a write over someone else's is refused, not merged.
@@ -3099,6 +3109,11 @@ app.put<{ Params: { id: string }; Body: { name?: unknown; stickers?: unknown; us
     );
     if (!rowCount) {
       return reply.status(409).send({ error: "That craft isn't yours." });
+    }
+    // A published craft's store copy follows its saves: saving content an
+    // administrator already took down takes it out of the store.
+    if (await takenDownBefore(identity.steamId, takedownMarks(id, cleanName(request.body?.name, "Sticker craft"), stickers))) {
+      await pool.query(`UPDATE inventory.sticker_crafts SET published_at = NULL WHERE id = $1 AND steam_id = $2`, [id, identity.steamId]);
     }
     return { ok: true };
   },
@@ -3232,21 +3247,25 @@ app.put<{ Params: { id: string } }>("/api/sticker-crafts/store/:id", async (requ
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
-  const { rows } = await pool.query<{ taken_down: boolean }>(
-    `UPDATE inventory.sticker_crafts SET published_at = coalesce(published_at, now())
-      WHERE id = $1 AND steam_id = $2 AND NOT taken_down
-      RETURNING taken_down`,
+  const { rows: found } = await pool.query<{ name: string; stickers: unknown; taken_down: boolean }>(
+    `SELECT name, stickers, taken_down FROM inventory.sticker_crafts WHERE id = $1 AND steam_id = $2`,
     [request.params.id, identity.steamId],
   );
-  if (!rows.length) {
-    const down = await pool.query(
-      `SELECT 1 FROM inventory.sticker_crafts WHERE id = $1 AND steam_id = $2 AND taken_down`,
-      [request.params.id, identity.steamId],
-    );
-    return down.rowCount
-      ? reply.status(403).send({ error: "An administrator took this craft out of the store." })
-      : reply.status(404).send({ error: "Save the craft before publishing it." });
+  const craft = found[0];
+  if (!craft) {
+    return reply.status(404).send({ error: "Save the craft before publishing it." });
   }
+  // The row's own flag, and the takedown ledger: a taken-down craft deleted and
+  // saved again (another id, or the same one) is still the craft taken down.
+  const marks = takedownMarks(request.params.id, craft.name, Array.isArray(craft.stickers) ? craft.stickers : []);
+  if (craft.taken_down || (await takenDownBefore(identity.steamId, marks))) {
+    return reply.status(403).send({ error: "An administrator took this craft out of the store." });
+  }
+  await pool.query(
+    `UPDATE inventory.sticker_crafts SET published_at = coalesce(published_at, now())
+      WHERE id = $1 AND steam_id = $2 AND NOT taken_down`,
+    [request.params.id, identity.steamId],
+  );
   return { ok: true };
 });
 
@@ -3264,9 +3283,20 @@ app.delete<{ Params: { id: string } }>("/api/sticker-crafts/store/:id", async (r
   if (identity.role !== "administrator") {
     return reply.status(403).send({ error: "Only its author or an administrator can take a craft down." });
   }
-  await pool.query(`UPDATE inventory.sticker_crafts SET published_at = NULL, taken_down = true WHERE id = $1`, [
-    request.params.id,
-  ]);
+  const { rows } = await pool.query<{ steam_id: string; name: string; stickers: unknown }>(
+    `UPDATE inventory.sticker_crafts SET published_at = NULL, taken_down = true WHERE id = $1
+     RETURNING steam_id, name, stickers`,
+    [request.params.id],
+  );
+  const down = rows[0];
+  // Remembered apart from the row, so deleting the craft doesn't undo it.
+  if (down) {
+    await pool.query(
+      `INSERT INTO inventory.sticker_craft_takedowns (steam_id, mark)
+       SELECT $1, unnest($2::text[]) ON CONFLICT DO NOTHING`,
+      [down.steam_id, takedownMarks(request.params.id, down.name, Array.isArray(down.stickers) ? down.stickers : [])],
+    );
+  }
   return { ok: true };
 });
 
@@ -3322,12 +3352,17 @@ app.get<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", asy
   }
   return { outline };
 });
-/** First trace per extraction wins: a second upload for the same version changes nothing. */
+/**
+ * First trace per extraction wins: a second upload for the same version changes
+ * nothing — except an administrator's, which replaces it (a bad trace is never
+ * stuck until the next extraction). DELETE clears one for re-tracing.
+ */
 app.put<{ Params: { model: string }; Body: unknown }>(
   "/api/catalog/weapon-outline/:model",
   { bodyLimit: 200_000 },
   async (request, reply) => {
-    if (!(await getIdentity(request))) {
+    const identity = await getIdentity(request);
+    if (!identity) {
       return reply.status(401).send({ error: "unauthorized" });
     }
     const model = request.params.model;
@@ -3339,15 +3374,28 @@ app.put<{ Params: { model: string }; Body: unknown }>(
       return reply.status(400).send({ error: "That isn't a weapon outline." });
     }
     const version = await renderVersion();
+    const admin = identity.role === "administrator";
     await pool.query(
       `INSERT INTO inventory.weapon_outlines (model, extract_version, outline) VALUES ($1, $2, $3::jsonb)
        ON CONFLICT (model) DO UPDATE SET extract_version = EXCLUDED.extract_version, outline = EXCLUDED.outline, updated_at = now()
-         WHERE inventory.weapon_outlines.extract_version <> EXCLUDED.extract_version`,
-      [model, version, JSON.stringify(outline)],
+         WHERE $4::boolean OR inventory.weapon_outlines.extract_version <> EXCLUDED.extract_version`,
+      [model, version, JSON.stringify(outline), admin],
     );
     return { ok: true };
   },
 );
+/** Clear a gun's stored outline (administrators): the next player to pick it traces it again. */
+app.delete<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  if (identity.role !== "administrator") {
+    return reply.status(403).send({ error: "Only an administrator can clear a weapon outline." });
+  }
+  await pool.query(`DELETE FROM inventory.weapon_outlines WHERE model = $1`, [request.params.model]);
+  return { ok: true };
+});
 
 // ---- Loadout (per-user; slots reference owned instances) ----
 

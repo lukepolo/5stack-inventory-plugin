@@ -10,6 +10,8 @@
 // linked is ever shown to anyone else — the Craft Store puts one player's craft
 // in front of everyone on the panel.
 
+import { createHash } from "node:crypto";
+
 /** A craft is one weapon's worth (CS2 takes five stickers); the mat holds a
  *  few crafts side by side. */
 export const CRAFT_LIMITS = {
@@ -182,6 +184,21 @@ export function normOutline(raw: unknown, model: string): WeaponOutline | null {
     paths: o.paths.map((p) => p.map((v) => round(v, 2))),
     anchors: cleanAnchors as WeaponOutline["anchors"],
   };
+}
+
+/**
+ * What an administrator's takedown remembers about a craft, per author: its
+ * id, its name and its set of stickers (main.ts writes them to
+ * inventory.sticker_craft_takedowns, apart from the craft row). Publishing and
+ * saving a published craft check them, so deleting a taken-down craft and
+ * saving it again — under a new id or the same one — never puts it back in the
+ * store. A craft with a new name AND new stickers is a different craft, which
+ * an administrator can take down in its own right.
+ */
+export function takedownMarks(id: string, name: string, stickers: readonly { id?: unknown }[]): string[] {
+  const hash = (s: string) => createHash("sha256").update(s).digest("hex").slice(0, 32);
+  const ids = stickers.map((s) => Number(s?.id)).filter(Number.isInteger).sort((a, b) => a - b);
+  return [`id:${id}`, `name:${hash(name.trim().toLowerCase().replace(/\s+/g, " "))}`, `set:${hash(JSON.stringify(ids))}`];
 }
 
 /** A LIKE pattern matching `q` anywhere, with LIKE's own wildcards taken literally. */

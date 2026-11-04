@@ -481,6 +481,16 @@ CREATE INDEX IF NOT EXISTS sticker_crafts_published ON inventory.sticker_crafts 
 -- One vote per player per published craft, +1 or -1. Goes with the craft (a
 -- deleted craft's votes cascade); unpublishing keeps them, so taking a craft
 -- down and putting it back up cannot wash a bad score.
+-- What an administrator's takedown remembers, per author (takedownMarks): the
+-- craft's id, its name and its sticker set. Apart from the craft row, so
+-- deleting a taken-down craft keeps it; publishing checks it.
+CREATE TABLE IF NOT EXISTS inventory.sticker_craft_takedowns (
+  steam_id text NOT NULL,
+  mark text NOT NULL,
+  taken_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (steam_id, mark)
+);
+
 CREATE TABLE IF NOT EXISTS inventory.sticker_craft_votes (
   craft_id text NOT NULL REFERENCES inventory.sticker_crafts (id) ON DELETE CASCADE,
   steam_id bigint NOT NULL,
