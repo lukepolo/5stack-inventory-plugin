@@ -28,6 +28,7 @@ import {
   Eraser,
   GripVertical,
   Group,
+  Hash,
   LayoutGrid,
   Link2,
   Link2Off,
@@ -127,6 +128,10 @@ const published = ref<Set<string>>(new Set());
 const scores = ref<Map<string, CraftScore>>(new Map());
 const selected = ref<Set<string>>(new Set());
 const snap = usePersistedBool("cs2inv.stickerCrafts.snap", true);
+/** The StatTrak counter on the chalk outline (the toggle left of Outline). Off,
+ *  it is neither chalked nor in a craft's proposed-use picture, which is drawn
+ *  from the chalk. Remembered in this browser. */
+const stattrakChalk = usePersistedBool("cs2inv.stickerCrafts.stattrakOutline", true);
 const boardView = ref<"angled" | "top">("angled");
 
 // ---- storage ----------------------------------------------------------------
@@ -1286,7 +1291,7 @@ const board = shallowRef<StickerBoard | null>(null);
 // The chalk and the mat's size follow the pick (and the board when it is made).
 // A new weapon flies the view out or in to fit; the mat growing round a
 // sticker left outside the work area leaves the camera be.
-watch([outline, board], ([o, b]) => b?.setOutline(o), { immediate: true });
+watch([outline, board, stattrakChalk], ([o, b, st]) => b?.setOutline(o && !st ? { ...o, stattrak: [] } : o), { immediate: true });
 let layoutFor: WeaponOutline | null | undefined;
 watch(
   [matLayout, board],
@@ -1788,6 +1793,22 @@ const FIELD =
         class="flex flex-none items-center gap-2 border-t border-border bg-background py-1"
         :class="compact ? 'min-h-[58px] px-2' : 'min-h-[62px] px-3'"
       >
+        <!-- The StatTrak counter on the chalk, on or off — the Snap button's
+             look. Off also keeps it out of a craft's proposed-use picture. -->
+        <button
+          type="button"
+          class="flex h-9 flex-none items-center gap-1.5 rounded-lg border px-2.5 text-f10 uppercase tracking-wider transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+          :class="stattrakChalk && outline?.stattrak?.length ? 'text-foreground' : 'border-border text-muted-foreground hover:text-foreground'"
+          :style="stattrakChalk && outline?.stattrak?.length ? { borderColor: 'hsl(var(--tac-amber) / 0.45)', background: 'hsl(var(--tac-amber) / 0.12)', boxShadow: '0 0 12px hsl(var(--tac-amber) / 0.25)' } : undefined"
+          :disabled="!outline?.stattrak?.length"
+          :aria-pressed="stattrakChalk"
+          :aria-label="tr('inventory.stickerCrafts.stattrakToggle', 'StatTrak')"
+          :title="!outline?.stattrak?.length ? 'Pick a gun under the mat to chalk its StatTrak counter' : stattrakChalk ? 'The StatTrak counter is chalked on the outline, and shown in the proposed use — click to hide it' : 'The StatTrak counter is hidden — click to chalk it on the outline'"
+          @click="stattrakChalk = !stattrakChalk"
+        >
+          <Hash class="h-3.5 w-3.5" />
+          <span v-if="!compact">{{ tr("inventory.stickerCrafts.stattrakToggle", "StatTrak") }}</span>
+        </button>
         <ModelRail
           :label="tr('inventory.stickerCrafts.outline', 'Outline')"
           :items="outlineItems"
