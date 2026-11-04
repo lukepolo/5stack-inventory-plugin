@@ -3812,9 +3812,11 @@ function equippedRowFor(model: string): LoadoutEntry | null {
 }
 const equippedInstanceFor = (model: string) => equippedRowFor(model)?.item_instance_id ?? null;
 /** For the mat's "Put on your …" button: that skin's name and its 2D art. */
-function equippedSkinFor(model: string): { name: string; image: string | null } | null {
+function equippedSkinFor(model: string): { name: string; image: string | null; legacy: boolean } | null {
   const item = equippedRowFor(model)?.item;
-  return item ? { name: item.name, image: item.image ?? null } : null;
+  // `legacy`: it renders on the gun's legacy body (a pre-CS2 finish), whose
+  // sticker slots sit and size differently — the mat draws them that way.
+  return item ? { name: item.name, image: item.image ?? null, legacy: !!(item.legacyPaint && item.paintMaterial) } : null;
 }
 /** The craft waiting for that gun's editor to open, and the gun. Held here, not
  *  in the URL: the draft's own query sync would strip a key on the way in. */

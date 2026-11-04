@@ -23,13 +23,28 @@ export interface WeaponOutline {
   h: number;
   /** Closed loops, in mat units from the box's top-left: x0, y0, x1, y1, … */
   paths: number[][];
-  /** Each sticker slot's anchor (0-based slot), in the same units. */
-  anchors: { index: number; x: number; y: number }[];
+  /** Each sticker slot's anchor (0-based slot), in the same units. `size` is
+   *  only ever set for drawing (the slot's sticker as a share of STICKER_CM). */
+  anchors: { index: number; x: number; y: number; size?: number }[];
   /** The StatTrak module's outline: closed loops in the same units and from the
    *  same corner, where the editor puts the module on this gun. [] when the gun
    *  takes none; absent on an outline traced before the module was. */
   stattrak?: number[][];
+  /** The trace's format (OUTLINE_V); absent = 1. */
+  v?: number;
+  /**
+   * Each body's sticker unwrap over this outline: TEXCOORD_1 at a point
+   * (x, y) of it (mat units from its top-left) is u = a·x + b·y + c,
+   * v = d·x + e·y + f, [a, b, c, d, e, f]. Measured off the body's own mesh
+   * (viewer3d sideOutline). A craft goes on the gun through the unwrap of the
+   * body its finish uses — the two differ (the AWP's by 2.2cm).
+   */
+  uv?: { hd?: number[]; legacy?: number[] };
 }
+
+/** This trace format: 2 adds the StatTrak counter and the bodies' unwraps. A
+ *  stored outline of an older format is traced again (and replaces it). */
+export const OUTLINE_V = 2;
 
 // Marching squares: for each cell's corner pattern (tl 8, tr 4, br 2, bl 1),
 // the edges it joins — T, R, B, L for the midpoints of the cell's sides.
@@ -166,6 +181,19 @@ export function traceOutline(model: string, o: SideOutline): WeaponOutline | nul
     // The module is small (a few dozen pixels across), so its loops are kept
     // down to 8 edge points.
     stattrak: o.stattrak ? traceLoops(o.stattrak, W, H, minX, minY, unit, 8) : [],
+    v: OUTLINE_V,
+    uv: Object.fromEntries(
+      (["hd", "legacy"] as const).flatMap((key) => {
+        const q = o.uv?.[key];
+        if (!q) return [];
+        // Pixels to mat units: px = x / unit + minX + 0.5 (the anchors' rule).
+        const [a, b, c, d, e, f] = q;
+        const r6 = (v: number) => Math.round(v * 1e6) / 1e6;
+        const cx = minX + 0.5;
+        const cy = minY + 0.5;
+        return [[key, [a / unit, b / unit, a * cx + b * cy + c, d / unit, e / unit, d * cx + e * cy + f].map(r6)]];
+      }),
+    ) as WeaponOutline["uv"],
   };
 }
 
@@ -209,55 +237,100 @@ export function slotScale(slots: StickerSlot[]): number {
 export function calibrateOutline(o: WeaponOutline, slots: StickerSlot[]): WeaponOutline {
   const body = bodySlots(slots);
   const k = STICKER_CM * slotScale(body);
-  const pairs = o.anchors.flatMap((a) => {
-    const s = body.find((x) => x.index === a.index);
-    return s ? [{ x: a.x, y: a.y, u: s.offset[0] * k, v: s.offset[1] * k }] : [];
-  });
-  if (pairs.length < 2) return o;
-  const mean = (f: (p: (typeof pairs)[number]) => number) => pairs.reduce((sum, p) => sum + f(p), 0) / pairs.length;
-  const ax = mean((p) => p.x);
-  const ay = mean((p) => p.y);
-  const au = mean((p) => p.u);
-  const av = mean((p) => p.v);
-  let num = 0;
-  let den = 0;
-  for (const p of pairs) {
-    num += (p.x - ax) * (p.u - au) + (p.y - ay) * (p.v - av);
-    den += (p.x - ax) ** 2 + (p.y - ay) ** 2;
+  let f: number | null = null;
+  const hd = o.uv?.hd;
+  if (hd) {
+    // Measured: how much of the unwrap one mat unit spans, against what it
+    // must (one sticker, 1/scale, over STICKER_CM units).
+    const m = (Math.hypot(hd[0], hd[3]) + Math.hypot(hd[1], hd[4])) / 2;
+    f = m * k;
+  } else {
+    // An outline traced before the unwraps were: from the slots alone.
+    const pairs = o.anchors.flatMap((a) => {
+      const s = body.find((x) => x.index === a.index);
+      return s ? [{ x: a.x, y: a.y, u: s.offset[0] * k, v: s.offset[1] * k }] : [];
+    });
+    if (pairs.length < 2) return o;
+    const mean = (g: (p: (typeof pairs)[number]) => number) => pairs.reduce((sum, p) => sum + g(p), 0) / pairs.length;
+    const ax = mean((p) => p.x);
+    const ay = mean((p) => p.y);
+    const au = mean((p) => p.u);
+    const av = mean((p) => p.v);
+    let num = 0;
+    let den = 0;
+    for (const p of pairs) {
+      num += (p.x - ax) * (p.u - au) + (p.y - ay) * (p.v - av);
+      den += (p.x - ax) ** 2 + (p.y - ay) ** 2;
+    }
+    if (den < 4) return o;
+    f = num / den;
   }
-  if (den < 4) return o;
-  const f = num / den;
   if (!(f > 0.8 && f < 1.25)) return o;
+  const ff = f;
   const round = (v: number) => Math.round(v * 100) / 100;
+  const r6 = (v: number) => Math.round(v * 1e6) / 1e6;
+  // An unwrap per mat unit shrinks as the units do; where it starts does not move.
+  const scaleUv = (q: number[]) => [q[0] / ff, q[1] / ff, q[2], q[3] / ff, q[4] / ff, q[5]].map(r6);
   return {
     ...o,
-    stickerCm: round(o.stickerCm / f),
-    w: round(o.w * f),
-    h: round(o.h * f),
-    paths: o.paths.map((p) => p.map((v) => round(v * f))),
-    anchors: o.anchors.map((a) => ({ index: a.index, x: round(a.x * f), y: round(a.y * f) })),
-    ...(o.stattrak ? { stattrak: o.stattrak.map((p) => p.map((v) => round(v * f))) } : {}),
+    stickerCm: round(o.stickerCm / ff),
+    w: round(o.w * ff),
+    h: round(o.h * ff),
+    paths: o.paths.map((p) => p.map((v) => round(v * ff))),
+    anchors: o.anchors.map((a) => ({ index: a.index, x: round(a.x * ff), y: round(a.y * ff) })),
+    ...(o.stattrak ? { stattrak: o.stattrak.map((p) => p.map((v) => round(v * ff))) } : {}),
+    ...(o.uv ? { uv: Object.fromEntries(Object.entries(o.uv).map(([key, q]) => [key, scaleUv(q!)])) as WeaponOutline["uv"] } : {}),
   };
 }
 
+/** Mat units of an outline to sticker-offset space (TEXCOORD_1 − 0.5): an offset
+ *  is m·(x, y) + c, m = [mxx, mxy, myx, myy]. */
+export type OutlineProjection = { m: [number, number, number, number]; c: [number, number] };
+
 /**
- * Where a point of an outline (mat units from its top-left corner) is on the
- * gun, in sticker-offset space: the outline's slot spots matched to the same
- * slots' offsets, by index, at slotScale. Null without a slot to match.
+ * How an outline's points land on the gun, for the body the finish renders on:
+ * through that body's measured unwrap (WeaponOutline.uv) — exact, and the only
+ * thing that is for a legacy finish, whose unwrap sits elsewhere than the HD
+ * body's the outline was traced on. An outline from before the unwraps were
+ * measured falls back to the slots: their spots matched to the same slots'
+ * offsets by index, at one scale (`scale`, slotScale of the HD slots). Null
+ * with neither.
  */
-export function outlineToOffset(
-  at: { x: number; y: number },
-  anchors: { index: number; x: number; y: number }[],
+export function outlineProjection(
+  o: { anchors: { index: number; x: number; y: number }[]; uv?: WeaponOutline["uv"] },
+  body: string,
   slotOf: (index: number) => StickerSlot | undefined,
   scale: number,
-): { u: number; v: number } | null {
+): OutlineProjection | null {
+  const q = o.uv?.[body === "body_legacy" ? "legacy" : "hd"];
+  if (q) return { m: [q[0], q[1], q[3], q[4]], c: [q[2] - 0.5, q[5] - 0.5] };
   const k = 1 / (STICKER_CM * scale);
-  const pairs = anchors.flatMap((a) => {
+  const pairs = o.anchors.flatMap((a) => {
     const s = slotOf(a.index);
     return s ? [{ a, s }] : [];
   });
   if (!pairs.length) return null;
-  const u = pairs.reduce((sum, { a, s }) => sum + s.offset[0] - a.x * k, 0) / pairs.length + at.x * k;
-  const v = pairs.reduce((sum, { a, s }) => sum + s.offset[1] - a.y * k, 0) / pairs.length + at.y * k;
-  return { u, v };
+  const cu = pairs.reduce((sum, { a, s }) => sum + s.offset[0] - a.x * k, 0) / pairs.length;
+  const cv = pairs.reduce((sum, { a, s }) => sum + s.offset[1] - a.y * k, 0) / pairs.length;
+  return { m: [k, 0, 0, k], c: [cu, cv] };
+}
+/** A point of the outline, in sticker-offset space. */
+export const projectPoint = (p: OutlineProjection, x: number, y: number) => ({
+  u: p.m[0] * x + p.m[1] * y + p.c[0],
+  v: p.m[2] * x + p.m[3] * y + p.c[1],
+});
+/** A distance on the mat (a sticker from its craft's centre), in offset space. */
+export const projectVector = (p: OutlineProjection, x: number, y: number) => ({
+  u: p.m[0] * x + p.m[1] * y,
+  v: p.m[2] * x + p.m[3] * y,
+});
+
+/** An offset on the gun (sticker-offset space) back to a point of the outline. */
+export function unprojectPoint(p: OutlineProjection, u: number, v: number): { x: number; y: number } | null {
+  const [a, b, c, d] = p.m;
+  const det = a * d - b * c;
+  if (Math.abs(det) < 1e-12) return null;
+  const du = u - p.c[0];
+  const dv = v - p.c[1];
+  return { x: (d * du - b * dv) / det, y: (a * dv - c * du) / det };
 }

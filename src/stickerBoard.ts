@@ -87,6 +87,9 @@ export interface StickerBoard {
   /** Grow or shrink the mat to this, animated — and with `refit`, fly the
    *  view out (or in) to fit it, on the same beat. */
   setLayout(layout: MatLayout, refit: boolean): void;
+  /** Each slot's sticker size on the chalked gun, as a share of STICKER_CM
+   *  ([] = all STICKER_CM): the mat draws a craft the size the gun will. */
+  setSlotSizes(sizes: number[]): void;
   dispose(): void;
 }
 
@@ -381,7 +384,9 @@ function drawChalkOutline(o: WeaponOutline): HTMLCanvasElement {
   g.textAlign = "center";
   g.textBaseline = "middle";
   for (const a of o.anchors) {
-    g.strokeRect(X(a.x) - side / 2, X(a.y) - side / 2, side, side);
+    // At the slot's own sticker size on the chalked gun, when it differs.
+    const sq = side * (a.size ?? 1);
+    g.strokeRect(X(a.x) - sq / 2, X(a.y) - sq / 2, sq, sq);
     g.fillText(String(a.index + 1), X(a.x), X(a.y));
   }
   // The StatTrak counter, where the editor puts it on this gun: in the same
@@ -453,10 +458,11 @@ function drawTurnHandle(): HTMLCanvasElement {
   return c;
 }
 
-/** A sticker's footprint on the mat — its ink box, turned — as an extent about its centre. */
-function extent(rot: number, inkW: number, inkH: number) {
-  const hw = (STICKER_CM * inkW) / 2;
-  const hh = (STICKER_CM * inkH) / 2;
+/** A sticker's footprint on the mat — its ink box, turned, at its slot's size
+ *  (`size`, see StickerBoard.setSlotSizes) — as an extent about its centre. */
+function extent(rot: number, inkW: number, inkH: number, size = 1) {
+  const hw = (STICKER_CM * inkW * size) / 2;
+  const hh = (STICKER_CM * inkH * size) / 2;
   const a = (rot * Math.PI) / 180;
   return {
     ex: Math.abs(hw * Math.cos(a)) + Math.abs(hh * Math.sin(a)),
@@ -477,6 +483,8 @@ type Node = {
   wear: number;
   /** Bumped per rebuild, so a slow load can't land on a newer one. */
   token: number;
+  /** Its slot's size on the chalked gun (setSlotSizes), 1 = STICKER_CM. */
+  size: number;
   /** A wear change waits for the slider to settle before it rebuilds. */
   wearTimer?: ReturnType<typeof setTimeout>;
 };
@@ -958,7 +966,7 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
     let top = Infinity;
     for (const s of list) {
       const node = nodes.get(s.uid);
-      top = Math.min(top, s.y - extent(s.rot, node?.inkW ?? 1, node?.inkH ?? 1).ey);
+      top = Math.min(top, s.y - extent(s.rot, node?.inkW ?? 1, node?.inkH ?? 1, node?.size ?? 1).ey);
     }
     const at = new THREE.Vector3(c.x - GRID_W / 2, 0, top - GRID_H / 2);
     return { c, d: c.y - top + HANDLE_GAP_PX * worldPerPx(at) };
@@ -997,7 +1005,7 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
     mesh.scale.set(STICKER_CM, 1, STICKER_CM);
     root.add(mesh);
     scene.add(root);
-    return { root, mesh, inkW: 1, inkH: 1, image: "", wear: -1, token: 0 };
+    return { root, mesh, inkW: 1, inkH: 1, size: 1, image: "", wear: -1, token: 0 };
   }
 
   /** (Re)build a node's material for its image and wear. */
@@ -1046,7 +1054,7 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
       let maxY = -Infinity;
       for (const m of members) {
         const node = nodes.get(m.uid);
-        const { ex, ey } = extent(m.rot, node?.inkW ?? 1, node?.inkH ?? 1);
+        const { ex, ey } = extent(m.rot, node?.inkW ?? 1, node?.inkH ?? 1, node?.size ?? 1);
         minX = Math.min(minX, m.x - ex);
         maxX = Math.max(maxX, m.x + ex);
         minY = Math.min(minY, m.y - ey);
@@ -1067,6 +1075,14 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
     }
   }
 
+  /**
+   * Each slot's sticker size on the chalked gun, as a share of STICKER_CM (the
+   * HD body's usual sticker): CS2 sizes stickers per slot and per body — the
+   * AWP's legacy body draws slot 2 at scale 20 and the rest at 22, against 19.6
+   * on the HD body — and the mat draws a craft's stickers as the gun will.
+   * [] = all the same.
+   */
+  let slotSizes: number[] = [];
   function sync(stickers: BoardSticker[], selected: ReadonlySet<string>) {
     current = new Map(stickers.map((s) => [s.uid, s]));
     selectedNow = selected;
@@ -1105,14 +1121,21 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
       }
       place(node, s);
       node.mesh.renderOrder = i + 1;
+      // Its slot (i) at that slot's size on the chalked gun.
+      node.size = slotSizes[i] ?? 1;
+      node.mesh.scale.set(STICKER_CM * node.size, 1, STICKER_CM * node.size);
     });
     drawGroups();
     dirty = true;
   }
+  function setSlotSizes(sizes: number[]) {
+    slotSizes = sizes;
+    sync([...current.values()].sort((a, b) => order.indexOf(a.uid) - order.indexOf(b.uid)), selectedNow);
+  }
 
   // ---- snapshots ------------------------------------------------------------------
   /** Stickers into a scene of their own, at world (x, z) = `at(s)`; and the box round their ink. */
-  async function layStickers(into: ThreeNS.Scene, list: CraftSticker[], at: (s: CraftSticker) => { x: number; z: number }) {
+  async function layStickers(into: ThreeNS.Scene, list: CraftSticker[], at: (s: CraftSticker) => { x: number; z: number }, sizes: number[] = []) {
     const made = await Promise.all(list.map((s) => stickerMaterial(THREE, s.image, s.wear).catch(() => null)));
     const box = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
     list.forEach((s, i) => {
@@ -1120,12 +1143,13 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
       if (!built) return;
       const p = at(s);
       const mesh = new THREE.Mesh(quadGeom, built.mat);
-      mesh.scale.set(STICKER_CM, 1, STICKER_CM);
+      const size = sizes[i] ?? 1;
+      mesh.scale.set(STICKER_CM * size, 1, STICKER_CM * size);
       mesh.position.set(p.x, 0.05, p.z);
       mesh.rotation.y = (-s.rot * Math.PI) / 180;
       mesh.renderOrder = i + 1;
       into.add(mesh);
-      const { ex, ey } = extent(s.rot, built.inkW, built.inkH);
+      const { ex, ey } = extent(s.rot, built.inkW, built.inkH, size);
       box.minX = Math.min(box.minX, p.x - ex);
       box.maxX = Math.max(box.maxX, p.x + ex);
       box.minY = Math.min(box.minY, p.z - ey);
@@ -1192,7 +1216,7 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
     const ch = new THREE.Mesh(chalk.geometry, chalkMat);
     ch.position.y = chalk.position.y;
     snap.add(ch);
-    const laid = await layStickers(snap, list, (s) => ({ x: s.x - GRID_W / 2, z: s.y - GRID_H / 2 }));
+    const laid = await layStickers(snap, list, (s) => ({ x: s.x - GRID_W / 2, z: s.y - GRID_H / 2 }), slotSizes);
     try {
       // The weapon's box (centred on the world origin) and the craft, a little room round both.
       const b = laid.box;
@@ -1322,6 +1346,7 @@ export async function mountStickerBoard(container: HTMLElement, cb: BoardCallbac
     viewCentre,
     setOutline,
     setLayout,
+    setSlotSizes,
     dispose() {
       disposed = true;
       cancelAnimationFrame(raf);

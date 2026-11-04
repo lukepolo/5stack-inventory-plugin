@@ -3355,9 +3355,8 @@ app.get<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", asy
 /**
  * First trace per extraction wins: a second upload for the same version changes
  * nothing — except an administrator's, which replaces it (a bad trace is never
- * stuck until the next extraction), and one that adds the StatTrak counter to
- * a trace stored without it (the mat traces those again). DELETE clears one for
- * re-tracing.
+ * stuck until the next extraction), and one in a newer trace format (`v`: the
+ * mat traces an older one again). DELETE clears one for re-tracing.
  */
 app.put<{ Params: { model: string }; Body: unknown }>(
   "/api/catalog/weapon-outline/:model",
@@ -3381,7 +3380,7 @@ app.put<{ Params: { model: string }; Body: unknown }>(
       `INSERT INTO inventory.weapon_outlines (model, extract_version, outline) VALUES ($1, $2, $3::jsonb)
        ON CONFLICT (model) DO UPDATE SET extract_version = EXCLUDED.extract_version, outline = EXCLUDED.outline, updated_at = now()
          WHERE $4::boolean OR inventory.weapon_outlines.extract_version <> EXCLUDED.extract_version
-            OR (NOT (inventory.weapon_outlines.outline ? 'stattrak') AND (EXCLUDED.outline ? 'stattrak'))`,
+            OR COALESCE((inventory.weapon_outlines.outline->>'v')::int, 1) < COALESCE((EXCLUDED.outline->>'v')::int, 1)`,
       [model, version, JSON.stringify(outline), admin],
     );
     return { ok: true };

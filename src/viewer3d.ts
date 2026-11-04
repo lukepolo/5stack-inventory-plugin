@@ -2547,6 +2547,15 @@ export interface SideOutline {
    *  size and order as `mask`), placed exactly as the editor places it — or
    *  null when the gun takes none. */
   stattrak: Uint8Array | null;
+  /**
+   * Each body's sticker unwrap (TEXCOORD_1) as seen from this side, measured
+   * off its own vertices: u = a·x + b·y + c, v = d·x + e·y + f with (x, y) in
+   * pixels of this view, [a, b, c, d, e, f]. A gun's sticker unwrap is a flat
+   * projection of its side, so this is exact (measured: 0.00 stickers off over
+   * the whole AWP) — and it is NOT the same for the two bodies: the AWP's
+   * legacy unwrap sits 2.2cm along from the HD one, at the same density.
+   */
+  uv: { hd?: number[]; legacy?: number[] };
 }
 const outlineCache = new Map<string, Promise<SideOutline | null>>();
 /**
@@ -3958,6 +3967,10 @@ async function buildViewer(
   let paintFailed = false;
   // Which body survived the hd/legacy prune below — slot markup is per-variant.
   let bodyVariant = "body_hd";
+  /** Outline mounts only: the body the finish does NOT use, kept aside when it
+   *  is pruned — its meshes and where they sat relative to `object` — so
+   *  sideOutline can measure that body's sticker unwrap too (SideOutline.uv). */
+  let spareBody: { variant: string; meshes: { geom: import("three").BufferGeometry; rel: import("three").Matrix4 }[] } | null = null;
   // What the prop cull removed — if this reads 0 tris on the Revolver or
   // XM1014, the bone-scale detection missed and the floating props are back.
   let propStats = "no skin";
@@ -4586,6 +4599,18 @@ async function buildViewer(
       object.traverse((node) => {
         if (dropPattern.test(node.name ?? "")) drop.push(node);
       });
+      if (opts?.outline) {
+        object.updateMatrixWorld(true);
+        const toObject = object.matrixWorld.clone().invert();
+        const meshes: { geom: import("three").BufferGeometry; rel: import("three").Matrix4 }[] = [];
+        for (const node of drop) {
+          node.traverse((c) => {
+            const m = c as import("three").Mesh;
+            if (m.isMesh && m.geometry) meshes.push({ geom: m.geometry, rel: toObject.clone().multiply(m.matrixWorld) });
+          });
+        }
+        spareBody = { variant: useLegacy ? "body_hd" : "body_legacy", meshes };
+      }
       drop.forEach((nodeToRemove) => nodeToRemove.parent?.remove(nodeToRemove));
     }
   }
@@ -6750,12 +6775,73 @@ async function buildViewer(
     };
     const mask = toMask(px);
     const stattrak = modPx ? toMask(modPx) : null;
+    // Each body's unwrap against this view: least squares over the vertices
+    // that face the camera, once more without the worst tenth (a stray part
+    // with its own unwrap must not tilt it).
+    const toCam = side.clone();
+    const fitBody = (meshes: { geom: import("three").BufferGeometry; world: import("three").Matrix4 }[]): number[] | null => {
+      const rows: [number, number, number, number][] = [];
+      const p = new THREE.Vector3();
+      const n = new THREE.Vector3();
+      const nm = new THREE.Matrix3();
+      for (const { geom, world } of meshes) {
+        const pos = geom.getAttribute("position");
+        const nor = geom.getAttribute("normal");
+        const uv = geom.getAttribute("uv1") ?? geom.getAttribute("uv2");
+        if (!pos || !nor || !uv) continue;
+        nm.getNormalMatrix(world);
+        for (let i = 0; i < pos.count; i++) {
+          n.fromBufferAttribute(nor, i).applyMatrix3(nm).normalize();
+          if (n.dot(toCam) < 0.6) continue;
+          p.fromBufferAttribute(pos, i).applyMatrix4(world).project(cam);
+          rows.push([((p.x + 1) / 2) * W, ((1 - p.y) / 2) * H, uv.getX(i), uv.getY(i)]);
+        }
+      }
+      const solve = (pts: typeof rows) => {
+        // Normal equations for [x y 1] against u and v.
+        const m = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const bu = [0, 0, 0];
+        const bv = [0, 0, 0];
+        for (const [x, y, u, v] of pts) {
+          const r = [x, y, 1];
+          for (let i = 0; i < 3; i++) {
+            for (let j = 0; j < 3; j++) m[i * 3 + j] += r[i] * r[j];
+            bu[i] += r[i] * u;
+            bv[i] += r[i] * v;
+          }
+        }
+        const inv = new THREE.Matrix3().set(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+        if (Math.abs(inv.determinant()) < 1e-9) return null;
+        inv.invert();
+        const e = inv.elements; // column-major
+        const mul = (b: number[]) => [0, 1, 2].map((i) => e[i] * b[0] + e[3 + i] * b[1] + e[6 + i] * b[2]);
+        const [a, b2, c] = mul(bu);
+        const [d, e2, f] = mul(bv);
+        return [a, b2, c, d, e2, f];
+      };
+      if (rows.length < 20) return null;
+      let fit = solve(rows);
+      if (!fit) return null;
+      const err = (r: (typeof rows)[number], q: number[]) => Math.hypot(q[0] * r[0] + q[1] * r[1] + q[2] - r[2], q[3] * r[0] + q[4] * r[1] + q[5] - r[3]);
+      const sorted = rows.map((r) => err(r, fit!)).sort((x, y) => x - y);
+      const cut = sorted[Math.floor(sorted.length * 0.9)];
+      fit = solve(rows.filter((r) => err(r, fit!) <= cut)) ?? fit;
+      return fit;
+    };
+    const keyOf = (variant: string) => (variant === "body_legacy" ? "legacy" : "hd");
+    const uv: { hd?: number[]; legacy?: number[] } = {};
+    const kept = fitBody(uv1Meshes.map((m) => ({ geom: m.geometry, world: m.matrixWorld })));
+    if (kept) uv[keyOf(bodyVariant)] = kept;
+    if (spareBody) {
+      const spare = fitBody(spareBody.meshes.map((m) => ({ geom: m.geom, world: object.matrixWorld.clone().multiply(m.rel) })));
+      if (spare) uv[keyOf(spareBody.variant)] = spare;
+    }
     const at = new THREE.Vector3();
     const pts = anchorPoints().map((a) => {
       at.copy(a.p).project(cam);
       return { index: a.index, x: ((at.x + 1) / 2) * W, y: ((1 - at.y) / 2) * H };
     });
-    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts, stattrak };
+    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts, stattrak, uv };
   }
   function frameStickers(mode: "in" | "back" | "stay", slots?: number[]) {
     if (disposed) return;

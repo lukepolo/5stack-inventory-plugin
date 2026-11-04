@@ -34,13 +34,19 @@
 import { computed, ref, watch, type Ref } from "vue";
 import { fetchStickerGeometry, type StickerBounds, type StickerGroupSpec, type StickerSlot } from "../api";
 import { STICKER_CM, type SavedCraft } from "../stickerCraftsModel";
-import { outlineToOffset, slotScale } from "../outlineTrace";
+import { bodySlots, outlineProjection, projectPoint, projectVector, slotScale, type WeaponOutline } from "../outlineTrace";
 import type { StickerPlacement, ViewerHandle } from "../viewer3d";
 
 /** Where a craft sat on a weapon's chalked outline on the mat: its centre, in
- *  mat units from the outline's top-left, and the outline's slot spots — what
- *  "Put on your …" hands the editor, so the craft lands where it was laid out. */
-export type OutlineSpot = { x: number; y: number; anchors: { index: number; x: number; y: number }[] };
+ *  mat units from the outline's top-left, the outline's slot spots and the
+ *  bodies' unwraps over it — what "Put on your …" hands the editor, so the
+ *  craft lands where it was laid out, on whichever body the finish uses. */
+export type OutlineSpot = {
+  x: number;
+  y: number;
+  anchors: { index: number; x: number; y: number }[];
+  uv?: WeaponOutline["uv"];
+};
 
 /** The shape of one of the craft form's sticker slots — App's `Attach`. */
 type SlotSticker = {
@@ -58,13 +64,14 @@ type CraftForm = {
   stickers: (SlotSticker | null)[];
 };
 
-/** Where each slot's offsets are measured from, on the body this finish uses;
- *  `exact` without the fallback to the first slot; `scale` is one sticker's
- *  size on this gun (slotScale), which mat centimetres convert at. */
+/** Where each slot's offsets are measured from, on the body this finish uses
+ *  (`body`); `exact` without the fallback to the first slot; `scale` is what
+ *  mat centimetres convert at — one HD sticker (slotScale of the HD slots). */
 type Frame = {
   anchorOf: (slot: number) => StickerSlot | undefined;
   exact: (slot: number) => StickerSlot | undefined;
   bounds: StickerBounds | null;
+  body: string;
   scale: number;
 };
 /** One sticker bound to a slot: its offset from the group's centre in unwrap
@@ -133,7 +140,11 @@ export function useStickerCraftPlacement(o: {
     if (!anchors.length) return null;
     const first = anchors.reduce((lo, s) => (s.index < lo.index ? s : lo));
     const exact = (slot: number) => anchors.find((s) => s.index === slot);
-    return { anchorOf: (slot) => exact(slot) ?? first, exact, bounds: geo.bounds, scale: slotScale(anchors) };
+    // Mat centimetres go on at the HD body's sticker size whatever the body:
+    // a legacy body's stickers are smaller (scale 22 against 19.6 on the AWP)
+    // but its unwrap has the same density, so a place on the gun is the same
+    // distance in it. Converting at the legacy size shrank a layout ~11%.
+    return { anchorOf: (slot) => exact(slot) ?? first, exact, bounds: geo.bounds, body: mine.length ? body : "body_hd", scale: slotScale(bodySlots(geo.slots)) };
   }
 
   /** Each sticker of a craft bound to its slot, measured in unwrap units —
@@ -353,10 +364,17 @@ export function useStickerCraftPlacement(o: {
   function placeOnOutline(at: OutlineSpot) {
     const p = pending.value;
     if (!p) return;
-    const spot = outlineToOffset(at, at.anchors, p.frame.exact, p.frame.scale);
-    if (!spot) return placeHere();
+    const proj = outlineProjection(at, p.frame.body, p.frame.exact, p.frame.scale);
+    if (!proj) return placeHere();
+    // The layout through the same unwrap as its centre, so its spacing (and
+    // any turn the unwrap has against the side) matches the mat too.
+    p.members = p.members.map((m, i) => {
+      const st = p.entry.stickers[i];
+      const d = projectVector(proj, st.x, st.y);
+      return { ...m, ou: d.u, ov: d.v };
+    });
     ghost.value = null;
-    land(p, spot);
+    land(p, projectPoint(proj, at.x, at.y));
   }
 
   /**

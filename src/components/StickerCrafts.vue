@@ -98,7 +98,7 @@ const props = defineProps<{
   /** The catalog's weapons — the chalk outline's choices. */
   weapons: CatalogWeapon[];
   /** Your equipped skin of this gun, if any (App's loadout): its name and 2D art. */
-  equippedSkin?: (model: string) => { name: string; image: string | null } | null;
+  equippedSkin?: (model: string) => { name: string; image: string | null; legacy: boolean } | null;
 }>();
 /** Messages go up to the host's toast, like every other screen's (AdminConsole). */
 const emit = defineEmits<{
@@ -816,7 +816,7 @@ async function putOnGun() {
   // on its slots' default spots. The chalk's box is centred on the home grid.
   const o = outline.value?.model === model ? outline.value : null;
   const c = centroid(keep.value);
-  const at = o ? { x: c.x - (GRID_W / 2 - o.w / 2), y: c.y - (GRID_H / 2 - o.h / 2), anchors: o.anchors } : null;
+  const at = o ? { x: c.x - (GRID_W / 2 - o.w / 2), y: c.y - (GRID_H / 2 - o.h / 2), anchors: o.anchors, uv: o.uv } : null;
   emit("put-on-gun", id, model, at);
 }
 /** Enter in the name field: Update when the mat is a saved craft, else Save. */
@@ -1106,8 +1106,9 @@ const outline = computed<WeaponOutline | null>(() => outlines.value.get(outlineM
  * The stored outline, or a fresh trace of the model, which is then stored —
  * calibrated against the gun's own slots on the way in (calibrateOutline), so
  * a layout on the chalk lands on the gun where it was laid out. The stored
- * copy stays as traced. One stored before outlines carried the StatTrak
- * counter (no `stattrak`) is traced again, and the new trace replaces it.
+ * copy stays as traced. One stored in an older format (OUTLINE_V: before the
+ * StatTrak counter and the bodies' unwraps) is traced again, and the new trace
+ * replaces it.
  */
 async function outlineFor(model: string): Promise<WeaponOutline | null> {
   const [stored, geo, trace] = await Promise.all([
@@ -1115,7 +1116,7 @@ async function outlineFor(model: string): Promise<WeaponOutline | null> {
     fetchStickerGeometry(model),
     import("../outlineTrace"),
   ]);
-  if (stored?.stattrak) return trace.calibrateOutline(stored, geo.slots);
+  if (stored && (stored.v ?? 1) >= trace.OUTLINE_V) return trace.calibrateOutline(stored, geo.slots);
   // Through the lazy edge, so three comes down alongside the viewer's chunk.
   const { weaponOutline } = await viewer3d();
   const side = await weaponOutline(model, geo.slots);
@@ -1150,6 +1151,62 @@ watch(
   },
   { immediate: true },
 );
+// ---- the chalked gun's own slots -------------------------------------------------
+/**
+ * The chalked gun as the craft will meet it: the body your equipped skin of it
+ * renders on (a pre-CS2 finish uses the legacy body; none equipped, or a new
+ * plain one, the HD body), its sticker slots, and how big each slot draws a
+ * sticker. CS2 sizes stickers per slot and per body — the AWP's legacy body
+ * draws slot 2 at scale 20 and the rest at 22, against 19.6 on the HD body the
+ * outline is measured on — so the mat draws a craft the size the gun will, and
+ * chalks that body's slot squares where they are on it.
+ */
+const outlineGeo = shallowRef<import("../api").StickerGeometry | null>(null);
+watch(
+  outlineModel,
+  async (model) => {
+    outlineGeo.value = null;
+    if (!model) return;
+    const geo = await fetchStickerGeometry(model).catch(() => null);
+    if (outlineModel.value === model) outlineGeo.value = geo;
+  },
+  { immediate: true },
+);
+const targetBody = computed(() => (outlineModel.value && props.equippedSkin?.(outlineModel.value)?.legacy ? "body_legacy" : "body_hd"));
+/** The target body's slots, and one HD sticker's scale (what STICKER_CM is). */
+const targetSlots = computed(() => {
+  const geo = outlineGeo.value;
+  if (!geo || !outline.value) return null;
+  const hd = trace.value?.bodySlots(geo.slots) ?? [];
+  const mine = geo.slots.filter((s) => s.mesh === targetBody.value);
+  return { slots: mine.length ? mine : hd, body: mine.length ? targetBody.value : "body_hd", hdScale: trace.value?.slotScale(hd) ?? 1 };
+});
+/** Each slot's sticker as a share of STICKER_CM, slot 1 first ([] = all equal). */
+const slotSizes = computed<number[]>(() => {
+  const t = targetSlots.value;
+  if (!t) return [];
+  return Array.from({ length: MAX_ON_BOARD }, (_, i) => {
+    const sc = t.slots.find((s) => s.index === i)?.scale ?? 0;
+    return sc > 0 ? Math.round((t.hdScale / sc) * 1000) / 1000 : 1;
+  });
+});
+/** The outline as chalked: the target body's slot squares, at their sizes. */
+const chalked = computed<WeaponOutline | null>(() => {
+  const o = outline.value;
+  const t = targetSlots.value;
+  const tr8 = trace.value;
+  if (!o || !t || !tr8) return o;
+  const proj = tr8.outlineProjection(o, t.body, (i) => t.slots.find((s) => s.index === i), t.hdScale);
+  const anchors = t.slots.flatMap((s) => {
+    const at = proj ? tr8.unprojectPoint(proj, s.offset[0], s.offset[1]) : o.anchors.find((a) => a.index === s.index) ?? null;
+    return at ? [{ index: s.index, x: at.x, y: at.y, size: s.scale > 0 ? t.hdScale / s.scale : 1 }] : [];
+  });
+  return { ...o, anchors: anchors.length ? anchors : o.anchors };
+});
+/** The outline module, for the sync helpers above (loaded with the first outline). */
+const trace = shallowRef<typeof import("../outlineTrace") | null>(null);
+void import("../outlineTrace").then((m) => (trace.value = m));
+
 /** The weapons that take stickers, by kind: the outline cards, in this order. */
 const OUTLINE_KINDS = ["rifle", "smg", "heavy", "secondary"] as const;
 /** The guns most crafts are for come first (AK-47, M4A4, M4A1-S, AWP, Desert
@@ -1291,7 +1348,8 @@ const board = shallowRef<StickerBoard | null>(null);
 // The chalk and the mat's size follow the pick (and the board when it is made).
 // A new weapon flies the view out or in to fit; the mat growing round a
 // sticker left outside the work area leaves the camera be.
-watch([outline, board, stattrakChalk], ([o, b, st]) => b?.setOutline(o && !st ? { ...o, stattrak: [] } : o), { immediate: true });
+watch([chalked, board, stattrakChalk], ([o, b, st]) => b?.setOutline(o && !st ? { ...o, stattrak: [] } : o), { immediate: true });
+watch([slotSizes, board], ([sz, b]) => b?.setSlotSizes(sz), { immediate: true });
 let layoutFor: WeaponOutline | null | undefined;
 watch(
   [matLayout, board],
