@@ -338,7 +338,9 @@ createServer(async (req, res) => {
       if (req.method === "PUT") {
         const o = crafts.normOutline(JSON.parse((await readBody(req)).toString() || "null"), model);
         if (!o || !weaponNameOf(model)) return status(res, 400, { error: "That isn't a weapon outline." });
-        if (!OUTLINES.has(model)) OUTLINES.set(model, o);
+        // First trace wins, as on the backend — but one in a newer format
+        // (`v`) replaces an older one.
+        if (!OUTLINES.has(model) || (OUTLINES.get(model).v ?? 1) < (o.v ?? 1)) OUTLINES.set(model, o);
         return json(res, { ok: true });
       }
       return OUTLINES.has(model) ? json(res, { outline: OUTLINES.get(model) }) : status(res, 404, { error: "not traced yet" });

@@ -174,7 +174,7 @@ import { useInventoryView } from "./composables/useInventoryView";
 import { useAttachmentPicker, type PickerRow } from "./composables/useAttachmentPicker";
 import type { SavedCraft } from "./stickerCraftsModel";
 import { loadStickerCrafts } from "./stickerCraftsModel";
-import { useStickerCraftPlacement } from "./composables/useStickerCraftPlacement";
+import { useStickerCraftPlacement, type OutlineSpot } from "./composables/useStickerCraftPlacement";
 import { usePersistedBool, usePersistedEnum, usePersistedNumber } from "./composables/usePersistedRef";
 import { accentSoft, ART_FADE_B, attachmentsOf, canInspect, CARD_ART, CARD_CHROME_PX, glowStyle, hasScratch, hasSeed, hasWear, isCustomizable, isReadOnly, itemName, RARITY_META, rarityName, rarityRank, selRing, STEAM_BLUE, stripName, weaponName, wearGradient, wearTier, wearPositionInTier } from "./itemVisuals";
 import { stackByDesign, TINT_SUFFIX } from "./decks";
@@ -3792,14 +3792,17 @@ function craftDrawerFit(entry: SavedCraft) {
   const plan = craftDrop.planFor(first, entry.stickers.length);
   return plan ? { slots: plan.slots, moved: plan.moves.length } : null;
 }
-/** One click in the drawer: the craft goes straight onto its slots, grouped. */
-async function placeCraftFromDrawer(entry: SavedCraft) {
+/** One click in the drawer: the craft goes straight onto its slots, grouped —
+ *  or, sent from the mat, where it sat on the gun's outline there. */
+async function placeCraftFromDrawer(entry: SavedCraft, at: OutlineSpot | null = null) {
   const c = craft.value;
   if (!c) return;
   const first = c.stickers.slice(0, stickerSlotCount).findIndex((s) => !s);
   if (first < 0) return;
   await craftDrop.pickCraft(entry, first);
-  if (craft.value === c) craftDrop.placeHere();
+  if (craft.value !== c) return;
+  if (at) craftDrop.placeOnOutline(at);
+  else craftDrop.placeHere();
 }
 // ---- a craft sent from the mat ("Put on your M4A4") ---------------------------------
 /** Your equipped skin of this gun (the loadout), this side first; null for none. */
@@ -3809,18 +3812,20 @@ function equippedRowFor(model: string): LoadoutEntry | null {
 }
 const equippedInstanceFor = (model: string) => equippedRowFor(model)?.item_instance_id ?? null;
 /** For the mat's "Put on your …" button: that skin's name and its 2D art. */
-function equippedSkinFor(model: string): { name: string; image: string | null } | null {
+function equippedSkinFor(model: string): { name: string; image: string | null; legacy: boolean } | null {
   const item = equippedRowFor(model)?.item;
-  return item ? { name: item.name, image: item.image ?? null } : null;
+  // `legacy`: it renders on the gun's legacy body (a pre-CS2 finish), whose
+  // sticker slots sit and size differently — the mat draws them that way.
+  return item ? { name: item.name, image: item.image ?? null, legacy: !!(item.legacyPaint && item.paintMaterial) } : null;
 }
 /** The craft waiting for that gun's editor to open, and the gun. Held here, not
  *  in the URL: the draft's own query sync would strip a key on the way in. */
-const craftToUse = ref<{ id: string; model: string } | null>(null);
-function putCraftOnGun(craftId: string, model: string) {
+const craftToUse = ref<{ id: string; model: string; at: OutlineSpot | null } | null>(null);
+function putCraftOnGun(craftId: string, model: string, at: OutlineSpot | null) {
   const inst = equippedInstanceFor(model);
   const w = weaponByModel.value.get(model);
   if (inst == null && !w) return;
-  craftToUse.value = { id: craftId, model };
+  craftToUse.value = { id: craftId, model, at };
   // Yours, equipped: its editor. None: a new one, from the plain gun. As a
   // modal OVER the mat (openModalRoute pins the backdrop and the way back), so
   // Cancel and Save land on Sticker Crafts again, not the inventory.
@@ -3839,7 +3844,8 @@ watch(craft, async (c) => {
     const n = entry.stickers.length;
     return notify(`“${entry.name}” needs ${n} empty sticker ${n === 1 ? "slot" : "slots"} on this gun — take some off, then pick it from Your crafts under the gun.`, "error");
   }
-  await placeCraftFromDrawer(entry);
+  // Where it sat on the gun's outline on the mat, when it was laid out on one.
+  await placeCraftFromDrawer(entry, want.at);
 });
 function applyStickerCraft(entry: SavedCraft) {
   const p = picker.value;
@@ -4055,6 +4061,13 @@ async function mountModalViewer() {
       // for the watcher below to talk to. Reconcile here so a mode change can't
       // be lost in the gap — no-ops when it already matches.
       handle.setInteractive(!viewOnly.value);
+      // The same gap for the STICKERS: the sticker watcher below has no handle
+      // to talk to while this mounts, so anything that changed them meanwhile
+      // never reached the gun — a craft put on from the mat (it lands while the
+      // editor is still mounting), a restored group, sticker art resolving late
+      // on a slow first load. The gun stood bare with every sticker in the
+      // panel. The viewer no-ops a placement it already shows.
+      handle.setStickers(craftStickerPlacements());
       // A remount starts the pet on its idle; Wander, if it was on, carries on —
       // and is switched on here the first time, unless it has been turned off.
       if (target.kind === "pet" && petWander.value) armPetWander();

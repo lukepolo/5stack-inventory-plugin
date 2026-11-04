@@ -2543,6 +2543,19 @@ export interface SideOutline {
   stickerWorld: number;
   /** Where each slot's anchor falls on it, in pixels. */
   anchors: { index: number; x: number; y: number }[];
+  /** The StatTrak module's own silhouette, seen from the same camera (same
+   *  size and order as `mask`), placed exactly as the editor places it — or
+   *  null when the gun takes none. */
+  stattrak: Uint8Array | null;
+  /**
+   * Each body's sticker unwrap (TEXCOORD_1) as seen from this side, measured
+   * off its own vertices: u = a·x + b·y + c, v = d·x + e·y + f with (x, y) in
+   * pixels of this view, [a, b, c, d, e, f]. A gun's sticker unwrap is a flat
+   * projection of its side, so this is exact (measured: 0.00 stickers off over
+   * the whole AWP) — and it is NOT the same for the two bodies: the AWP's
+   * legacy unwrap sits 2.2cm along from the HD one, at the same density.
+   */
+  uv: { hd?: number[]; legacy?: number[] };
 }
 const outlineCache = new Map<string, Promise<SideOutline | null>>();
 /**
@@ -2567,6 +2580,9 @@ export function weaponOutline(model: string, slots: StickerSlot[]): Promise<Side
           frame: "fit",
           outline: true,
           stickerSlots: slots,
+          // The counter, so the chalk can show where it sits: the dark (card)
+          // module, placed by the same code as the editor's.
+          stattrak: { count: null },
         });
         return handle.sideOutline();
       } catch {
@@ -3951,6 +3967,10 @@ async function buildViewer(
   let paintFailed = false;
   // Which body survived the hd/legacy prune below — slot markup is per-variant.
   let bodyVariant = "body_hd";
+  /** Outline mounts only: the body the finish does NOT use, kept aside when it
+   *  is pruned — its meshes and where they sat relative to `object` — so
+   *  sideOutline can measure that body's sticker unwrap too (SideOutline.uv). */
+  let spareBody: { variant: string; meshes: { geom: import("three").BufferGeometry; rel: import("three").Matrix4 }[] } | null = null;
   // What the prop cull removed — if this reads 0 tris on the Revolver or
   // XM1014, the bone-scale detection missed and the floating props are back.
   let propStats = "no skin";
@@ -4579,6 +4599,18 @@ async function buildViewer(
       object.traverse((node) => {
         if (dropPattern.test(node.name ?? "")) drop.push(node);
       });
+      if (opts?.outline) {
+        object.updateMatrixWorld(true);
+        const toObject = object.matrixWorld.clone().invert();
+        const meshes: { geom: import("three").BufferGeometry; rel: import("three").Matrix4 }[] = [];
+        for (const node of drop) {
+          node.traverse((c) => {
+            const m = c as import("three").Mesh;
+            if (m.isMesh && m.geometry) meshes.push({ geom: m.geometry, rel: toObject.clone().multiply(m.matrixWorld) });
+          });
+        }
+        spareBody = { variant: useLegacy ? "body_hd" : "body_legacy", meshes };
+      }
       drop.forEach((nodeToRemove) => nodeToRemove.parent?.remove(nodeToRemove));
     }
   }
@@ -6695,14 +6727,37 @@ async function buildViewer(
     const clear = renderer.getClearColor(new THREE.Color());
     const clearA = renderer.getClearAlpha();
     const px = new Uint8Array(W * H * 4);
-    try {
-      stage.add(object);
+    // The StatTrak module gets a silhouette of its own: the gun is drawn
+    // without it, then it is drawn alone, from the same camera.
+    const mod = stattrakMod;
+    const modPx = mod ? new Uint8Array(W * H * 4) : null;
+    const draw = (into: Uint8Array) => {
       renderer.setRenderTarget(rt);
-      renderer.setClearColor(0x000000, 0);
       renderer.clear();
       renderer.render(stage, cam);
-      renderer.readRenderTargetPixels(rt, 0, 0, W, H, px);
+      renderer.readRenderTargetPixels(rt, 0, 0, W, H, into);
+    };
+    const hidden: import("three").Object3D[] = [];
+    try {
+      stage.add(object);
+      renderer.setClearColor(0x000000, 0);
+      if (mod) mod.visible = false;
+      draw(px);
+      if (mod && modPx) {
+        mod.visible = true;
+        const own = new Set<import("three").Object3D>();
+        mod.traverse((c) => own.add(c));
+        object.traverse((c) => {
+          if ((c as import("three").Mesh).isMesh && !own.has(c) && c.visible) {
+            c.visible = false;
+            hidden.push(c);
+          }
+        });
+        draw(modPx);
+      }
     } finally {
+      for (const c of hidden) c.visible = true;
+      if (mod) mod.visible = true;
       renderer.setRenderTarget(null);
       renderer.setClearColor(clear, clearA);
       if (parent) parent.add(object);
@@ -6710,17 +6765,83 @@ async function buildViewer(
       flat.dispose();
     }
     // Top row first, as an image is.
-    const mask = new Uint8Array(W * H);
-    for (let y = 0; y < H; y++) {
-      const src = (H - 1 - y) * W * 4;
-      for (let x = 0; x < W; x++) mask[y * W + x] = px[src + x * 4] > 127 ? 1 : 0;
+    const toMask = (from: Uint8Array) => {
+      const out = new Uint8Array(W * H);
+      for (let y = 0; y < H; y++) {
+        const src = (H - 1 - y) * W * 4;
+        for (let x = 0; x < W; x++) out[y * W + x] = from[src + x * 4] > 127 ? 1 : 0;
+      }
+      return out;
+    };
+    const mask = toMask(px);
+    const stattrak = modPx ? toMask(modPx) : null;
+    // Each body's unwrap against this view: least squares over the vertices
+    // that face the camera, once more without the worst tenth (a stray part
+    // with its own unwrap must not tilt it).
+    const toCam = side.clone();
+    const fitBody = (meshes: { geom: import("three").BufferGeometry; world: import("three").Matrix4 }[]): number[] | null => {
+      const rows: [number, number, number, number][] = [];
+      const p = new THREE.Vector3();
+      const n = new THREE.Vector3();
+      const nm = new THREE.Matrix3();
+      for (const { geom, world } of meshes) {
+        const pos = geom.getAttribute("position");
+        const nor = geom.getAttribute("normal");
+        const uv = geom.getAttribute("uv1") ?? geom.getAttribute("uv2");
+        if (!pos || !nor || !uv) continue;
+        nm.getNormalMatrix(world);
+        for (let i = 0; i < pos.count; i++) {
+          n.fromBufferAttribute(nor, i).applyMatrix3(nm).normalize();
+          if (n.dot(toCam) < 0.6) continue;
+          p.fromBufferAttribute(pos, i).applyMatrix4(world).project(cam);
+          rows.push([((p.x + 1) / 2) * W, ((1 - p.y) / 2) * H, uv.getX(i), uv.getY(i)]);
+        }
+      }
+      const solve = (pts: typeof rows) => {
+        // Normal equations for [x y 1] against u and v.
+        const m = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        const bu = [0, 0, 0];
+        const bv = [0, 0, 0];
+        for (const [x, y, u, v] of pts) {
+          const r = [x, y, 1];
+          for (let i = 0; i < 3; i++) {
+            for (let j = 0; j < 3; j++) m[i * 3 + j] += r[i] * r[j];
+            bu[i] += r[i] * u;
+            bv[i] += r[i] * v;
+          }
+        }
+        const inv = new THREE.Matrix3().set(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8]);
+        if (Math.abs(inv.determinant()) < 1e-9) return null;
+        inv.invert();
+        const e = inv.elements; // column-major
+        const mul = (b: number[]) => [0, 1, 2].map((i) => e[i] * b[0] + e[3 + i] * b[1] + e[6 + i] * b[2]);
+        const [a, b2, c] = mul(bu);
+        const [d, e2, f] = mul(bv);
+        return [a, b2, c, d, e2, f];
+      };
+      if (rows.length < 20) return null;
+      let fit = solve(rows);
+      if (!fit) return null;
+      const err = (r: (typeof rows)[number], q: number[]) => Math.hypot(q[0] * r[0] + q[1] * r[1] + q[2] - r[2], q[3] * r[0] + q[4] * r[1] + q[5] - r[3]);
+      const sorted = rows.map((r) => err(r, fit!)).sort((x, y) => x - y);
+      const cut = sorted[Math.floor(sorted.length * 0.9)];
+      fit = solve(rows.filter((r) => err(r, fit!) <= cut)) ?? fit;
+      return fit;
+    };
+    const keyOf = (variant: string) => (variant === "body_legacy" ? "legacy" : "hd");
+    const uv: { hd?: number[]; legacy?: number[] } = {};
+    const kept = fitBody(uv1Meshes.map((m) => ({ geom: m.geometry, world: m.matrixWorld })));
+    if (kept) uv[keyOf(bodyVariant)] = kept;
+    if (spareBody) {
+      const spare = fitBody(spareBody.meshes.map((m) => ({ geom: m.geom, world: object.matrixWorld.clone().multiply(m.rel) })));
+      if (spare) uv[keyOf(spareBody.variant)] = spare;
     }
     const at = new THREE.Vector3();
     const pts = anchorPoints().map((a) => {
       at.copy(a.p).project(cam);
       return { index: a.index, x: ((at.x + 1) / 2) * W, y: ((1 - at.y) / 2) * H };
     });
-    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts };
+    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts, stattrak, uv };
   }
   function frameStickers(mode: "in" | "back" | "stay", slots?: number[]) {
     if (disposed) return;
@@ -11562,6 +11683,35 @@ async function buildViewer(
    * Returns false when the anchor is unusable, which callers treat as "render
    * the weapon without this module".
    */
+  /**
+   * The StatTrak module and the name plate draw OVER the stickers — never the
+   * other way round. In the game a sticker is part of the gun's own surface and
+   * these are separate pieces bolted on in front of it, so a sticker under one
+   * is hidden by it. Here a sticker is a decal lifted ~1mm off the surface
+   * (DECAL_LIFT, so it never z-fights the gun) while a module's readout may
+   * clear that surface by less (clearReadout pushes it out only until it
+   * clears): wherever it did, the sticker won the depth test and was drawn
+   * across the digits.
+   *
+   * So the module joins the TRANSPARENT pass (fully opaque still: transparent
+   * only moves it to after the opaque pass) at a renderOrder above every
+   * sticker (10 + slot). It is then drawn after them, tested against the gun's
+   * depth alone — stickers write none — and covers a sticker wherever it is in
+   * front of the gun, whatever the lift or the depth buffer's precision.
+   */
+  const OVER_STICKERS = 20;
+  function drawOverStickers(root: import("three").Object3D) {
+    root.traverse((child) => {
+      const mesh = child as import("three").Mesh;
+      if (!mesh.isMesh) return;
+      mesh.renderOrder = OVER_STICKERS;
+      for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+        if (!m || m.transparent) continue;
+        m.transparent = true;
+        m.needsUpdate = true;
+      }
+    });
+  }
   function placeAttachedModule(
     mod: import("three").Object3D,
     anchor: import("./stattrakModule").StatTrakAnchor,
@@ -12215,6 +12365,7 @@ async function buildViewer(
     // perpendicular to its blade. As a QAngle all 22 lie flat on the blade,
     // front face outward, within 0.2mm of the surface on most.
     if (!placeAttachedModule(mod, anchor, bone, knife, false, "none")) return;
+    drawOverStickers(mod);
     object.add(mod);
     stattrakMod = mod;
     object.updateMatrixWorld(true);
@@ -12463,6 +12614,7 @@ async function buildViewer(
     // diagonally across the handle or stood it on edge.
     const asAuthored = model === "c4" || picked.knife;
     if (!placeAttachedModule(mod, picked.anchor, picked.bone, asAuthored, !asAuthored, asAuthored ? "none" : "posed")) return;
+    drawOverStickers(mod);
     object.add(mod);
     if (asAuthored) seatPlateOnSurface(mod);
     /**

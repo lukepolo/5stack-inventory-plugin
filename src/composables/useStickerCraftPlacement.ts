@@ -34,7 +34,19 @@
 import { computed, ref, watch, type Ref } from "vue";
 import { fetchStickerGeometry, type StickerBounds, type StickerGroupSpec, type StickerSlot } from "../api";
 import { STICKER_CM, type SavedCraft } from "../stickerCraftsModel";
+import { bodySlots, outlineProjection, projectPoint, projectVector, slotScale, type WeaponOutline } from "../outlineTrace";
 import type { StickerPlacement, ViewerHandle } from "../viewer3d";
+
+/** Where a craft sat on a weapon's chalked outline on the mat: its centre, in
+ *  mat units from the outline's top-left, the outline's slot spots and the
+ *  bodies' unwraps over it — what "Put on your …" hands the editor, so the
+ *  craft lands where it was laid out, on whichever body the finish uses. */
+export type OutlineSpot = {
+  x: number;
+  y: number;
+  anchors: { index: number; x: number; y: number }[];
+  uv?: WeaponOutline["uv"];
+};
 
 /** The shape of one of the craft form's sticker slots — App's `Attach`. */
 type SlotSticker = {
@@ -52,8 +64,16 @@ type CraftForm = {
   stickers: (SlotSticker | null)[];
 };
 
-/** Where each slot's offsets are measured from, on the body this finish uses. */
-type Frame = { anchorOf: (slot: number) => StickerSlot | undefined; bounds: StickerBounds | null };
+/** Where each slot's offsets are measured from, on the body this finish uses
+ *  (`body`); `exact` without the fallback to the first slot; `scale` is what
+ *  mat centimetres convert at — one HD sticker (slotScale of the HD slots). */
+type Frame = {
+  anchorOf: (slot: number) => StickerSlot | undefined;
+  exact: (slot: number) => StickerSlot | undefined;
+  bounds: StickerBounds | null;
+  body: string;
+  scale: number;
+};
 /** One sticker bound to a slot: its offset from the group's centre in unwrap
  *  units and its rotation, both before any turn of the whole. */
 type Member = { slot: number; id: number; image: string; wear: number; ou: number; ov: number; r0: number };
@@ -119,14 +139,20 @@ export function useStickerCraftPlacement(o: {
     const anchors = mine.length ? mine : geo.slots;
     if (!anchors.length) return null;
     const first = anchors.reduce((lo, s) => (s.index < lo.index ? s : lo));
-    return { anchorOf: (slot) => anchors.find((s) => s.index === slot) ?? first, bounds: geo.bounds };
+    const exact = (slot: number) => anchors.find((s) => s.index === slot);
+    // Mat centimetres go on at the HD body's sticker size whatever the body:
+    // a legacy body's stickers are smaller (scale 22 against 19.6 on the AWP)
+    // but its unwrap has the same density, so a place on the gun is the same
+    // distance in it. Converting at the legacy size shrank a layout ~11%.
+    return { anchorOf: (slot) => exact(slot) ?? first, exact, bounds: geo.bounds, body: mine.length ? body : "body_hd", scale: slotScale(bodySlots(geo.slots)) };
   }
 
-  /** Each sticker of a craft bound to its slot, measured in unwrap units. */
+  /** Each sticker of a craft bound to its slot, measured in unwrap units —
+   *  all at the gun's one scale, so the layout keeps its shape (slotScale). */
   function membersOf(entry: SavedCraft, slots: number[], frame: Frame): Member[] {
+    const k = 1 / (STICKER_CM * frame.scale);
     return slots.map((slot, i) => {
       const s = entry.stickers[i];
-      const k = 1 / (STICKER_CM * (frame.anchorOf(slot)?.scale || 1));
       return { slot, id: s.id, image: s.image, wear: s.wear, ou: s.x * k, ov: s.y * k, r0: wrapDeg(-s.rot) };
     });
   }
@@ -328,6 +354,27 @@ export function useStickerCraftPlacement(o: {
     const v = at.reduce((sum, a) => sum + a.offset[1], 0) / at.length;
     ghost.value = null;
     land(p, { u, v });
+  }
+
+  /**
+   * Place the waiting craft where it sat on the gun's outline on the mat
+   * ("Put on your …"): the outline's slot spots matched to this gun's slots.
+   * Without one to match, as placeHere.
+   */
+  function placeOnOutline(at: OutlineSpot) {
+    const p = pending.value;
+    if (!p) return;
+    const proj = outlineProjection(at, p.frame.body, p.frame.exact, p.frame.scale);
+    if (!proj) return placeHere();
+    // The layout through the same unwrap as its centre, so its spacing (and
+    // any turn the unwrap has against the side) matches the mat too.
+    p.members = p.members.map((m, i) => {
+      const st = p.entry.stickers[i];
+      const d = projectVector(proj, st.x, st.y);
+      return { ...m, ou: d.u, ov: d.v };
+    });
+    ghost.value = null;
+    land(p, projectPoint(proj, at.x, at.y));
   }
 
   /**
@@ -580,6 +627,7 @@ export function useStickerCraftPlacement(o: {
     cancel,
     startDrag,
     placeHere,
+    placeOnOutline,
     planFor,
     followMove,
     followTurn,

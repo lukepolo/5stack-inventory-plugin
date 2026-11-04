@@ -151,8 +151,15 @@ export interface WeaponOutline {
   h: number;
   paths: number[][];
   anchors: { index: number; x: number; y: number }[];
+  /** The StatTrak module's outline, loops in the same units ([] for none).
+   *  Absent on outlines traced before it was. */
+  stattrak?: number[][];
+  /** The trace's format (the client's OUTLINE_V); absent = 1. */
+  v?: number;
+  /** Each body's sticker unwrap over the outline, [a, b, c, d, e, f]. */
+  uv?: { hd?: number[]; legacy?: number[] };
 }
-const OUTLINE_LIMITS = { loops: 64, coords: 8000, anchors: 8, extent: 1000 } as const;
+const OUTLINE_LIMITS = { loops: 64, coords: 8000, anchors: 8, extent: 1000, counterLoops: 8 } as const;
 
 /**
  * A browser's trace of a gun (the mat traces it from the gun's own model the
@@ -176,6 +183,31 @@ export function normOutline(raw: unknown, model: string): WeaponOutline | null {
   if (anchors.length > L.anchors) return null;
   const cleanAnchors = anchors.map((a) => ({ index: a?.index, x: a?.x, y: a?.y }));
   if (!cleanAnchors.every((a) => Number.isInteger(a.index) && (a.index as number) >= 0 && inBox(a.x) && inBox(a.y))) return null;
+  // The StatTrak counter's loops: optional (older traces have none), a few
+  // small loops at most, counted against the same coordinate budget.
+  let stattrak: number[][] | undefined;
+  if (o.stattrak !== undefined) {
+    if (!Array.isArray(o.stattrak) || o.stattrak.length > L.counterLoops) return null;
+    for (const p of o.stattrak) {
+      if (!Array.isArray(p) || p.length < 6 || p.length % 2 || !p.every(inBox)) return null;
+      coords += p.length;
+    }
+    if (coords > L.coords) return null;
+    stattrak = o.stattrak.map((p) => p.map((v) => round(v, 2)));
+  }
+  // The format, and the bodies' unwraps: six finite numbers each.
+  const v = Number.isInteger(o.v) && (o.v as number) >= 1 && (o.v as number) <= 1000 ? (o.v as number) : undefined;
+  let uv: WeaponOutline["uv"];
+  if (o.uv !== undefined) {
+    if (!o.uv || typeof o.uv !== "object") return null;
+    uv = {};
+    for (const key of ["hd", "legacy"] as const) {
+      const q = (o.uv as Record<string, unknown>)[key];
+      if (q === undefined) continue;
+      if (!Array.isArray(q) || q.length !== 6 || !q.every((x) => finite(x) && Math.abs(x) <= 1e4)) return null;
+      uv[key] = q.map((x) => round(x, 6));
+    }
+  }
   return {
     model,
     stickerCm: round(o.stickerCm, 3),
@@ -183,6 +215,9 @@ export function normOutline(raw: unknown, model: string): WeaponOutline | null {
     h: round(o.h, 3),
     paths: o.paths.map((p) => p.map((v) => round(v, 2))),
     anchors: cleanAnchors as WeaponOutline["anchors"],
+    ...(stattrak ? { stattrak } : {}),
+    ...(v ? { v } : {}),
+    ...(uv ? { uv } : {}),
   };
 }
 
