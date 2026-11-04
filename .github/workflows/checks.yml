@@ -79,6 +79,9 @@ jobs:
       - name: Steam import covers the economy
         run: npm run check:steam-sync
 
+      - name: Steam sync backs off while Steam rate-limits this server
+        run: npm run check:steam-cooldown
+
       - name: Inspect link round-trips
         run: npm run check:inspect
 
