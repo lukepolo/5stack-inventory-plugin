@@ -33,6 +33,9 @@ const props = withDefaults(
   defineProps<{
     /** Whether a 3D model exists at all. No model, no switch. */
     available?: boolean;
+    /** Something sits along the pane's bottom edge (the editor's crafts
+     *  drawer, shut): the bottom chrome rises clear of it. */
+    liftBottom?: boolean;
     /** Which view is up. */
     is3d: boolean;
     /** First person — the model in your hands. Only offered for weapons. */
@@ -123,6 +126,10 @@ watch(
     clearTimeout(freezeTimer);
     if (busy) {
       if (frozen.value) return;
+      // A viewer drawing straight to the screen (`directgl`, Safari's default)
+      // keeps nothing in its 2D canvas; this asks it to copy one frame there
+      // first. Synchronous, so the frame is in place for the read below.
+      hostEl.value?.dispatchEvent(new Event("cs2-hold-frame"));
       for (const c of hostEl.value?.querySelectorAll("canvas") ?? []) {
         try {
           const url = (c as HTMLCanvasElement).toDataURL("image/png");
@@ -163,9 +170,10 @@ const iconMarkup = (k: string) => ACTION_ICON[k as keyof typeof ACTION_ICON] ?? 
  * the pane was pulled out of, and everything lines up with the text again.
  */
 const chromeTL = computed(() => (props.bleed ? (isCompact.value ? "left-4 top-3" : "left-8 top-5") : "left-0 top-0"));
-const chromeBL = computed(() => (props.bleed ? (isCompact.value ? "bottom-3 left-4" : "bottom-4 left-8") : "bottom-2 left-4"));
-const chromeBR = computed(() => (props.bleed ? (isCompact.value ? "bottom-3 right-4" : "bottom-4 right-8") : "bottom-2 right-4"));
-const chromeBC = computed(() => (props.bleed ? (isCompact.value ? "bottom-3" : "bottom-4") : "bottom-2"));
+// Lifted: above a 36px lip along the bottom edge (liftBottom), with the usual gap.
+const chromeBL = computed(() => (props.liftBottom ? "bottom-11 left-4" : props.bleed ? (isCompact.value ? "bottom-3 left-4" : "bottom-4 left-8") : "bottom-2 left-4"));
+const chromeBR = computed(() => (props.liftBottom ? "bottom-11 right-4" : props.bleed ? (isCompact.value ? "bottom-3 right-4" : "bottom-4 right-8") : "bottom-2 right-4"));
+const chromeBC = computed(() => (props.liftBottom ? "bottom-11" : props.bleed ? (isCompact.value ? "bottom-3" : "bottom-4") : "bottom-2"));
 
 const REPORT_LINK =
   "text-f9 uppercase tracking-cs2 text-muted-foreground/45 underline decoration-dotted underline-offset-2 transition-colors hover:text-muted-foreground";

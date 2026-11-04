@@ -17,7 +17,8 @@ const props = defineProps<{
   links: ShareLink[];
   /** Caveat shown at the foot of the menu — e.g. that item links are owner-only. */
   note?: string;
-  /** Compact icon-only trigger, for tight toolbars. */
+  /** Icon-only trigger, for tight toolbars. Shaped by `btnClass` when given,
+   *  the header's 36px square otherwise. */
   icon?: boolean;
   label?: string;
   /**
@@ -65,10 +66,10 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
       <button
         :class="[
           'tac-action',
-          props.icon
-            ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground'
-            : props.btnClass
-              ? [props.btnClass, 'text-muted-foreground']
+          props.btnClass
+            ? [props.btnClass, 'text-muted-foreground']
+            : props.icon
+              ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground'
               : 'flex h-8 items-center gap-1.5 rounded-md border px-3 text-f10 uppercase tracking-wider text-muted-foreground',
           open ? 'tac-on' : 'border-border',
         ]"

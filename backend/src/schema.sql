@@ -23,6 +23,11 @@ ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS stattrak_count intege
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'crafted'; -- crafted | steam | copied
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS steam_asset_id text; -- Steam asset id for import dedupe
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS charm_offset jsonb;  -- {x,y,z} keychain placement
+-- A placed Sticker Craft: {name, slots, linked}, the sticker slots that move and
+-- turn as one in the editor (useStickerCraftPlacement). Saved with `stickers`
+-- in the same write and normalised against them (normStickerGroup), and cleared
+-- whenever something else rewrites this row's stickers (detachElsewhere).
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS sticker_group jsonb;
 -- Pets only. Both null means "the pet's default", which is NOT the same as a
 -- value: a null style is the breed's stock look, and a null upgrade_level is the
 -- last stage the pet can reach (a hen for a breed). cs2-lib resolves both.
@@ -436,4 +441,68 @@ CREATE TABLE IF NOT EXISTS inventory.wishlist (
   item_id integer NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (steam_id, item_id)
+);
+
+-- STICKER CRAFTS (src/components/StickerCrafts.vue): a player's saved layouts
+-- of up to five stickers, made on the mat and put on any gun.
+--
+-- The server owns the shape (backend/src/stickerCrafts.ts): `stickers` is
+-- normalised on write and on read to [{id, x, y, rot, wear}] — x/y centimetres
+-- from the craft's centre — and a sticker's name and art are looked up from its
+-- id on the way out, never stored, so nothing an author sends reaches anyone
+-- else. `id` is the client's own (a UUID), because the mat links its stickers
+-- to the craft they came from before any request has answered; every write
+-- checks the owner.
+--
+-- The pictures are files in CRAFTS_DIR (/cs2-models/crafts), named by craft and
+-- content; the row keeps the name. `preview_v` is the board look they were
+-- drawn with (PREVIEW_VERSION), so an older one is redrawn.
+--
+-- `published_at` puts a craft in the CRAFT STORE for everyone on the panel
+-- (null = private). `taken_down` is an administrator's: once set the author
+-- can no longer publish that craft again.
+CREATE TABLE IF NOT EXISTS inventory.sticker_crafts (
+  id text PRIMARY KEY,
+  steam_id bigint NOT NULL,
+  name text NOT NULL,
+  stickers jsonb NOT NULL,
+  use_model text,
+  preview_key text,
+  use_preview_key text,
+  preview_v smallint NOT NULL DEFAULT 0,
+  published_at timestamptz,
+  taken_down boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS sticker_crafts_steam_id ON inventory.sticker_crafts (steam_id);
+CREATE INDEX IF NOT EXISTS sticker_crafts_published ON inventory.sticker_crafts (published_at) WHERE published_at IS NOT NULL;
+
+-- One vote per player per published craft, +1 or -1. Goes with the craft (a
+-- deleted craft's votes cascade); unpublishing keeps them, so taking a craft
+-- down and putting it back up cannot wash a bad score.
+CREATE TABLE IF NOT EXISTS inventory.sticker_craft_votes (
+  craft_id text NOT NULL REFERENCES inventory.sticker_crafts (id) ON DELETE CASCADE,
+  steam_id bigint NOT NULL,
+  vote smallint NOT NULL CHECK (vote IN (-1, 1)),
+  PRIMARY KEY (craft_id, steam_id)
+);
+
+-- The mat itself, one per player: what lies on it (normBoard) and its groupings.
+CREATE TABLE IF NOT EXISTS inventory.sticker_boards (
+  steam_id bigint PRIMARY KEY,
+  stickers jsonb NOT NULL,
+  groups jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- WEAPON OUTLINES, for the mat to chalk: each gun's side, traced in a browser
+-- from this instance's own extracted model the first time anyone picks it, and
+-- kept for everyone after. `extract_version` is the extraction it was traced
+-- from; a re-extract makes it stale and the next pick traces it again.
+CREATE TABLE IF NOT EXISTS inventory.weapon_outlines (
+  model text PRIMARY KEY,
+  extract_version integer NOT NULL,
+  outline jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
 );

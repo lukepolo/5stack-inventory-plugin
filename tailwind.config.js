@@ -81,6 +81,7 @@ module.exports = {
         f9: "9px",
         f10: "10px",
         f11: "11px",
+        f12: "12px",
         f13: "13px",
       },
     },

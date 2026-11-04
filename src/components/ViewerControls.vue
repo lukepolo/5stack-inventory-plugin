@@ -58,8 +58,16 @@ const props = withDefaults(
      * CAMERA · ITEM · MOTION · VIEW, and VIEW is the frame around the render.
      */
     stage?: StageKey[];
+    /**
+     * What the gestures act on. `mat` is the Sticker Crafts board: the same
+     * glyphs and the same mouse as the gun (so moving a sticker there is moving
+     * one here), worded for a mat — the camera turns and tilts over it rather
+     * than spinning a model, and the item cells carry its keyboard and
+     * multi-select.
+     */
+    subject?: "model" | "mat";
   }>(),
-  { edit: false, rotate: false, variant: "plain", inspect: null, stage: () => [] },
+  { edit: false, rotate: false, variant: "plain", inspect: null, stage: () => [], subject: "model" },
 );
 
 const emit = defineEmits<{
@@ -227,14 +235,19 @@ interface Control {
 
 const controls = computed<Control[]>(() => {
   const coarse = isCoarse.value;
+  const mat = props.subject === "mat";
   const out: Control[] = [
     {
       key: "spin",
       icon: coarse ? "spinTouch" : "spin",
       label: tr("inventory.viewer.controls.spin", "Spin"),
-      hint: coarse
-        ? tr("inventory.viewer.controls.spin_hint_touch", "Drag with one finger to rotate the model")
-        : tr("inventory.viewer.controls.spin_hint", "Drag to rotate the model"),
+      hint: mat
+        ? coarse
+          ? tr("inventory.viewer.controls.spin_hint_mat_touch", "Drag with one finger to turn and tilt the view")
+          : tr("inventory.viewer.controls.spin_hint_mat", "Drag the mat to turn and tilt the view")
+        : coarse
+          ? tr("inventory.viewer.controls.spin_hint_touch", "Drag with one finger to rotate the model")
+          : tr("inventory.viewer.controls.spin_hint", "Drag to rotate the model"),
     },
     {
       key: "zoom",
@@ -260,7 +273,11 @@ const controls = computed<Control[]>(() => {
       label: tr("inventory.viewer.controls.move", "Move"),
       // The zoom advice belongs here rather than on Zoom: it only matters once
       // you're placing something, and that's the cell you're looking at.
-      hint: tr("inventory.viewer.controls.move_hint", "Drag a sticker or charm to move it — zoom in for fine placement"),
+      hint: mat
+        ? coarse
+          ? tr("inventory.viewer.controls.move_hint_mat_touch", "Drag a sticker to move it")
+          : tr("inventory.viewer.controls.move_hint_mat", "Drag a sticker to move it — Shift-click picks several, arrows nudge")
+        : tr("inventory.viewer.controls.move_hint", "Drag a sticker or charm to move it — zoom in for fine placement"),
       group: true,
     });
     // Touch has no shift key, so this cell used to be hidden there entirely and
@@ -275,7 +292,9 @@ const controls = computed<Control[]>(() => {
         label: tr("inventory.viewer.controls.turn", "Turn"),
         hint: coarse
           ? tr("inventory.viewer.controls.turn_hint_touch", "Twist two fingers on a sticker to rotate it")
-          : tr("inventory.viewer.controls.turn_hint", "Shift-drag a sticker to rotate it"),
+          : mat
+            ? tr("inventory.viewer.controls.turn_hint_mat", "Shift-drag to turn the selection — Q / E turn it 5°")
+            : tr("inventory.viewer.controls.turn_hint", "Shift-drag a sticker to rotate it"),
         mod: coarse ? undefined : "shift",
       });
     }

@@ -39,6 +39,15 @@ import {
 import type { FacetAxis } from "../components/CatalogFilters.vue";
 import { SEARCH_DEBOUNCE_MS } from "./useDebouncedSearch";
 import { usePersistedNumber } from "./usePersistedRef";
+import {
+  MAX_PER_GROUPING,
+  loadCraftStore,
+  loadStickerCrafts,
+  vote,
+  type CraftScore,
+  type SavedCraft,
+  type StoreCraft,
+} from "../stickerCraftsModel";
 import { useSortControl } from "./useSortControl";
 
 export const PICKER_PAGE = 120;
@@ -79,6 +88,9 @@ export type PickerRow = {
   inst?: string | null;
   /** What this owned one is already applied to, if anything. */
   attachedName?: string | null;
+  /** The capsule it came in, for the label over the tile (stickers, patches,
+   *  slabs). */
+  capsule?: string | null;
   /** The owned row's own scratch / pattern, so picking it previews truthfully. */
   wear?: number | null;
   seed?: number | null;
@@ -91,7 +103,32 @@ export interface AttachmentPickerOptions {
   attachedName: (inst?: InventoryItem | null) => string | null;
   /** App's notification funnel (useI18n) — a failed search is a toast, not a throw. */
   fail: (e: unknown) => void;
+  /**
+   * How many stickers a Sticker Craft may bring, picked for this slot: the gun's
+   * empty slots. A gun with three stickers already on takes a craft of two at
+   * most. Five when not given.
+   */
+  craftRoom?: (slot: number) => number;
+  /**
+   * Where a craft of n stickers would go, picked for this slot, and which of the
+   * gun's stickers move along to make room for it — said on the tile BEFORE Use
+   * rather than found out after. Null when nothing can say (the mat has no
+   * slots).
+   */
+  craftPlan?: (slot: number, n: number) => CraftPlan | null;
+  /**
+   * The crafts and which of them are published, LIVE — for a caller that owns
+   * them (the Sticker Crafts tab), so a craft published or deleted from the
+   * picker's own tiles shows at once. Without them the picker loads its own copy.
+   */
+  library?: Ref<SavedCraft[]>;
+  published?: Ref<Set<string>>;
+  /** Their votes in the store, live — see `library`. */
+  scores?: Ref<Map<string, CraftScore>>;
 }
+
+/** A craft's run on the gun: its slots (0-based) and the stickers it moves. */
+export type CraftPlan = { slots: number[]; moved: { name: string; to: number }[] };
 
 export function useAttachmentPicker(opts: AttachmentPickerOptions) {
   const { inventory, attachedName } = opts;
@@ -144,13 +181,141 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
   const pickerDone = computed(() => pickerResults.value.length >= pickerTotal.value);
 
   /**
-   * Which shelf the picker is browsing: the whole catalog, or your own drawer.
+   * Which shelf the picker is browsing: the whole catalog, your own drawer, or
+   * (stickers only) your saved Sticker Crafts.
    *
    * Owned mode is answered entirely from `inventory` — no fetch, no paging. The
    * client already holds every instance the user owns, and an attachment you own
    * is a few dozen rows next to a catalog of ten thousand.
    */
-  const pickerSource = ref<"all" | "owned">("all");
+  const pickerSource = ref<"all" | "owned" | "crafts">("all");
+
+  /**
+   * The Sticker Crafts shelf, two ways: MINE, the layouts saved on your Sticker
+   * Crafts board, and the CRAFT STORE, everyone's published ones with their
+   * authors and votes. Both are kept on the account, so they arrive a moment
+   * after the picker opens.
+   */
+  const craftsScope = ref<"mine" | "store">("mine");
+  const loadedCrafts = ref<SavedCraft[]>([]);
+  const pickerCrafts = computed(() => opts.library?.value ?? loadedCrafts.value);
+  /** Which of yours are in the store, for their "Public" mark. */
+  const loadedPublished = ref<Set<string>>(new Set());
+  const craftsPublished = computed(() => opts.published?.value ?? loadedPublished.value);
+  const pickerCraftsLoading = ref(false);
+  /** How many stickers a craft may bring here — see AttachmentPickerOptions.craftRoom. */
+  const craftRoom = computed(() =>
+    Math.max(0, Math.min(MAX_PER_GROUPING, picker.value ? (opts.craftRoom?.(picker.value.slot) ?? MAX_PER_GROUPING) : MAX_PER_GROUPING)),
+  );
+  /** The sticker-count filter: 0 is all of them, 1..5 exactly that many. */
+  const craftCount = ref(0);
+  /** A craft of n stickers fits the room here. Crafts that don't are still
+   *  SHOWN, after the ones that do and saying why — a shelf that silently
+   *  hid them read as crafts gone missing. */
+  const craftFits = (n: number) => n <= craftRoom.value;
+  const countMatches = (n: number) => !craftCount.value || n === craftCount.value;
+  /** Where a craft of n stickers would go — see AttachmentPickerOptions.craftPlan. */
+  const craftPlanFor = (n: number): CraftPlan | null =>
+    picker.value && craftFits(n) ? (opts.craftPlan?.(picker.value.slot, n) ?? null) : null;
+  const pickerCraftRows = computed(() => {
+    const q = pickerQuery.value.trim().toLowerCase();
+    return pickerCrafts.value.filter(
+      (c) =>
+        countMatches(c.stickers.length) &&
+        (!q || c.name.toLowerCase().includes(q) || c.stickers.some((s) => s.name.toLowerCase().includes(q))),
+    );
+  });
+  /** How your own published crafts are rated, so Mine can show it. They come
+   *  with the crafts themselves (loadStickerCrafts). */
+  const loadedScores = ref<Map<string, CraftScore>>(new Map());
+  const myScores = computed(() => opts.scores?.value ?? loadedScores.value);
+  /**
+   * Your crafts, fetched the first time this picker's Sticker Crafts shelf is
+   * opened — not on every sticker pick: most picks never look at it, and the
+   * library is the heaviest thing the picker could ask for.
+   */
+  let craftsFor: object | null = null;
+  function loadCrafts() {
+    const opened = picker.value;
+    if (opts.library || !opened || craftsFor === opened) return;
+    craftsFor = opened;
+    pickerCraftsLoading.value = true;
+    loadStickerCrafts()
+      .then(({ library, published, scores }) => {
+        if (picker.value !== opened) return;
+        loadedCrafts.value = library.filter((c) => c.stickers.length <= MAX_PER_GROUPING);
+        loadedPublished.value = published;
+        loadedScores.value = scores;
+      })
+      .catch((e) => {
+        if (picker.value === opened) opts.fail(e);
+      })
+      .finally(() => {
+        if (picker.value === opened) pickerCraftsLoading.value = false;
+      });
+  }
+  const storeSort = ref<"top" | "new">("top");
+  const storeRows = ref<StoreCraft[]>([]);
+  const storeLoading = ref(false);
+  let storeToken = 0;
+  let storeTimer: ReturnType<typeof setTimeout> | undefined;
+  async function storeFetch() {
+    clearTimeout(storeTimer);
+    if (!picker.value || picker.value.kind !== "sticker") return;
+    const token = ++storeToken;
+    storeLoading.value = true;
+    try {
+      // Every size: the ones that don't fit here are shown too, marked.
+      const rows = await loadCraftStore({
+        sort: storeSort.value,
+        count: craftCount.value || undefined,
+        q: pickerQuery.value.trim() || undefined,
+      });
+      if (token !== storeToken) return;
+      storeRows.value = rows;
+    } catch (e) {
+      if (token === storeToken) opts.fail(e);
+    } finally {
+      if (token === storeToken) storeLoading.value = false;
+    }
+  }
+  // The store answers the filters server-side; every change asks again. Typing
+  // waits for a pause, like the catalog's search.
+  watch([craftsScope, storeSort, craftCount], () => {
+    if (craftsScope.value === "store" && pickerSource.value === "crafts") void storeFetch();
+  });
+  watch(pickerSource, (src) => {
+    if (src === "crafts" && craftsScope.value === "store") void storeFetch();
+    if (src === "crafts") loadCrafts();
+  });
+  watch(pickerQuery, () => {
+    if (pickerSource.value !== "crafts" || craftsScope.value !== "store") return;
+    clearTimeout(storeTimer);
+    storeTimer = setTimeout(storeFetch, SEARCH_DEBOUNCE_MS);
+  });
+  onBeforeUnmount(() => clearTimeout(storeTimer));
+  /**
+   * Vote a store craft up or down; the same vote again takes it back. Shown at
+   * once and put right from the server's answer, or undone if it fails.
+   */
+  async function voteOn(c: StoreCraft, v: -1 | 1) {
+    if (c.mine) return;
+    const before = { ups: c.ups, downs: c.downs, score: c.score, myVote: c.myVote };
+    const next = c.myVote === v ? 0 : v;
+    c.ups += (next === 1 ? 1 : 0) - (c.myVote === 1 ? 1 : 0);
+    c.downs += (next === -1 ? 1 : 0) - (c.myVote === -1 ? 1 : 0);
+    c.score = c.ups - c.downs;
+    c.myVote = next;
+    try {
+      const r = await vote(c.id, next);
+      Object.assign(c, { ups: r.ups, downs: r.downs, score: r.score, myVote: r.myVote });
+    } catch (e) {
+      Object.assign(c, before);
+      opts.fail(e);
+    }
+  }
+  /** The craft open in the 3D preview, if any (CraftPreview.vue). */
+  const previewCraft = ref<SavedCraft | StoreCraft | null>(null);
 
   const pickerOwned = computed<PickerRow[]>(() => {
     const p = picker.value;
@@ -168,6 +333,7 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
         type: i.item?.type,
         inst: String(i.id),
         attachedName: attachedName(i),
+        capsule: i.item?.capsule ?? null,
         wear: i.wear,
         seed: i.seed,
       }))
@@ -176,8 +342,11 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
       // make the common case the hard one.
       .sort((a, b) => Number(!!a.attachedName) - Number(!!b.attachedName) || byName(a.name, b.name));
   });
+  // Crafts are not rows of one attachment each; that shelf draws its own tiles.
   const pickerRows = computed<PickerRow[]>(() =>
-    pickerSource.value === "owned"
+    pickerSource.value === "crafts"
+      ? []
+      : pickerSource.value === "owned"
       ? pickerOwned.value
       : pickerResults.value.map((it) => ({
           key: `cat-${it.id}`,
@@ -186,6 +355,7 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
           image: it.image,
           rarity: it.rarity,
           type: it.type ?? PICKER_TYPE[picker.value?.kind ?? "sticker"],
+          capsule: it.capsule ?? null,
         })),
   );
 
@@ -393,6 +563,13 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
 
   function openPicker(kind: "sticker" | "charm" | "patch", slot = 0) {
     picker.value = { kind, slot };
+    loadedCrafts.value = [];
+    pickerCraftsLoading.value = false;
+    craftsScope.value = "mine";
+    craftCount.value = 0;
+    loadedScores.value = new Map();
+    storeRows.value = [];
+    previewCraft.value = null;
     // Always opens on the catalog. Owned is the narrower shelf and is often
     // empty, and a picker that opened on "no results" would read as broken.
     pickerSource.value = "all";
@@ -443,6 +620,22 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
     pickerTotal,
     pickerRows,
     pickerOwned,
+    pickerCrafts,
+    pickerCraftsLoading,
+    pickerCraftRows,
+    craftsPublished,
+    craftsScope,
+    craftRoom,
+    craftCount,
+    craftFits,
+    craftPlanFor,
+    myScores,
+    storeSort,
+    storeRows,
+    storeLoading,
+    storeFetch,
+    voteOn,
+    previewCraft,
     pickerNoun,
     attachCardSize,
     attachGridStyle,

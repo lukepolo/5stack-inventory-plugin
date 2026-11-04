@@ -7,6 +7,16 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Features
 
+- **Sticker Crafts**: a new tab, a 3D cutting mat ruled in centimetres, for laying out one gun's worth of stickers once and putting it on any gun. Add stickers from the editor's own picker and handle them with the 3D editor's mouse: drag a sticker to move it, Shift-drag to turn it, left-drag the mat to turn and tilt the view, right-drag to pan, scroll to zoom (Q / E turn 5°, arrows or WASD nudge, Snap holds half centimetres and 5° turns).
+- **The mat's five slots**: beside the mat, its stickers are five slots, top to bottom, as on a gun. Each sticker sits big on a dark plate with its name and wear along the bottom and a thin wear bar under it; exact position, duplicate and remove sit in the plate's corner. Click the chain between two slots to link them so they move and turn as one: links join up (2 to all 5), and clicking a linked chain splits them there. Drag a slot to move it, and its link with it. Name the craft at the top, then Save, or Update the craft the mat came from. Clear, removing a sticker and deleting a craft undo for a few seconds (Ctrl/⌘ + Z).
+- **All crafts and Put on a gun**: All crafts shows every saved craft as a picture over the mat, by gun and by search, with rename, publish and delete on each card; clicking one opens it on the mat, and Undo puts back what was there. The button under the slots, with your skin's picture on it, saves the craft and opens your equipped skin of that gun with the craft placed ("Put on your M4A4"), or starts a new plain one when you have none equipped. Cancel brings you back to the mat.
+- **Weapon outlines on the mat**: an Outline rail along the bottom, each gun's own buy-menu glyph, chalks that gun's side on the mat at sticker scale with each slot's spot dashed and numbered, and the mat grows or narrows to it. With a gun chalked the rulers read that gun's real centimetres, since CS2 sizes stickers per gun (4.4 cm on a Glock, 7.2 on an AK-47). A gun's outline is traced from this instance's own model the first time anyone picks it, then kept for everyone until the next extraction.
+- **Craft Store**: a saved craft's publish switch puts it in the store for everyone on the panel. The store sorts by Top or New, shows each craft's author by their current Steam name and picture and its up and down votes (one per player, none on your own), and opens any craft on your mat to change and save as your own. The server keeps a craft as sticker ids and placement only and draws every name and picture from the catalog, so a craft shows everyone the real stickers. An administrator can take a craft down for good; taking your own out and back keeps its votes.
+- **Sticker Crafts on a gun**: along the bottom of the item editor's 3D view, Your crafts opens (click it, or drag it up on a phone) to your crafts for that gun, each saying which slots it would take; one click puts a craft on as a group. The sticker picker's shelves are one row (Catalog, Owned, Your crafts, Craft Store) and say where a craft would go before you use it. A placed craft's stickers stay a group — dragging, turning or typing a number into one moves them all — until you Ungroup, and the group is saved with the item. Saving while a craft is still waiting says to place it or put it back first.
+- **Stickers as plates in the editor**: under the slot wells, the gun's stickers are the mat's plates — big art, name and wear, exact X / Y / ROT behind the corner button. Drag a plate onto another to swap their slots, so you can see which sticker sits over which.
+- **Screen tabs as icons**: the header's Loadout / Inventory / Craft / Sticker Crafts tabs are the panel's collapsing strip — icons, with the open screen a solid amber pill wearing its name — so four tabs fit on one row.
+- **Item actions as icons**: Inspect in game, Share, Edit, Delete and Reset are icon buttons named on hover, in the editor, the 3D view and focus.
+- **Wear track for the finish's own range**: the editor's wear slider shows the ramp for the floats the finish can have (a 0.00–0.40 skin ends in Well-Worn orange, not Battle-Scarred red), under a "Range 0.00–0.40" label.
 - **StatTrak kill count in the editor**: the craft editor shows the item's kill count under the StatTrak switch, and the 3D preview shows it on the module. It is read-only: only the game server writes kills.
 - **Craftable C4**: the C4's Craft tab now offers the plain C4, which takes stickers, a charm and a name tag. Items with no finishes, the C4 included, are no longer offered a float, pattern or StatTrak they can't have.
 - **Glove pattern control**: every painted glove gets the same pattern tools as weapons: type a number, roll the dice, scrub the rail with a live 3D preview, and "Compare with another". Newer (Gen2) finishes whose artwork moves with the pattern also get Placement bars (Shift X, Shift Y, Rotation).
@@ -18,6 +28,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 - **Music kit preview in the editor**: Edit on a music kit plays the full song and, separately, its round-MVP anthem, each with play/pause and seek. One volume control sits above both and shares the level with every other player.
 - **One volume bar per music kit list**: the music kit sheet's Owned and Craft tabs have a single volume control in the toolbar instead of a slider on every card.
 - **Agent pose and motion in the sidebar**: an agent's pose (Ready, Stand, Open) moved from the top-left corner of the 3D view into the right-hand column, like the pet's controls. A new Motion setting makes the agent breathe and look around (Idle), move through all three poses in turn (Cycle), or hold still for placing patches (Still).
+- **Capsule over each sticker in the picker**: every sticker, patch and sticker slab tile in the "Pick a sticker" sheet shows its capsule in small grey capitals on top, like the model label on knife and glove cards. The 126 stickers the game data leaves unnamed show no label.
 - **Precise sticker dragging**: a sticker picked up in the 3D editor keeps the point where you grabbed it. Small nudges no longer jump the sticker's centre to the pointer.
 
 ### Removed
@@ -27,11 +38,13 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Bug Fixes
 
+- **The craft close-up looked at the wrong part of some guns**: while a Sticker Craft waited over the gun, the camera framed everything near any sticker slot's position in the gun's texture space, which on the M4A4 took in its stock and sat the view on the back half. It now finds each slot's point on the gun's surface (the side facing the camera) and frames the slots the craft will take.
 - Editing or duplicating an owned item keeps its finish's float range. Owned Dopplers could be dragged to 1.00, and the save then failed.
 - Craft & Equip defaults to the team you are crafting from instead of "Both teams".
 - On a short window the item details panel ran down over the 3D view's first-person and screenshot buttons, StatTrak under the toggle. The panel now ends above them and scrolls.
 - A charm's pattern in the details panel's Applied list sat on a line of its own, reading as one more attachment. It now sits under the charm's name.
 - The focus view of a default-finish weapon showed Float and Pattern as "—", with a line across the bottom of the 3D view. A default finish has neither, so the row is gone.
+- Dropping a Sticker Craft onto a gun no longer leaves stray copies of its stickers along the path the pointer took. A sticker's first appearance on a gun builds its material, and when the sticker moved on before that finished, the unfinished build still landed and stayed. Such builds are now thrown away, and the drop preview updates once per frame.
 - The glove Craft list no longer includes ten gloves nobody can own: the eight bare models and the two stock pairs.
 - While editing, the item's name and estimated value sat on the very corner of the 3D view. They now stand clear of the edge, as in the focus view.
 
@@ -39,6 +52,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Features
 
+- **Smooth 3D in Safari**: Safari copied every 3D frame into the page through its graphics process, which on an M3 Pro held the view to 12–20 fps with stutter even though each frame took under 2 ms to draw. In Safari (and every browser on an iPhone) the 3D view on top is now shown directly, at a steady 60 fps: the item editor, a sticker's 3D preview over the editor, and a Sticker Craft's preview all get it, and the views underneath hold a still picture instead of drawing behind the overlay. Chrome and Firefox keep the old way, which costs them nothing. The "Draw straight to screen" switch in ⚙ under 3D viewer turns it on or off; reopen the item after switching. Saving an image and the held frame during a reload still work, and no earlier frame shows through behind the live one.
 - **Rare inspects**: in first person, pressing Inspect again while a weapon is being inspected plays its rarer inspect, the one the game rolls now and then: the Deagle's spin, the AK-47's, a second trick on most knives, and the C4's and the Butterfly Knife's third. Weapons with only one inspect behave as before. Needs the next run of the first-person animation step.
 - **CS2 lighting preset (new default)**: neutral daylight and the main menu's blue-grey haze, measured against in-game inspect screenshots. Items no longer come out pink-tinted and dull.
 - **CS2 scene presets**: Ancient (night), Italy and Italy (alley) place the item in front of a blurred in-game screenshot of the map. The same image lights the item's reflections.
@@ -53,6 +67,8 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Bug Fixes
 
+- **Stretched stickers in the 3D sticker preview**: the preview squeezed its card to the ink's proportions while the art is a square with the ink centred in it, so every wide sticker came out stretched (Ruby Stream by 1.8 times). The art keeps its square now, and only the backing card is cut to the ink, from the middle of the backing print rather than by squeezing it.
+- **Sticker art in Safari cut from the wrong rows**: Safari flips an image before it crops it, the other way round from Chrome, so every sticker's art was cut from a window shifted by the difference between its top and bottom margins. Its effect masks no longer lined up: Econometer's lenticular light sat 35px above its letters and gauge. About one sticker in five, whose square runs past the edge of its texture, came out squashed instead of padded. The art is now cropped and flipped in two steps, and the padded ones are laid out from their exact pixels, so Safari and Chrome draw the same sticker.
 - In first person the agent's sleeve wore the equipped glove's finish up to the elbow. Only the gloves take the finish now, and the sleeve keeps the agent's own look.
 - Stickers and charms disappeared in first person. They stay on the gun now, hidden only where the hand covers them, and a charm swings as the gun moves through reloads and shots.
 - A placed charm hung about a centimetre from where the game draws it. On the AK-47 a charm the game hangs in the hole under the receiver hung from the receiver's edge. Charm offsets are now mapped exactly like the game's own charm surfaces, so the 3D view shows the charm where the game will.
@@ -116,6 +132,7 @@ The 3D model extraction is now at pipeline version 39; run it once to get every 
 
 ### Bug Fixes
 
+- On a computer, baking missing inventory cards no longer eats memory. Each card bake kept that skin's paint textures for the rest of the visit (about 80 MB a skin; 570 MB after 7 cards in a test), so a large inventory could slow the whole Mac down. They are now freed after every bake, which keeps it at about 30 MB. Bakes also run in batches of 4 with a short pause between bakes and a 2 second rest after each batch, so the page stays responsive while cards are made. Cards that are already stored add no wait.
 - Scrubbing glove patterns no longer stutters: each repaint went from 60–100 ms to about 1 ms with identical output.
 - Models, EXR maps, HDR lighting and WAV music kits are served with their real file types instead of as unknown binary data.
 - When the web server had to hand a file to the backend, unversioned models and textures were kept by browsers for a year, and a re-check downloaded the whole file. They are now re-checked like everywhere else, with a tiny "not modified" answer, and first-person animations and projected-finish position maps no longer come back missing on that path.

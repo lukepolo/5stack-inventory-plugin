@@ -99,6 +99,11 @@ export interface CatalogSkin {
   /** Capsule, case, map or drop pool this came in. Omitted when it came in
    *  none — see collectionOf, which is what fills it for every finish. */
   collection?: string;
+  /** STICKERS, PATCHES and sticker slabs: the capsule it came in ("Katowice
+   *  2014", "Paris 2023 Legends") — the attachment picker's label over each
+   *  tile. Its own field rather than `collection`, which drives the inventory
+   *  grid's collection facet; see capsuleOf. */
+  capsule?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
   /**
@@ -215,6 +220,27 @@ function specialCollectionOf(id: number): string {
     );
   }
   return specialCollections.get(id) ?? "";
+}
+
+/**
+ * The capsule a sticker, patch or sticker slab came in — the same answer the
+ * attachment index files under `collection` (buildAttachIndex), so the picker's
+ * catalog and owned shelves label a tile alike. A slab carries no capsule of
+ * its own: it borrows the one of the sticker it displays.
+ */
+function capsuleOf(i: (typeof items)[number]): string {
+  if (i.type === "sticker" || i.type === "patch") return capsuleLabel(i.categoryName as string);
+  if (i.type === "keychain" && i.isStickerDisplayCase()) return capsuleLabel(i.displayedSticker?.categoryName as string);
+  return "";
+}
+
+/**
+ * A capsule name fit to print, or "". cs2-lib leaves 126 stickers (the
+ * Warhammer set among them) on the untranslated key
+ * "#CSGO_sticker_crate_key_community", which is no name at all.
+ */
+function capsuleLabel(name: string | undefined): string {
+  return name && !name.startsWith("#") ? name : "";
 }
 
 /**
@@ -750,7 +776,7 @@ export function searchAttachments(query: AttachQuery): AttachPage {
     // and falls back to the loadout slot when it's missing. From a picker that
     // was harmless (a slot was always in play); from the armory it meant a
     // sticker opened the gun editor, because `selected` was still on a rifle.
-    out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image, type: ATTACH_TYPE[query.kind] });
+    out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image, type: ATTACH_TYPE[query.kind], ...(capsuleLabel(e.collection) ? { capsule: e.collection } : {}) });
   }
   if (ordered) {
     // Rarity naturally descending (covert first, like the weapon sheets), with
@@ -762,7 +788,7 @@ export function searchAttachments(query: AttachQuery): AttachPage {
       matched.sort((a, b) => flip * (rarityRank(b.rarity) - rarityRank(a.rarity)) || a.name.localeCompare(b.name));
     } else matched.reverse(); // "default" reversed = newest capsules first
     for (const e of matched.slice(offset, offset + (limit === Infinity ? matched.length : limit))) {
-        out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image, type: ATTACH_TYPE[query.kind] });
+        out.push({ id: e.id, name: e.name, rarity: e.rarity, image: e.image, type: ATTACH_TYPE[query.kind], ...(capsuleLabel(e.collection) ? { capsule: e.collection } : {}) });
     }
   }
   return {
@@ -1537,6 +1563,7 @@ export function getItem(id: number) {
       // lets the inventory grid and the loadout sheet sort by collection at all
       // — the catalog listings alone only cover things you haven't crafted yet.
       ...collectionFacet(i),
+      ...(capsuleOf(i) ? { capsule: capsuleOf(i) } : {}),
     };
   } catch {
     return null;

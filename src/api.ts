@@ -18,7 +18,8 @@ const API_BASE = resolveApiBase();
 export const API_ORIGIN = API_BASE;
 
 import { WEAR_STOPS } from "./itemVisuals";
-import { postCard } from "./cardEncode";
+import { cardAsWebp, postCard } from "./cardEncode";
+import type { WeaponOutline } from "./outlineTrace";
 
 export type Team = "CT" | "T";
 
@@ -94,6 +95,10 @@ export interface Skin {
    *  with the skin, and the classic knife pool is the special of eleven cases at
    *  once, so no single one is true. */
   collection?: string;
+  /** STICKERS, PATCHES and sticker slabs: the capsule it came in — the label
+   *  over each attachment-picker tile. Not `collection`, which is the inventory
+   *  grid's facet. */
+  capsule?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
   /** KNIVES and GLOVES only: the bare model the finish is painted onto
@@ -177,6 +182,8 @@ export interface CatalogItem {
    *  too (the backend resolver fills it), which is what lets the inventory grid
    *  and the loadout sheet sort by collection. */
   collection?: string;
+  /** See `Skin.capsule` — filled on an owned sticker, patch or slab too. */
+  capsule?: string;
   /**
    * MUSIC KITS only: the kit's menu theme, as a fully resolved, playable URL.
    *
@@ -264,6 +271,13 @@ export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; 
  *  — an owned item and a public loadout row — and they must not drift. */
 export type PlacedCharm = (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
 
+/** A placed Sticker Craft's group, as an item stores it (normStickerGroup in the backend). */
+export interface StickerGroupSpec {
+  name: string;
+  slots: number[];
+  linked: boolean;
+}
+
 export interface InventoryItem {
   id: number;
   item_id: number;
@@ -283,6 +297,9 @@ export interface InventoryItem {
   stickers?: PlacedItem[];
   patches?: PlacedItem[];
   charm?: PlacedCharm;
+  /** A placed Sticker Craft: the slots whose stickers move and turn as one in
+   *  the editor. Saved with the stickers (craftItem / updateInstance). */
+  sticker_group?: StickerGroupSpec | null;
   slot: string | null;
   item: CatalogItem | null;
   equipped: { team: Team; slot: string }[];
@@ -900,6 +917,7 @@ export const craftItem = (body: {
   patches?: AttachSpec[];
   charm_id?: number | null;
   charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+  sticker_group?: StickerGroupSpec | null;
 }) =>
   request<InventoryItem>("/inventory/craft", {
     method: "POST",
@@ -919,6 +937,7 @@ export const updateInstance = (
     patches?: AttachSpec[];
     charm_id?: number | null;
     charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+    sticker_group?: StickerGroupSpec | null;
   },
 ) =>
   request<InventoryItem>(`/inventory/${id}`, {
@@ -1628,4 +1647,112 @@ export const activatePreset = (id: string) =>
   request<{ ok: true; active: string }>(`/loadout/presets/${id}/activate`, {
     method: "POST",
     body: "{}",
+  });
+
+// ---- Sticker Crafts ------------------------------------------------------------
+// The mat, the saved crafts and the Craft Store, kept against the account (the
+// Sticker Crafts block in backend/src/main.ts). A sticker is stored as its id
+// and placement only; its name and art come back looked up from the id. The
+// client-side vocabulary built from these is src/stickerCraftsModel.ts.
+
+/** A sticker as the server sends it: its placement, and the catalog's name and art for its id. */
+export interface CraftStickerWire {
+  id: number;
+  name: string;
+  image: string | null;
+  x: number;
+  y: number;
+  rot: number;
+  wear: number;
+}
+export interface SavedCraftWire {
+  id: string;
+  name: string;
+  savedAt: number;
+  stickers: CraftStickerWire[];
+  /** Its top-down picture (craftPictureUrl), once one is stored. */
+  previewKey: string | null;
+  /** The board look the picture was drawn with (PREVIEW_VERSION). */
+  previewV: number;
+  /** The weapon it was made on, and the picture of it there. */
+  useCase: { model: string; weapon: string; imageKey: string | null } | null;
+  /** Your own crafts in the store carry their standing. */
+  published?: true;
+  ups?: number;
+  downs?: number;
+  score?: number;
+}
+export interface StoreCraftWire extends SavedCraftWire {
+  author: { steamId: string; name: string; avatar: string | null };
+  ups: number;
+  downs: number;
+  score: number;
+  myVote: -1 | 0 | 1;
+  mine: boolean;
+}
+export interface BoardWire {
+  stickers: (CraftStickerWire & { uid: string; group: string | null; craft: string | null })[];
+  groups: { id: string; name: string }[];
+}
+/** What a craft write takes: placement only — see CraftStickerWire. */
+type CraftStickerBody = { id: number; x: number; y: number; rot: number; wear: number };
+
+export const fetchStickerCrafts = () => request<{ board: BoardWire; crafts: SavedCraftWire[] }>("/sticker-crafts");
+export const saveStickerBoard = (board: {
+  stickers: (CraftStickerBody & { uid: string; group: string | null; craft: string | null })[];
+  groups: { id: string; name: string }[];
+}) => request<{ ok: true }>("/sticker-crafts/board", { method: "PUT", body: JSON.stringify(board) });
+export const saveStickerCraft = (id: string, craft: { name: string; stickers: CraftStickerBody[]; useModel: string | null }) =>
+  request<{ ok: true }>(`/sticker-crafts/crafts/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(craft) });
+export const deleteStickerCraft = (id: string) =>
+  request<{ ok: true }>(`/sticker-crafts/crafts/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+/** Where a craft picture is served — immutable: a new picture is a new key. */
+export const craftPictureUrl = (key: string) => `${API_BASE}/api/sticker-crafts/pictures/${encodeURIComponent(key)}`;
+/**
+ * Store one of a craft's pictures — `top`, its top-down render, or `use`, the
+ * render of it on its weapon — raw, like a card. WebP when this browser can
+ * make one (cardAsWebp), else the PNG, which the server stores as WebP.
+ */
+export async function uploadCraftPicture(id: string, kind: "top" | "use", png: Blob, previewV: number): Promise<string> {
+  const body = (await cardAsWebp(png)) ?? png;
+  const response = await fetch(
+    `${API_BASE}/api/sticker-crafts/crafts/${encodeURIComponent(id)}/picture/${kind}?v=${previewV}`,
+    { method: "PUT", credentials: "include", headers: { "Content-Type": "application/octet-stream" }, body },
+  );
+  if (!response.ok) throw new Error(`The craft's picture didn't save (${response.status}).`);
+  return ((await response.json()) as { key: string }).key;
+}
+
+/** The Craft Store: published crafts, best or newest first; `count` keeps to crafts of exactly that many stickers. */
+export function fetchCraftStore(params: { sort?: "top" | "new"; count?: number; q?: string; offset?: number; limit?: number }) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== "" && v !== 0) qs.set(k, String(v));
+  return request<{ items: StoreCraftWire[] }>(`/sticker-crafts/store?${qs}`);
+}
+export const publishCraft = (id: string) =>
+  request<{ ok: true }>(`/sticker-crafts/store/${encodeURIComponent(id)}`, { method: "PUT", body: "{}" });
+export const unpublishCraft = (id: string) =>
+  request<{ ok: true }>(`/sticker-crafts/store/${encodeURIComponent(id)}`, { method: "DELETE" });
+export const voteCraft = (id: string, vote: -1 | 0 | 1) =>
+  request<{ ups: number; downs: number; score: number; myVote: -1 | 0 | 1 }>(
+    `/sticker-crafts/store/${encodeURIComponent(id)}/vote`,
+    { method: "POST", body: JSON.stringify({ vote }) },
+  );
+
+/**
+ * A gun's outline for the mat, as traced from this instance's own model — or
+ * null when nobody has traced it since the last extraction, in which case the
+ * mat traces it (weaponOutline in viewer3d.ts) and stores it for everyone.
+ */
+export async function fetchWeaponOutline(model: string): Promise<WeaponOutline | null> {
+  const response = await fetch(`${API_BASE}/api/catalog/weapon-outline/${encodeURIComponent(model)}`, { credentials: "include" });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`The ${model} outline didn't load (${response.status}).`);
+  return ((await response.json()) as { outline: WeaponOutline }).outline;
+}
+export const saveWeaponOutline = (outline: WeaponOutline) =>
+  request<{ ok: true }>(`/catalog/weapon-outline/${encodeURIComponent(outline.model)}`, {
+    method: "PUT",
+    body: JSON.stringify(outline),
   });

@@ -14,6 +14,18 @@ import { pool } from "./db.ts";
 // Shared with scripts/serve.mjs — see the module header for why it is .mjs.
 import { IMMUTABLE, openAssetBody, planAsset } from "./assetResponse.mjs";
 import { getIdentity } from "./identity.ts";
+import {
+  CRAFT_LIMITS,
+  DOC_ID_RE,
+  cleanName,
+  likeAnywhere,
+  normBoard,
+  normCraftStickers,
+  normOutline,
+  normStickerGroup,
+  type CraftSticker,
+  type StickerGroup,
+} from "./stickerCrafts.ts";
 import { isAllowedOrigin, originPolicyFromEnv, refuseCrossSite, requestHost } from "./originGuard.ts";
 import { autoExtractor, installProblem } from "./autoExtract.ts";
 import { readSavedExtractState, IDLE_STATE, type ExtractState } from "./extractState.ts";
@@ -23,6 +35,7 @@ import {
   gamePluginState,
   installGamePlugin,
   panelCapabilities,
+  playerCards,
   readPluginCfg,
   readTypeCfgs,
   writePluginCfg,
@@ -2108,6 +2121,8 @@ interface ItemRow {
    *  it in the same breath as the offsets. */
   charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
   patches?: unknown[] | null;
+  /** A placed Sticker Craft: the slots that move as one (schema.sql, normStickerGroup). */
+  sticker_group?: StickerGroup | null;
   /**
    * When this instance entered the inventory.
    *
@@ -2301,6 +2316,17 @@ function enrichAttachments<T extends { stickers?: unknown[] | null; charm_id?: n
 
 // Enrich an owned instance with catalog data + its loadout slot + where it's
 // equipped, so the UI can render and validate without a second catalog lookup.
+/** A group, checked against the stickers it is stored beside: on write, and on
+ *  read for a row written before a rule tightened. */
+const stickerGroupFor = (group: unknown, stickers: unknown) => {
+  const specs = normSpecs(stickers);
+  return normStickerGroup(group, (slot) => specs[slot] != null, STICKER_LIMITS.maxStickers);
+};
+/** The group as the column takes it: JSON, or SQL NULL for no group. */
+const stickerGroupJson = (group: unknown, stickers: unknown) => {
+  const g = stickerGroupFor(group, stickers);
+  return g ? JSON.stringify(g) : null;
+};
 function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }[]) {
   const item = getItem(row.item_id);
   return {
@@ -2317,6 +2343,7 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     nametag: row.nametag,
     style: row.style ?? null,
     upgrade_level: row.upgrade_level ?? null,
+    sticker_group: stickerGroupFor(row.sticker_group, row.stickers),
     // Drives the "Recently added" sort. Emitted for every instance rather than
     // only when that sort is active: the client sorts in memory over the list it
     // already holds, so a field the row omits is a mode that silently does
@@ -2336,7 +2363,7 @@ app.get("/api/inventory", async (request, reply) => {
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
       `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level,
-              stickers, charm_id, charm_offset, patches, origin, created_at
+              stickers, charm_id, charm_offset, patches, sticker_group, origin, created_at
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
     ),
@@ -2541,6 +2568,8 @@ async function detachElsewhere(steamId: string, insts: number[], keepRowId: numb
     await pool.query(
       `UPDATE inventory.owned_items
          SET stickers = $2::jsonb, patches = $3::jsonb,
+             -- A sticker taken off this row breaks its placed craft's group.
+             sticker_group = CASE WHEN $5 THEN NULL ELSE sticker_group END,
              charm_id = CASE WHEN $4 THEN NULL ELSE charm_id END,
              charm_offset = CASE WHEN $4 THEN NULL ELSE charm_offset END
        WHERE id = $1`,
@@ -2549,6 +2578,7 @@ async function detachElsewhere(steamId: string, insts: number[], keepRowId: numb
         nextStickers.some(Boolean) ? JSON.stringify(nextStickers) : null,
         nextPatches.some(Boolean) ? JSON.stringify(nextPatches) : null,
         dropCharm,
+        nextStickers.some((s, i) => s !== stickers[i]),
       ],
     );
   }
@@ -2559,7 +2589,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
-  const { item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
+  const { item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group } =
     request.body;
   if (typeof item_id !== "number" || !getItem(item_id)) {
     return reply.status(400).send({ error: "That item doesn't exist." });
@@ -2585,9 +2615,9 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
   const linked = await linkAttachments(identity.steamId, { stickers, patches, charm_id, charm_offset }, null);
   const { rows } = await pool.query<ItemRow>(
     `INSERT INTO inventory.owned_items
-       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12)
-     RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
+       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level, sticker_group)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12,$13::jsonb)
+     RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group`,
     [
       identity.steamId, item_id,
       checked.clean.wear ?? null, checked.clean.seed ?? null,
@@ -2596,6 +2626,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
       linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
       normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
       checked.clean.style ?? null, checked.clean.upgrade_level ?? null,
+      stickerGroupJson(sticker_group, linked.stickers),
     ],
   );
   return {
@@ -2630,7 +2661,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
       return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
     }
     const id = Number(request.params.id);
-    const { wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches } =
+    const { wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group } =
       request.body;
     const attachErr = checkAttachments(chk.rows[0].item_id, stickers, charm_id, patches);
     if (attachErr) {
@@ -2667,6 +2698,9 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
          wear = COALESCE($3, wear), seed = COALESCE($4, seed),
          stattrak = COALESCE($5, stattrak), nametag = $6,
          stickers = CASE WHEN $7 THEN $8::jsonb ELSE stickers END,
+         -- The group goes with the stickers: written in the same breath, and
+         -- gone with them when a request rewrites them without one.
+         sticker_group = CASE WHEN $7 THEN $18::jsonb ELSE sticker_group END,
          charm_id = CASE WHEN $9 THEN $10 ELSE charm_id END,
          charm_offset = CASE WHEN $9 THEN $11::jsonb ELSE charm_offset END,
          patches = CASE WHEN $12 THEN $13::jsonb ELSE patches END,
@@ -2675,7 +2709,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
          style = CASE WHEN $14 THEN $15::integer ELSE style END,
          upgrade_level = CASE WHEN $16 THEN $17::integer ELSE upgrade_level END
        WHERE id = $1 AND steam_id = $2
-       RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches`,
+       RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group`,
       [
         // `?? null` keeps the COALESCE contract: a key validateCraftAttrs left
         // unset is one the request never sent, and null means "leave it alone".
@@ -2688,6 +2722,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
         hasPatches, hasPatches && normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
         "style" in checked.clean, checked.clean.style ?? null,
         "upgrade_level" in checked.clean, checked.clean.upgrade_level ?? null,
+        hasStickers ? stickerGroupJson(sticker_group, linked.stickers) : null,
       ],
     );
     if (!rows.length) {
@@ -2926,6 +2961,391 @@ app.post<{ Body: { item_id?: number; want?: boolean } }>(
       [identity.steamId, itemId],
     );
     return { want: true };
+  },
+);
+
+// ---- Sticker Crafts ------------------------------------------------------------
+//
+// The Sticker Crafts tab (src/components/StickerCrafts.vue): a player's mat,
+// their saved crafts, and the Craft Store where crafts are published for
+// everyone on the panel. What may be stored is decided in stickerCrafts.ts;
+// these routes are its storage. A sticker goes out with its name and art looked
+// up from its id (craftStickerOut), so a craft shows everyone the catalog's
+// sticker and never anything its author sent.
+
+const CRAFTS_DIR = process.env.CRAFTS_DIR ?? "/cs2-models/crafts";
+const isSticker = (id: number) => getItem(id)?.type === "sticker";
+const weaponNameOf = (model: string | null) => (model ? (getWeapons().find((w) => w.model === model)?.name ?? null) : null);
+const craftStickerOut = (s: CraftSticker) => {
+  const item = getItem(s.id);
+  return { ...s, name: item?.name ?? "Sticker", image: item?.image ?? null };
+};
+
+type CraftRow = {
+  id: string;
+  steam_id: string;
+  name: string;
+  stickers: unknown;
+  use_model: string | null;
+  preview_key: string | null;
+  use_preview_key: string | null;
+  preview_v: number;
+  published_at: string | null;
+  updated_at: string;
+};
+const CRAFT_COLS = "c.id, c.steam_id::text AS steam_id, c.name, c.stickers, c.use_model, c.preview_key, c.use_preview_key, c.preview_v, c.published_at, c.updated_at";
+/** A craft as the client keeps it (SavedCraft in src/stickerCraftsModel.ts). */
+function craftOut(r: CraftRow) {
+  return {
+    id: r.id,
+    name: r.name,
+    savedAt: new Date(r.updated_at).getTime(),
+    stickers: (normCraftStickers(r.stickers, isSticker) ?? []).map(craftStickerOut),
+    previewKey: r.preview_key,
+    previewV: r.preview_v,
+    useCase: r.use_model ? { model: r.use_model, weapon: weaponNameOf(r.use_model) ?? r.use_model, imageKey: r.use_preview_key } : null,
+  };
+}
+const voteTally = (r: { ups: string | number; downs: string | number }) => {
+  const ups = Number(r.ups);
+  const downs = Number(r.downs);
+  return { ups, downs, score: ups - downs };
+};
+
+/** The mat and every saved craft, with the store standing of the published ones. */
+app.get("/api/sticker-crafts", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const [board, crafts] = await Promise.all([
+    pool.query<{ stickers: unknown; groups: unknown }>(
+      `SELECT stickers, groups FROM inventory.sticker_boards WHERE steam_id = $1`,
+      [identity.steamId],
+    ),
+    pool.query<CraftRow & { ups: string; downs: string }>(
+      `SELECT ${CRAFT_COLS},
+              count(v.*) FILTER (WHERE v.vote = 1) AS ups,
+              count(v.*) FILTER (WHERE v.vote = -1) AS downs
+         FROM inventory.sticker_crafts c
+         LEFT JOIN inventory.sticker_craft_votes v ON v.craft_id = c.id
+        WHERE c.steam_id = $1
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC`,
+      [identity.steamId],
+    ),
+  ]);
+  const mat = normBoard(board.rows[0] ?? null, isSticker);
+  return {
+    board: { stickers: mat.stickers.map((s) => ({ ...craftStickerOut(s), uid: s.uid, group: s.group, craft: s.craft })), groups: mat.groups },
+    crafts: crafts.rows.map((r) => ({ ...craftOut(r), ...(r.published_at ? { published: true, ...voteTally(r) } : {}) })),
+  };
+});
+
+app.put<{ Body: unknown }>("/api/sticker-crafts/board", { bodyLimit: 64_000 }, async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const mat = normBoard(request.body, isSticker);
+  await pool.query(
+    `INSERT INTO inventory.sticker_boards (steam_id, stickers, groups, updated_at) VALUES ($1, $2::jsonb, $3::jsonb, now())
+     ON CONFLICT (steam_id) DO UPDATE SET stickers = EXCLUDED.stickers, groups = EXCLUDED.groups, updated_at = now()`,
+    [identity.steamId, JSON.stringify(mat.stickers), JSON.stringify(mat.groups)],
+  );
+  return { ok: true };
+});
+
+/**
+ * Save one craft — new, or the caller's own under the same id. The id is the
+ * client's (see DOC_ID_RE); a write over someone else's is refused, not merged.
+ */
+app.put<{ Params: { id: string }; Body: { name?: unknown; stickers?: unknown; useModel?: unknown } }>(
+  "/api/sticker-crafts/crafts/:id",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const id = request.params.id;
+    if (!DOC_ID_RE.test(id)) {
+      return reply.status(400).send({ error: "That isn't a craft." });
+    }
+    const sent = request.body?.stickers;
+    if (!Array.isArray(sent) || !sent.length || sent.length > CRAFT_LIMITS.stickersPerCraft) {
+      return reply.status(400).send({ error: `A craft is 1 to ${CRAFT_LIMITS.stickersPerCraft} stickers.` });
+    }
+    const stickers = normCraftStickers(sent, isSticker);
+    if (!stickers) {
+      return reply.status(400).send({ error: "That isn't a sticker." });
+    }
+    const useModel = typeof request.body?.useModel === "string" && weaponNameOf(request.body.useModel) ? request.body.useModel : null;
+    const count = await pool.query<{ n: number; mine: boolean }>(
+      `SELECT count(*)::int AS n, bool_or(id = $2) AS mine FROM inventory.sticker_crafts WHERE steam_id = $1`,
+      [identity.steamId, id],
+    );
+    if (!count.rows[0]?.mine && (count.rows[0]?.n ?? 0) >= CRAFT_LIMITS.craftsPerPlayer) {
+      return reply
+        .status(400)
+        .send({ error: `You can keep ${CRAFT_LIMITS.craftsPerPlayer} crafts — delete one to make room.` });
+    }
+    const { rowCount } = await pool.query(
+      `INSERT INTO inventory.sticker_crafts (id, steam_id, name, stickers, use_model)
+            VALUES ($1, $2, $3, $4::jsonb, $5)
+       ON CONFLICT (id) DO UPDATE
+             SET name = EXCLUDED.name, stickers = EXCLUDED.stickers, use_model = EXCLUDED.use_model, updated_at = now()
+           WHERE inventory.sticker_crafts.steam_id = EXCLUDED.steam_id`,
+      [id, identity.steamId, cleanName(request.body?.name, "Sticker craft"), JSON.stringify(stickers), useModel],
+    );
+    if (!rowCount) {
+      return reply.status(409).send({ error: "That craft isn't yours." });
+    }
+    return { ok: true };
+  },
+);
+
+/** Delete one of the caller's crafts: out of the store with it, its votes and its pictures. */
+app.delete<{ Params: { id: string } }>("/api/sticker-crafts/crafts/:id", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{ preview_key: string | null; use_preview_key: string | null }>(
+    `DELETE FROM inventory.sticker_crafts WHERE id = $1 AND steam_id = $2 RETURNING preview_key, use_preview_key`,
+    [request.params.id, identity.steamId],
+  );
+  for (const key of [rows[0]?.preview_key, rows[0]?.use_preview_key]) if (key) await removeCraftPicture(key);
+  return { ok: true };
+});
+
+// A craft's pictures — its top-down render (`top`) and the render of it on the
+// weapon it was made for (`use`) — are files in CRAFTS_DIR, uploaded raw like a
+// card (POST /api/render/:id) and checked by their own bytes. Named by craft,
+// kind and content, so a picture's URL never changes under it (immutable) and
+// two crafts never share one file.
+const CRAFT_PICTURE_RE = /^[A-Za-z0-9_-]{1,64}-(top|use)-[0-9a-f]{16}\.png$/;
+async function removeCraftPicture(key: string) {
+  if (!CRAFT_PICTURE_RE.test(key)) return;
+  const stem = cardStem(key);
+  for (const ext of ["png", "webp"]) await fs.rm(path.join(CRAFTS_DIR, `${stem}.${ext}`), { force: true }).catch(() => {});
+}
+app.put<{ Params: { id: string; kind: string }; Querystring: { v?: string }; Body: Buffer }>(
+  "/api/sticker-crafts/crafts/:id/picture/:kind",
+  { bodyLimit: 1_000_000 },
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const { id, kind } = request.params;
+    if (!DOC_ID_RE.test(id) || (kind !== "top" && kind !== "use")) {
+      return reply.status(400).send({ error: "That isn't a craft picture." });
+    }
+    const body = request.body;
+    if (!Buffer.isBuffer(body) || !plausibleCard(body)) {
+      return reply.status(400).send({ error: "That isn't a PNG or WebP picture." });
+    }
+    const col = kind === "top" ? "preview_key" : "use_preview_key";
+    const { rows } = await pool.query<{ key: string | null }>(
+      `SELECT ${col} AS key FROM inventory.sticker_crafts WHERE id = $1 AND steam_id = $2`,
+      [id, identity.steamId],
+    );
+    if (!rows.length) {
+      return reply.status(404).send({ error: "Save the craft before its picture." });
+    }
+    const key = `${id}-${kind}-${createHash("sha256").update(body).digest("hex").slice(0, 16)}.png`;
+    await storeCard(CRAFTS_DIR, key, body);
+    const v = Number(request.query.v);
+    await pool.query(
+      `UPDATE inventory.sticker_crafts SET ${col} = $3${kind === "top" ? ", preview_v = $4" : ""} WHERE id = $1 AND steam_id = $2`,
+      kind === "top" ? [id, identity.steamId, key, Number.isInteger(v) && v >= 0 && v < 1000 ? v : 0] : [id, identity.steamId, key],
+    );
+    if (rows[0].key && rows[0].key !== key) await removeCraftPicture(rows[0].key);
+    return { key };
+  },
+);
+app.get<{ Params: { key: string } }>("/api/sticker-crafts/pictures/:key", async (request, reply) => {
+  const key = request.params.key;
+  const picture = CRAFT_PICTURE_RE.test(key) ? await readCard(CRAFTS_DIR, key) : null;
+  if (!picture) {
+    reply.header("Cache-Control", "no-store");
+    return reply.status(404).send({ error: "not found" });
+  }
+  // The name carries the content hash: a new picture is a new name.
+  reply.header("Cache-Control", IMMUTABLE);
+  return reply.type(picture.type).send(picture.body);
+});
+
+/**
+ * The Craft Store: published crafts, best or newest first, with each one's votes
+ * and the caller's own. `count` keeps to crafts of exactly that many stickers;
+ * `q` matches the craft's name. Authors are named live (playerCards), so a
+ * renamed player is never shown under an old name.
+ */
+app.get<{ Querystring: { sort?: string; count?: string; q?: string; offset?: string; limit?: string } }>(
+  "/api/sticker-crafts/store",
+  async (request, reply) => {
+    const identity = await getIdentity(request);
+    if (!identity) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const q = request.query;
+    const count = Math.min(CRAFT_LIMITS.stickersPerCraft, Math.max(0, Math.trunc(Number(q.count)) || 0));
+    const limit = Math.min(60, Math.max(1, Math.trunc(Number(q.limit)) || 30));
+    const offset = Math.min(10_000, Math.max(0, Math.trunc(Number(q.offset)) || 0));
+    const search = typeof q.q === "string" && q.q.trim() ? likeAnywhere(q.q.trim().slice(0, CRAFT_LIMITS.nameMax)) : null;
+    const order = q.sort === "new" ? "c.published_at DESC" : "score DESC, c.published_at DESC";
+    const { rows } = await pool.query<CraftRow & { ups: string; downs: string; score: string; my_vote: number | null }>(
+      `SELECT ${CRAFT_COLS},
+              count(v.*) FILTER (WHERE v.vote = 1) AS ups,
+              count(v.*) FILTER (WHERE v.vote = -1) AS downs,
+              coalesce(sum(v.vote), 0) AS score,
+              max(v.vote) FILTER (WHERE v.steam_id = $1) AS my_vote
+         FROM inventory.sticker_crafts c
+         LEFT JOIN inventory.sticker_craft_votes v ON v.craft_id = c.id
+        WHERE c.published_at IS NOT NULL
+          AND ($2 = 0 OR jsonb_array_length(c.stickers) = $2)
+          AND ($3::text IS NULL OR c.name ILIKE $3)
+        GROUP BY c.id
+        ORDER BY ${order}
+        LIMIT $4 OFFSET $5`,
+      [identity.steamId, count, search, limit, offset],
+    );
+    const authors = await playerCards(request.headers.cookie ?? "", [...new Set(rows.map((r) => r.steam_id))]).catch(
+      () => new Map<string, { name: string; avatar: string | null }>(),
+    );
+    return {
+      items: rows.map((r) => ({
+        ...craftOut(r),
+        author: { steamId: r.steam_id, ...(authors.get(r.steam_id) ?? { name: "Player", avatar: null }) },
+        ...voteTally(r),
+        myVote: r.my_vote ?? 0,
+        mine: r.steam_id === String(identity.steamId),
+      })),
+    };
+  },
+);
+
+/** Publish one of the caller's crafts. Not one an administrator took down. */
+app.put<{ Params: { id: string } }>("/api/sticker-crafts/store/:id", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{ taken_down: boolean }>(
+    `UPDATE inventory.sticker_crafts SET published_at = coalesce(published_at, now())
+      WHERE id = $1 AND steam_id = $2 AND NOT taken_down
+      RETURNING taken_down`,
+    [request.params.id, identity.steamId],
+  );
+  if (!rows.length) {
+    const down = await pool.query(
+      `SELECT 1 FROM inventory.sticker_crafts WHERE id = $1 AND steam_id = $2 AND taken_down`,
+      [request.params.id, identity.steamId],
+    );
+    return down.rowCount
+      ? reply.status(403).send({ error: "An administrator took this craft out of the store." })
+      : reply.status(404).send({ error: "Save the craft before publishing it." });
+  }
+  return { ok: true };
+});
+
+/** Take a craft out of the store: its author, or an administrator — whose takedown sticks. */
+app.delete<{ Params: { id: string } }>("/api/sticker-crafts/store/:id", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const own = await pool.query(
+    `UPDATE inventory.sticker_crafts SET published_at = NULL WHERE id = $1 AND steam_id = $2`,
+    [request.params.id, identity.steamId],
+  );
+  if (own.rowCount) return { ok: true };
+  if (identity.role !== "administrator") {
+    return reply.status(403).send({ error: "Only its author or an administrator can take a craft down." });
+  }
+  await pool.query(`UPDATE inventory.sticker_crafts SET published_at = NULL, taken_down = true WHERE id = $1`, [
+    request.params.id,
+  ]);
+  return { ok: true };
+});
+
+/**
+ * Vote a published craft up (1) or down (-1), or take the vote back (0). Never
+ * your own. One statement: the craft is checked in the same query that writes,
+ * so a vote cannot land on a craft unpublished in between.
+ */
+app.post<{ Params: { id: string }; Body: { vote?: number } }>("/api/sticker-crafts/store/:id/vote", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const id = request.params.id;
+  const vote = Number(request.body?.vote);
+  if (![1, -1, 0].includes(vote)) {
+    return reply.status(400).send({ error: "A vote is up, down or none." });
+  }
+  const open = `EXISTS (SELECT 1 FROM inventory.sticker_crafts WHERE id = $1 AND published_at IS NOT NULL AND steam_id <> $2)`;
+  const wrote =
+    vote === 0
+      ? await pool.query(`DELETE FROM inventory.sticker_craft_votes WHERE craft_id = $1 AND steam_id = $2 AND ${open}`, [id, identity.steamId])
+      : await pool.query(
+          `INSERT INTO inventory.sticker_craft_votes (craft_id, steam_id, vote) SELECT $1, $2, $3 WHERE ${open}
+           ON CONFLICT (craft_id, steam_id) DO UPDATE SET vote = EXCLUDED.vote`,
+          [id, identity.steamId, vote],
+        );
+  if (vote !== 0 && !wrote.rowCount) {
+    return reply.status(400).send({ error: "That craft isn't in the store, or it's your own." });
+  }
+  const { rows } = await pool.query<{ ups: string; downs: string }>(
+    `SELECT count(*) FILTER (WHERE vote = 1) AS ups, count(*) FILTER (WHERE vote = -1) AS downs
+       FROM inventory.sticker_craft_votes WHERE craft_id = $1`,
+    [id],
+  );
+  return { ...voteTally(rows[0] ?? { ups: 0, downs: 0 }), myVote: vote };
+});
+
+/**
+ * A gun's traced outline for the mat (normOutline), or 404 when none is stored
+ * for this extraction — the mat then traces it from the model itself and PUTs
+ * it here, so the next player to pick that gun gets it straight away.
+ */
+app.get<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", async (request, reply) => {
+  const { rows } = await pool.query<{ outline: unknown }>(
+    `SELECT outline FROM inventory.weapon_outlines WHERE model = $1 AND extract_version = $2`,
+    [request.params.model, await renderVersion()],
+  );
+  const outline = rows[0] ? normOutline(rows[0].outline, request.params.model) : null;
+  if (!outline) {
+    reply.header("Cache-Control", "no-store");
+    return reply.status(404).send({ error: "not traced yet" });
+  }
+  return { outline };
+});
+/** First trace per extraction wins: a second upload for the same version changes nothing. */
+app.put<{ Params: { model: string }; Body: unknown }>(
+  "/api/catalog/weapon-outline/:model",
+  { bodyLimit: 200_000 },
+  async (request, reply) => {
+    if (!(await getIdentity(request))) {
+      return reply.status(401).send({ error: "unauthorized" });
+    }
+    const model = request.params.model;
+    if (!weaponNameOf(model)) {
+      return reply.status(400).send({ error: "That isn't a weapon." });
+    }
+    const outline = normOutline(request.body, model);
+    if (!outline) {
+      return reply.status(400).send({ error: "That isn't a weapon outline." });
+    }
+    const version = await renderVersion();
+    await pool.query(
+      `INSERT INTO inventory.weapon_outlines (model, extract_version, outline) VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (model) DO UPDATE SET extract_version = EXCLUDED.extract_version, outline = EXCLUDED.outline, updated_at = now()
+         WHERE inventory.weapon_outlines.extract_version <> EXCLUDED.extract_version`,
+      [model, version, JSON.stringify(outline)],
+    );
+    return { ok: true };
   },
 );
 

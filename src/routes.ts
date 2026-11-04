@@ -26,6 +26,8 @@ export type Route =
   | { name: "inventory" }
   /** The catalog browser. `/craft` with no id — `/craft/<id>` is a draft of one. */
   | { name: "armory" }
+  /** The sticker board: lay stickers out on a measuring mat and group them. */
+  | { name: "stickerCrafts" }
   | { name: "item"; id: string; modal: ItemModal }
   | { name: "draft"; skinId: number }
   | { name: "admin"; section: string };
@@ -54,6 +56,7 @@ export function parsePath(path: string): Route {
   // Bare /craft is the browser; /craft/<id> is a draft of one particular finish.
   // Checked before the draft pattern so the two can share the segment.
   if (path === "/craft" || path === "/craft/") return { name: "armory" };
+  if (path === "/sticker-crafts") return { name: "stickerCrafts" };
   const draft = path.match(/^\/craft\/(\d+)$/);
   if (draft) return { name: "draft", skinId: Number(draft[1]) };
 
@@ -80,6 +83,8 @@ export function buildPath(route: Route): string {
       return "/items";
     case "armory":
       return "/craft";
+    case "stickerCrafts":
+      return "/sticker-crafts";
     case "item":
       return route.modal === "detail"
         ? `/items/${encodeURIComponent(route.id)}`
@@ -92,7 +97,7 @@ export function buildPath(route: Route): string {
 }
 
 /** Which top-level screen renders behind whatever modal is open. */
-export function screenFor(route: Route): "grid" | "focus" | "inventory" | "armory" | "admin" {
+export function screenFor(route: Route): "grid" | "focus" | "inventory" | "armory" | "stickers" | "admin" {
   switch (route.name) {
     case "focus":
       return "focus";
@@ -100,6 +105,8 @@ export function screenFor(route: Route): "grid" | "focus" | "inventory" | "armor
       return "inventory";
     case "armory":
       return "armory";
+    case "stickerCrafts":
+      return "stickers";
     case "admin":
       return "admin";
     // An item modal is layered over the inventory; a draft over wherever you

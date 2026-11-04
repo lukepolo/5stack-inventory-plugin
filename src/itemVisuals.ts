@@ -22,9 +22,24 @@ const pct = (n: number) => Math.round(Math.min(n, 1) * 1e4) / 100;
 // Interior boundaries as percentages — hairlines that make the scale readable.
 export const WEAR_BOUNDS = WEAR_STOPS.slice(0, -1).map((s) => pct(s.max));
 
-export const WEAR_GRADIENT = `linear-gradient(90deg,${WEAR_STOPS.map(
-  (s, i) => `${s.color} ${pct(WEAR_STOPS[i - 1]?.max ?? 0)}% ${pct(s.max)}%`,
-).join(",")})`;
+/**
+ * The ramp across the floats from `min` to `max` only — a wear slider's track,
+ * whose ends are the finish's own limits. A 0.00–0.40 finish drawn on the whole
+ * 0–1 scale put Battle-Scarred red under a thumb that tops out at 0.40, which is
+ * Well-Worn.
+ */
+export function wearGradient(min = 0, max = 1): string {
+  const span = max - min || 1;
+  const at = (wear: number) => pct(Math.max(0, (wear - min) / span));
+  const stops = WEAR_STOPS.flatMap((s, i) => {
+    const from = at(WEAR_STOPS[i - 1]?.max ?? 0);
+    const to = at(s.max);
+    return to > from ? [`${s.color} ${from}% ${to}%`] : [];
+  });
+  return `linear-gradient(90deg,${stops.join(",")})`;
+}
+
+export const WEAR_GRADIENT = wearGradient();
 
 const stopFor = (wear: number) => WEAR_STOPS.find((s) => wear < s.max) ?? WEAR_STOPS[4];
 /** Ramp colour at a float — tints the marker so it reads against its own tier. */
