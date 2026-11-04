@@ -1101,7 +1101,8 @@ const outline = computed<WeaponOutline | null>(() => outlines.value.get(outlineM
  * The stored outline, or a fresh trace of the model, which is then stored —
  * calibrated against the gun's own slots on the way in (calibrateOutline), so
  * a layout on the chalk lands on the gun where it was laid out. The stored
- * copy stays as traced.
+ * copy stays as traced. One stored before outlines carried the StatTrak
+ * counter (no `stattrak`) is traced again, and the new trace replaces it.
  */
 async function outlineFor(model: string): Promise<WeaponOutline | null> {
   const [stored, geo, trace] = await Promise.all([
@@ -1109,7 +1110,7 @@ async function outlineFor(model: string): Promise<WeaponOutline | null> {
     fetchStickerGeometry(model),
     import("../outlineTrace"),
   ]);
-  if (stored) return trace.calibrateOutline(stored, geo.slots);
+  if (stored?.stattrak) return trace.calibrateOutline(stored, geo.slots);
   // Through the lazy edge, so three comes down alongside the viewer's chunk.
   const { weaponOutline } = await viewer3d();
   const side = await weaponOutline(model, geo.slots);

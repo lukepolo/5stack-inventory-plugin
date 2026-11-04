@@ -351,23 +351,26 @@ function drawChalkOutline(o: WeaponOutline): HTMLCanvasElement {
   // strength, which is what makes a line read as drawn rather than printed.
   let seed = 7;
   const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-  for (const p of o.paths) {
-    const n = p.length / 2;
-    for (let i = 0; i < n; i++) {
-      const x0 = X(p[i * 2]);
-      const y0 = X(p[i * 2 + 1]);
-      const x1 = X(p[((i + 1) % n) * 2]);
-      const y1 = X(p[((i + 1) % n) * 2 + 1]);
-      const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 1.3));
-      for (let s = 0; s < steps; s++) {
-        const t = s / steps;
-        g.fillStyle = `rgba(240, 245, 238, ${0.45 + rnd() * 0.45})`;
-        g.beginPath();
-        g.arc(x0 + (x1 - x0) * t + (rnd() - 0.5) * 1.2, y0 + (y1 - y0) * t + (rnd() - 0.5) * 1.2, 1.1 + rnd() * 0.9, 0, Math.PI * 2);
-        g.fill();
+  const chalkLoops = (loops: number[][]) => {
+    for (const p of loops) {
+      const n = p.length / 2;
+      for (let i = 0; i < n; i++) {
+        const x0 = X(p[i * 2]);
+        const y0 = X(p[i * 2 + 1]);
+        const x1 = X(p[((i + 1) % n) * 2]);
+        const y1 = X(p[((i + 1) % n) * 2 + 1]);
+        const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 1.3));
+        for (let s = 0; s < steps; s++) {
+          const t = s / steps;
+          g.fillStyle = `rgba(240, 245, 238, ${0.45 + rnd() * 0.45})`;
+          g.beginPath();
+          g.arc(x0 + (x1 - x0) * t + (rnd() - 0.5) * 1.2, y0 + (y1 - y0) * t + (rnd() - 0.5) * 1.2, 1.1 + rnd() * 0.9, 0, Math.PI * 2);
+          g.fill();
+        }
       }
     }
-  }
+  };
+  chalkLoops(o.paths);
   // Each slot's default spot: a dashed sticker square, numbered.
   const side = STICKER_CM * k;
   g.setLineDash([7, 6]);
@@ -380,6 +383,36 @@ function drawChalkOutline(o: WeaponOutline): HTMLCanvasElement {
   for (const a of o.anchors) {
     g.strokeRect(X(a.x) - side / 2, X(a.y) - side / 2, side, side);
     g.fillText(String(a.index + 1), X(a.x), X(a.y));
+  }
+  // The StatTrak counter, where the editor puts it on this gun: in the same
+  // chalk, over everything else (it covers a sticker under it on the gun too),
+  // with a firmer wash than the gun's so it reads as a part bolted on — and,
+  // where there is room, its name.
+  const st = o.stattrak ?? [];
+  if (st.length) {
+    g.setLineDash([]);
+    const counter = new Path2D();
+    let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+    for (const p of st) {
+      counter.moveTo(X(p[0]), X(p[1]));
+      for (let i = 0; i < p.length; i += 2) {
+        counter.lineTo(X(p[i]), X(p[i + 1]));
+        bx0 = Math.min(bx0, X(p[i]));
+        bx1 = Math.max(bx1, X(p[i]));
+        by0 = Math.min(by0, X(p[i + 1]));
+        by1 = Math.max(by1, X(p[i + 1]));
+      }
+      counter.closePath();
+    }
+    g.fillStyle = "rgba(235, 242, 236, 0.14)";
+    g.fill(counter, "evenodd");
+    chalkLoops(st);
+    const font = Math.min(k * 0.5, (bx1 - bx0) / 7.5, (by1 - by0) * 0.45);
+    if (font >= 7) {
+      g.fillStyle = "rgba(240, 245, 238, 0.7)";
+      g.font = `700 ${Math.round(font)}px sans-serif`;
+      g.fillText("STATTRAK", (bx0 + bx1) / 2, (by0 + by1) / 2);
+    }
   }
   return c;
 }

@@ -2543,6 +2543,10 @@ export interface SideOutline {
   stickerWorld: number;
   /** Where each slot's anchor falls on it, in pixels. */
   anchors: { index: number; x: number; y: number }[];
+  /** The StatTrak module's own silhouette, seen from the same camera (same
+   *  size and order as `mask`), placed exactly as the editor places it — or
+   *  null when the gun takes none. */
+  stattrak: Uint8Array | null;
 }
 const outlineCache = new Map<string, Promise<SideOutline | null>>();
 /**
@@ -2567,6 +2571,9 @@ export function weaponOutline(model: string, slots: StickerSlot[]): Promise<Side
           frame: "fit",
           outline: true,
           stickerSlots: slots,
+          // The counter, so the chalk can show where it sits: the dark (card)
+          // module, placed by the same code as the editor's.
+          stattrak: { count: null },
         });
         return handle.sideOutline();
       } catch {
@@ -6695,14 +6702,37 @@ async function buildViewer(
     const clear = renderer.getClearColor(new THREE.Color());
     const clearA = renderer.getClearAlpha();
     const px = new Uint8Array(W * H * 4);
-    try {
-      stage.add(object);
+    // The StatTrak module gets a silhouette of its own: the gun is drawn
+    // without it, then it is drawn alone, from the same camera.
+    const mod = stattrakMod;
+    const modPx = mod ? new Uint8Array(W * H * 4) : null;
+    const draw = (into: Uint8Array) => {
       renderer.setRenderTarget(rt);
-      renderer.setClearColor(0x000000, 0);
       renderer.clear();
       renderer.render(stage, cam);
-      renderer.readRenderTargetPixels(rt, 0, 0, W, H, px);
+      renderer.readRenderTargetPixels(rt, 0, 0, W, H, into);
+    };
+    const hidden: import("three").Object3D[] = [];
+    try {
+      stage.add(object);
+      renderer.setClearColor(0x000000, 0);
+      if (mod) mod.visible = false;
+      draw(px);
+      if (mod && modPx) {
+        mod.visible = true;
+        const own = new Set<import("three").Object3D>();
+        mod.traverse((c) => own.add(c));
+        object.traverse((c) => {
+          if ((c as import("three").Mesh).isMesh && !own.has(c) && c.visible) {
+            c.visible = false;
+            hidden.push(c);
+          }
+        });
+        draw(modPx);
+      }
     } finally {
+      for (const c of hidden) c.visible = true;
+      if (mod) mod.visible = true;
       renderer.setRenderTarget(null);
       renderer.setClearColor(clear, clearA);
       if (parent) parent.add(object);
@@ -6710,17 +6740,22 @@ async function buildViewer(
       flat.dispose();
     }
     // Top row first, as an image is.
-    const mask = new Uint8Array(W * H);
-    for (let y = 0; y < H; y++) {
-      const src = (H - 1 - y) * W * 4;
-      for (let x = 0; x < W; x++) mask[y * W + x] = px[src + x * 4] > 127 ? 1 : 0;
-    }
+    const toMask = (from: Uint8Array) => {
+      const out = new Uint8Array(W * H);
+      for (let y = 0; y < H; y++) {
+        const src = (H - 1 - y) * W * 4;
+        for (let x = 0; x < W; x++) out[y * W + x] = from[src + x * 4] > 127 ? 1 : 0;
+      }
+      return out;
+    };
+    const mask = toMask(px);
+    const stattrak = modPx ? toMask(modPx) : null;
     const at = new THREE.Vector3();
     const pts = anchorPoints().map((a) => {
       at.copy(a.p).project(cam);
       return { index: a.index, x: ((at.x + 1) / 2) * W, y: ((1 - at.y) / 2) * H };
     });
-    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts };
+    return { width: W, height: H, mask, worldPerPx: (lenW * pad) / W, stickerWorld: stickerWorld(), anchors: pts, stattrak };
   }
   function frameStickers(mode: "in" | "back" | "stay", slots?: number[]) {
     if (disposed) return;

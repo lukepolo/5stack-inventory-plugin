@@ -25,6 +25,10 @@ export interface WeaponOutline {
   paths: number[][];
   /** Each sticker slot's anchor (0-based slot), in the same units. */
   anchors: { index: number; x: number; y: number }[];
+  /** The StatTrak module's outline: closed loops in the same units and from the
+   *  same corner, where the editor puts the module on this gun. [] when the gun
+   *  takes none; absent on an outline traced before the module was. */
+  stattrak?: number[][];
 }
 
 // Marching squares: for each cell's corner pattern (tl 8, tr 4, br 2, bl 1),
@@ -64,19 +68,24 @@ function simplify(pts: [number, number][], eps: number): [number, number][] {
   return pts.filter((_, i) => keep[i]);
 }
 
-export function traceOutline(model: string, o: SideOutline): WeaponOutline | null {
-  const { width: W, height: H, mask } = o;
-  let minX = W, minY = H, maxX = -1, maxY = -1;
+/**
+ * A mask's edges as closed loops (marching squares, linked, thinned), in mat
+ * units measured from (minX, minY) — the GUN's box corner for both the gun and
+ * its StatTrak module, so the two line up. Loops of fewer than `minLoop` edge
+ * points are specks, not shape.
+ */
+function traceLoops(mask: Uint8Array, W: number, H: number, minX: number, minY: number, unit: number, minLoop: number): number[][] {
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       if (!mask[y * W + x]) continue;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
     }
   }
-  if (maxX < 0) return null;
+  if (x1 < 0) return [];
   const at = (x: number, y: number) => (x >= 0 && y >= 0 && x < W && y < H && mask[y * W + x] ? 1 : 0);
   // Segments between side midpoints, keyed at twice their coordinates so every
   // point is an integer and a shared midpoint is the same key from both cells.
@@ -90,8 +99,8 @@ export function traceOutline(model: string, o: SideOutline): WeaponOutline | nul
     if (!coord.has(k)) coord.set(k, [x2 / 2, y2 / 2]);
     return k;
   };
-  for (let y = minY - 1; y <= maxY; y++) {
-    for (let x = minX - 1; x <= maxX; x++) {
+  for (let y = y0 - 1; y <= y1; y++) {
+    for (let x = x0 - 1; x <= x1; x++) {
       const c = (at(x, y) << 3) | (at(x + 1, y) << 2) | (at(x + 1, y + 1) << 1) | at(x, y + 1);
       for (const pair of CASES[c]) segs.push([mid(x, y, pair[0]), mid(x, y, pair[1])]);
     }
@@ -103,7 +112,6 @@ export function traceOutline(model: string, o: SideOutline): WeaponOutline | nul
     (ends.get(b) ?? ends.set(b, []).get(b)!).push(i);
   });
   const used = new Uint8Array(segs.length);
-  const unit = (o.worldPerPx * STICKER_CM) / o.stickerWorld;
   const round = (v: number) => Math.round(v * 100) / 100;
   const paths: number[][] = [];
   for (let s = 0; s < segs.length; s++) {
@@ -120,13 +128,33 @@ export function traceOutline(model: string, o: SideOutline): WeaponOutline | nul
       if (cur === start) break;
       loop.push(coord.get(cur)!);
     }
-    // Specks of a few pixels are noise, not part of the shape.
-    if (loop.length < 12) continue;
+    if (loop.length < minLoop) continue;
     // A closed loop thins as two halves, so its ends stay put.
     const half = loop.length >> 1;
     const thin = [...simplify(loop.slice(0, half + 1), 0.7), ...simplify(loop.slice(half).concat([loop[0]]), 0.7).slice(1, -1)];
     paths.push(thin.flatMap(([x, y]) => [round((x - minX) * unit), round((y - minY) * unit)]));
   }
+  return paths;
+}
+
+export function traceOutline(model: string, o: SideOutline): WeaponOutline | null {
+  const { width: W, height: H, mask } = o;
+  let minX = W, minY = H, maxX = -1, maxY = -1;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (!mask[y * W + x]) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (maxX < 0) return null;
+  const unit = (o.worldPerPx * STICKER_CM) / o.stickerWorld;
+  const round = (v: number) => Math.round(v * 100) / 100;
+  // Specks of a few pixels are noise, not part of the shape.
+  const paths = traceLoops(mask, W, H, minX, minY, unit, 12);
+  if (!paths.length) return null;
   return {
     model,
     stickerCm: round(o.stickerWorld * 100),
@@ -135,6 +163,9 @@ export function traceOutline(model: string, o: SideOutline): WeaponOutline | nul
     paths,
     // The anchors are in pixel-EDGE coordinates, the loops in pixel centres.
     anchors: o.anchors.map((a) => ({ index: a.index, x: round((a.x - 0.5 - minX) * unit), y: round((a.y - 0.5 - minY) * unit) })),
+    // The module is small (a few dozen pixels across), so its loops are kept
+    // down to 8 edge points.
+    stattrak: o.stattrak ? traceLoops(o.stattrak, W, H, minX, minY, unit, 8) : [],
   };
 }
 
@@ -205,6 +236,7 @@ export function calibrateOutline(o: WeaponOutline, slots: StickerSlot[]): Weapon
     h: round(o.h * f),
     paths: o.paths.map((p) => p.map((v) => round(v * f))),
     anchors: o.anchors.map((a) => ({ index: a.index, x: round(a.x * f), y: round(a.y * f) })),
+    ...(o.stattrak ? { stattrak: o.stattrak.map((p) => p.map((v) => round(v * f))) } : {}),
   };
 }
 
