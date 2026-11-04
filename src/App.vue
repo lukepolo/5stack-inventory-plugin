@@ -4061,6 +4061,13 @@ async function mountModalViewer() {
       // for the watcher below to talk to. Reconcile here so a mode change can't
       // be lost in the gap — no-ops when it already matches.
       handle.setInteractive(!viewOnly.value);
+      // The same gap for the STICKERS: the sticker watcher below has no handle
+      // to talk to while this mounts, so anything that changed them meanwhile
+      // never reached the gun — a craft put on from the mat (it lands while the
+      // editor is still mounting), a restored group, sticker art resolving late
+      // on a slow first load. The gun stood bare with every sticker in the
+      // panel. The viewer no-ops a placement it already shows.
+      handle.setStickers(craftStickerPlacements());
       // A remount starts the pet on its idle; Wander, if it was on, carries on —
       // and is switched on here the first time, unless it has been turned off.
       if (target.kind === "pet" && petWander.value) armPetWander();
