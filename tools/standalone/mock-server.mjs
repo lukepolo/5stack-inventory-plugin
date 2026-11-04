@@ -15,7 +15,7 @@
 //
 // MOCK_INVENTORY is a JSON array of
 //   { item_id, wear?, seed?, stattrak?, stattrak_count?, nametag?, slot?,
-//     stickers?: [{ id, x?, y?, r?, w? }] }
+//     stickers?: [{ id, x?, y?, r?, w? } | null] }   (null: an empty slot)
 // and item ids come from cs2-lib (see backend/src/catalog.ts getItemIdByName).
 // MOCK_LOADOUT is the /api/loadout answer, inline JSON (default []).
 // MOCK_CARDS=stub answers every instance card with a 1x1 PNG, so the card
@@ -40,6 +40,12 @@
 // MOCK_COMPOSITES=keep also lets a composite this mock does not hold fall
 // through to the real backend's store (read only), for timing a store HIT
 // on skins someone already opened against the dev mount.
+//
+// STICKER CRAFTS (/api/sticker-crafts/...) and the weapon outlines
+// (/api/catalog/weapon-outline/...) are answered here too, in memory for one
+// run, under the backend's own rules (backend/src/stickerCrafts.ts). The Craft
+// Store starts with one craft by "Bob" so there is something to browse; you are
+// player "1".
 import { createServer } from "node:http";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -51,6 +57,7 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const cat = await import(join(REPO, "backend/src/catalog.ts"));
 const { cardFormatOf, CARD_FORMATS, findCard, readCard, storeCard } = await import(join(REPO, "backend/src/cardStore.ts"));
 const store = await import(join(REPO, "backend/src/compositeStore.ts"));
+const crafts = await import(join(REPO, "backend/src/stickerCrafts.ts"));
 const DIST = process.argv[2];
 if (!DIST) {
   console.error("usage: node --experimental-strip-types tools/standalone/mock-server.mjs <dist dir>");
@@ -68,7 +75,8 @@ const INVENTORY = seed.map((e, n) => ({
   stattrak: !!e.stattrak,
   stattrak_count: e.stattrak_count ?? 0,
   nametag: e.nametag ?? null,
-  stickers: (e.stickers ?? []).map((s) => ({ ...cat.getItem(s.id), x: s.x ?? null, y: s.y ?? null, r: s.r ?? 0, w: s.w ?? 0 })),
+  // null keeps a slot empty, so a gun can have a gap between its stickers.
+  stickers: (e.stickers ?? []).map((s) => (s ? { ...cat.getItem(s.id), x: s.x ?? null, y: s.y ?? null, r: s.r ?? 0, w: s.w ?? 0 } : null)),
   patches: [],
   slot: e.slot ?? cat.slotForItem(e.item_id),
   item: cat.getItem(e.item_id),
@@ -95,6 +103,41 @@ const CARD_MODE = process.env.MOCK_CARD_FORMATS ?? "";
 /** gen -> Map<file, Buffer>: the in-memory composite store. */
 const COMPOSITES = new Map();
 const ADMIN = process.env.MOCK_ADMIN !== "0";
+/** Sticker Crafts, in memory for one run, kept the way the backend keeps them:
+ *  a sticker is its id and placement, its name and art looked up on the way out. */
+const ME = "1";
+const isSticker = (id) => cat.getItem(id)?.type === "sticker";
+const stickerOut = (s) => ({ ...s, name: cat.getItem(s.id)?.name ?? "Sticker", image: cat.getItem(s.id)?.image ?? null });
+const weaponNameOf = (model) => cat.getWeapons().find((w) => w.model === model)?.name ?? null;
+const MAT = { board: { stickers: [], groups: [] } };
+/** id -> { steamId, author, name, stickers, useModel, previewKey, usePreviewKey, previewV, publishedAt, votes, savedAt } */
+const CRAFTS = new Map([
+  ["seed-bob", {
+    steamId: "2",
+    author: { name: "Bob", avatar: "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg" },
+    name: "Bob's duo",
+    stickers: [{ id: 1944, x: -3, y: 0, rot: -10, wear: 0 }, { id: 6387, x: 3, y: 1, rot: 12, wear: 0 }],
+    useModel: null, previewKey: null, usePreviewKey: null, previewV: 0,
+    publishedAt: "2026-10-20T10:00:00.000Z",
+    votes: new Map([["3", 1], ["4", 1], ["5", -1]]),
+    savedAt: 1,
+  }],
+]);
+/** Craft pictures: key -> Buffer. */
+const PICTURES = new Map();
+/** Weapon outlines: model -> outline. */
+const OUTLINES = new Map();
+const tally = (c) => {
+  const vs = [...c.votes.values()];
+  const ups = vs.filter((v) => v === 1).length;
+  const downs = vs.filter((v) => v === -1).length;
+  return { ups, downs, score: ups - downs };
+};
+const craftOut = (id, c) => ({
+  id, name: c.name, savedAt: c.savedAt, stickers: c.stickers.map(stickerOut),
+  previewKey: c.previewKey, previewV: c.previewV,
+  useCase: c.useModel ? { model: c.useModel, weapon: weaponNameOf(c.useModel) ?? c.useModel, imageKey: c.usePreviewKey } : null,
+});
 const readBody = async (req) => {
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -144,6 +187,21 @@ createServer(async (req, res) => {
       const slot = url.searchParams.get("slot");
       if (slot === "knife") return json(res, { base: null, skins: cat.getKnives() });
       if (slot === "gloves") return json(res, { base: null, skins: cat.getGloves() });
+    }
+    // The attachment pickers' search, from the working tree's catalog like the
+    // knife and glove sheets above — so a change to what it returns (the
+    // capsule label, a facet) shows here before any backend is deployed.
+    const attach = { "/api/catalog/stickers": "sticker", "/api/catalog/charms": "charm", "/api/catalog/patches": "patch" }[p];
+    if (attach) {
+      const q = Object.fromEntries(url.searchParams);
+      const limit = Number(q.limit);
+      return json(res, cat.searchAttachments({
+        kind: attach, q: q.q ?? "", group: q.group ?? "", collection: q.collection ?? "", rarity: q.rarity ?? "",
+        sort: ["default", "rarity", "name"].includes(q.sort) ? q.sort : undefined,
+        dir: q.dir === "asc" || q.dir === "desc" ? q.dir : undefined,
+        offset: Math.max(0, Math.floor(Number(q.offset)) || 0),
+        limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+      }));
     }
     // Made-up but stable prices, so price labels and sorts have something to show.
     if (p === "/api/prices")
@@ -272,6 +330,98 @@ createServer(async (req, res) => {
     if (card && process.env.MOCK_CARDS === "stub") {
       res.writeHead(200, { "content-type": "image/png" });
       return res.end(STUB_PNG);
+    }
+    // Sticker Crafts — see the header.
+    const outlineAt = p.match(/^\/api\/catalog\/weapon-outline\/([^/]+)$/);
+    if (outlineAt) {
+      const model = decodeURIComponent(outlineAt[1]);
+      if (req.method === "PUT") {
+        const o = crafts.normOutline(JSON.parse((await readBody(req)).toString() || "null"), model);
+        if (!o || !weaponNameOf(model)) return status(res, 400, { error: "That isn't a weapon outline." });
+        if (!OUTLINES.has(model)) OUTLINES.set(model, o);
+        return json(res, { ok: true });
+      }
+      return OUTLINES.has(model) ? json(res, { outline: OUTLINES.get(model) }) : status(res, 404, { error: "not traced yet" });
+    }
+    if (p.startsWith("/api/sticker-crafts")) {
+      const raw = req.method === "PUT" || req.method === "POST" ? await readBody(req) : null;
+      const body = () => JSON.parse(raw?.toString() || "null");
+      if (p === "/api/sticker-crafts" && req.method === "GET") {
+        const mine = [...CRAFTS].filter(([, c]) => c.steamId === ME).sort((a, b) => b[1].savedAt - a[1].savedAt);
+        return json(res, {
+          board: { stickers: MAT.board.stickers.map((s) => ({ ...stickerOut(s), uid: s.uid, group: s.group, craft: s.craft })), groups: MAT.board.groups },
+          crafts: mine.map(([id, c]) => ({ ...craftOut(id, c), ...(c.publishedAt ? { published: true, ...tally(c) } : {}) })),
+        });
+      }
+      if (p === "/api/sticker-crafts/board" && req.method === "PUT") {
+        MAT.board = crafts.normBoard(body(), isSticker);
+        return json(res, { ok: true });
+      }
+      const pic = p.match(/^\/api\/sticker-crafts\/crafts\/([^/]+)\/picture\/(top|use)$/);
+      if (pic && req.method === "PUT") {
+        const c = CRAFTS.get(pic[1]);
+        if (!c || c.steamId !== ME) return status(res, 404, { error: "Save the craft before its picture." });
+        if (!cardFormatOf(raw)) return status(res, 400, { error: "That isn't a PNG or WebP picture." });
+        const key = `${pic[1]}-${pic[2]}-${Date.now().toString(16).padStart(16, "0").slice(-16)}.png`;
+        PICTURES.set(key, raw);
+        if (pic[2] === "top") Object.assign(c, { previewKey: key, previewV: Number(url.searchParams.get("v")) || 0 });
+        else c.usePreviewKey = key;
+        return json(res, { key });
+      }
+      const shown = p.match(/^\/api\/sticker-crafts\/pictures\/([^/]+)$/);
+      if (shown) {
+        const buf = PICTURES.get(shown[1]);
+        if (!buf) return status(res, 404, { error: "not found" });
+        res.writeHead(200, { "content-type": cardFormatOf(buf) === "webp" ? "image/webp" : "image/png" });
+        return res.end(buf);
+      }
+      const one = p.match(/^\/api\/sticker-crafts\/crafts\/([^/]+)$/);
+      if (one) {
+        const id = decodeURIComponent(one[1]);
+        const had = CRAFTS.get(id);
+        if (had && had.steamId !== ME) return status(res, 409, { error: "That craft isn't yours." });
+        if (req.method === "DELETE") {
+          CRAFTS.delete(id);
+          return json(res, { ok: true });
+        }
+        const b = body() ?? {};
+        const stickers = crafts.normCraftStickers(b.stickers, isSticker);
+        if (!stickers) return status(res, 400, { error: "A craft is 1 to 5 stickers." });
+        CRAFTS.set(id, {
+          ...(had ?? { steamId: ME, author: { name: "You (mock)", avatar: null }, previewKey: null, usePreviewKey: null, previewV: 0, publishedAt: null, votes: new Map() }),
+          name: crafts.cleanName(b.name, "Sticker craft"),
+          stickers,
+          useModel: typeof b.useModel === "string" && weaponNameOf(b.useModel) ? b.useModel : null,
+          savedAt: Date.now(),
+        });
+        return json(res, { ok: true });
+      }
+      if (p === "/api/sticker-crafts/store" && req.method === "GET") {
+        const count = Number(url.searchParams.get("count")) || 0;
+        const q = (url.searchParams.get("q") ?? "").toLowerCase();
+        let items = [...CRAFTS]
+          .filter(([, c]) => c.publishedAt && (!count || c.stickers.length === count) && (!q || c.name.toLowerCase().includes(q)))
+          .map(([id, c]) => ({ ...craftOut(id, c), author: { steamId: c.steamId, ...c.author }, ...tally(c), myVote: c.votes.get(ME) ?? 0, mine: c.steamId === ME, publishedAt: c.publishedAt }));
+        items = url.searchParams.get("sort") === "new"
+          ? items.sort((a, b) => b.publishedAt.localeCompare(a.publishedAt))
+          : items.sort((a, b) => b.score - a.score || b.publishedAt.localeCompare(a.publishedAt));
+        return json(res, { items });
+      }
+      const st = p.match(/^\/api\/sticker-crafts\/store\/([^/]+)(\/vote)?$/);
+      if (st) {
+        const c = CRAFTS.get(decodeURIComponent(st[1]));
+        if (st[2]) {
+          const v = body()?.vote;
+          if (!c?.publishedAt || c.steamId === ME) return status(res, 400, { error: "That craft isn't in the store, or it's your own." });
+          if (v === 0) c.votes.delete(ME);
+          else c.votes.set(ME, v);
+          return json(res, { ...tally(c), myVote: c.votes.get(ME) ?? 0 });
+        }
+        if (!c || c.steamId !== ME) return status(res, 404, { error: "Save the craft before publishing it." });
+        c.publishedAt = req.method === "PUT" ? (c.publishedAt ?? new Date().toISOString()) : null;
+        return json(res, { ok: true });
+      }
+      return status(res, 404, { error: "not found" });
     }
     if (p === "/api/loadout") return json(res, LOADOUT);
     if (p === "/api/inventory") return json(res, INVENTORY);

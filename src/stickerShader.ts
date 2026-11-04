@@ -401,6 +401,18 @@ export function applyStickerMask(mat: ThreeNS.MeshStandardMaterial, mask: ThreeN
  *     a plain one at the same wear are different programs, and keying on wear
  *     alone would have let the first one compiled win for both.
  */
+/**
+ * Change a built sticker's wear in place — true when it could. A material the
+ * patch never touched (plain icon art at wear 0) has no live wear; build a new
+ * one for it instead.
+ */
+export function setStickerWear(mat: ThreeNS.Material | null | undefined, wear: number): boolean {
+  const u = (mat?.userData as { stkWear?: { value: number } } | undefined)?.stkWear;
+  if (!u) return false;
+  u.value = wear;
+  return true;
+}
+
 export async function applyStickerSfx(
   THREE: Three,
   mat: ThreeNS.MeshStandardMaterial,
@@ -444,6 +456,11 @@ export async function applyStickerSfx(
       }
     : null;
   mat.userData.stkHolo = live;
+  // The wear, live the same way: a slider drag writes `.value` (setStickerWear)
+  // instead of building a material per tick. Wear is not in the program key,
+  // and the scratch texture is loaded with the effects whatever the wear.
+  const wearU = { value: wear };
+  mat.userData.stkWear = wearU;
   // Where the decal's map sits inside the game's texture — see STK_UV below.
   const crop = (mat.map?.userData as { stkArtUv?: number[] } | undefined)?.stkArtUv;
   const artUv: [number, number, number, number] =
@@ -469,7 +486,7 @@ export async function applyStickerSfx(
       uPbrFit: { value: s.pbrFit },
       uLegacyTint: { value: s.legacyTint },
       uSelfIllum: { value: s.selfIllum },
-      uWear: { value: wear },
+      uWear: wearU,
       uWearScratches: { value: s.wearScratches },
       uSfxColorBoost: { value: s.sfxColorBoost },
       uGlitterScale: { value: s.glitterScale },

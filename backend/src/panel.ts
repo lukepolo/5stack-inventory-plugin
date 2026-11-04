@@ -274,3 +274,35 @@ export async function deleteTypeCfg(
     variables: { type },
   });
 }
+
+export type PlayerCard = { name: string; avatar: string | null };
+
+/**
+ * Players as the panel shows them — name and picture — for the Craft Store's
+ * authors. One query for a page of them, asked live with the viewer's own
+ * session, so a renamed player reads right everywhere at once rather than
+ * wearing the name they had when they published.
+ *
+ * Only an http(s) picture is passed on: the client puts it in an <img>.
+ */
+export async function playerCards(
+  cookie: string,
+  steamIds: Array<string>,
+): Promise<Map<string, PlayerCard>> {
+  if (!steamIds.length) return new Map();
+  const data = await query<{
+    players: Array<{ steam_id: string; name: string | null; avatar_url: string | null; custom_avatar_url: string | null }>;
+  }>(cookie, {
+    query: `query playerCards($ids: [bigint!]) {
+      players(where: { steam_id: { _in: $ids } }) { steam_id name avatar_url custom_avatar_url }
+    }`,
+    variables: { ids: steamIds },
+  });
+  const web = (u: string | null) => (u && /^https?:\/\//.test(u) ? u : null);
+  return new Map(
+    (data.players ?? []).map((p) => [
+      String(p.steam_id),
+      { name: p.name || "Player", avatar: web(p.custom_avatar_url) ?? web(p.avatar_url) },
+    ]),
+  );
+}

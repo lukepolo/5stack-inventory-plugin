@@ -11,26 +11,37 @@
 //
 // The two emits are the two things a pick DOES, and both belong to App: writing
 // the choice into the craft draft, and opening the preview stage over the top.
-import { Box, LayoutGrid, Link2, Loader2, Search, X } from "lucide-vue-next";
+import { computed } from "vue";
+import { Box, LayoutGrid, Link2, Loader2, Search, Store, X } from "lucide-vue-next";
 import { CARD_ART, glowStyle } from "../itemVisuals";
 import { isCompact } from "../responsive";
 import { ATTACH_SORTS } from "../sortModes";
 import { Z } from "../zLayers";
 import { PICKER_PAGE, type AttachmentPickerView, type PickerRow } from "../composables/useAttachmentPicker";
+import { MAX_PER_GROUPING, type SavedCraft, type StoreCraft } from "../stickerCraftsModel";
 import CatalogFilters from "./CatalogFilters.vue";
+import CraftTile from "./CraftTile.vue";
+import CraftPreview from "./CraftPreview.vue";
 import InfiniteSentinel from "./InfiniteSentinel.vue";
+import TrackTabs from "./TrackTabs.vue";
 
 const props = defineProps<{
   /** The screen's own state, created once in App.vue. See useAttachmentPicker. */
   view: AttachmentPickerView;
+  /** No 3D preview button on the tiles — for a caller with no preview stage
+   *  (Sticker Crafts, where picking IS the preview: it lands on the board). */
+  hidePreview?: boolean;
+  /** The Back button's tooltip; says what is underneath. */
+  backTitle?: string;
+  /** The Back button's word, when "Back" alone doesn't say where to. */
+  backLabel?: string;
+  /** Where a pick goes: a gun's sticker slots (the editor, the default) or the
+   *  Sticker Crafts mat. Only the words change — room, footer, empty shelf. */
+  target?: "gun" | "mat";
 }>();
+const onMat = computed(() => props.target === "mat");
 
-defineEmits<{
-  /** Apply this row to the waiting slot — App writes it into the craft draft. */
-  (e: "pick", row: PickerRow): void;
-  /** Look at one before committing, on the small preview stage App owns. */
-  (e: "preview", row: PickerRow, kind: "sticker" | "charm" | "patch"): void;
-}>();
+
 
 // Destructured so the template reads exactly as it did inside App.vue — a ref
 // nested inside an object is not auto-unwrapped in a template, only a top-level
@@ -62,43 +73,127 @@ const {
   pickerTotal,
   pickerRows,
   pickerOwned,
+  pickerCrafts,
+  pickerCraftsLoading,
+  pickerCraftRows,
+  craftsPublished,
+  craftsScope,
+  craftRoom,
+  craftCount,
+  craftFits,
+  craftPlanFor,
+  myScores,
+  storeSort,
+  storeRows,
+  storeLoading,
+  voteOn,
+  previewCraft,
   pickerNoun,
   attachCardSize,
   attachGridStyle,
 } = props.view;
+
+/** The shelves on offer. Sticker Crafts only to a sticker picker. */
+const sources = computed(() =>
+  picker.value?.kind === "sticker" ? (["all", "owned", "crafts"] as const) : (["all", "owned"] as const),
+);
+/**
+ * The shelves as ONE track (TrackTabs — the web player page's large tab set):
+ * your crafts and the Craft Store are tabs beside Catalog and Owned, not tabs
+ * inside a Crafts tab. No heading beside them: its words changed per shelf and
+ * shoved the row on every switch.
+ */
+type Shelf = "all" | "owned" | "crafts" | "store";
+const shelf = computed<Shelf>(() =>
+  pickerSource.value === "crafts" ? (craftsScope.value === "store" ? "store" : "crafts") : pickerSource.value,
+);
+const shelves = computed(() => {
+  const kind = picker.value?.kind ?? "sticker";
+  const out: { id: Shelf; label: string; count?: number | null; title: string }[] = [
+    { id: "all", label: "Catalog", title: `Every ${kind} in the game` },
+    // Owned counts the SPARES, not the total: the question this shelf answers
+    // is "have I got one going spare".
+    { id: "owned", label: "Owned", count: pickerOwned.value.length ? pickerOwned.value.filter((r) => !r.attachedName).length : null, title: `Only ${kind}s you own` },
+  ];
+  if ((sources.value as readonly string[]).includes("crafts")) {
+    out.push(
+      { id: "crafts", label: "Your crafts", count: pickerCrafts.value.length || null, title: "Layouts saved on the Sticker Crafts tab — up to five stickers placed in one pick" },
+      { id: "store", label: "Craft Store", title: "Crafts other players published" },
+    );
+  }
+  return out;
+});
+function pickShelf(id: Shelf) {
+  if (id === "crafts" || id === "store") {
+    craftsScope.value = id === "store" ? "store" : "mine";
+    pickerSource.value = "crafts";
+  } else pickerSource.value = id;
+}
+/**
+ * Craft tiles: a reading width rather than the sticker slider's scale — at a
+ * large card size they became posters with 8px captions — and rows as tall as
+ * their content. `max-content`, not `auto`: in a full shelf `auto` rows gave
+ * way to the scroller's height and squashed every picture to a strip, where
+ * they must stay whole and the shelf scroll.
+ */
+const craftGridStyle = computed(() => ({
+  display: "grid",
+  gridTemplateColumns: isCompact.value ? "minmax(0, 1fr)" : "repeat(auto-fill, minmax(260px, 340px))",
+  gridAutoRows: "max-content",
+  justifyContent: "start",
+}));
+/** The crafts on show: yours, or the store's. */
+const craftRows = computed<(SavedCraft | StoreCraft)[]>(() =>
+  craftsScope.value === "store" ? storeRows.value : pickerCraftRows.value,
+);
+const craftsBusy = computed(() => (craftsScope.value === "store" ? storeLoading.value : pickerCraftsLoading.value));
+/** The ones there is room for first; the rest after, under a line saying why. */
+const craftFitRows = computed(() => craftRows.value.filter((c) => craftFits(c.stickers.length)));
+const craftBigRows = computed(() => craftRows.value.filter((c) => !craftFits(c.stickers.length)));
+const emit = defineEmits<{
+  /** Apply this row to the waiting slot — App writes it into the craft draft. */
+  (e: "pick", row: PickerRow): void;
+  /** Look at one before committing, on the small preview stage App owns. */
+  (e: "preview", row: PickerRow, kind: "sticker" | "charm" | "patch"): void;
+  /** A saved Sticker Craft — up to five stickers placed together, in one pick. */
+  (e: "pickCraft", craft: SavedCraft): void;
+}>();
+function useCraft(c: SavedCraft | StoreCraft) {
+  previewCraft.value = null;
+  emit("pickCraft", c);
+}
 </script>
 
 <template>
     <!-- fixed + above the 3D overlay (z-1200): the picker is reachable from
          both the form and the 3D editor, and must cover whichever is up. -->
-    <div v-if="picker" class="fixed inset-0 flex flex-col bg-card/[0.985] p-4" :style="{ zIndex: Z.picker }" role="dialog" aria-modal="true" aria-label="Pick an attachment">
-      <div class="mb-3 flex items-center gap-3">
-        <span class="text-f11 font-semibold uppercase tracking-cs1">Pick a {{ picker.kind }}</span>
-        <!-- Catalog vs your own drawer. Owned counts the SPARES, not the
-             total: the question this shelf answers is "have I got one going
-             spare", and a badge counting ones already stuck to a gun would
-             answer a different one. -->
-        <div class="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5">
-          <button
-            v-for="src in (['all', 'owned'] as const)"
-            :key="src"
-            class="flex items-center gap-1.5 rounded px-2.5 py-1 text-f10 uppercase tracking-cs1 transition-colors"
-            :class="pickerSource === src ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'"
-            :title="src === 'all' ? 'Browse every ' + picker.kind + ' in the game' : 'Only ' + picker.kind + 's you own'"
-            @click="pickerSource = src"
-          >
-            {{ src === 'all' ? 'Catalog' : 'Owned' }}
-            <span
-              v-if="src === 'owned' && pickerOwned.length"
-              class="rounded bg-background/70 px-1 font-mono text-f8"
-            >{{ pickerOwned.filter((r) => !r.attachedName).length }}</span>
-          </button>
-        </div>
-        <div class="ml-auto flex flex-none items-center gap-2 text-muted-foreground" title="Card size">
+    <div v-if="picker" class="fixed inset-0 flex flex-col bg-card/[0.985] p-4" :style="{ zIndex: Z.picker }" role="dialog" aria-modal="true" :aria-label="'Pick a ' + picker.kind">
+      <!-- On a phone: title and Back on the first row, then the shelves, then
+           search, each full width. In one row Back and search ran off the
+           screen, and with no Esc key Back is the only way out. -->
+      <div class="mb-3 flex items-center" :class="isCompact ? 'flex-wrap gap-2' : 'gap-3'">
+        <TrackTabs
+          :items="shelves"
+          :active="shelf"
+          :compact="isCompact"
+          :label="'Where to pick a ' + picker.kind + ' from'"
+          class="min-w-0"
+          :class="isCompact ? 'order-3' : 'flex-1'"
+          @select="pickShelf"
+        />
+        <!-- Card size: crafts have their own width, so it sits out there — but
+             keeps its place, or the track would grow and shift on every switch. -->
+        <div
+          v-if="!isCompact"
+          class="flex flex-none items-center gap-2 text-muted-foreground"
+          :class="pickerSource === 'crafts' ? 'invisible' : ''"
+          :aria-hidden="pickerSource === 'crafts'"
+          title="Card size"
+        >
           <LayoutGrid class="h-3.5 w-3.5" />
-          <input v-model.number="attachCardSize" type="range" min="72" max="200" step="4" class="w-24 accent-[#e0a24a]" />
+          <input v-model.number="attachCardSize" type="range" min="72" max="200" step="4" class="w-24 accent-[#e0a24a]" :tabindex="pickerSource === 'crafts' ? -1 : 0" aria-label="Card size" />
         </div>
-        <div class="relative w-[240px]">
+        <div class="relative flex-none" :class="isCompact ? 'order-4 w-full' : 'w-[240px]'">
           <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <input
             v-model="pickerQuery"
@@ -117,12 +212,52 @@ const {
              modal's own ✕ reads as "close everything", which is the one thing
              it must not do — the edit underneath is unsaved. -->
         <button
-          class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 py-2 text-f10 uppercase tracking-cs1 text-muted-foreground tac-action"
-          title="Back to the editor — nothing is applied"
+          class="flex flex-none items-center gap-1.5 rounded-md border border-border px-2.5 text-f10 uppercase tracking-cs1 text-muted-foreground tac-action"
+          :class="isCompact ? 'order-2 ml-auto h-9' : 'py-2'"
+          :title="backTitle ?? 'Back to the editor — nothing is applied'"
           @click="picker = null"
         >
-          <X class="h-3.5 w-3.5" /> Back
+          <X class="h-3.5 w-3.5" /> {{ backLabel ?? "Back" }}
         </button>
+      </div>
+
+      <!-- STICKER CRAFTS: yours or the store's, and how many stickers. The
+           count chips past the room this gun has are off — a craft has to fit
+           the free slots it lands in (useStickerCraftPlacement). -->
+      <!-- What there is room for first, then whose crafts, then the size filter
+           — labelled, so its 1–5 don't read as the gun's slot numbers. -->
+      <div v-if="pickerSource === 'crafts'" class="mb-3 flex flex-wrap items-center gap-2">
+        <!-- On the mat the room only matters when it is short: "5" read as the
+             mat's size, when it is a craft's. -->
+        <span v-if="!onMat || craftRoom < MAX_PER_GROUPING" class="order-none text-f11 text-foreground" :class="isCompact ? 'w-full' : ''">
+          <template v-if="onMat">Room on the mat: {{ craftRoom }} more {{ craftRoom === 1 ? "sticker" : "stickers" }}</template>
+          <template v-else>This gun: {{ craftRoom }} empty {{ craftRoom === 1 ? "slot" : "slots" }}</template>
+        </span>
+        <div class="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5" :class="isCompact ? 'order-3' : 'order-2'">
+          <span class="px-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Stickers</span>
+          <button
+            v-for="c in [0, 1, 2, 3, 4, 5]"
+            :key="c"
+            class="rounded px-2 font-mono text-f10 uppercase tracking-cs1 transition-colors"
+            :class="[craftCount === c ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground', isCompact ? 'h-9 min-w-9' : 'py-1']"
+            :title="c === 0 ? 'Crafts of any size' : `Crafts of exactly ${c} ${c === 1 ? 'sticker' : 'stickers'}`"
+            @click="craftCount = c"
+          >{{ c === 0 ? 'All' : c }}</button>
+        </div>
+        <div v-if="craftsScope === 'store'" class="flex flex-none items-center gap-0.5 rounded-md border border-border p-0.5" :class="isCompact ? 'order-2' : 'order-3 ml-auto'">
+          <button
+            v-for="so in (['top', 'new'] as const)"
+            :key="so"
+            class="rounded px-2.5 text-f10 uppercase tracking-cs1 transition-colors"
+            :class="[storeSort === so ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground', isCompact ? 'h-9' : 'py-1']"
+            :title="so === 'top' ? 'Best rated first' : 'Newest first'"
+            @click="storeSort = so"
+          >{{ so === 'top' ? 'Top' : 'New' }}</button>
+        </div>
+      </div>
+
+      <div v-if="pickerSource === 'crafts' && onMat && craftsScope === 'store'" class="mb-3 text-f11 text-muted-foreground">
+        Lay any craft on the mat, change it if you like, then Save as craft to keep your own copy.
       </div>
 
       <!-- Facets. THE shared bar — same component the armory uses, so a rarity
@@ -164,8 +299,8 @@ const {
         ref="pickerScrollEl"
         data-scroller
         class="flex-1 content-start gap-2 overflow-y-auto transition-opacity duration-200 ease-out"
-        :class="pickerLoading ? 'opacity-45' : 'opacity-100'"
-        :style="attachGridStyle"
+        :class="(pickerSource === 'crafts' ? craftsBusy && craftRows.length > 0 : pickerLoading) ? 'opacity-45' : 'opacity-100'"
+        :style="pickerSource === 'crafts' ? craftGridStyle : attachGridStyle"
       >
         <!-- Rarity is read the same way as on a weapon card: the tier's colour
              as a bottom rule plus a soft glow behind the art. Without it the
@@ -201,6 +336,7 @@ const {
                propagation — otherwise picking is the only thing a tile can
                do, and choosing a holo sticker from a flat icon is a guess. -->
           <span
+            v-if="!hidePreview"
             role="button"
             tabindex="0"
             class="absolute right-1 top-1 z-[3] hidden items-center justify-center rounded border border-border bg-background/90 p-1 text-muted-foreground tac-action group-hover:flex"
@@ -208,6 +344,16 @@ const {
             @click.stop="$emit('preview', it, picker?.kind ?? 'sticker')"
             @keydown.enter.stop.prevent="$emit('preview', it, picker?.kind ?? 'sticker')"
           ><Box class="h-3.5 w-3.5" /></span>
+          <!-- The capsule it came in, over the art — the place the knife and
+               glove craft cards put their model label, in the same grey caps.
+               The name under the art says WHAT it is; this says where it is
+               from, which is how stickers are actually hunted ("the Katowice
+               2014 one"). Clear of the corner badges either side. -->
+          <span
+            v-if="it.capsule"
+            class="relative z-[2] w-full truncate text-center text-f8 uppercase tracking-cs1 text-muted-foreground/70"
+            :class="it.attachedName ? 'px-4' : 'pr-4'"
+          >{{ it.capsule }}</span>
           <div :class="CARD_ART" class="relative z-[2]">
             <!-- decoding="async" keeps the decode off the main thread. With
                  `lazy`, a fast scroll brings dozens of images into view at
@@ -217,7 +363,102 @@ const {
           </div>
           <span class="relative z-[2] w-full truncate text-center text-f8 text-muted-foreground">{{ it.name.replace(/^(Sticker|Charm|Sticker Slab) \| /, '') }}</span>
         </button>
-        <div v-if="!pickerLoading && !pickerRows.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
+        <!-- STICKER CRAFTS — a whole layout per tile, pictured by the Sticker
+             Crafts board itself. The picture opens it in 3D; Use fills that
+             many free slots. -->
+        <template v-if="pickerSource === 'crafts'">
+          <CraftTile
+            v-for="(c, i) in craftFitRows"
+            :key="'craft-' + craftsScope + c.id"
+            class="animate-cell-in"
+            :style="{ '--i': i }"
+            :craft="c"
+            fits
+            :room="craftRoom"
+            :plan="craftPlanFor(c.stickers.length)"
+            :target="onMat ? 'mat' : 'gun'"
+            :published="craftsScope === 'mine' && craftsPublished.has(c.id)"
+            :score="craftsScope === 'mine' ? (myScores.get(c.id) ?? null) : null"
+            @preview="previewCraft = c"
+            @use="useCraft(c)"
+            @vote="(v) => voteOn(c as StoreCraft, v)"
+          >
+            <template v-if="$slots.craftActions && craftsScope === 'mine'" #actions>
+              <slot name="craftActions" :craft="c as SavedCraft" />
+            </template>
+          </CraftTile>
+          <div v-if="craftBigRows.length" class="col-span-full mt-2 flex items-center gap-2 text-f11 text-muted-foreground">
+            {{ onMat ? "Need more room on the mat" : "Need more empty slots" }} ({{ craftBigRows.length }})
+            <span class="h-px flex-1 bg-border"></span>
+          </div>
+          <CraftTile
+            v-for="c in craftBigRows"
+            :key="'craft-big-' + craftsScope + c.id"
+            :craft="c"
+            :fits="false"
+            :room="craftRoom"
+            :plan="null"
+            :target="onMat ? 'mat' : 'gun'"
+            :published="craftsScope === 'mine' && craftsPublished.has(c.id)"
+            :score="craftsScope === 'mine' ? (myScores.get(c.id) ?? null) : null"
+            @preview="previewCraft = c"
+            @use="useCraft(c)"
+            @vote="(v) => voteOn(c as StoreCraft, v)"
+          >
+            <template v-if="$slots.craftActions && craftsScope === 'mine'" #actions>
+              <slot name="craftActions" :craft="c as SavedCraft" />
+            </template>
+          </CraftTile>
+          <!-- First load of a shelf: ghost tiles built from CraftTile's own
+               boxes (2:1 picture, name, count, sticker thumbs), breathing in a
+               stagger, so the real tiles land where the eye already is. A lone
+               spinner in an empty grid was the store's whole entrance. -->
+          <template v-if="!craftRows.length && craftsBusy">
+            <div
+              v-for="g in isCompact ? 3 : 6"
+              :key="'craft-ghost-' + g"
+              class="flex flex-col overflow-hidden rounded-md border border-border bg-background"
+              aria-hidden="true"
+            >
+              <div class="animate-skeleton aspect-[2/1] w-full bg-secondary/40" :style="{ '--i': g }"></div>
+              <div class="flex flex-col gap-1.5 p-2">
+                <div class="animate-skeleton h-4 w-2/3 rounded bg-secondary/40" :style="{ '--i': g }"></div>
+                <div class="animate-skeleton h-3 w-1/4 rounded bg-secondary/40" :style="{ '--i': g }"></div>
+                <div class="flex gap-1">
+                  <div v-for="k in 3" :key="k" class="animate-skeleton h-7 w-7 rounded bg-secondary/40" :style="{ '--i': g }"></div>
+                </div>
+              </div>
+            </div>
+          </template>
+          <div v-else-if="!craftRows.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
+<template v-if="pickerQuery">No crafts match that search.</template>
+            <template v-else-if="craftCount">
+              {{ craftsScope === 'store' ? 'No published crafts' : 'None of your crafts' }} {{ craftsScope === 'store' ? 'of' : 'has' }} {{ craftCount }} {{ craftCount === 1 ? 'sticker' : 'stickers' }}.
+              <div class="mt-4 flex justify-center">
+                <button
+                  class="tac-action flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground"
+                  @click="craftCount = 0"
+                >Show crafts of any size</button>
+              </div>
+            </template>
+            <template v-else-if="craftsScope === 'store'">No one has published a craft yet.</template>
+            <template v-else>
+              You haven't saved any crafts yet.
+              {{ onMat ? "Select up to five stickers on the mat and press Save as craft" : "Make one on the Sticker Crafts tab in the top menu" }}, or use one from the Craft Store.
+              <!-- Or use someone else's: the way into the store from an empty shelf. -->
+              <div class="mt-4 flex justify-center">
+                <button
+                  class="tac-action flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground"
+                  title="See the crafts other players published"
+                  @click="craftsScope = 'store'"
+                >
+                  <Store class="h-3.5 w-3.5" /> Browse the Craft Store
+                </button>
+              </div>
+            </template>
+          </div>
+        </template>
+        <div v-if="pickerSource !== 'crafts' && !pickerLoading && !pickerRows.length" class="col-span-full animate-fade-in py-8 text-center text-f13 text-muted-foreground">
           <template v-if="pickerSource === 'owned' && !pickerQuery">
             You don't own any {{ picker.kind }}s yet — pick one from the catalog and it's
             yours once you save.
@@ -251,10 +492,15 @@ const {
            its space whether or not there is anything to say, and the status
            text now stays visible instead of scrolling away. -->
       <div class="flex h-11 flex-none items-center justify-center gap-2 text-f10 uppercase tracking-cs1 text-muted-foreground">
-        <template v-if="pickerLoading"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Searching…</template>
+        <template v-if="pickerLoading && pickerSource !== 'crafts'"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Searching…</template>
         <template v-else-if="pickerLoadingMore"><Loader2 class="h-3.5 w-3.5 animate-spin" /> Loading more…</template>
         <!-- Nothing to say on an empty result set; `h-11` holds the space
              regardless, so the grid above never resizes either way. -->
+        <template v-else-if="pickerSource === 'crafts'">
+          <span v-if="craftRows.length && !isCompact" class="text-f11 normal-case tracking-normal">
+            {{ onMat ? "Place lays the craft on the mat as a group, where you can change it." : "Use holds the craft over the gun — drag it into place, or press Place to put it on its slots." }}
+          </span>
+        </template>
         <template v-else-if="!pickerRows.length"></template>
         <!-- Owned counts spares against the total, because "3 of 11 spare"
              is the number you are actually shopping against. -->
@@ -264,5 +510,17 @@ const {
         <template v-else-if="pickerDone">{{ pickerTotal }} {{ pickerNoun }}</template>
         <template v-else>{{ pickerResults.length }} of {{ pickerTotal }}</template>
       </div>
+      <!-- A craft in 3D, over the picker (CraftPreview). -->
+      <CraftPreview
+        v-if="previewCraft"
+        :craft="previewCraft"
+        :fits="craftFits(previewCraft.stickers.length)"
+        :room="craftRoom"
+        :plan="craftPlanFor(previewCraft.stickers.length)"
+        :target="onMat ? 'mat' : 'gun'"
+        @close="previewCraft = null"
+        @use="useCraft(previewCraft)"
+        @vote="(v) => voteOn(previewCraft as StoreCraft, v)"
+      />
     </div>
 </template>
