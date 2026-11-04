@@ -1,60 +1,104 @@
 import assert from "node:assert/strict";
-import {
-  STEAM_COOLDOWN_MIN_MS,
-  STEAM_COOLDOWN_MAX_MS,
-  createSteamCooldown,
-  parseRetryAfter,
-  steamRateLimitedMessage,
-  steamWaitText,
-} from "../backend/src/steamCooldown.ts";
+import { STEAM_COOLDOWN_MS, SteamFetchError, createSteamInventoryFetcher } from "../backend/src/steamInventory.ts";
 
-const now = Date.parse("2026-10-29T00:00:00Z");
 let cases = 0;
-function check(actual: unknown, expected: unknown) {
-  assert.deepEqual(actual, expected);
+async function check(name: string, run: () => Promise<void>) {
+  await run();
   cases++;
+  console.log(`ok  ${name}`);
 }
 
-// Retry-After, both shapes, and the ones that carry no hint.
-check(parseRetryAfter("120", now), 120_000);
-check(parseRetryAfter(" 5 ", now), 5_000);
-check(parseRetryAfter("0", now), null);
-check(parseRetryAfter(new Date(now + 90_000).toUTCString(), now), 90_000);
-check(parseRetryAfter(new Date(now - 1_000).toUTCString(), now), null);
-check(parseRetryAfter("soon", now), null);
-check(parseRetryAfter("", now), null);
-check(parseRetryAfter(null, now), null);
-check(parseRetryAfter("-5", now), null);
-
-// No hint, or a short one, still waits the minimum: Steam's blocks last minutes.
-{
-  const cooldown = createSteamCooldown();
-  check(cooldown.remainingMs(now), 0);
-  check(cooldown.trip(null, now), STEAM_COOLDOWN_MIN_MS);
-  check(cooldown.remainingMs(now + 15_000), STEAM_COOLDOWN_MIN_MS - 15_000);
-  check(cooldown.remainingMs(now + STEAM_COOLDOWN_MIN_MS), 0);
-}
-{
-  const cooldown = createSteamCooldown();
-  check(cooldown.trip("3", now), STEAM_COOLDOWN_MIN_MS);
-}
-// A longer hint is honoured, but never past the cap.
-{
-  const cooldown = createSteamCooldown();
-  check(cooldown.trip("300", now), 300_000);
-  check(cooldown.trip("86400", now), STEAM_COOLDOWN_MAX_MS);
-}
-// A second, shorter refusal never shortens a wait already promised.
-{
-  const cooldown = createSteamCooldown();
-  cooldown.trip("300", now);
-  check(cooldown.trip(null, now + 10_000), 290_000);
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), { status });
 }
 
-check(steamWaitText(0), "1 s");
-check(steamWaitText(45_000), "45 s");
-check(steamWaitText(59_001), "1 min");
-check(steamWaitText(61_000), "2 min");
-check(steamRateLimitedMessage(45_000), "Steam is rate-limiting this server. Try again in 45 s.");
+function steam(...answers: Array<Response | Promise<Response>>) {
+  const urls: string[] = [];
+  let clock = Date.parse("2026-11-04T00:00:00Z");
+  const fetchSteamInventory = createSteamInventoryFetcher(
+    (async (url: string) => {
+      urls.push(url);
+      const answer = answers.shift();
+      assert.ok(answer, `unexpected request ${url}`);
+      return answer;
+    }) as typeof fetch,
+    () => clock,
+  );
+  return {
+    fetchSteamInventory,
+    urls,
+    advance(ms: number) {
+      clock += ms;
+    },
+  };
+}
+
+async function refused(sync: Promise<unknown>) {
+  const error = await sync.then(
+    () => assert.fail("the sync should have been refused"),
+    (e: unknown) => e,
+  );
+  assert.ok(error instanceof SteamFetchError);
+  return error;
+}
+
+const lastPage = { assets: [{ classid: "1", assetid: "10" }], descriptions: [{ classid: "1" }] };
+
+await check("a 429 answers with the cooldown", async () => {
+  const { fetchSteamInventory, urls } = steam(json({}, 429));
+  const error = await refused(fetchSteamInventory("76561198000000001"));
+  assert.equal(error.status, 429);
+  assert.equal(error.retryAfterMs, STEAM_COOLDOWN_MS);
+  assert.equal(error.message, "Steam is rate-limiting this server. Try again in 60 s.");
+  assert.equal(urls.length, 1);
+});
+
+await check("a sync during the cooldown never reaches Steam", async () => {
+  const { fetchSteamInventory, urls, advance } = steam(json({}, 429), json(lastPage));
+  await refused(fetchSteamInventory("76561198000000001"));
+  advance(15_000);
+  const error = await refused(fetchSteamInventory("76561198000000002"));
+  assert.equal(error.status, 429);
+  assert.equal(error.retryAfterMs, STEAM_COOLDOWN_MS - 15_000);
+  assert.equal(error.message, "Steam is rate-limiting this server. Try again in 45 s.");
+  assert.equal(urls.length, 1);
+
+  advance(STEAM_COOLDOWN_MS - 15_000);
+  const inventory = await fetchSteamInventory("76561198000000002");
+  assert.equal(inventory.complete, true);
+  assert.equal(inventory.assets.length, 1);
+  assert.equal(urls.length, 2);
+});
+
+await check("a sync already paging stops at the next page once another sync is refused", async () => {
+  let firstPage!: (res: Response) => void;
+  const { fetchSteamInventory, urls } = steam(
+    new Promise<Response>((resolve) => {
+      firstPage = resolve;
+    }),
+    json({}, 429),
+  );
+  const paging = fetchSteamInventory("76561198000000001");
+  await refused(fetchSteamInventory("76561198000000002"));
+  firstPage(json({ ...lastPage, more_items: 1, last_assetid: "10" }));
+  const error = await refused(paging);
+  assert.equal(error.status, 429);
+  assert.equal(urls.length, 2);
+});
+
+await check("a 429 on a later page returns nothing", async () => {
+  const { fetchSteamInventory, urls } = steam(json({ ...lastPage, more_items: 1, last_assetid: "10" }), json({}, 429));
+  const error = await refused(fetchSteamInventory("76561198000000001"));
+  assert.equal(error.status, 429);
+  assert.match(urls[1], /&start_assetid=10$/);
+});
+
+await check("any other refusal starts no cooldown", async () => {
+  const { fetchSteamInventory, urls } = steam(json({}, 500), json(lastPage));
+  const error = await refused(fetchSteamInventory("76561198000000001"));
+  assert.equal(error.status, 502);
+  assert.equal((await fetchSteamInventory("76561198000000001")).complete, true);
+  assert.equal(urls.length, 2);
+});
 
 console.log(`steam cooldown: ${cases} cases ok`);
