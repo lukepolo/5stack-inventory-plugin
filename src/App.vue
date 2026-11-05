@@ -5946,7 +5946,7 @@ function measureSheetScroll(el: HTMLElement | null) {
   // screen. That hidden strip is content below the fold too — count it, or the
   // tally claims you've seen everything while a whole detent's worth is
   // sitting under the edge.
-  const offscreen = isCompact.value ? sheetTranslate.value : 0;
+  const offscreen = isCompact.value ? Math.max(0, sheetTranslate.value - sheetListPadPx.value) : 0;
   sheetHasMore.value = el.scrollHeight - el.scrollTop - el.clientHeight + offscreen > 8;
 }
 // Same per-frame coalescing as scrollFade, and for the same reason: the three
@@ -5968,6 +5968,45 @@ const onSheetScroll = (e: Event) => {
 // every mode switch and a static ref would go stale. Measured on the next frame
 // because the grid's children mount after the container does.
 let sheetScrollEl: HTMLElement | null = null;
+/** The list's bottom padding, which lags sheetRestHiddenPx when it shrinks.
+ *  Opening the sheet further would drop the padding under a list scrolled to
+ *  its end and clamp it down a whole detent in one frame; instead the list
+ *  scrolls down in step with the slide and the padding goes once it lands. */
+const sheetListPadPx = ref(0);
+let sheetPadTimer: ReturnType<typeof setTimeout> | null = null;
+watch(
+  sheetRestHiddenPx,
+  (next) => {
+    if (sheetPadTimer) {
+      clearTimeout(sheetPadTimer);
+      sheetPadTimer = null;
+    }
+    if (next >= sheetListPadPx.value) {
+      sheetListPadPx.value = next;
+      return;
+    }
+    const el = sheetScrollEl;
+    if (el) {
+      const settled = el.scrollHeight - (sheetListPadPx.value - next) - el.clientHeight;
+      if (el.scrollTop > settled) {
+        el.scrollTo({ top: Math.max(0, settled), behavior: reducedMotion.value ? "auto" : "smooth" });
+      }
+    }
+    sheetPadTimer = setTimeout(
+      () => {
+        sheetListPadPx.value = next;
+        sheetPadTimer = null;
+      },
+      reducedMotion.value ? 0 : SHEET_SNAP_MS,
+    );
+  },
+  { immediate: true },
+);
+onBeforeUnmount(() => {
+  if (sheetPadTimer) {
+    clearTimeout(sheetPadTimer);
+  }
+});
 function setSheetScrollEl(el: unknown) {
   sheetScrollEl = (el as HTMLElement) ?? null;
   if (sheetScrollEl) {
@@ -9899,7 +9938,7 @@ if (MDEBUG) {
           ]"
           :style="[
             pickerGridStyle,
-            sheetRestHiddenPx ? { paddingBottom: `calc(2rem + ${sheetRestHiddenPx}px)` } : null,
+            sheetListPadPx ? { paddingBottom: `calc(2rem + ${sheetListPadPx}px)` } : null,
           ]"
           @scroll.passive="onSheetScroll"
         >
