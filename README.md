@@ -1,12 +1,12 @@
-# 5stack Inventory
+# 5Stack Inventory
 
-A CS2 inventory and loadout simulator that runs inside your 5stack panel.
+A CS2 inventory and loadout simulator that runs inside your 5Stack panel.
 Players craft and equip skins, knives, gloves, agents, stickers and charms, and
 see them in game on your servers.
 
 ## Install
 
-On the machine your 5stack panel runs on, from your `5stack-panel` folder:
+On the machine your 5Stack panel runs on, from your `5stack-panel` folder:
 
 ```bash
 ./plugin.sh https://github.com/lukepolo/5stack-inventory-plugin
