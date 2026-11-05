@@ -21,6 +21,18 @@ spec:
       labels:
         app: inventory-frontend
     spec:
+      # NO AppArmor confinement. The node's containerd stacks its default
+      # profile (`cri-containerd.apparmor.d//&unconfined`), and that profile only
+      # accepts signals from its exact, unstacked label — so EVERY signal inside
+      # the container is refused with EACCES, even root to its own child. Seen
+      # 2026-11-05: `process.kill(pid, 0)` in liveExtractionPid threw, so a
+      # running extraction read as "none running"; cwebp's timeout SIGKILL never
+      # landed; and in a codepier swap, `node --watch` could not restart its
+      # child, so every backend edit killed the dev loop. Pod-level so it covers
+      # every container, and so a hot-swap built from this template inherits it.
+      securityContext:
+        appArmorProfile:
+          type: Unconfined
       # The hostPath below only exists on the node install.sh labeled
       # `5stack-inventory=true`. Without this the surge pod can schedule
       # elsewhere and come up with an empty models mount.
@@ -107,6 +119,18 @@ spec:
       labels:
         app: inventory-backend
     spec:
+      # NO AppArmor confinement. The node's containerd stacks its default
+      # profile (`cri-containerd.apparmor.d//&unconfined`), and that profile only
+      # accepts signals from its exact, unstacked label — so EVERY signal inside
+      # the container is refused with EACCES, even root to its own child. Seen
+      # 2026-11-05: `process.kill(pid, 0)` in liveExtractionPid threw, so a
+      # running extraction read as "none running"; cwebp's timeout SIGKILL never
+      # landed; and in a codepier swap, `node --watch` could not restart its
+      # child, so every backend edit killed the dev loop. Pod-level so it covers
+      # every container, and so a hot-swap built from this template inherits it.
+      securityContext:
+        appArmorProfile:
+          type: Unconfined
       # Both hostPaths (models mount, CS2 install) are node-local — pin to the
       # node install.sh labeled `5stack-inventory=true`.
       affinity:
