@@ -69,7 +69,7 @@ onBeforeUnmount(() => clearTimeout(copiedTimer));
           props.btnClass
             ? [props.btnClass, 'text-muted-foreground']
             : props.icon
-              ? 'grid h-9 w-9 place-items-center rounded-md border text-muted-foreground'
+              ? 'touch-hit grid h-9 w-9 place-items-center rounded-md border text-muted-foreground'
               : 'flex h-8 items-center gap-1.5 rounded-md border px-3 text-f10 uppercase tracking-wider text-muted-foreground',
           open ? 'tac-on' : 'border-border',
         ]"

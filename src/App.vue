@@ -5699,6 +5699,15 @@ const sheetTranslate = computed(() =>
     : Math.max(0, sheetFullPx.value - snapPx(sheetSnap.value, loadoutH.value)),
 );
 
+/** How far the resting sheet sits below fully open. Its list pads by this much
+ *  so the last rows can scroll into view; the live drag offset is left out so
+ *  a drag stays a transform and never relays out the list. */
+const sheetRestHiddenPx = computed(() =>
+  isCompact.value
+    ? Math.max(0, Math.round(sheetFullPx.value - snapPx(sheetSnap.value, loadoutH.value)))
+    : 0,
+);
+
 const sheetStyle = computed(() => {
   if (!isCompact.value) {
     // Desktop: absolutely positioned, so the height IS the whole interaction.
@@ -8632,7 +8641,7 @@ if (MDEBUG) {
         :active="team"
         variant="solid"
         :solid-background="gradient"
-        :button-class="`relative z-[1] flex h-7 items-center rounded-md font-bold uppercase tracking-widest transition-colors ${isCompact ? 'px-2.5 text-f13' : 'px-5 text-sm'}`"
+        :button-class="`touch-hit relative z-[1] flex h-7 items-center rounded-md font-bold uppercase tracking-widest transition-colors ${isCompact ? 'px-2.5 text-f13' : 'px-5 text-sm'}`"
         active-class="text-black"
         @select="(t) => switchTeam(t as Team)"
       />
@@ -8677,7 +8686,7 @@ if (MDEBUG) {
         <button
           v-else
           ref="presetBtnEl"
-          class="tac-action flex min-w-0 items-center gap-1.5 border border-border uppercase tracking-wider text-muted-foreground disabled:opacity-60"
+          class="tac-action touch-hit flex min-w-0 items-center gap-1.5 border border-border uppercase tracking-wider text-muted-foreground disabled:opacity-60"
           :class="[isCompact ? 'h-8 rounded-md px-2 text-f11' : 'h-9 rounded-lg px-3 text-f11 font-semibold', presetDeck && 'tac-on']"
           :disabled="presetBusy"
           :title="`${activePresetName} — ${isCompact ? 'tap' : 'click'} to switch or manage`"
@@ -8691,7 +8700,7 @@ if (MDEBUG) {
       </div>
       <button
         v-if="view === 'grid' || view === 'focus'"
-        class="tac-action flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
+        class="tac-action touch-hit flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
         :class="[isCompact ? 'order-6 h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'tac-on' : 'border-border text-muted-foreground']"
         :title="view === 'focus' ? 'Focused' : 'Focus'"
         @click="go(view === 'focus' ? '/' : '/focus')"
@@ -8795,7 +8804,7 @@ if (MDEBUG) {
              button. The dialog behind it says what it will do first. -->
         <button
           v-if="viewerId && !viewingSelf && signedIn && loadout.length && !loading && !error"
-          class="tac-action flex items-center gap-1.5 rounded-lg border border-border text-f11 font-semibold uppercase tracking-wider text-muted-foreground disabled:opacity-60"
+          class="tac-action touch-hit flex items-center gap-1.5 rounded-lg border border-border text-f11 font-semibold uppercase tracking-wider text-muted-foreground disabled:opacity-60"
           :class="isCompact ? 'h-8 px-2' : 'h-9 px-3.5'"
           :disabled="copyBusy"
           title="Copy every skin in this loadout into your own inventory"
@@ -8826,7 +8835,7 @@ if (MDEBUG) {
               : 'Sync from Steam — read-only: mirrors your public Steam inventory. No passwords, keys, or trades, ever.'"
           >
             <button
-              class="relative grid place-items-center rounded-md border text-muted-foreground tac-action disabled:opacity-60"
+              class="relative grid place-items-center rounded-md border text-muted-foreground tac-action touch-hit disabled:opacity-60"
               :class="[
                 isCompact ? 'h-8 w-8' : 'h-9 w-9',
                 needsSteamSync ? 'border-[#f97316]/60' : 'border-border',
@@ -8864,7 +8873,7 @@ if (MDEBUG) {
                  as the control being stood down rather than as a second accent
                  colour in a row that already has amber. -->
             <button
-              class="relative grid place-items-center rounded-md border tac-action"
+              class="relative grid place-items-center rounded-md border tac-action touch-hit"
               :class="[
                 isCompact ? 'h-8 w-8' : 'h-9 w-9',
                 showPrices ? 'border-border text-foreground' : 'border-border/40 text-muted-foreground/40',
@@ -8880,7 +8889,7 @@ if (MDEBUG) {
             :text="gearWarnings.length ? gearWarnings.join(' · ') : 'Game-server configuration'"
           >
             <button
-              class="relative grid place-items-center rounded-md border border-border text-muted-foreground tac-action"
+              class="relative grid place-items-center rounded-md border border-border text-muted-foreground tac-action touch-hit"
               :class="isCompact ? 'h-8 w-8' : 'h-9 w-9'"
               @click="go('/admin')"
             >
@@ -9888,7 +9897,10 @@ if (MDEBUG) {
             // the rail; the usual top padding was a dead band above it.
             sheetMode === 'craft' && craftLabels ? 'pt-0' : isCompact ? 'pt-2' : 'pt-3.5',
           ]"
-          :style="pickerGridStyle"
+          :style="[
+            pickerGridStyle,
+            sheetRestHiddenPx ? { paddingBottom: `calc(2rem + ${sheetRestHiddenPx}px)` } : null,
+          ]"
           @scroll.passive="onSheetScroll"
         >
           <!-- OWNED: your skins for the slot's weapon -->

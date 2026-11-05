@@ -149,7 +149,7 @@ const LIFT_SPACER_PAD = 12;
             <button
               v-for="c in compactCats"
               :key="c.key"
-              class="flex min-h-[30px] flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-md border px-2 text-f10 font-semibold uppercase tracking-cs1 transition-colors"
+              class="touch-hit flex min-h-[30px] flex-1 items-center justify-center gap-1 whitespace-nowrap rounded-md border px-2 text-f10 font-semibold uppercase tracking-cs1 transition-colors"
               :class="compactCat === c.key
                 ? 'border-[color:var(--acc)] text-foreground'
                 : 'border-border/60 text-muted-foreground'"

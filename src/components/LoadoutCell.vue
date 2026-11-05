@@ -31,6 +31,7 @@ import PriceTag from "./PriceTag.vue";
 import SlotStatus from "./SlotStatus.vue";
 import TileActions from "./TileActions.vue";
 import WearBar from "./WearBar.vue";
+import { isCompact } from "../responsive";
 import { Clock, Loader2 } from "lucide-vue-next";
 import { cn } from "@5stack/ui";
 import { ART_FADE_B, CARD_ART, glowStyle } from "../itemVisuals";
@@ -228,14 +229,20 @@ defineEmits<{
         · {{ audioLength }}</span>
     </div>
 
-    <div v-else-if="showName || showWear" class="relative z-[2] flex items-end justify-between gap-2">
+    <!-- Phones stack the wear bar under the name: sharing one row with the
+         badges and the bar, a skin name got ~50px and read "Hyper …". -->
+    <div
+      v-else-if="showName || showWear"
+      class="relative z-[2] flex"
+      :class="isCompact ? 'flex-col items-stretch gap-1' : 'items-end justify-between gap-2'"
+    >
       <span v-if="showName" class="flex min-w-0 flex-1 items-center gap-1.5">
         <ItemName :item="item" :strip="strip" :fallback="fallback" :nametag="item?.type === 'pet' ? (inst ?? badges)?.nametag : null" name-class="text-f11 font-medium" class="min-w-0 flex-1" />
         <!-- StatTrak and what's applied. The loadout showed neither until this
              component existed; the inventory grid has shown both all along. -->
         <ItemBadges v-if="showBadges" :inst="badges ?? inst" :max="3" compact />
       </span>
-      <WearBar v-if="showWear" :item="item" :wear="wear" :seed="seed" mini class="mb-1" />
+      <WearBar v-if="showWear" :item="item" :wear="wear" :seed="seed" mini :class="isCompact ? 'self-start' : 'mb-1'" />
     </div>
   </button>
 </template>

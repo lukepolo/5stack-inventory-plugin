@@ -53,7 +53,7 @@ const props = withDefaults(
     variant: "accent",
     solidBackground: "",
     listClass: "",
-    buttonClass: "relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors",
+    buttonClass: "touch-hit relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors",
     activeClass: "text-foreground",
     inactiveClass: "text-muted-foreground hover:text-foreground",
   },
