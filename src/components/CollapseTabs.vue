@@ -27,6 +27,7 @@
 //     mounting (a 3D mat, an inventory grid) and it played late and choppy.
 import { nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from "vue";
 import Tooltip from "./Tooltip.vue";
+import { isCoarse } from "../responsive";
 
 const props = defineProps<{
   items: readonly T[];
@@ -285,7 +286,9 @@ watch(
 </script>
 
 <template>
-  <!-- 26px tabs + p-1 + the 1px border = the header's 36px controls. -->
+  <!-- 26px tabs + p-1 + the 1px border = the header's 36px controls. On a
+       touch screen the tabs are 44px tall (a 54px strip); the compact
+       header keeps their 34px width so row one still fits a 375px phone. -->
   <div
     ref="containerRef"
     class="relative inline-flex max-w-full justify-end gap-1 rounded-md border border-border bg-muted/30 p-1"
@@ -310,8 +313,11 @@ watch(
       <button
         :ref="(el) => setBtn(el, item.key)"
         type="button"
-        class="relative z-10 inline-flex h-[26px] items-center justify-center rounded-sm px-2.5 font-mono text-f10 font-semibold uppercase leading-none tracking-cs1 transition-colors duration-200"
-        :class="current === item.key ? 'min-w-0 grow font-bold text-black' : 'shrink-0 grow-0 text-muted-foreground hover:text-foreground'"
+        class="relative z-10 inline-flex items-center justify-center rounded-sm font-mono text-f10 font-semibold uppercase leading-none tracking-cs1 transition-colors duration-200"
+        :class="[
+          isCoarse ? (hideLabels ? 'h-11 px-2.5' : 'h-11 px-4') : 'h-[26px] px-2.5',
+          current === item.key ? 'min-w-0 grow font-bold text-black' : 'shrink-0 grow-0 text-muted-foreground hover:text-foreground',
+        ]"
         :aria-label="item.label"
         :aria-current="current === item.key ? 'page' : undefined"
         @click="pick(item.key)"
