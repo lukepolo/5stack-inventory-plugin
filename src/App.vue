@@ -75,7 +75,8 @@ import {
   renderUrlFor,
   type GameConfigState,
 } from "./api";
-import { usePluginRouter, type HostRouting } from "./pluginRouter";
+import { usePluginRouter, type HostCrumb, type HostRouting } from "./pluginRouter";
+import { adminTabLabel } from "./adminTabs";
 import {
   parsePath,
   buildPath,
@@ -8728,6 +8729,47 @@ if (MDEBUG) {
   );
 }
 // ---- end temporary tracing -------------------------------------------------
+
+// ---- the panel's breadcrumbs -----------------------------------------------
+//
+// The host shows "<plugin title> › <this trail>" in its top bar, so pages are
+// named by what they ARE — "Inventory › Settings › 3D Models", "Inventory ›
+// AWP | Dragon Lore" — instead of the URL's "apps › inventory › admin ›
+// models" or an item id. It is why the settings console no longer needs a page
+// header of its own.
+//
+// Each step's `to` is plugin-relative; the last step is this page. A name not
+// known yet (an item still loading) is left off rather than shown as an id, and
+// the next evaluation adds it. Down here, after everything it reads: it is an
+// immediate watcher, and one declared above a `const` it reads dies silently
+// in setup (see the note on focusSubject).
+const crumbTrail = computed<HostCrumb[]>(() => {
+  const r = route.value;
+  const named = (label: string): HostCrumb[] => (label ? [{ label }] : []);
+  switch (r.name) {
+    case "loadout":
+      return [];
+    case "focus":
+      return [{ label: "Loadout", to: "/" }, ...named(itemName(focusRow.value?.item))];
+    // "Items", not the tab's "Inventory": the plugin's own title already is.
+    case "inventory":
+      return [{ label: "Items" }];
+    case "armory":
+      return [{ label: "Craft" }];
+    case "stickerCrafts":
+      return [{ label: "Sticker Crafts" }];
+    case "item":
+      return named(itemName(instanceById(r.id)?.item));
+    case "draft":
+      return [
+        { label: "Craft", to: "/craft" },
+        ...named(craft.value?.skin.id === r.skinId ? itemName(craft.value.skin) : ""),
+      ];
+    case "admin":
+      return [{ label: "Settings", to: "/admin" }, { label: adminTabLabel(r.section) }];
+  }
+});
+watch(crumbTrail, (trail) => props.setCrumb?.(trail), { immediate: true });
 </script>
 
 <template>

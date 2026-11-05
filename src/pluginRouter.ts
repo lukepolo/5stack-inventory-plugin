@@ -35,6 +35,20 @@ export interface HostRouting {
    * plain href, so a missing prop costs a page load, not a dead link.
    */
   navigateApp?: (to: string) => unknown;
+  /**
+   * Name the page in the HOST's breadcrumbs: the trail inside the plugin, each
+   * step's `to` plugin-relative ("/admin"), the last one usually without (it is
+   * this page). The host shows "<plugin title> › <trail>" for the path it was
+   * set on, and its plain URL trail until then — so an older host that does not
+   * pass this, or a page that never sets it, just keeps the URL.
+   */
+  setCrumb?: (trail: string | HostCrumb[]) => unknown;
+}
+
+/** One step of the host breadcrumb trail — see `HostRouting.setCrumb`. */
+export interface HostCrumb {
+  label: string;
+  to?: string;
 }
 
 export interface PluginRouter {
