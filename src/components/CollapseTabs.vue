@@ -310,7 +310,7 @@ watch(
       <button
         :ref="(el) => setBtn(el, item.key)"
         type="button"
-        class="relative z-10 inline-flex h-[26px] items-center justify-center rounded-sm px-2.5 font-mono text-f10 font-semibold uppercase leading-none tracking-cs1 transition-colors duration-200"
+        class="touch-hit relative z-10 inline-flex h-[26px] items-center justify-center rounded-sm px-2.5 font-mono text-f10 font-semibold uppercase leading-none tracking-cs1 transition-colors duration-200"
         :class="current === item.key ? 'min-w-0 grow font-bold text-black' : 'shrink-0 grow-0 text-muted-foreground hover:text-foreground'"
         :aria-label="item.label"
         :aria-current="current === item.key ? 'page' : undefined"

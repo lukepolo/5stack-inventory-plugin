@@ -133,7 +133,7 @@ function axisOptions(a: FacetAxis): FacetOption[] {
         v-for="t in tabs"
         :key="t.value"
         :ref="(el) => pill.setRef(t.value, el)"
-        class="relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
+        class="touch-hit relative z-[1] flex h-6 items-center rounded-md px-3 text-f10 uppercase tracking-wider transition-colors"
         :class="tab === t.value ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'"
         @click="emit('update:tab', t.value)"
       >
