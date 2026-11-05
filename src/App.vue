@@ -8771,7 +8771,13 @@ const crumbTrail = computed<HostCrumb[]>(() => {
       return [{ label: "Settings", to: "/admin" }, { label: adminTabLabel(r.section) }];
   }
 });
-watch(crumbTrail, (trail) => props.setCrumb?.(trail), { immediate: true });
+// Sent on the HOST's path too, not just when the trail changes. A click inside
+// the plugin moves its own path first (pluginRouter's pendingPath) and the
+// host's route a moment later, so the first send is stamped with the page we
+// are leaving; when the host's path arrives the trail is already up to date
+// and would never be sent again — leaving the panel a name for the wrong path
+// and its URL trail on screen ("Apps › Inventory › Admin › Prices").
+watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { immediate: true });
 </script>
 
 <template>
