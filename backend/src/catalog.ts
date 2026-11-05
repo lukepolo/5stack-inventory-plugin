@@ -106,6 +106,8 @@ export interface CatalogSkin {
   capsule?: string;
   /** Artwork identity shared by every colour variant — the STACK key. */
   design?: number;
+  /** A finish that can be crafted as a Souvenir (cs2-lib 9.10). */
+  hasSouvenir?: boolean;
   /**
    * KNIVES and GLOVES only: the bare model every finish of the kind is painted
    * onto — "Butterfly Knife", "Bloodhound Gloves". The craft sheet sections its
@@ -166,6 +168,10 @@ function wearRange(i: (typeof items)[number]) {
   return {
     ...(i.hasWear() ? { wearMin: i.getMinimumWear(), wearMax: i.getMaximumWear() } : {}),
     ...(i.hasSeed() ? { seedMin: i.getMinimumSeed(), seedMax: i.getMaximumSeed() } : {}),
+    // Rides with the ranges for the same reason: the editor draws a Souvenir
+    // toggle only on a listing that says true, and a NEW craft has no owned row
+    // (getItem) to ask. Only ever present as `true`.
+    ...(i.type === "weapon" && i.hasSouvenir() ? { hasSouvenir: true } : {}),
   };
 }
 
@@ -1316,11 +1322,16 @@ export function parseSteamMarketName(marketHashName: string): {
   /** The name after the decorations came off — what got looked up. */
   name: string;
   stattrak: boolean;
-  /** Souvenir variant. The IMPORT ignores it (we don't model souvenirs), but a
-   *  price feed keys on it: a Souvenir AWP is a different market item from a
-   *  plain one and trades nothing like it. */
+  /** Souvenir variant. A price feed keys on it (a Souvenir AWP is a different
+   *  market item from a plain one and trades nothing like it), and the import
+   *  keeps it on the finishes that can be one. A loose highlight charm is
+   *  "Souvenir Charm | …" too, which is NOT a souvenir weapon — see `highlight`. */
   souvenir: boolean;
   wearTier: SteamWearTier | null;
+  /** A highlight-reel charm: Steam names the highlight after the charm
+   *  ("Charm | Austin 2025 Highlight | flameZ Double Dust II Kill"), cs2-lib
+   *  keeps it as an attribute of "Charm | Austin 2025 Highlight". */
+  highlight?: number;
 } {
   let name = marketHashName
     .replace(/^★ /, "")
@@ -1329,8 +1340,23 @@ export function parseSteamMarketName(marketHashName: string): {
   const wearMatch = STEAM_WEAR_RE.exec(name);
   const wearTier = (wearMatch?.[1] as SteamWearTier | undefined) ?? null;
   if (wearMatch) name = name.slice(0, -wearMatch[0].length);
+  let itemId = getItemIdBySteamName(name);
+  let highlight: number | undefined;
+  if (itemId == null && name.startsWith("Charm | ")) {
+    // Longest charm name first, the rest is the highlight's.
+    const parts = name.split(" | ");
+    for (let end = parts.length - 1; end > 1 && itemId == null; end--) {
+      const charm = getItemIdByName(parts.slice(0, end).join(" | "));
+      const hit = charm != null ? highlightIdByName(charm, parts.slice(end).join(" | ")) : undefined;
+      if (hit != null) {
+        itemId = charm;
+        highlight = hit;
+      }
+    }
+  }
   return {
-    itemId: getItemIdBySteamName(name),
+    itemId,
+    ...(highlight != null ? { highlight } : {}),
     name,
     // `★ StatTrak™ ` for knives and gloves — the star comes off first above, so
     // one prefix test covers both forms.
@@ -1532,6 +1558,21 @@ export function getItem(id: number) {
       hasSeed: i.hasSeed(),
       hasStatTrak: i.hasStatTrak(),
       hasNameTag: i.hasNameTag(),
+      /**
+       * Can this finish be a Souvenir (cs2-lib 9.10)? Every painted gun can:
+       * besides the souvenir packages that drop it, cs2-lib counts the events
+       * whose souvenirs are crafted (Cologne 2026) as a source for any finish.
+       * Asked of weapons only — it walks the souvenir index, and getItem runs
+       * for every sticker on every row.
+       */
+      hasSouvenir: i.type === "weapon" ? i.hasSouvenir() : false,
+      /**
+       * A highlight-reel charm (Austin 2025, Budapest 2025, Cologne 2026):
+       * one charm entry whose look is picked by WHICH highlight it carries, the
+       * way a slab's is picked by its sticker. It has no pattern of its own —
+       * cs2-lib 9.10 turned hasSeed off for these.
+       */
+      hasHighlights: i.type === "keychain" ? i.hasHighlights() : false,
       wearMin: i.hasWear() ? i.getMinimumWear() : undefined,
       wearMax: i.hasWear() ? i.getMaximumWear() : undefined,
       seedMin: i.hasSeed() ? i.getMinimumSeed() : undefined,
@@ -1609,6 +1650,13 @@ export interface CraftAttrs {
    *  request never sent is left alone. */
   style?: number | null;
   upgrade_level?: number | null;
+  /** Weapons that can be one (getItem's hasSouvenir). Exclusive with StatTrak:
+   *  the game gives an item one quality, and 12 (Souvenir) is not 9 (StatTrak). */
+  souvenir?: boolean | null;
+  /** A highlight-reel charm crafted on its own: which highlight it carries, as
+   *  the highlight's economy id. A charm hanging off a gun carries its own in
+   *  charm_offset instead — see linkAttachments. */
+  highlight?: number | null;
 }
 export function validateCraftAttrs(
   itemId: number,
@@ -1670,6 +1718,31 @@ export function validateCraftAttrs(
     clean.stattrak = true;
   } else if (attrs.stattrak != null) {
     clean.stattrak = false;
+  }
+
+  // Souvenir. Rejected (not dropped) on a finish that cannot be one, the same as
+  // StatTrak above: a Souvenir toggle is only drawn where hasSouvenir says so, so
+  // a `true` on anything else is a request for an item that cannot exist. The
+  // STICKERS a souvenir carries are checked where the stickers are, in main.ts
+  // (checkAttachments), because this function never sees them.
+  if (attrs.souvenir) {
+    if (!item.hasSouvenir()) return { error: `${item.name} doesn't come as a Souvenir.` };
+    if (clean.stattrak) return { error: "A Souvenir can't also be StatTrak™." };
+    clean.souvenir = true;
+  } else if (attrs.souvenir != null) {
+    clean.souvenir = false;
+  }
+
+  // A highlight is only an attribute of a highlight charm; on anything else it
+  // is dropped like any other attribute the item does not have. Not REQUIRED on
+  // one here, although cs2-lib's own rule requires it: rows written before
+  // 9.10 carry none, and the readers fall back to the charm's first highlight
+  // (highlightFor) rather than lose the charm.
+  if (attrs.highlight != null && item.isKeychain() && item.hasHighlights()) {
+    if (!CS2Economy.safeValidateHighlight(attrs.highlight, item)) {
+      return { error: `That highlight isn't one of ${item.name}'s.` };
+    }
+    clean.highlight = attrs.highlight;
   }
 
   if (attrs.nametag != null) {
@@ -1781,6 +1854,184 @@ export function stickerSchemaFor(itemId: number, slot: number): number {
   } catch {
     return slot;
   }
+}
+
+// ---- Souvenirs and highlight reels (cs2-lib 9.10) ---------------------------
+//
+// Upstream added both in cs2-inventory-simulator#724 and the server plugin in
+// cs2-ss2-inventory-simulator#64: a souvenir weapon goes out as `souvenir: true`
+// (econ quality 12), and a highlight-reel charm as `keychains[].highlight` (the
+// highlight's variant index, written as "keychain slot N highlight").
+
+/**
+ * Why a souvenir's stickers are not a souvenir's, or null when they are.
+ *
+ * cs2-lib's rule: every sticker comes from ONE source (a souvenir package, or an
+ * event whose souvenirs are crafted), with at most one event sticker, one map
+ * sticker and one autograph, and no more than two teams between the team logos
+ * and the autograph's team. No stickers at all is a valid souvenir too.
+ */
+export function souvenirStickersError(itemId: number, stickerIds: number[]): string | null {
+  let item;
+  try {
+    item = CS2Economy.getById(itemId);
+  } catch {
+    return "Unknown item.";
+  }
+  if (!item.hasSouvenir()) return `${item.name} doesn't come as a Souvenir.`;
+  if (CS2Economy.safeValidateSouvenir(true, item, stickerIds)) return null;
+  return "A Souvenir's stickers come from one event: two teams, one event sticker, one map and at most one autograph.";
+}
+
+export interface SouvenirSticker {
+  id: number;
+  name: string;
+  image: string | null;
+}
+export interface HighlightOption {
+  id: number;
+  name: string;
+  description: string | null;
+  /** The clip, on Valve's own CDN. Linked from the picker, never embedded. */
+  video: string | null;
+  /** "MOUZ vs Vitality", from the two team stickers the highlight names. */
+  matchup: string | null;
+  /** The charm this highlight belongs to. */
+  charmId: number;
+  /** In a souvenir source only: the two TEAM ids the highlight fixes. */
+  teams?: number[];
+}
+export interface SouvenirSource {
+  eventId: number;
+  /** "ESL One Cologne 2014 Overpass Souvenir Package", or the event's name for
+   *  one whose souvenirs are crafted rather than dropped. */
+  name: string;
+  image: string | null;
+  /** A package drops ONE map's sticker; a crafted souvenir picks any. */
+  fixedMap: boolean;
+  event: number[];
+  maps: number[];
+  teams: { id: number; sticker: number; autographs: number[] }[];
+  /** Highlight packages (Austin 2025, Budapest 2025): picking a highlight
+   *  fixes the two teams and hangs its charm on the gun. */
+  highlights: HighlightOption[];
+}
+
+/** "Sticker | MOUZ (Gold) | Austin 2025" -> "MOUZ": the team, without the
+ *  finish the event printed its logo in. */
+const teamOfSticker = (name: string) => (name.split(" | ")[1] ?? name).replace(/\s*\([^)]*\)$/, "");
+
+function highlightOption(h: (typeof items)[number]): HighlightOption {
+  const teams = (h.teamStickerIds ?? []).map((id) => {
+    try {
+      return teamOfSticker(CS2Economy.getById(id).name);
+    } catch {
+      return null;
+    }
+  });
+  return {
+    id: h.id,
+    name: h.name,
+    description: (h.description as string | undefined) ?? null,
+    video: typeof h.videoUrl === "string" ? h.videoUrl : null,
+    matchup: teams.length === 2 && teams.every(Boolean) ? `${teams[0]} vs ${teams[1]}` : null,
+    charmId: h.parentId as number,
+  };
+}
+
+/**
+ * Everything the souvenir editor offers for one finish, or null when it cannot
+ * be a souvenir. Stickers are sent ONCE, by id, beside sources that name them:
+ * the Dragon Lore has eleven sources and about a thousand sticker references,
+ * most of them the same few hundred stickers.
+ *
+ * Newest event first — that is the one the editor opens on.
+ */
+export function getSouvenirOptions(itemId: number): { sources: SouvenirSource[]; stickers: Record<number, SouvenirSticker> } | null {
+  let item;
+  try {
+    item = CS2Economy.getById(itemId);
+  } catch {
+    return null;
+  }
+  if (item.type !== "weapon" || !item.hasSouvenir()) return null;
+  const stickers: Record<number, SouvenirSticker> = {};
+  const take = (s: (typeof items)[number]) => {
+    stickers[s.id] ??= { id: s.id, name: s.name, image: img(s.imagePath) };
+    return s.id;
+  };
+  const sources = item.getSouvenirSources().map((source): SouvenirSource => {
+    const first = source.teams[0]?.sticker;
+    return {
+      eventId: source.eventId,
+      name: source.container
+        ? source.container.name.replace(/^Container \| /, "")
+        : ((first?.categoryName as string | undefined) ?? `Event ${source.eventId}`),
+      image: img((source.container ?? first)?.imagePath),
+      fixedMap: source.container !== undefined,
+      event: source.eventStickers.map(take),
+      maps: source.mapStickers.map(take),
+      teams: source.teams.map((team) => ({ id: team.id, sticker: take(team.sticker), autographs: team.autographs.map(take) })),
+      highlights: source.highlights.map((h) => ({
+        ...highlightOption(h),
+        teams: (h.teamStickerIds ?? [])
+          .map((sid) => source.teams.find((team) => team.sticker.id === sid)?.id)
+          .filter((id): id is number => id != null),
+      })),
+    };
+  });
+  sources.sort((a, b) => b.eventId - a.eventId);
+  return { sources, stickers };
+}
+
+/** A highlight charm's highlights, or null for any other item. */
+export function getCharmHighlights(charmId: number): HighlightOption[] | null {
+  try {
+    const charm = CS2Economy.getById(charmId);
+    if (!charm.isKeychain() || !charm.hasHighlights()) return null;
+    return charm.getHighlights().map(highlightOption);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The highlight a charm actually carries: the stored one when it is the charm's
+ * own, else the charm's FIRST highlight, else undefined for an ordinary charm.
+ *
+ * The fallback is not a nicety. cs2-lib 9.10 made a highlight REQUIRED on these
+ * charms, and its repairInventoryItem now deletes a highlight charm that has
+ * none — so every Austin 2025 / Cologne 2026 Highlight charm saved before the
+ * bump would silently fall off its gun's inspect link.
+ */
+export function highlightFor(charmId: number, stored: unknown): number | undefined {
+  try {
+    const charm = CS2Economy.getById(charmId);
+    if (!charm.isKeychain() || !charm.hasHighlights()) return undefined;
+    if (typeof stored === "number" && CS2Economy.safeValidateHighlight(stored, charm)) return stored;
+    return charm.getHighlights()[0]?.id;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A highlight's variant index — the number the plugin writes as the
+ *  "keychain slot N highlight" attribute. */
+export function highlightIndex(highlightId: number): number | undefined {
+  try {
+    return CS2Economy.getById(highlightId).variantIndex as number | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A highlight by the name Steam prints after its charm — "flameZ Double Dust
+ * II Kill" in "Austin 2025 Highlight | flameZ Double Dust II Kill". cs2-lib
+ * carries those names verbatim, unique within a charm.
+ */
+export function highlightIdByName(charmId: number, name: string): number | undefined {
+  return getCharmHighlights(charmId)?.find((h) => h.name === name)?.id;
 }
 
 /**

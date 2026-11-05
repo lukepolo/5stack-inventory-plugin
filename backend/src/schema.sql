@@ -33,6 +33,17 @@ ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS sticker_group jsonb;
 -- last stage the pet can reach (a hen for a breed). cs2-lib resolves both.
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS style integer;         -- material group, 1..styleCount
 ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS upgrade_level integer; -- 0 egg, 1 chick, 2 pullet, 3 hen
+-- Souvenir weapons (cs2-lib 9.10). Never true together with `stattrak`: the
+-- game gives an item one quality, and Souvenir (12) is not StatTrak (9). A
+-- souvenir's stickers are the event's own and are stored as plain specs, never
+-- linked to owned sticker rows (linkAttachments).
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS souvenir boolean NOT NULL DEFAULT false;
+-- A highlight-reel CHARM's own highlight, as the highlight's economy id. Null
+-- on everything else, and on charms saved before 9.10 — readers fall back to
+-- the charm's first highlight (highlightFor). The copy riding a gun lives in
+-- that gun's charm_offset beside the charm's seed, and is folded back from
+-- this column on read the way the seed is (resolveAttachments).
+ALTER TABLE inventory.owned_items ADD COLUMN IF NOT EXISTS highlight integer;
 CREATE UNIQUE INDEX IF NOT EXISTS owned_items_steam_asset_idx
   ON inventory.owned_items (steam_id, steam_asset_id) WHERE steam_asset_id IS NOT NULL;
 

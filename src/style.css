@@ -360,6 +360,10 @@
      --tac-amber: the panel's brand amber means "you can press this", and a
      StatTrak badge is a fact about the item, not a control. */
   --tac-stattrak: 45 86% 62%;
+
+  /* SOUVENIR. CS2's own quality colour for it (#ffd700), for the same reason
+     StatTrak keeps the game's gold: it names a fact about the item. */
+  --tac-souvenir: 51 100% 50%;
 }
 
 /* ---- action buttons --------------------------------------------------------

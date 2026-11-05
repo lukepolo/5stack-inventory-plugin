@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, type ComputedRef, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, shallowRef, type ComputedRef, watch } from "vue";
 import { cn } from "@5stack/ui";
 import { useI18n } from "./composables/useI18n";
 import {
@@ -13,6 +13,7 @@ import {
   fetchSkins,
   type AttachSort,
   fetchCatalogItems,
+  fetchCharmHighlights,
   fetchLoadout,
   fetchInventory,
   craftItem,
@@ -125,6 +126,9 @@ import PriceTag from "./components/PriceTag.vue";
 const ItemSpecs = defineAsyncComponent(() => import("./components/ItemSpecs.vue"));
 const PetControls = defineAsyncComponent(() => import("./components/PetControls.vue"));
 const AgentControls = defineAsyncComponent(() => import("./components/AgentControls.vue"));
+// Editor-only, and only on a souvenir finish or a highlight charm.
+const SouvenirPanel = defineAsyncComponent(() => import("./components/SouvenirPanel.vue"));
+const HighlightPicker = defineAsyncComponent(() => import("./components/HighlightPicker.vue"));
 import TraitBars, { type TraitRow } from "./components/TraitBars.vue";
 import { DEFAULT_PET_CLIP, loadPetClipIndex, petWanderPool } from "./petAnim";
 import ItemBadges from "./components/ItemBadges.vue";
@@ -1951,13 +1955,20 @@ const craft = ref<{
   /** Kills on the StatTrak module, for display only: the owned row's on an
    *  edit, 0 for a new craft. Only the game server writes the count. */
   stattrakCount: number;
+  /** Souvenir finish (cs2-lib 9.10). Never on beside `stattrak` — the toggles
+   *  turn each other off. While on, SouvenirPanel owns the stickers. */
+  souvenir: boolean;
+  /** A highlight charm crafted ON ITS OWN: which highlight it carries. A charm
+   *  on a gun carries its own as `charm.highlight`. */
+  highlight: number | null;
   nametag: string;
   stickers: (Attach | null)[];
   patches: (Attach | null)[];
   /** `seed` is the charm's own PATTERN, the same idea as the weapon's and a
    *  tradeable attribute in its own right. Purely an attribute: CS2 varies no
-   *  charm geometry or art by it, so the 3D viewer never sees it. */
-  charm: (Attach & { z?: number | null; seed?: number | null; inst?: string | null }) | null;
+   *  charm geometry or art by it, so the 3D viewer never sees it. A highlight
+   *  charm has no pattern; `highlight` is what it carries instead. */
+  charm: (Attach & { z?: number | null; seed?: number | null; inst?: string | null; highlight?: number | null }) | null;
   /** PETS only: material group, null = the stock look. */
   style: number | null;
   /** PETS only: life stage (upgrade level), null = the pet's own default. */
@@ -2185,6 +2196,100 @@ const craftHasStatTrak = computed(() =>
   (craftType.value
     ? ["weapon", "melee", "musickit"].includes(craftType.value)
     : craftSlotSays(["agent", "graffiti", "collectible", "pet"])),
+);
+/**
+ * Souvenir (cs2-lib 9.10). Asks the item and ONLY the item, `=== true`: every
+ * painted gun can be one and nothing else can, so there is no type-level answer
+ * to fall back on — a listing that does not say so is not a souvenir finish.
+ */
+const craftHasSouvenir = computed(
+  () => craftType.value === "weapon" && (craft.value?.skin ?? craftInst.value?.item)?.hasSouvenir === true,
+);
+/**
+ * Souvenir and StatTrak are one quality slot in game (12 or 9, never both), so
+ * each switch turns the other off. Turning Souvenir OFF takes its stickers with
+ * it: they were the event's, picked in SouvenirPanel, never stickers the player
+ * applied — leaving them would quietly mint them as owned stickers on save.
+ */
+function setCraftSouvenir(on: boolean) {
+  const c = craft.value;
+  if (!c) return;
+  c.souvenir = on;
+  if (on) c.stattrak = false;
+  else {
+    c.stickers = emptySlots(MAX_STICKERS);
+    if (c.charm?.highlight != null && souvenirCharm.value) c.charm = null;
+  }
+  souvenirCharm.value = false;
+}
+function setCraftStatTrak(on: boolean) {
+  const c = craft.value;
+  if (!c) return;
+  if (on && c.souvenir) setCraftSouvenir(false);
+  c.stattrak = on;
+}
+/** Whether the charm on the gun was hung by a souvenir HIGHLIGHT package, so
+ *  leaving that package (or Souvenir) takes it back off — and only then. */
+const souvenirCharm = ref(false);
+/**
+ * SouvenirPanel's stickers, into the slots in the game's order. A sticker that
+ * stays in its slot keeps its scratch and placement; everything else starts
+ * fresh, and none carries an `inst` — a souvenir's stickers are never minted.
+ */
+function applySouvenirStickers(list: { id: number; name: string; image: string | null }[]) {
+  const c = craft.value;
+  if (!c) return;
+  c.stickers = Array.from({ length: MAX_STICKERS }, (_, i) => {
+    const want = list[i];
+    if (!want) return null;
+    const had = c.stickers[i];
+    return had && had.id === want.id
+      ? { ...had, inst: null }
+      : { id: want.id, name: want.name, image: want.image, inst: null };
+  });
+}
+/** A highlight package's charm: hung (placement kept when it is the same
+ *  charm), or taken off when the package or highlight no longer gives one. */
+async function applySouvenirCharm(next: { id: number; highlight: number } | null) {
+  const c = craft.value;
+  if (!c) return;
+  if (!next) {
+    if (souvenirCharm.value) c.charm = null;
+    souvenirCharm.value = false;
+    return;
+  }
+  if (c.charm?.id === next.id) {
+    c.charm.highlight = next.highlight;
+    souvenirCharm.value = true;
+    return;
+  }
+  const [item] = await fetchCatalogItems([next.id]).catch(() => []);
+  if (!item || craft.value !== c) return;
+  c.charm = { id: item.id, name: item.name, image: item.image, highlight: next.highlight, inst: null };
+  souvenirCharm.value = true;
+}
+/**
+ * Which charms are highlight reels, by id, once asked. Three charms in the
+ * whole catalog are, and the editor needs to know before it draws a charm's
+ * controls — a reel charm has a highlight to pick and NO pattern (cs2-lib 9.10
+ * turned hasSeed off for them), and the catalog listings the picker reads do
+ * not carry either fact.
+ */
+const reelCharms = reactive(new Map<number, boolean>());
+watch(
+  // `craft` only, NOT craftType: this runs at setup (immediate), and craftType
+  // reads craftInst, declared further down — a TDZ throw Vue swallows, which
+  // would leave this watcher dead (see the setup-TDZ note on focusSubject).
+  () => [craft.value?.charm?.id, craft.value?.skin.type === "keychain" ? craft.value.skin.id : undefined] as const,
+  (ids) => {
+    for (const id of ids) {
+      if (id == null || reelCharms.has(id)) continue;
+      void fetchCharmHighlights(id).then((list) => {
+        if (list) reelCharms.set(id, list.length > 0);
+      });
+    }
+  },
+  { immediate: true },
 );
 /**
  * A GLOVE's pattern range. Gloves get their own plain control rather than a
@@ -2428,7 +2533,7 @@ function openCraft(skin: Skin) {
   const skinIsWeapon = !skin.type || skin.type === "weapon" || skin.type === "melee";
   craftModel.value =
     skin.model ?? (skinIsWeapon && isWeaponPos(selected.value) ? occupantModel(selected.value) : null);
-  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, stattrakCount: 0, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null, style: null, stage: null };
+  craft.value = { skin, wear: DEFAULT_WEAR, seed: 1, stattrak: false, stattrakCount: 0, souvenir: false, highlight: null, nametag: "", stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null, style: null, stage: null };
   craftBaseline = ""; // new craft — no stored render to reuse
   // A brand-new craft gets a URL too: /craft/<skinId>, with the draft itself in
   // the query. Without it the one state worth sharing before you commit to it
@@ -2467,6 +2572,8 @@ async function restoreDraftRoute(skinId: number) {
         seed: d.seed,
         stattrak: d.stattrak,
         stattrakCount: 0,
+        souvenir: !!d.souvenir && skin.hasSouvenir === true,
+        highlight: d.highlight ?? null,
         nametag: d.nametag,
         stickers: d.stickers
           .slice(0, MAX_STICKERS)
@@ -2477,7 +2584,8 @@ async function restoreDraftRoute(skinId: number) {
           y: d.charm?.y ?? null,
           z: d.charm?.z ?? null,
           seed: d.charm?.seed ?? null,
-        }) as (Attach & { z?: number | null; seed?: number | null }) | null,
+          highlight: d.charm?.highlight ?? null,
+        }) as (Attach & { z?: number | null; seed?: number | null; highlight?: number | null }) | null,
         style: d.style,
         stage: d.stage,
       };
@@ -2532,6 +2640,7 @@ function openEdit(inst: InventoryItem, warm: "edit" | "open" = "edit") {
       // 0..1 slider on Edit — a Doppler, which exists only to 0.08, dragged to
       // 0.9 and then failed to save.
       hasWear: inst.item.hasWear, hasSeed: inst.item.hasSeed, hasStatTrak: inst.item.hasStatTrak, seedMin: inst.item.seedMin, seedMax: inst.item.seedMax,
+      hasSouvenir: inst.item.hasSouvenir,
       wearMin: inst.item.wearMin, wearMax: inst.item.wearMax,
       // Music kits: what the editor's player plays.
       audio: inst.item.audio ?? null, mvpAudio: inst.item.mvpAudio ?? null,
@@ -2540,15 +2649,24 @@ function openEdit(inst: InventoryItem, warm: "edit" | "open" = "edit") {
     seed: inst.seed ?? 1,
     stattrak: inst.stattrak,
     stattrakCount: inst.stattrak_count ?? 0,
+    souvenir: inst.souvenir === true,
+    highlight: inst.highlight ?? null,
     nametag: inst.nametag ?? "",
     stickers,
     patches,
     charm: inst.charm
-      ? { id: inst.charm.id, name: inst.charm.name, image: inst.charm.image, x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null, inst: inst.charm.inst ?? null }
+      ? {
+          id: inst.charm.id, name: inst.charm.name, image: inst.charm.image,
+          x: inst.charm.x ?? null, y: inst.charm.y ?? null, z: inst.charm.z ?? null, seed: inst.charm.seed ?? null,
+          inst: inst.charm.inst ?? null, highlight: inst.charm.highlight ?? null,
+        }
       : null,
     style: inst.style ?? null,
     stage: inst.upgrade_level ?? null,
   };
+  // A souvenir's highlight charm came from its HIGHLIGHT package, and goes with
+  // it if the package changes in SouvenirPanel.
+  souvenirCharm.value = inst.souvenir === true && inst.charm?.highlight != null;
   // Until something changes, show the render we already have for this item.
   craftBaseline = craftStateJson();
   craftPreview.value = renderSrc(inst);
@@ -2728,7 +2846,7 @@ function randomSeed() {
 function resetCraft() {
   if (craft.value)
     Object.assign(craft.value, {
-      wear: DEFAULT_WEAR, seed: 1, stattrak: false, stattrakCount: 0, nametag: "",
+      wear: DEFAULT_WEAR, seed: 1, stattrak: false, stattrakCount: 0, souvenir: false, highlight: null, nametag: "",
       stickers: emptySlots(MAX_STICKERS), patches: emptySlots(MAX_PATCHES), charm: null,
       style: null, stage: null,
     });
@@ -2752,7 +2870,10 @@ function craftBody() {
     // at all, so what is sent is exactly what was editable.
     wear: craftHasWear.value || craftHasScratch.value ? c.wear : null,
     seed: craftHasSeed.value ? c.seed : null,
-    stattrak: craftHasStatTrak.value ? c.stattrak : false,
+    stattrak: craftHasStatTrak.value && !c.souvenir ? c.stattrak : false,
+    souvenir: craftHasSouvenir.value ? c.souvenir : false,
+    // A loose highlight charm's own; undefined (left alone) on everything else.
+    highlight: craftType.value === "keychain" && c.highlight != null ? c.highlight : undefined,
     nametag: craftHasNameTag.value ? c.nametag.trim() || null : null,
     // Left OFF the body (undefined) for anything but a pet, rather than sent as
     // null: on these two a null is a value — "back to the default" — and the
@@ -2762,7 +2883,12 @@ function craftBody() {
     stickers: c.stickers.map(toSpec),
     patches: c.patches.map(toSpec),
     charm_id: c.charm?.id ?? null,
-    charm_offset: c.charm ? { x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null, inst: c.charm.inst ?? null } : null,
+    charm_offset: c.charm
+      ? {
+          x: c.charm.x ?? null, y: c.charm.y ?? null, z: c.charm.z ?? null, seed: c.charm.seed ?? null,
+          inst: c.charm.inst ?? null, highlight: c.charm.highlight ?? null,
+        }
+      : null,
   };
 }
 /** The kill count the module shows. Read-only: kills are the game server's to
@@ -2889,6 +3015,7 @@ async function saveCraft(andEquip = false) {
               seed: updated.seed,
               stattrak: updated.stattrak,
               stattrak_count: updated.stattrak_count,
+              souvenir: updated.souvenir,
               nametag: updated.nametag,
               style: updated.style,
               upgrade_level: updated.upgrade_level,
@@ -3591,10 +3718,12 @@ function draftFromCraft(): Draft | null {
     wear: c.wear,
     seed: c.seed,
     stattrak: c.stattrak,
+    souvenir: c.souvenir,
+    highlight: c.highlight,
     nametag: c.nametag,
     stickers: c.stickers.map((s) => (s ? { id: s.id, x: s.x, y: s.y, r: s.r, w: s.w } : null)),
     patches: c.patches.map((p) => p?.id ?? null),
-    charm: c.charm ? { id: c.charm.id, x: c.charm.x, y: c.charm.y, z: c.charm.z, seed: c.charm.seed } : null,
+    charm: c.charm ? { id: c.charm.id, x: c.charm.x, y: c.charm.y, z: c.charm.z, seed: c.charm.seed, highlight: c.charm.highlight } : null,
     style: c.style,
     stage: c.stage,
   };
@@ -4442,7 +4571,7 @@ let craftPreviewToken = 0;
 let craftBaseline = "";
 const craftStateJson = () =>
   craft.value
-    ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm, craft.value.stattrak, craft.value.style, craft.value.stage])
+    ? JSON.stringify([craft.value.skin.id, craft.value.wear, craft.value.seed, craft.value.stickers, craft.value.charm, craft.value.stattrak, craft.value.style, craft.value.stage, craft.value.souvenir, craft.value.highlight])
     : "";
 /**
  * The still's image didn't load — a stored card bake that was never made (or a
@@ -5012,7 +5141,9 @@ function pickAttachment(item: PickerRow) {
   } else if (kind === "patch") {
     craft.value.patches[picker.value.slot] = a;
   } else {
-    craft.value.charm = item.inst ? { ...a, seed: item.seed ?? null } : a;
+    // A different charm is a different reel: an owned one brings its own, a
+    // catalog pick starts with none and HighlightPicker picks the first.
+    craft.value.charm = item.inst ? { ...a, seed: item.seed ?? null, highlight: item.highlight ?? null } : { ...a, highlight: null };
   }
   picker.value = null;
   // Anything you just stuck on the gun is something you'll want to place, so
@@ -6296,6 +6427,7 @@ const focusSubject = shallowRef<{
   wear: number;
   seed: number;
   stattrak: boolean;
+  souvenir: boolean;
   nametag: string;
   stickers: (Attach | null)[];
   patches: (Attach | null)[];
@@ -6315,6 +6447,7 @@ function quoteKeyOf(c: NonNullable<typeof priceSubject.value>) {
     c.skin.id,
     c.wear,
     c.stattrak ? 1 : 0,
+    c.souvenir ? 1 : 0,
     c.stickers.map((x) => x?.id ?? "-").join(","),
     c.patches.map((x) => x?.id ?? "-").join(","),
     c.charm?.id ?? "-",
@@ -6368,6 +6501,7 @@ function scheduleQuote() {
         item_id: c.skin.id,
         wear: c.wear,
         stattrak: c.stattrak,
+        souvenir: c.souvenir,
         stickers: c.stickers.map((x) => (x ? { id: x.id } : null)),
         patches: c.patches.map((x) => (x ? { id: x.id } : null)),
         charm_id: c.charm?.id ?? null,
@@ -6531,13 +6665,14 @@ function scheduleDetail() {
     itemDetail.value = null;
     return;
   }
-  const key = `${c.skin.id}:${wearTier(c.wear ?? 0)}:${c.stattrak ? 1 : 0}`;
+  const keyOf = (s: NonNullable<typeof c>) => `${s.skin.id}:${wearTier(s.wear ?? 0)}:${s.stattrak ? 1 : 0}:${s.souvenir ? 1 : 0}`;
+  const key = keyOf(c);
   detailTimer = setTimeout(async () => {
     try {
-      const detail = await fetchPriceDetail(c.skin.id, c.wear ?? null, c.stattrak);
+      const detail = await fetchPriceDetail(c.skin.id, c.wear ?? null, c.stattrak, c.souvenir);
       priceLog("detail: back", { available: detail?.available, rows: detail?.history?.length });
       const still = priceSubject.value;
-      if (still && `${still.skin.id}:${wearTier(still.wear ?? 0)}:${still.stattrak ? 1 : 0}` === key) {
+      if (still && keyOf(still) === key) {
         itemDetail.value = detail.available ? detail : null;
       }
     } catch (e) {
@@ -7595,6 +7730,9 @@ const focusPriceable = computed(() => {
     wear: row.wear ?? 0,
     seed: row.seed ?? 0,
     stattrak: !!row.stattrak,
+    // The instance's, when it is yours: a loadout row only carries it from a
+    // backend new enough to send it.
+    souvenir: (instanceById(row.item_instance_id)?.souvenir ?? row.souvenir) === true,
     nametag: "",
     stickers: (a?.stickers ?? []) as (Attach | null)[],
     patches: (a?.patches ?? []) as (Attach | null)[],
@@ -8222,10 +8360,13 @@ function draftFromRow(row: LoadoutEntry): Draft {
     wear: src.wear ?? DEFAULT_WEAR,
     seed: src.seed ?? 1,
     stattrak: !!src.stattrak,
+    souvenir: src.souvenir === true,
     nametag: src.nametag ?? "",
     stickers: (src.stickers ?? []).map((a) => (a ? { id: a.id, x: a.x, y: a.y, r: a.r, w: a.w } : null)),
     patches: (src.patches ?? []).map((a) => a?.id ?? null),
-    charm: src.charm ? { id: src.charm.id, x: src.charm.x, y: src.charm.y, z: src.charm.z, seed: src.charm.seed } : null,
+    charm: src.charm
+      ? { id: src.charm.id, x: src.charm.x, y: src.charm.y, z: src.charm.z, seed: src.charm.seed, highlight: src.charm.highlight }
+      : null,
     style: src.style ?? null,
     stage: src.upgrade_level ?? null,
   };
@@ -10650,6 +10791,9 @@ if (MDEBUG) {
             <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
               <div class="mb-1.5 flex items-baseline gap-2">
                 <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Stickers</span>
+                <!-- A souvenir's stickers are the event's: picked in the
+                     Souvenir box, still scratched and placed here. -->
+                <span v-if="craft.souvenir" class="ml-auto text-f9 text-[hsl(var(--tac-souvenir))]">Set by Souvenir</span>
               </div>
               <!-- A picked Sticker Craft, waiting to be dragged onto the gun —
                    see useStickerCraftPlacement. The whole card is the handle. -->
@@ -10724,9 +10868,9 @@ if (MDEBUG) {
                     craftPendingSlots.has(idx) && '!border-dashed !border-[color:var(--acc)]',
                     craftGroupSlots.has(idx) && (craftGroup?.linked ? 'shadow-[inset_0_-2px_0_var(--acc)]' : 'shadow-[inset_0_-2px_0_color-mix(in_srgb,var(--acc)_35%,transparent)]'),
                   ]"
-                  :title="craftPending ? (craftPendingSlots.has(idx) ? 'Kept for ' : 'Waiting on ') + craftPending.entry.name + ' — place it or put it back first' : st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
+                  :title="craftPending ? (craftPendingSlots.has(idx) ? 'Kept for ' : 'Waiting on ') + craftPending.entry.name + ' — place it or put it back first' : craft.souvenir ? (st ? st.name + ' — a souvenir sticker, chosen in Souvenir' : 'A souvenir carries only its event\'s stickers — choose them in Souvenir') : st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
                   :draggable="!!st && !craftPending"
-                  @click="!craftPending && openPicker('sticker', idx)"
+                  @click="!craftPending && !craft.souvenir && openPicker('sticker', idx)"
                   @dragstart="stickerDragFrom = idx; $event.dataTransfer?.setData('text/plain', String(idx))"
                   @dragover.prevent="!craftPending && stickerDragFrom != null && (stickerDropOn = idx)"
                   @dragleave="stickerDropOn === idx && (stickerDropOn = null)"
@@ -10737,7 +10881,7 @@ if (MDEBUG) {
                   <img v-if="st?.image" :src="st.image" alt="" class="max-h-8 max-w-full object-contain" />
                   <Plus v-else class="h-3.5 w-3.5" />
                   <span
-                    v-if="st"
+                    v-if="st && !craft.souvenir"
                     class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/st:opacity-100"
                     @click.stop="!craftPending && (craft!.stickers[idx] = null)"
                   ><X class="h-3 w-3" /></span>
@@ -10777,7 +10921,7 @@ if (MDEBUG) {
                   @pointerdown="(e: PointerEvent) => stickerRowsTopFirst.length > 1 && !craftPending && stickerSort.press(e, 'gun', pos)"
                   @wear="(w: number) => setStickerWear(idx, w)"
                   @place="(k: 'x' | 'y' | 'r', v: number) => placeSticker(idx, k, v)"
-                  @remove="!craftPending && (craft!.stickers[idx] = null)"
+                  @remove="!craftPending && !craft!.souvenir && (craft!.stickers[idx] = null)"
                 />
               </div>
             </div>
@@ -10822,8 +10966,21 @@ if (MDEBUG) {
                    coordinates at it is the problem the rail solves. The rail
                    owns the readout and it is still click-to-edit, so a pattern
                    quoted from a trade site is no harder to enter than before. -->
+              <!-- A HIGHLIGHT charm (Austin 2025, Budapest 2025, Cologne 2026)
+                   has no pattern: which highlight it carries is its look, and
+                   the game shows a blank reel without one. -->
+              <HighlightPicker
+                v-if="craft.charm && reelCharms.get(craft.charm.id)"
+                class="mt-2"
+                :charm-id="craft.charm.id"
+                :model-value="craft.charm.highlight ?? null"
+                auto-pick
+                @update:model-value="craft!.charm!.highlight = $event"
+              />
+              <!-- `v-else`: an unanswered lookup (or a failed one) draws the rail,
+                   as before reels existed — only a known reel hides it. -->
               <PatternRail
-                v-if="craft.charm"
+                v-else-if="craft.charm"
                 class="mt-2"
                 :model-value="craft.charm.seed ?? 0"
                 :image="craft.charm.image"
@@ -10857,7 +11014,19 @@ if (MDEBUG) {
             <!-- The panel goes with the rail when the charm has no pattern to
                  pick. Hiding the control alone would leave an empty card. -->
             <div
-              v-if="craftHasSeed && craftSeedIsCharm && !craftCharmInert"
+              v-if="craftSeedIsCharm && reelCharms.get(craft.skin.id)"
+              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+              :style="{ '--i': 3 }"
+            >
+              <HighlightPicker
+                :charm-id="craft.skin.id"
+                :model-value="craft.highlight"
+                auto-pick
+                @update:model-value="craft!.highlight = $event"
+              />
+            </div>
+            <div
+              v-if="craftHasSeed && craftSeedIsCharm && !craftCharmInert && reelCharms.get(craft.skin.id) !== true"
               class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
               :style="{ '--i': 3 }"
             >
@@ -11046,7 +11215,7 @@ if (MDEBUG) {
                   :aria-checked="craft.stattrak"
                   class="relative h-5 w-9 flex-none rounded-full transition-colors"
                   :class="craft.stattrak ? 'bg-[#e0a92e]' : 'bg-muted'"
-                  @click="craft.stattrak = !craft.stattrak"
+                  @click="setCraftStatTrak(!craft.stattrak)"
                 >
                   <span
                     class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
@@ -11060,6 +11229,42 @@ if (MDEBUG) {
                 <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Kills</span>
                 <span class="font-mono text-f13 tabular-nums text-foreground">{{ craftStatTrakCount().toLocaleString() }}</span>
               </div>
+            </div>
+            <!-- SOUVENIR (cs2-lib 9.10): every painted gun can be one. Its
+                 stickers are an event's — two teams, the event, an autograph
+                 and the map — so switching it on hands the sticker slots to
+                 the panel below, and switching it off clears them. One quality
+                 in game: StatTrak goes off when this goes on, and back. -->
+            <div
+              v-if="craftHasSouvenir"
+              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+              :style="{ '--i': 5 }"
+            >
+              <div class="flex items-center justify-between">
+                <span class="text-f10 uppercase tracking-cs1" :class="craft.souvenir ? 'text-[hsl(var(--tac-souvenir))]' : 'text-muted-foreground'">Souvenir</span>
+                <button
+                  role="switch"
+                  :aria-checked="craft.souvenir"
+                  aria-label="Souvenir"
+                  class="relative h-5 w-9 flex-none rounded-full transition-colors"
+                  :class="craft.souvenir ? 'bg-[hsl(var(--tac-souvenir))]' : 'bg-muted'"
+                  @click="setCraftSouvenir(!craft.souvenir)"
+                >
+                  <span
+                    class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
+                    :class="craft.souvenir && 'translate-x-4'"
+                  ></span>
+                </button>
+              </div>
+              <SouvenirPanel
+                v-if="craft.souvenir"
+                class="mt-2.5"
+                :item-id="craft.skin.id"
+                :sticker-ids="craft.stickers.map((st) => st?.id ?? null)"
+                :highlight-id="craft.charm?.highlight ?? null"
+                @stickers="applySouvenirStickers"
+                @charm="applySouvenirCharm"
+              />
             </div>
             <!-- Music kits: the kit IS its sound, so the editor plays it — the
                  full menu theme and, when the mount has it, the round-MVP
@@ -11262,7 +11467,8 @@ if (MDEBUG) {
         <button
           v-if="ctx && !['agent', 'graffiti', 'musickit', 'collectible', 'pet'].includes(ctx.pos)"
           :class="[MENU_ROW, 'disabled:opacity-40 disabled:hover:bg-transparent']"
-          :disabled="!equippedInstance(ctx.pos)"
+          :disabled="!equippedInstance(ctx.pos) || equippedInstance(ctx.pos)?.souvenir === true"
+          :title="equippedInstance(ctx.pos)?.souvenir ? 'A Souvenir can\'t be StatTrak™' : undefined"
           @click="ctxStatTrak"
         >
           <Sparkles class="h-3.5 w-3.5" /> Toggle StatTrak™
@@ -11560,7 +11766,7 @@ if (MDEBUG) {
           </button>
         </template>
         <button
-          v-if="itemCtx && !['agent', 'graffiti', 'musickit', 'collectible', 'pet'].includes(itemCtx.inst.slot ?? '')"
+          v-if="itemCtx && !itemCtx.inst.souvenir && !['agent', 'graffiti', 'musickit', 'collectible', 'pet'].includes(itemCtx.inst.slot ?? '')"
           :class="MENU_ROW"
           @click="itemCtxStatTrak"
         >

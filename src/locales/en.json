@@ -215,7 +215,8 @@
       "preparing": "preparing"
     },
     "badges": {
-      "stattrak_kills": "StatTrak™ — {kills} kills"
+      "stattrak_kills": "StatTrak™ — {kills} kills",
+      "souvenir": "Souvenir"
     },
     "specs": {
       "nametag": "Name tag",

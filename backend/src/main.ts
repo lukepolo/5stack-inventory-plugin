@@ -136,6 +136,12 @@ import {
   normStickerRotation,
   getRenderTestCatalog,
   stickerMaterialFor,
+  souvenirStickersError,
+  getSouvenirOptions,
+  getCharmHighlights,
+  highlightFor,
+  highlightIndex,
+  highlightIdByName,
 } from "./catalog.ts";
 
 // Per-request in/out logging drowns out everything the app actually says
@@ -859,9 +865,9 @@ async function shareArtFor(facts: ShareFacts | null, version: number): Promise<S
  */
 async function equippedShareFacts(instanceId: number): Promise<ShareFacts | null> {
   const { rows } = await pool.query<{
-    id: string; item_id: number; wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
+    id: string; item_id: number; wear: number | null; seed: number | null; stattrak: boolean; souvenir: boolean; nametag: string | null;
   }>(
-    `SELECT i.id, i.item_id, i.wear, i.seed, i.stattrak, i.nametag
+    `SELECT i.id, i.item_id, i.wear, i.seed, i.stattrak, i.souvenir, i.nametag
        FROM inventory.owned_items i
       WHERE i.id = $1
         AND EXISTS (SELECT 1 FROM inventory.loadout l WHERE l.item_instance_id = i.id)`,
@@ -875,6 +881,7 @@ async function equippedShareFacts(instanceId: number): Promise<ShareFacts | null
         wear: row.wear == null ? null : Number(row.wear),
         seed: row.seed == null ? null : Number(row.seed),
         stattrak: !!row.stattrak,
+        souvenir: !!row.souvenir,
         nametag: row.nametag,
       }
     : null;
@@ -890,13 +897,14 @@ async function loadoutShareFacts(
 ): Promise<ShareFacts | null> {
   const { rows } = await pool.query<{
     team: string; slot: string; id: string | null; item_id: number | null;
-    wear: number | null; seed: number | null; stattrak: boolean | null; nametag: string | null;
+    wear: number | null; seed: number | null; stattrak: boolean | null; souvenir: boolean | null; nametag: string | null;
   }>(
     `SELECT l.team, l.slot, i.id,
             COALESCE(i.item_id, l.item_id) AS item_id,
             COALESCE(i.wear, l.wear) AS wear,
             COALESCE(i.seed, l.seed) AS seed,
             COALESCE(i.stattrak, l.stattrak) AS stattrak,
+            i.souvenir,
             COALESCE(i.nametag, l.nametag) AS nametag
        FROM inventory.loadout l
        LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
@@ -920,6 +928,7 @@ async function loadoutShareFacts(
       wear: r.wear == null ? null : Number(r.wear),
       seed: r.seed == null ? null : Number(r.seed),
       stattrak: !!r.stattrak,
+      souvenir: !!r.souvenir,
       nametag: r.nametag,
     }));
   for (const facts of ordered) {
@@ -1973,6 +1982,23 @@ app.get<{ Querystring: { ids?: string } }>("/api/catalog/items", async (request)
   );
 });
 
+// Souvenir options for one finish: each event it can come from, with the
+// stickers that event's souvenirs carry. Public and pure catalog, like the rest
+// of /api/catalog. A finish that cannot be a souvenir answers an EMPTY list
+// rather than a 404, so the client can cache the answer and keep "failed" (try
+// again) apart from "nothing to offer".
+app.get<{ Params: { id: string } }>("/api/catalog/souvenir/:id", async (request, reply) => {
+  reply.header("Cache-Control", "public, max-age=3600");
+  return getSouvenirOptions(Number(request.params.id)) ?? { sources: [], stickers: {} };
+});
+
+// A highlight-reel charm's highlights (the Austin 2025 charm has 492); [] for
+// any other charm, which is how the editor learns it needs no picker.
+app.get<{ Params: { id: string } }>("/api/catalog/highlights/:id", async (request, reply) => {
+  reply.header("Cache-Control", "public, max-age=3600");
+  return getCharmHighlights(Number(request.params.id)) ?? [];
+});
+
 // ---- Inventory (per-user owned item instances; the loadout is craft-gated) ----
 
 // Sticker/patch slot entries: legacy rows stored plain item ids; newer rows
@@ -2067,7 +2093,11 @@ function normCharmOffset(v: unknown): AttachBody["charm_offset"] {
     o.seed <= CHARM_LIMITS.seedMax
       ? o.seed
       : null;
-  return { x: axis(o.x), y: axis(o.y), z: axis(o.z), seed, inst: normInst(o.inst) };
+  // A highlight charm's highlight, as an economy id. Shape only here — whether
+  // it belongs to THIS charm needs the charm, and highlightFor answers that on
+  // every read (an id that isn't the charm's falls back to its first).
+  const highlight = typeof o.highlight === "number" && Number.isInteger(o.highlight) && o.highlight > 0 ? o.highlight : null;
+  return { x: axis(o.x), y: axis(o.y), z: axis(o.z), seed, inst: normInst(o.inst), highlight };
 }
 function normSpecs(arr: unknown): AttachSpec[] {
   if (!Array.isArray(arr)) return [];
@@ -2121,8 +2151,12 @@ interface ItemRow {
    *  x/y/z rather than taking a column of its own: it is per-attached-charm,
    *  arrives and leaves with the charm, and the game's keychain message carries
    *  it in the same breath as the offsets. */
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; highlight?: number | null } | null;
   patches?: unknown[] | null;
+  /** Souvenir weapon (schema.sql). Never true beside `stattrak`. */
+  souvenir?: boolean;
+  /** A highlight charm crafted on its own: its highlight's economy id. */
+  highlight?: number | null;
   /** A placed Sticker Craft: the slots that move as one (schema.sql, normStickerGroup). */
   sticker_group?: StickerGroup | null;
   /**
@@ -2163,6 +2197,9 @@ function checkAttachments(
   stickers?: unknown[] | null,
   charm_id?: number | null,
   patches?: unknown[] | null,
+  /** The item is (or is being made) a Souvenir: its stickers must then be one
+   *  event's set, which cs2-lib can say exactly — see souvenirStickersError. */
+  souvenir = false,
 ): string | null {
   if (stickers != null) {
     if (!Array.isArray(stickers) || stickers.length > STICKER_LIMITS.maxStickers) {
@@ -2173,6 +2210,10 @@ function checkAttachments(
     }
     const badWear = checkWear(stickers);
     if (badWear) return badWear;
+    if (souvenir && item_id != null) {
+      const bad = souvenirStickersError(item_id, normSpecs(stickers).flatMap((spec) => (spec ? [spec.id] : [])));
+      if (bad) return bad;
+    }
   }
   if (patches != null) {
     // Occupied slots, not array length: a client built before the cap dropped to
@@ -2203,7 +2244,7 @@ function checkAttachments(
   return null;
 }
 /** wear/seed of the owned rows an item's attachments are linked to. */
-type InstFacts = Map<number, { wear: number | null; seed: number | null }>;
+type InstFacts = Map<number, { wear: number | null; seed: number | null; highlight?: number | null }>;
 /**
  * Load the attachment instances a set of item rows point at.
  *
@@ -2215,11 +2256,11 @@ async function instFactsFor(steamId: string, rows: Parameters<typeof referencedI
   if (!ids.length) return new Map();
   // Scoped to the owner: an `inst` is user input, and without this a crafted
   // spec could name someone else's row and read its wear back out.
-  const { rows: found } = await pool.query<{ id: string; wear: number | null; seed: number | null }>(
-    `SELECT id, wear, seed FROM inventory.owned_items WHERE steam_id = $1 AND id = ANY($2::bigint[])`,
+  const { rows: found } = await pool.query<{ id: string; wear: number | null; seed: number | null; highlight: number | null }>(
+    `SELECT id, wear, seed, highlight FROM inventory.owned_items WHERE steam_id = $1 AND id = ANY($2::bigint[])`,
     [steamId, ids],
   );
-  return new Map(found.map((r) => [Number(r.id), { wear: r.wear, seed: r.seed }]));
+  return new Map(found.map((r) => [Number(r.id), { wear: r.wear, seed: r.seed, highlight: r.highlight }]));
 }
 /**
  * Fold each LINKED attachment's own wear/seed back into the spec that names it.
@@ -2247,7 +2288,15 @@ function resolveAttachments<T extends AttachBody>(row: T, insts: InstFacts): T {
     ...row,
     stickers: normSpecs(row.stickers).map(fix),
     patches: normSpecs(row.patches).map(fix),
-    charm_offset: charmOwn ? { ...(row.charm_offset ?? {}), seed: charmOwn.seed ?? null } : row.charm_offset,
+    // A highlight charm's highlight rides the same way as its seed. The blob's
+    // copy only stands when the charm's own row has none (saved before 9.10).
+    charm_offset: charmOwn
+      ? {
+          ...(row.charm_offset ?? {}),
+          seed: charmOwn.seed ?? null,
+          highlight: charmOwn.highlight ?? row.charm_offset?.highlight ?? null,
+        }
+      : row.charm_offset,
   };
 }
 /** Load the links for these rows and dereference them in one step. */
@@ -2310,6 +2359,9 @@ function enrichAttachments<T extends { stickers?: unknown[] | null; charm_id?: n
         ? {
             ...getItem(row.charm_id),
             ...(row.charm_offset ?? {}),
+            // Resolved, so a highlight charm saved before 9.10 still names the
+            // highlight the game and the inspect link will actually get.
+            highlight: highlightFor(row.charm_id, row.charm_offset?.highlight) ?? null,
             inst: normInst(row.charm_offset?.inst) != null ? String(normInst(row.charm_offset?.inst)) : null,
           }
         : null,
@@ -2342,6 +2394,10 @@ function enrichInstance(row: ItemRow, equippedOn: { team: string; slot: string }
     // which is what keeps the count out of renderKeyFor and the card off the
     // re-bake treadmill every time a kill lands.
     stattrak_count: row.stattrak ? row.stattrak_count ?? 0 : 0,
+    souvenir: row.souvenir === true,
+    // A loose highlight charm's highlight, resolved (see highlightFor) so a row
+    // saved before 9.10 still names one. Null on everything else.
+    highlight: highlightFor(row.item_id, row.highlight) ?? null,
     nametag: row.nametag,
     style: row.style ?? null,
     upgrade_level: row.upgrade_level ?? null,
@@ -2364,7 +2420,7 @@ app.get("/api/inventory", async (request, reply) => {
   }
   const [{ rows: items }, { rows: equips }] = await Promise.all([
     pool.query<ItemRow>(
-      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level,
+      `SELECT id, item_id, wear, seed, stattrak, stattrak_count, souvenir, highlight, nametag, style, upgrade_level,
               stickers, charm_id, charm_offset, patches, sticker_group, origin, created_at
        FROM inventory.owned_items WHERE steam_id = $1 ORDER BY id DESC`,
       [identity.steamId],
@@ -2384,7 +2440,7 @@ app.get("/api/inventory", async (request, reply) => {
   // Every row the user owns is already in hand, so the attachment links resolve
   // out of THIS result set — instFactsFor's query is for the endpoints that
   // only have one row.
-  const insts: InstFacts = new Map(items.map((r) => [Number(r.id), { wear: r.wear, seed: r.seed }]));
+  const insts: InstFacts = new Map(items.map((r) => [Number(r.id), { wear: r.wear, seed: r.seed, highlight: r.highlight ?? null }]));
   const resolved = items.map((r) => resolveAttachments(r, insts));
   // Which weapon each attachment instance is currently on. Derived rather than
   // stored: the weapon's spec list is the single record of what is applied, and
@@ -2402,6 +2458,8 @@ app.get("/api/inventory", async (request, reply) => {
   // its own after a sync, a craft, or the switch being turned on.
   return resolved.map((row) => ({
     ...enrichAttachments(row),
+    souvenir: row.souvenir === true,
+    highlight: highlightFor(row.item_id, row.highlight) ?? null,
     card_look: cardLook(row),
     slot: slotForItem(row.item_id),
     item: getItem(row.item_id),
@@ -2417,7 +2475,10 @@ type AttachBody = {
   stickers?: unknown[] | null;
   patches?: unknown[] | null;
   charm_id?: number | null;
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: number | null } | null;
+  charm_offset?: {
+    x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: number | null;
+    highlight?: number | null;
+  } | null;
 };
 /**
  * Turn attachment specs into OWNED attachments, and take them off whatever else
@@ -2443,7 +2504,15 @@ type AttachBody = {
  * catalog ids straight to the column, so routing it through here would mint a
  * fresh sticker instance on every re-sync.
  */
-async function linkAttachments(steamId: string, body: AttachBody, selfId: number | null): Promise<AttachBody> {
+async function linkAttachments(
+  steamId: string,
+  body: AttachBody,
+  selfId: number | null,
+  /** A souvenir's stickers are the EVENT's, not things the user owns: they are
+   *  stored as plain specs, never minted, and never taken off another gun. The
+   *  same shape the Steam sync writes, for the same reason. */
+  opts: { souvenir?: boolean } = {},
+): Promise<AttachBody> {
   const stickers = normSpecs(body.stickers);
   const patches = normSpecs(body.patches).slice(0, STICKER_LIMITS.maxPatches);
   const charmId = body.charm_id ?? null;
@@ -2454,7 +2523,7 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
   // through to minting rather than erroring — the attachment is still valid,
   // it just isn't the instance it said it was.
   const claimed = [
-    ...stickers.map((s) => s?.inst ?? null),
+    ...(opts.souvenir ? [] : stickers.map((s) => s?.inst ?? null)),
     ...patches.map((s) => s?.inst ?? null),
     normInst(charmOffset?.inst),
   ].filter((v): v is number => v != null);
@@ -2475,7 +2544,14 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
   // through to minting, which is what a second copy of a sticker is.
   const taken = new Set<number>();
   /** Resolve one spec to an owned instance, minting if it hasn't got one. */
-  const link = async (itemId: number, w: number | null, seedFor: number | null, inst: number | null) => {
+  const link = async (
+    itemId: number,
+    w: number | null,
+    seedFor: number | null,
+    inst: number | null,
+    /** A highlight charm's highlight — its own row is where it lives, like the seed. */
+    highlight: number | null = null,
+  ) => {
     if (inst != null && valid.get(inst) === itemId && !taken.has(inst)) {
       taken.add(inst);
       // The attachment's OWN row is what read time dereferences — see
@@ -2489,20 +2565,20 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
       // kind has (a sticker has no pattern, a patch has neither), and a null
       // there means "this spec has nothing to say about it" rather than
       // "clear it".
-      if (w != null || seedFor != null) {
+      if (w != null || seedFor != null || highlight != null) {
         await pool.query(
           `UPDATE inventory.owned_items
-              SET wear = COALESCE($3, wear), seed = COALESCE($4, seed)
+              SET wear = COALESCE($3, wear), seed = COALESCE($4, seed), highlight = COALESCE($5, highlight)
             WHERE id = $1 AND steam_id = $2`,
-          [inst, steamId, w, seedFor],
+          [inst, steamId, w, seedFor, highlight],
         );
       }
       return inst;
     }
     const { rows } = await pool.query<{ id: string }>(
-      `INSERT INTO inventory.owned_items (steam_id, item_id, wear, seed, origin)
-       VALUES ($1,$2,$3,$4,'crafted') RETURNING id`,
-      [steamId, itemId, w, seedFor],
+      `INSERT INTO inventory.owned_items (steam_id, item_id, wear, seed, highlight, origin)
+       VALUES ($1,$2,$3,$4,$5,'crafted') RETURNING id`,
+      [steamId, itemId, w, seedFor, highlight],
     );
     const id = Number(rows[0].id);
     minted.push(id);
@@ -2512,7 +2588,8 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
 
   const outStickers: AttachSpec[] = [];
   for (const s of stickers) {
-    outStickers.push(s ? { ...s, inst: await link(s.id, s.w ?? null, null, s.inst ?? null) } : null);
+    if (opts.souvenir) outStickers.push(s ? { ...s, inst: null } : null);
+    else outStickers.push(s ? { ...s, inst: await link(s.id, s.w ?? null, null, s.inst ?? null) } : null);
   }
   const outPatches: AttachSpec[] = [];
   for (const p of patches) {
@@ -2520,8 +2597,13 @@ async function linkAttachments(steamId: string, body: AttachBody, selfId: number
   }
   let outCharm = charmOffset;
   if (charmId != null) {
-    const inst = await link(charmId, null, charmOffset?.seed ?? null, normInst(charmOffset?.inst));
-    outCharm = { ...(charmOffset ?? {}), inst };
+    // Only a highlight the charm really has is kept; anything else is dropped
+    // here and the readers' fallback (highlightFor) answers instead.
+    const highlight = charmOffset?.highlight != null && highlightFor(charmId, charmOffset.highlight) === charmOffset.highlight
+      ? charmOffset.highlight
+      : null;
+    const inst = await link(charmId, null, charmOffset?.seed ?? null, normInst(charmOffset?.inst), highlight);
+    outCharm = { ...(charmOffset ?? {}), highlight, inst };
   }
 
   const used = [
@@ -2586,40 +2668,60 @@ async function detachElsewhere(steamId: string, insts: number[], keepRowId: numb
   }
 }
 
+/** What a craft or an edit answers with: the row as /api/inventory shows it.
+ *  `souvenir` and `highlight` go on LAST — enrichAttachments spreads the raw row,
+ *  and its stored highlight (null on a pre-9.10 charm) must not win over the
+ *  resolved one. */
+async function instanceResponse(steamId: string, row: ItemRow) {
+  const resolved = (await withAttachments(steamId, [row]))[0];
+  return {
+    ...enrichInstance(row, []),
+    ...enrichAttachments(resolved),
+    card_look: cardLook(resolved),
+    souvenir: row.souvenir === true,
+    highlight: highlightFor(row.item_id, row.highlight) ?? null,
+  };
+}
+
 app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
-  const { item_id, wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group } =
-    request.body;
+  const {
+    item_id, wear, seed, stattrak, souvenir, highlight, nametag, style, upgrade_level,
+    stickers, charm_id, charm_offset, patches, sticker_group,
+  } = request.body;
   if (typeof item_id !== "number" || !getItem(item_id)) {
     return reply.status(400).send({ error: "That item doesn't exist." });
   }
   if (!isOwnable(item_id)) {
     return reply.status(400).send({ error: "That item can't be owned." });
   }
-  const attachErr = checkAttachments(item_id, stickers, charm_id, patches);
-  if (attachErr) {
-    return reply.status(400).send({ error: attachErr });
-  }
   // Scalars were going into the column unchecked and straight on into the feed
   // the CS2 server applies. cs2-lib knows each item's real float range, pattern
   // range and whether it can be StatTrak'd at all — see validateCraftAttrs.
-  const checked = validateCraftAttrs(item_id, { wear, seed, stattrak, nametag, style, upgrade_level });
+  const checked = validateCraftAttrs(item_id, { wear, seed, stattrak, souvenir, highlight, nametag, style, upgrade_level });
   if ("error" in checked) {
     return reply.status(400).send({ error: checked.error });
+  }
+  const attachErr = checkAttachments(item_id, stickers, charm_id, patches, checked.clean.souvenir === true);
+  if (attachErr) {
+    return reply.status(400).send({ error: attachErr });
   }
   // Mint the attachments into the inventory and take them off anything else
   // wearing them, BEFORE the weapon row is written — the specs it stores are
   // the linked ones. selfId null: this row doesn't exist yet, so there is
   // nothing of its own to preserve.
-  const linked = await linkAttachments(identity.steamId, { stickers, patches, charm_id, charm_offset }, null);
+  const linked = await linkAttachments(identity.steamId, { stickers, patches, charm_id, charm_offset }, null, {
+    souvenir: checked.clean.souvenir === true,
+  });
   const { rows } = await pool.query<ItemRow>(
     `INSERT INTO inventory.owned_items
-       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level, sticker_group)
-     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12,$13::jsonb)
-     RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group`,
+       (steam_id, item_id, wear, seed, stattrak, nametag, stickers, charm_id, charm_offset, patches, style, upgrade_level,
+        sticker_group, souvenir, highlight)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb,$11,$12,$13::jsonb,$14,$15)
+     RETURNING id, item_id, wear, seed, stattrak, stattrak_count, souvenir, highlight, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group`,
     [
       identity.steamId, item_id,
       checked.clean.wear ?? null, checked.clean.seed ?? null,
@@ -2629,12 +2731,10 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inventory/craft", async (request, rep
       normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
       checked.clean.style ?? null, checked.clean.upgrade_level ?? null,
       stickerGroupJson(sticker_group, linked.stickers),
+      checked.clean.souvenir === true, checked.clean.highlight ?? null,
     ],
   );
-  return {
-    ...enrichInstance(rows[0], []),
-    ...((r) => ({ ...enrichAttachments(r), card_look: cardLook(r) }))((await withAttachments(identity.steamId, [rows[0]]))[0]),
-  };
+  return instanceResponse(identity.steamId, rows[0]);
 });
 
 // Update a crafted instance (StatTrak / wear / pattern / nametag). Reflects
@@ -2649,8 +2749,10 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
     // Imported items mirror a real Steam inventory — read-only by design.
     // `item_id` comes back too: the body doesn't carry it on an edit, and the
     // attachment rules need to know WHAT is being attached to.
-    const chk = await pool.query<{ origin: string | null; item_id: number }>(
-      `SELECT origin, item_id FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
+    const chk = await pool.query<{
+      origin: string | null; item_id: number; souvenir: boolean; stattrak: boolean; stickers: unknown[] | null;
+    }>(
+      `SELECT origin, item_id, souvenir, stattrak, stickers FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
       [Number(request.params.id), identity.steamId],
     );
     // Existence is settled HERE, before anything is written. linkAttachments
@@ -2663,19 +2765,37 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
       return reply.status(400).send({ error: "Imported items are read-only — duplicate them to edit." });
     }
     const id = Number(request.params.id);
-    const { wear, seed, stattrak, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group } =
-      request.body;
-    const attachErr = checkAttachments(chk.rows[0].item_id, stickers, charm_id, patches);
-    if (attachErr) {
-      return reply.status(400).send({ error: attachErr });
-    }
+    const {
+      wear, seed, stattrak, souvenir, highlight, nametag, style, upgrade_level,
+      stickers, charm_id, charm_offset, patches, sticker_group,
+    } = request.body;
+    const stored = chk.rows[0];
     // Same per-item check the craft path does. It matters MORE here: an edit is
     // where a float gets dragged, and the row it writes is already equipped, so
     // an impossible value reaches the game server on the next poll rather than
     // waiting to be equipped.
-    const checked = validateCraftAttrs(chk.rows[0].item_id, { wear, seed, stattrak, nametag, style, upgrade_level });
+    const checked = validateCraftAttrs(stored.item_id, { wear, seed, stattrak, souvenir, highlight, nametag, style, upgrade_level });
     if ("error" in checked) {
       return reply.status(400).send({ error: checked.error });
+    }
+    // Souvenir and StatTrak as they will STAND after this write: a key the
+    // request leaves out keeps the row's value (the COALESCE below), so the
+    // context menu's lone `{ stattrak: true }` on a souvenir is caught here,
+    // not written as an item the game cannot have.
+    const willSouvenir = checked.clean.souvenir ?? stored.souvenir;
+    if (willSouvenir && (checked.clean.stattrak ?? stored.stattrak)) {
+      return reply.status(400).send({ error: "A Souvenir can't also be StatTrak™ — turn one off first." });
+    }
+    const attachErr = checkAttachments(stored.item_id, stickers, charm_id, patches, willSouvenir);
+    if (attachErr) {
+      return reply.status(400).send({ error: attachErr });
+    }
+    // Made a souvenir WITHOUT sending stickers: the ones already on it have to
+    // pass as the event's set, or the gun would carry someone's Crown as a
+    // souvenir sticker.
+    if (willSouvenir && !stored.souvenir && stickers === undefined) {
+      const bad = souvenirStickersError(stored.item_id, normSpecs(stored.stickers).flatMap((spec) => (spec ? [spec.id] : [])));
+      if (bad) return reply.status(400).send({ error: bad });
     }
     const hasStickers = stickers !== undefined;
     const hasCharm = charm_id !== undefined;
@@ -2694,6 +2814,7 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
       // Keep THIS row's own links: an edit that only moves a sticker must not
       // read as "applied elsewhere" and strip the gun it is already on.
       id,
+      { souvenir: willSouvenir },
     );
     const { rows } = await pool.query<ItemRow>(
       `UPDATE inventory.owned_items SET
@@ -2709,9 +2830,11 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
          -- CASE, not COALESCE: null is a real answer for these two ("back to the
          -- stock look"), so only a key the request never sent leaves them alone.
          style = CASE WHEN $14 THEN $15::integer ELSE style END,
-         upgrade_level = CASE WHEN $16 THEN $17::integer ELSE upgrade_level END
+         upgrade_level = CASE WHEN $16 THEN $17::integer ELSE upgrade_level END,
+         souvenir = COALESCE($19, souvenir),
+         highlight = COALESCE($20, highlight)
        WHERE id = $1 AND steam_id = $2
-       RETURNING id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group`,
+       RETURNING id, item_id, wear, seed, stattrak, stattrak_count, souvenir, highlight, nametag, style, upgrade_level, stickers, charm_id, charm_offset, patches, sticker_group`,
       [
         // `?? null` keeps the COALESCE contract: a key validateCraftAttrs left
         // unset is one the request never sent, and null means "leave it alone".
@@ -2725,15 +2848,13 @@ app.post<{ Params: { id: string }; Body: Partial<ItemRow> }>(
         "style" in checked.clean, checked.clean.style ?? null,
         "upgrade_level" in checked.clean, checked.clean.upgrade_level ?? null,
         hasStickers ? stickerGroupJson(sticker_group, linked.stickers) : null,
+        checked.clean.souvenir ?? null, checked.clean.highlight ?? null,
       ],
     );
     if (!rows.length) {
       return reply.status(404).send({ error: "That item isn't in your inventory." });
     }
-    return {
-      ...enrichInstance(rows[0], []),
-      ...((r) => ({ ...enrichAttachments(r), card_look: cardLook(r) }))((await withAttachments(identity.steamId, [rows[0]]))[0]),
-    };
+    return instanceResponse(identity.steamId, rows[0]);
   },
 );
 
@@ -2752,13 +2873,16 @@ function inspectLinkFor(
     seed?: number | null;
     stattrak?: boolean;
     stattrak_count?: number | null;
+    souvenir?: boolean | null;
+    /** A loose highlight charm's own highlight. */
+    highlight?: number | null;
     nametag?: string | null;
     stickers?: unknown[] | null;
     patches?: unknown[] | null;
     charm_id?: number | null;
     // seed included, or "Inspect in game" on an UNSAVED craft would drop the
     // charm pattern the user just set and show 0.
-    charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+    charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; highlight?: number | null } | null;
     style?: number | null;
     upgrade_level?: number | null;
   },
@@ -2770,7 +2894,13 @@ function inspectLinkFor(
     id: itemId,
     wear: row.wear ?? undefined,
     seed: row.seed ?? undefined,
-    statTrak: row.stattrak ? clampCount(row.stattrak_count) : undefined,
+    // A souvenir is quality 12 on the preview (cs2-lib-inspect 9.6). Never
+    // both: cs2-lib's repair drops the souvenir flag beside a StatTrak count.
+    statTrak: row.stattrak && !row.souvenir ? clampCount(row.stattrak_count) : undefined,
+    souvenir: row.souvenir ? true : undefined,
+    // Required on a highlight charm by cs2-lib 9.10, which drops the item
+    // without one — highlightFor supplies the charm's first for old rows.
+    highlight: highlightFor(itemId, row.highlight),
     nameTag: row.nametag || undefined,
     style: row.style ?? undefined,
     upgradeLevel: row.upgrade_level ?? undefined,
@@ -2807,13 +2937,17 @@ function inspectLinkFor(
     // charm's own economy entry — the same `displayedSticker` the equipped feed
     // sends as `keychains[].sticker`, so the slab you inspect is the slab the
     // server puts on the gun.
+    // A highlight charm has no pattern of its own (cs2-lib 9.10's hasSeed is
+    // false for it) and must name its highlight, or repair takes it off the gun.
+    const highlight = highlightFor(row.charm_id, charmOffset?.highlight);
     base.keychains = {
       0: {
         id: row.charm_id,
         x: charmOffset?.x ?? undefined,
         y: charmOffset?.y ?? undefined,
         z: charmOffset?.z ?? undefined,
-        seed: charmOffset?.seed ?? CHARM_LIMITS.seedMin,
+        seed: highlight != null ? undefined : charmOffset?.seed ?? CHARM_LIMITS.seedMin,
+        highlight,
       },
     };
   }
@@ -2836,7 +2970,7 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inspect/preview", async (request, rep
   if (typeof b.item_id !== "number") {
     return reply.status(400).send({ error: "Nothing to inspect yet." });
   }
-  const attachErr = checkAttachments(b.item_id, b.stickers, b.charm_id, b.patches);
+  const attachErr = checkAttachments(b.item_id, b.stickers, b.charm_id, b.patches, b.souvenir === true);
   if (attachErr) {
     return reply.status(400).send({ error: attachErr });
   }
@@ -2844,6 +2978,8 @@ app.post<{ Body: Partial<ItemRow> }>("/api/inspect/preview", async (request, rep
     wear: b.wear,
     seed: b.seed,
     stattrak: b.stattrak,
+    souvenir: b.souvenir,
+    highlight: b.highlight,
     // The count comes from the client here because a draft has no row to read
     // it off — clamped to what the protobuf field can hold, since it goes out
     // as a uint32 varint and a negative or fractional one writes garbage.
@@ -2870,7 +3006,7 @@ app.get<{ Params: { id: string } }>("/api/inventory/:id/inspect", async (request
     return reply.status(401).send({ error: "unauthorized" });
   }
   const { rows } = await pool.query<ItemRow & { stattrak_count: number | null }>(
-    `SELECT id, item_id, wear, seed, stattrak, stattrak_count, nametag, style, upgrade_level, stickers,
+    `SELECT id, item_id, wear, seed, stattrak, stattrak_count, souvenir, highlight, nametag, style, upgrade_level, stickers,
             charm_id, charm_offset, patches
      FROM inventory.owned_items WHERE id = $1 AND steam_id = $2`,
     [Number(request.params.id), identity.steamId],
@@ -3417,6 +3553,7 @@ app.get("/api/loadout", async (request, reply) => {
     seed: number | null;
     stattrak: boolean;
     stattrak_count: number;
+    souvenir: boolean;
     nametag: string | null;
     style: number | null;
     upgrade_level: number | null;
@@ -3430,6 +3567,7 @@ app.get("/api/loadout", async (request, reply) => {
        -- Only owned instances carry a count; loadout defaults have no such
        -- column, so an unskinned StatTrak default reads 0.
        COALESCE(i.stattrak_count, 0)    AS stattrak_count,
+       COALESCE(i.souvenir, false)      AS souvenir,
        COALESCE(i.nametag, l.nametag)   AS nametag,
        -- Pets only, and only on instances: a loadout row has no such columns.
        i.style, i.upgrade_level
@@ -4136,7 +4274,7 @@ app.get<{ Params: { steamId: string }; Querystring: { preset?: string } }>(
   }
   const { rows } = await pool.query<{
     team: string; slot: string; item_id: number | null; skinned: boolean;
-    wear: number | null; seed: number | null; stattrak: boolean; stattrak_count: number;
+    wear: number | null; seed: number | null; stattrak: boolean; stattrak_count: number; souvenir: boolean;
     nametag: string | null; style: number | null; upgrade_level: number | null;
     stickers: unknown[] | null; patches: unknown[] | null;
     charm_id: number | null; charm_offset: ItemRow["charm_offset"];
@@ -4148,6 +4286,7 @@ app.get<{ Params: { steamId: string }; Querystring: { preset?: string } }>(
        COALESCE(i.stattrak, l.stattrak) AS stattrak,
        -- Same as /api/loadout: only owned instances carry a count.
        COALESCE(i.stattrak_count, 0) AS stattrak_count,
+       COALESCE(i.souvenir, false) AS souvenir,
        COALESCE(i.nametag, l.nametag) AS nametag,
        i.style, i.upgrade_level,
        -- Attachments are i.* with no COALESCE: inventory.loadout has no columns
@@ -4208,12 +4347,12 @@ app.post<{ Params: { steamId: string } }>(
     const { rows } = await pool.query<{
       team: string; slot: string; base_item_id: number | null; item_id: number | null;
       wear: number | null; seed: number | null; stattrak: boolean; nametag: string | null;
-      style: number | null; upgrade_level: number | null;
+      style: number | null; upgrade_level: number | null; souvenir: boolean | null; highlight: number | null;
       stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
       charm_offset: AttachBody["charm_offset"];
     }>(
       `SELECT l.team, l.slot, l.item_id AS base_item_id, i.item_id, i.wear, i.seed,
-              i.stattrak, i.nametag, i.style, i.upgrade_level,
+              i.stattrak, i.nametag, i.style, i.upgrade_level, i.souvenir, i.highlight,
               i.stickers, i.patches, i.charm_id, i.charm_offset
        FROM inventory.loadout l
        LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
@@ -4264,19 +4403,22 @@ app.post<{ Params: { steamId: string } }>(
             charm_offset: row.charm_offset,
           },
           null,
+          // A souvenir's stickers come along as the event's, not as stickers
+          // minted into the new owner's inventory.
+          { souvenir: row.souvenir === true },
         );
         const { rows: inserted } = await pool.query<{ id: string }>(
           `INSERT INTO inventory.owned_items
              (steam_id, item_id, wear, seed, stattrak, nametag, stickers, patches, charm_id, charm_offset,
-              style, upgrade_level, origin)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10::jsonb,$11,$12,'copied') RETURNING id`,
+              style, upgrade_level, souvenir, highlight, origin)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10::jsonb,$11,$12,$13,$14,'copied') RETURNING id`,
           [
             identity.steamId, row.item_id, row.wear, row.seed, row.stattrak, row.nametag,
             normSpecs(linked.stickers).some(Boolean) ? JSON.stringify(normSpecs(linked.stickers)) : null,
             normSpecs(linked.patches).some(Boolean) ? JSON.stringify(normSpecs(linked.patches)) : null,
             row.charm_id,
             linked.charm_offset ? JSON.stringify(linked.charm_offset) : null,
-            row.style, row.upgrade_level,
+            row.style, row.upgrade_level, row.souvenir === true, row.highlight,
           ],
         );
         await pool.query(
@@ -4358,6 +4500,29 @@ function attachmentIds(
   return [];
 }
 
+/**
+ * The highlight on a gun's highlight charm. The "Charm:" line names it after
+ * the charm family ("Austin 2025 Highlight | flameZ Double Dust II Kill"), which
+ * attachmentIds trims down to the family; the trimmed part is the highlight.
+ */
+function charmHighlightOf(desc: SteamDescription | undefined, charmId: number | null): number | null {
+  if (charmId == null) return null;
+  for (const d of desc?.descriptions ?? []) {
+    const text = String(d.value ?? "")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]*>/g, " ");
+    const line = text.match(/Charm:\s*([^\n]+)/)?.[1];
+    if (!line) continue;
+    const parts = line.split(",")[0].trim().split(" | ");
+    for (let start = 1; start < parts.length; start++) {
+      const hit = highlightIdByName(charmId, parts.slice(start).join(" | "));
+      if (hit != null) return hit;
+    }
+    return null;
+  }
+  return null;
+}
+
 function nametagOf(desc: SteamDescription | undefined): string | null {
   for (const w of desc?.fraudwarnings ?? []) {
     const m = String(w).match(/Name Tag:\s*''(.*)''\s*$/);
@@ -4423,7 +4588,7 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     // ★ / StatTrak™ / Souvenir / the wear bracket all come off in there — see
     // parseSteamMarketName for what each decoration means and why only two of
     // them are kept.
-    const { itemId, name, stattrak, wearTier } = parseSteamMarketName(marketName);
+    const { itemId, name, stattrak, souvenir: souvenirName, wearTier, highlight } = parseSteamMarketName(marketName);
     // `isOwnable`, not `slotForItem`: the old gate was "can it go in a loadout
     // slot", which answers no for a loose sticker or charm — so a player with a
     // drawer full of Katowice Crowns imported none of them and the picker's
@@ -4452,6 +4617,10 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     const stickers = attachmentIds(desc, "Sticker", "Sticker", unresolved);
     const patches = attachmentIds(desc, "Patch", "Patch", unresolved);
     const charmId = attachmentIds(desc, "Charm", "Charm", unresolved)[0] ?? null;
+    const charmHighlight = charmHighlightOf(desc, charmId);
+    // Only a finish that can BE a souvenir keeps the flag: "Souvenir Charm | …"
+    // is how Steam names a loose highlight charm, which is no souvenir weapon.
+    const souvenir = souvenirName && getItem(itemId)?.hasSouvenir === true;
     // Re-sync mutable state (stickers scraped/added, charm swapped, item
     // renamed) onto the existing row: the id stays put, so anything equipped
     // in the loadout stays equipped. charm_offset is the user's own placement
@@ -4465,10 +4634,13 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
     // ever changes, this line has to merge instead of replace, or every re-sync
     // will unlink a player's whole imported collection and mint it again.
     const { rows } = await pool.query<{ inserted: boolean }>(
+      // The attached charm's highlight goes into charm_offset beside the user's
+      // own placement, merged rather than replacing it (see the note above).
       `INSERT INTO inventory.owned_items
          (steam_id, item_id, wear, seed, stattrak, origin, steam_asset_id,
-          stickers, charm_id, patches, nametag)
-       VALUES ($1,$2,$3,$4,$5,'steam',$6,$7,$8,$9,$10)
+          stickers, charm_id, patches, nametag, souvenir, highlight, charm_offset)
+       VALUES ($1,$2,$3,$4,$5,'steam',$6,$7,$8,$9,$10,$11,$12,
+               CASE WHEN $13::integer IS NULL THEN NULL ELSE jsonb_build_object('highlight', $13::integer) END)
        ON CONFLICT (steam_id, steam_asset_id) WHERE steam_asset_id IS NOT NULL
        DO UPDATE SET
          item_id = EXCLUDED.item_id,
@@ -4478,7 +4650,11 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
          stickers = EXCLUDED.stickers,
          charm_id = EXCLUDED.charm_id,
          patches = EXCLUDED.patches,
-         nametag = EXCLUDED.nametag
+         nametag = EXCLUDED.nametag,
+         souvenir = EXCLUDED.souvenir,
+         highlight = EXCLUDED.highlight,
+         charm_offset = CASE WHEN $13::integer IS NULL THEN owned_items.charm_offset
+                             ELSE COALESCE(owned_items.charm_offset, '{}'::jsonb) || jsonb_build_object('highlight', $13::integer) END
        WHERE owned_items.item_id IS DISTINCT FROM EXCLUDED.item_id
           OR owned_items.wear IS DISTINCT FROM EXCLUDED.wear
           OR owned_items.seed IS DISTINCT FROM EXCLUDED.seed
@@ -4487,6 +4663,9 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
           OR owned_items.charm_id IS DISTINCT FROM EXCLUDED.charm_id
           OR owned_items.patches IS DISTINCT FROM EXCLUDED.patches
           OR owned_items.nametag IS DISTINCT FROM EXCLUDED.nametag
+          OR owned_items.souvenir IS DISTINCT FROM EXCLUDED.souvenir
+          OR owned_items.highlight IS DISTINCT FROM EXCLUDED.highlight
+          OR (owned_items.charm_offset->>'highlight')::integer IS DISTINCT FROM $13::integer
        RETURNING (xmax = 0) AS inserted`,
       [
         identity.steamId, itemId,
@@ -4497,6 +4676,7 @@ app.post("/api/inventory/import-steam", async (request, reply) => {
         charmId,
         patches.some((p) => p != null) ? JSON.stringify(patches) : null,
         nametagOf(desc),
+        souvenir, highlight ?? null, charmHighlight,
       ],
     );
     // No row back means the DO UPDATE's WHERE filtered it out — already in sync.
@@ -4667,6 +4847,9 @@ interface PriceTarget {
   itemId: number;
   wear: number | null;
   stattrak: boolean;
+  /** Asks for the Souvenir listing — and ONLY that: a souvenir is never priced
+   *  off the plain finish, which can be a fraction (or a multiple) of it. */
+  souvenir?: boolean;
 }
 
 /**
@@ -4701,10 +4884,10 @@ interface PriceTarget {
  *  0.07000000029802322, so the caller keys it as Factory New while the row would
  *  key as Minimal Wear, the get() misses, and a tile renders "no listing" for an
  *  item the query actually priced. */
-const boundTargetKey = (itemId: number, wear: number | null, stattrak: boolean) =>
-  `${itemId}:${stattrak ? 1 : 0}:${wear == null ? "-" : Math.fround(wear)}`;
+const boundTargetKey = (itemId: number, wear: number | null, stattrak: boolean, souvenir = false) =>
+  `${itemId}:${stattrak ? 1 : 0}:${souvenir ? 1 : 0}:${wear == null ? "-" : Math.fround(wear)}`;
 
-/** Targets per statement. Each costs three bind parameters and Postgres stops
+/** Targets per statement. Each costs four bind parameters and Postgres stops
  *  at 65535 of them, so a large enough set of distinct items turned the whole
  *  price overlay into a `bind message supplies N parameters` 500 rather than
  *  degrading. Chunked here rather than capped at the call sites: this is the
@@ -4715,7 +4898,7 @@ const PRICE_LOOKUP_CHUNK = 2_000;
 async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promise<Map<string, PricePoint>> {
   const unique = new Map<string, PriceTarget>();
   for (const target of targets) {
-    unique.set(priceTargetKey(target.itemId, target.wear, target.stattrak), target);
+    unique.set(priceTargetKey(target.itemId, target.wear, target.stattrak, target.souvenir === true), target);
   }
   const found = new Map<string, PricePoint>();
   if (unique.size === 0) return found;
@@ -4725,7 +4908,7 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
   // one question, asked once and answered once.
   const byBound = new Map<string, [string, PriceTarget]>();
   for (const entry of unique) {
-    byBound.set(boundTargetKey(entry[1].itemId, entry[1].wear, entry[1].stattrak), entry);
+    byBound.set(boundTargetKey(entry[1].itemId, entry[1].wear, entry[1].stattrak, entry[1].souvenir === true), entry);
   }
   const asked = [...unique.values()];
   for (let i = 0; i < asked.length; i += PRICE_LOOKUP_CHUNK) {
@@ -4733,15 +4916,16 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
     const values: unknown[] = [];
     const tuples = chunk
       .map((target, n) => {
-        values.push(target.itemId, target.wear, target.stattrak);
-        const b = n * 3;
-        return `($${b + 1}::int, $${b + 2}::real, $${b + 3}::boolean)`;
+        values.push(target.itemId, target.wear, target.stattrak, target.souvenir === true);
+        const b = n * 4;
+        return `($${b + 1}::int, $${b + 2}::real, $${b + 3}::boolean, $${b + 4}::boolean)`;
       })
       .join(",");
     const { rows } = await pool.query<{
       item_id: number;
       wear: number | null;
       stattrak_asked: boolean;
+      souvenir_asked: boolean;
       market_hash_name: string;
       wear_tier: number;
       stattrak: boolean;
@@ -4753,10 +4937,10 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
       median: number | null;
       lowest: number | null;
     }>(
-      `SELECT v.item_id, v.wear, v.stattrak AS stattrak_asked,
+      `SELECT v.item_id, v.wear, v.stattrak AS stattrak_asked, v.souvenir AS souvenir_asked,
               p.market_hash_name, p.wear_tier, p.stattrak, p.last_24h, p.last_7d, p.last_30d,
               p.last_90d, p.suggested, p.median, p.lowest
-         FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak)
+         FROM (VALUES ${tuples}) AS v(item_id, wear, stattrak, souvenir)
          LEFT JOIN inventory.price_aliases a ON a.item_id = v.item_id
          -- Two candidate rows, and the ORDER BY is the whole point: the item's OWN
          -- id first, the name-collapsed one only as a fallback. A source that
@@ -4775,9 +4959,10 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
               -- very much has a float. Asking only for the float's bracket missed
               -- every one of them — 22 melee items, and the most valuable things
               -- most inventories hold.
-              -- Nothing here mints souvenirs. The column exists so a Souvenir AWP's
-              -- price is never filed on the plain one; this side just never asks.
-              AND pr.souvenir = false
+              -- A filter, not a preference: a Souvenir AWP and a plain one are
+              -- different markets, and substituting one for the other would be a
+              -- price off by any factor at all. No souvenir listing, no price.
+              AND pr.souvenir = v.souvenir
             -- Preference, not filter. Markets do not carry every variant: StatTrak
             -- exists for a fraction of finishes and trades thinly, and the ends of
             -- the wear range are often unlisted — so a Battle-Scarred StatTrak
@@ -4823,7 +5008,7 @@ async function lookupPrices(targets: PriceTarget[], window: PriceWindow): Promis
       // present as exact.
       // The target this row answers, looked up by the value that was BOUND
       // rather than re-derived from the float that came back.
-      const target = byBound.get(boundTargetKey(row.item_id, row.wear, row.stattrak_asked));
+      const target = byBound.get(boundTargetKey(row.item_id, row.wear, row.stattrak_asked, row.souvenir_asked));
       if (!target) continue;
       const askedTier = wearTierIndex(wearTierOf(target[1].wear));
       if (row.wear_tier !== askedTier || row.stattrak !== row.stattrak_asked) {
@@ -4849,7 +5034,10 @@ async function priceListingCount(): Promise<number> {
  *  attachments as the same jsonb specs, so both go through normSpecs. One query
  *  for the weapon and everything on it. */
 async function quoteFor(
-  row: { item_id: number; wear?: number | null; stattrak?: boolean | null; stickers?: unknown[] | null; patches?: unknown[] | null; charm_id?: number | null },
+  row: {
+    item_id: number; wear?: number | null; stattrak?: boolean | null; souvenir?: boolean | null;
+    stickers?: unknown[] | null; patches?: unknown[] | null; charm_id?: number | null;
+  },
   window: PriceWindow,
 ): Promise<Quote> {
   const ids = (arr: unknown) => normSpecs(arr).map((spec) => (spec ? { id: spec.id } : null));
@@ -4857,12 +5045,13 @@ async function quoteFor(
     itemId: row.item_id,
     wear: row.wear ?? null,
     stattrak: row.stattrak === true,
+    souvenir: row.souvenir === true,
     stickers: ids(row.stickers),
     patches: ids(row.patches),
     charmId: row.charm_id ?? null,
   };
   // Attachments price at their bare name: no float, no StatTrak.
-  const targets: PriceTarget[] = [{ itemId: spec.itemId, wear: spec.wear, stattrak: spec.stattrak }];
+  const targets: PriceTarget[] = [{ itemId: spec.itemId, wear: spec.wear, stattrak: spec.stattrak, souvenir: spec.souvenir }];
   for (const attachment of [...(spec.stickers ?? []), ...(spec.patches ?? [])]) {
     if (attachment) targets.push({ itemId: attachment.id, wear: null, stattrak: false });
   }
@@ -4870,7 +5059,7 @@ async function quoteFor(
   const prices = await lookupPrices(targets, window);
   return quoteItem(
     spec,
-    (id, wear, stattrak) => prices.get(priceTargetKey(id, wear, stattrak)) ?? null,
+    (id, wear, stattrak, souvenir) => prices.get(priceTargetKey(id, wear, stattrak, souvenir)) ?? null,
     itemNameOf,
   );
 }
@@ -5083,8 +5272,8 @@ app.get("/api/inventory/prices", async (request, reply) => {
   const { enabled, window } = await priceSettings();
   if (!enabled) return { ready: false, window, items: {}, slots: {} };
   const [{ rows: owned }, { rows: equipped }] = await Promise.all([
-    pool.query<{ id: string; item_id: number; wear: number | null; stattrak: boolean }>(
-      `SELECT id, item_id, wear, stattrak FROM inventory.owned_items WHERE steam_id = $1`,
+    pool.query<{ id: string; item_id: number; wear: number | null; stattrak: boolean; souvenir: boolean }>(
+      `SELECT id, item_id, wear, stattrak, souvenir FROM inventory.owned_items WHERE steam_id = $1`,
       [identity.steamId],
     ),
     // The live loadout AND every parked preset, in one read — `preset_id` is
@@ -5095,13 +5284,14 @@ app.get("/api/inventory/prices", async (request, reply) => {
     // the account that owns it.
     pool.query<{
       preset_id: string | null;
-      team: string; slot: string; item_id: number | null; wear: number | null; stattrak: boolean;
+      team: string; slot: string; item_id: number | null; wear: number | null; stattrak: boolean; souvenir: boolean;
       stickers: unknown[] | null; patches: unknown[] | null; charm_id: number | null;
     }>(
       `SELECT NULL::text AS preset_id, l.team, l.slot,
               COALESCE(i.item_id, l.item_id)   AS item_id,
               COALESCE(i.wear, l.wear)         AS wear,
               COALESCE(i.stattrak, l.stattrak) AS stattrak,
+              COALESCE(i.souvenir, false)      AS souvenir,
               i.stickers, i.patches, i.charm_id
          FROM inventory.loadout l
          LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
@@ -5111,6 +5301,7 @@ app.get("/api/inventory/prices", async (request, reply) => {
               COALESCE(i.item_id, s.item_id)   AS item_id,
               COALESCE(i.wear, s.wear)         AS wear,
               COALESCE(i.stattrak, s.stattrak) AS stattrak,
+              COALESCE(i.souvenir, false)      AS souvenir,
               i.stickers, i.patches, i.charm_id
          FROM inventory.loadout_preset_slots s
          JOIN inventory.loadout_presets p ON p.id = s.preset_id AND p.steam_id = $1
@@ -5124,10 +5315,11 @@ app.get("/api/inventory/prices", async (request, reply) => {
     itemId: row.item_id,
     wear: row.wear,
     stattrak: row.stattrak,
+    souvenir: row.souvenir,
   }));
   for (const row of equipped) {
     if (row.item_id == null) continue;
-    targets.push({ itemId: row.item_id, wear: row.wear, stattrak: row.stattrak });
+    targets.push({ itemId: row.item_id, wear: row.wear, stattrak: row.stattrak, souvenir: row.souvenir });
     for (const spec of [...normSpecs(row.stickers), ...normSpecs(row.patches)]) {
       if (spec) targets.push({ itemId: spec.id, wear: null, stattrak: false });
     }
@@ -5136,7 +5328,7 @@ app.get("/api/inventory/prices", async (request, reply) => {
   const prices = await lookupPrices(targets, window);
   const items: Record<string, PricePoint> = {};
   for (const row of owned) {
-    const price = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak));
+    const price = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak, row.souvenir));
     if (price) items[String(row.id)] = price;
   }
   const bare = (id: number) => prices.get(priceTargetKey(id, null, false))?.value ?? 0;
@@ -5146,7 +5338,7 @@ app.get("/api/inventory/prices", async (request, reply) => {
   const presets: Record<string, Record<string, number>> = {};
   for (const row of equipped) {
     if (row.item_id == null) continue;
-    const base = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak))?.value ?? 0;
+    const base = prices.get(priceTargetKey(row.item_id, row.wear, row.stattrak, row.souvenir))?.value ?? 0;
     const attachments =
       normSpecs(row.stickers).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
       normSpecs(row.patches).reduce((sum, spec) => sum + (spec ? bare(spec.id) : 0), 0) +
@@ -5353,7 +5545,7 @@ const positiveOrNull = (v: unknown): number | null =>
  * deliberately does not, because a spread is a fact and the adjustment is an
  * inference, and mixing them produces a number that looks measured.
  */
-app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>(
+app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string; souvenir?: string } }>(
   "/api/prices/detail",
   async (request, reply) => {
     const identity = await getIdentity(request);
@@ -5363,13 +5555,16 @@ app.get<{ Querystring: { item_id?: string; wear?: string; stattrak?: string } }>
     const { enabled, source, window } = await priceSettings();
     const wear = request.query.wear != null && request.query.wear !== "" ? Number(request.query.wear) : null;
     const stattrak = request.query.stattrak === "1";
+    // A souvenir's sales are the Souvenir listing's — the plain finish's history
+    // under a souvenir's price was a range for a different item.
+    const souvenir = request.query.souvenir === "1";
     const none = { available: false, window, marketHashName: null, version: null, history: [] as HistoryRow[] };
     // Only one provider publishes a sale history, and the market name to ask it
     // about comes out of our own mirror — which is keyed by exactly the four
     // facts a listing is: item, bracket, StatTrak, Souvenir.
     if (!enabled || source !== "skinport") return none;
-    const prices = await lookupPrices([{ itemId, wear, stattrak }], window);
-    const point = prices.get(priceTargetKey(itemId, wear, stattrak));
+    const prices = await lookupPrices([{ itemId, wear, stattrak, souvenir }], window);
+    const point = prices.get(priceTargetKey(itemId, wear, stattrak, souvenir));
     if (!point) return none;
     const marketHashName = point.marketHashName;
     // The phase, when the item has one: the source reports a row per version and
@@ -6964,9 +7159,14 @@ interface EquippedItem {
   seed?: number | null;
   wear?: number | null;
   stattrak?: number;
+  /** Present, and only ever `true`, on a souvenir (cs2-ss2-inventory-simulator
+   *  #64): the plugin sets econ quality 12 from it, ahead of StatTrak's 9. */
+  souvenir?: true;
   nametag?: string;
   stickers?: { def: number; slot: number; schema?: number; wear: number; x?: number; y?: number; rotation?: number }[];
-  keychains?: { def: number; seed: number; slot: number; sticker?: number; x?: number; y?: number; z?: number }[];
+  /** `highlight` is a highlight charm's reel, as the highlight's variant index
+   *  — the plugin writes it as "keychain slot N highlight". */
+  keychains?: { def: number; highlight?: number; seed: number; slot: number; sticker?: number; x?: number; y?: number; z?: number }[];
   musicId?: number;
   /** Pets: the breed's variant index — the plugin's "pet id" attribute. */
   petId?: number;
@@ -7051,16 +7251,17 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     seed: number | null;
     stattrak: boolean;
     stattrak_count: number | null;
+    souvenir: boolean | null;
     nametag: string | null;
     style: number | null;
     upgrade_level: number | null;
     stickers: unknown[] | null;
     patches: unknown[] | null;
     charm_id: number | null;
-    charm_offset: { x?: number; y?: number; z?: number; seed?: number } | null;
+    charm_offset: { x?: number; y?: number; z?: number; seed?: number; highlight?: number } | null;
   }>(
     `SELECT l.team, l.slot, l.item_id AS base_item_id, i.id AS uid, i.item_id, i.wear, i.seed, i.stattrak,
-            i.stattrak_count, i.nametag, i.style, i.upgrade_level,
+            i.stattrak_count, i.souvenir, i.nametag, i.style, i.upgrade_level,
             i.stickers, i.patches, i.charm_id, i.charm_offset
      FROM inventory.loadout l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
@@ -7157,12 +7358,19 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     } else {
       // Weapon positions incl. zeus/c4 — keyed by weapon def index.
       if (item.def == null) continue;
+      // Key left OUT rather than `false` on everything else, as upstream does:
+      // the plugin reads only `== true`, and an absent key keeps every
+      // non-souvenir entry's hash exactly what it was before this field existed.
+      const souvenir = row.souvenir === true && item.hasSouvenir === true;
       const entry: EquippedItem = {
         def: item.def as number,
         nametag,
         paint: (item.index as number | undefined) ?? 0,
         seed: row.seed ?? 1,
-        stattrak,
+        // -1 on a souvenir even if a stale row says StatTrak: the plugin would
+        // still write the kill-eater attributes under a Souvenir quality.
+        stattrak: souvenir ? -1 : stattrak,
+        ...(souvenir ? { souvenir: true as const } : {}),
         stickers: equippedStickers(row.stickers, row.item_id as number),
         keychains: [],
         uid,
@@ -7174,6 +7382,11 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
         const keychain: NonNullable<EquippedItem["keychains"]>[number] = {
           def: charm.index as number, seed: charmOffset?.seed ?? CHARM_LIMITS.seedMin, slot: 0,
         };
+        // A highlight charm with no highlight is a blank reel in game. Rows
+        // from before 9.10 have none, so they get the charm's first.
+        const highlight = highlightFor(row.charm_id as number, charmOffset?.highlight);
+        const reel = highlight != null ? highlightIndex(highlight) : undefined;
+        if (reel != null) keychain.highlight = reel;
         // A Sticker Slab is one model wearing one sticker, and 10.5k of the
         // 10.6k charms are slabs — the charm's own def only picks the slab, so
         // without this every slab in the game arrived as the same blank hanger.

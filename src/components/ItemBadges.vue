@@ -51,6 +51,8 @@ const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>
 
 const attachments = computed(() => (props.inst ? attachmentsOf(props.inst) : []));
 const stattrak = computed(() => props.inst?.stattrak === true);
+/** Never beside StatTrak — the game gives an item one quality. */
+const souvenir = computed(() => props.inst?.souvenir === true);
 const kills = computed(() => props.inst?.stattrak_count ?? 0);
 const shown = computed(() => attachments.value.slice(0, props.max));
 /** "+2" rather than silently dropping them: a gun with six stickers and room
@@ -62,7 +64,7 @@ const overflow = computed(() => Math.max(0, attachments.value.length - props.max
   <!-- ONE group, not two. Apart, each aligned itself against a row whose height
        is set by the tallest chip, so the badge floated relative to them — and
        the taller charm chip makes any such gap worse. -->
-  <span v-if="stattrak || attachments.length" class="flex flex-none items-center gap-1.5">
+  <span v-if="stattrak || souvenir || attachments.length" class="flex flex-none items-center gap-1.5">
     <!-- One size in both modes, deliberately. `compact` shrinks the attachment
          thumbnails, but f8 is the floor of the type scale (tailwind.config.js)
          and there is nothing below it to shrink to — the binding that used to be
@@ -73,6 +75,14 @@ const overflow = computed(() => Math.max(0, attachments.value.length - props.max
       class="font-mono text-f8 leading-none text-[hsl(var(--tac-stattrak))]"
       :title="count && kills ? tr('inventory.badges.stattrak_kills', 'StatTrak™ — {kills} kills', { kills: kills.toLocaleString() }) : 'StatTrak™'"
       >ST™<template v-if="count && kills"> {{ kills.toLocaleString() }}</template></span
+    >
+    <!-- SV, in the game's souvenir gold: the same two-letter mark as ST™, so a
+         grid of cards reads both at the same glance. -->
+    <span
+      v-if="souvenir"
+      class="font-mono text-f8 leading-none text-[hsl(var(--tac-souvenir))]"
+      :title="tr('inventory.badges.souvenir', 'Souvenir')"
+      >SV</span
     >
     <span v-if="shown.length" class="flex items-center gap-0.5">
       <!-- The charm is drawn LARGER and last, behind a hairline: there is only

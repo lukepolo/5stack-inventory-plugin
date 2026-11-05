@@ -55,7 +55,9 @@ const SYNCED_TYPES = [
 ] as const;
 // Resolve, but deliberately do NOT enter an inventory: this app does not model
 // unopened containers or the tools that alter items.
-const SKIPPED_TYPES = ["case", "key", "tool", "utility", "stub"] as const;
+// `highlight` (cs2-lib 9.10) is not an item at all in game: it is WHICH reel a
+// highlight charm carries, an attribute of that charm — see the samples below.
+const SKIPPED_TYPES = ["case", "key", "tool", "utility", "stub", "highlight"] as const;
 // Skipped items whose Steam name is ALSO the exact name of a synced item, so a
 // name-only import cannot keep them apart. Each is a decision, not a leak:
 //
@@ -94,6 +96,10 @@ const SAMPLES: [name: string, wantType: string, wantSlot: string | null][] = [
   ["Sticker | Natus Vincere | Paris 2023", "sticker", null],
   ["Patch | Crazy Banana", "patch", null],
   ["Charm | Die-cast AK", "keychain", null],
+  // A loose highlight charm. Steam names the HIGHLIGHT after the charm family;
+  // cs2-lib has the family as the item and the highlight as its attribute.
+  ["Souvenir Charm | Austin 2025 Highlight | The Fast Rotation", "keychain", null],
+  ["Souvenir Charm | Budapest 2025 Highlight | ropz round flip", "keychain", null],
 ];
 
 console.log("Steam market names -> catalog");
@@ -121,6 +127,17 @@ check("wear bracket is read, not just dropped", st.wearTier === "Factory New", `
 const plain = parseSteamMarketName("AK-47 | Redline (Minimal Wear)");
 check("a plain item is not StatTrak", !plain.stattrak);
 check("wear bracket parsed", plain.wearTier === "Minimal Wear", `got ${plain.wearTier}`);
+// Souvenir is kept for a finish (the import stores it), and a highlight charm
+// keeps WHICH highlight it is — without it every one imports as the charm's
+// first reel.
+const souvenir = parseSteamMarketName("Souvenir AWP | Dragon Lore (Factory New)");
+check("Souvenir survives the strip", souvenir.souvenir && getItem(souvenir.itemId!)?.hasSouvenir === true);
+const reel = parseSteamMarketName("Souvenir Charm | Austin 2025 Highlight | The Fast Rotation");
+check(
+  "a highlight charm resolves its highlight",
+  reel.highlight != null && getItem(reel.highlight)?.type === "highlight" && getItem(reel.highlight)?.name === "The Fast Rotation",
+  `got ${reel.highlight}`,
+);
 
 // ---- 3. the whole economy, family by family ---------------------------------
 // The inverse of the parser: what Steam calls a given catalog item.

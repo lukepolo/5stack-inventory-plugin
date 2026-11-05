@@ -173,6 +173,9 @@ export interface DraftCharm {
    *  one still parse — the encoder strips trailing empties, so an old
    *  `id_x_y_z` simply arrives with no fifth field. */
   seed?: number | null;
+  /** A highlight charm's highlight (economy id) — the sixth field, appended
+   *  after the seed for the same reason the seed was appended after z. */
+  highlight?: number | null;
 }
 export interface Draft {
   wear: number;
@@ -186,6 +189,10 @@ export interface Draft {
    *  that is what an older link without the keys decodes to. */
   style: number | null;
   stage: number | null;
+  /** Souvenir finish. Optional so every older Draft literal stays one. */
+  souvenir?: boolean;
+  /** A highlight charm crafted on its own: which highlight (economy id). */
+  highlight?: number | null;
 }
 
 // Fields are joined with "_", NOT ".". Sticker offsets are signed decimals, so
@@ -211,6 +218,8 @@ export function encodeDraft(d: Draft, defaultWear: number): Record<string, strin
   if (d.wear !== defaultWear) out.wear = num(d.wear);
   if (d.seed !== 1) out.seed = String(d.seed);
   if (d.stattrak) out.st = "1";
+  if (d.souvenir) out.sv = "1";
+  if (d.highlight != null) out.hl = String(d.highlight);
   if (d.nametag.trim()) out.name = d.nametag.trim();
   if (d.style != null) out.style = String(d.style);
   if (d.stage != null) out.stage = String(d.stage);
@@ -226,7 +235,7 @@ export function encodeDraft(d: Draft, defaultWear: number): Record<string, strin
     if (id) out[`p${i}`] = String(id);
   });
   if (d.charm) {
-    out.charm = [String(d.charm.id), num(d.charm.x), num(d.charm.y), num(d.charm.z), num(d.charm.seed)]
+    out.charm = [String(d.charm.id), num(d.charm.x), num(d.charm.y), num(d.charm.z), num(d.charm.seed), num(d.charm.highlight, 0)]
       .join(SEP)
       .replace(/_+$/, "");
   }
@@ -255,18 +264,21 @@ export function decodeDraft(
   // attach() and silently landing `z` in the sticker rotation slot.
   const parseCharm = (raw: string | undefined): DraftCharm | null => {
     if (!raw) return null;
-    const [id, x, y, z, seed] = raw.split(SEP);
+    const [id, x, y, z, seed, highlight] = raw.split(SEP);
     const n = Number(id);
     if (!Number.isInteger(n) || n <= 0) return null;
     // Clamped like the weapon's seed above: a mangled link must not hand the
     // game server a nonsense pattern.
     const p = parseNum(seed);
+    const h = parseNum(highlight);
     return {
       id: n,
       x: parseNum(x),
       y: parseNum(y),
       z: parseNum(z),
       seed: p === null ? null : Math.min(100000, Math.max(0, Math.round(p))),
+      // Shape only; the backend keeps it only if it is this charm's.
+      highlight: h !== null && Number.isInteger(h) && h > 0 ? h : null,
     };
   };
 
@@ -292,6 +304,12 @@ export function decodeDraft(
     // this is only a sanity bound. See craftSeedIsCharm.
     seed: seed === null ? 1 : Math.min(100000, Math.max(0, Math.round(seed))),
     stattrak: q.st === "1",
+    // Never both — the form keeps one, the backend rejects the pair.
+    souvenir: q.sv === "1" && q.st !== "1",
+    highlight: (() => {
+      const h = parseNum(q.hl);
+      return h !== null && Number.isInteger(h) && h > 0 ? h : null;
+    })(),
     nametag: q.name ?? "",
     // Exactly as many slots as an item carries. This used to read six (`s0..s5`),
     // one more than anything downstream can hold — the craft form sliced the

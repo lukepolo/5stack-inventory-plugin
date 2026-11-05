@@ -80,6 +80,10 @@ export interface Skin {
   hasSeed?: boolean;
   hasStatTrak?: boolean;
   hasNameTag?: boolean;
+  /** A finish that can be a Souvenir (cs2-lib 9.10). Only ever sent as `true`
+   *  — absent is "no", unlike the facts above, because nothing but a painted
+   *  gun can be one. */
+  hasSouvenir?: boolean;
   wearMin?: number | null;
   wearMax?: number | null;
   seedMin?: number | null;
@@ -201,6 +205,10 @@ export interface CatalogItem {
   hasWear?: boolean;
   hasSeed?: boolean;
   hasStatTrak?: boolean;
+  /** See `Skin.hasSouvenir`. */
+  hasSouvenir?: boolean;
+  /** A highlight-reel charm: which highlight it carries is its look. */
+  hasHighlights?: boolean;
   /** The finish's real float range — see `Skin.wearMin`. */
   wearMin?: number | null;
   wearMax?: number | null;
@@ -232,6 +240,8 @@ export interface LoadoutEntry {
   seed: number | null;
   stattrak: boolean;
   stattrak_count: number;
+  /** See InventoryItem.souvenir. Optional: an older backend does not send it. */
+  souvenir?: boolean;
   nametag: string | null;
   /** PETS only — see InventoryItem.style. */
   style?: number | null;
@@ -269,7 +279,11 @@ export type PlacedItem = (CatalogItem & { x?: number | null; y?: number | null; 
 /** An attached charm: catalog item, its offset on the gun, and the pattern that
  *  grades its material. Named rather than inlined because two shapes carry one
  *  — an owned item and a public loadout row — and they must not drift. */
-export type PlacedCharm = (CatalogItem & { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null }) | null;
+export type PlacedCharm = (CatalogItem & {
+  x?: number | null; y?: number | null; z?: number | null; seed?: number | null; inst?: string | null;
+  /** A highlight charm's highlight (economy id), resolved server-side. */
+  highlight?: number | null;
+}) | null;
 
 /** A placed Sticker Craft's group, as an item stores it (normStickerGroup in the backend). */
 export interface StickerGroupSpec {
@@ -289,6 +303,11 @@ export interface InventoryItem {
   /** Kills recorded on the module. 0 when the item isn't StatTrak. Drives the
    *  3D digit display only — 2D cards render a blank display on purpose. */
   stattrak_count: number;
+  /** A Souvenir finish. Never true beside `stattrak`. Optional: an older
+   *  backend does not send it. */
+  souvenir?: boolean;
+  /** A loose highlight charm's highlight (economy id); null otherwise. */
+  highlight?: number | null;
   nametag: string | null;
   /** PETS only. Material group 1..styleCount; null is the stock look. */
   style?: number | null;
@@ -905,18 +924,80 @@ export const fetchCatalogItems = (ids: number[]) =>
     ? request<Skin[]>(`/catalog/items?ids=${ids.join(",")}`)
     : Promise.resolve([]);
 
+// ---- Souvenirs and highlight reels (cs2-lib 9.10) ----------------------------
+
+export interface SouvenirSticker {
+  id: number;
+  name: string;
+  image: string | null;
+}
+export interface HighlightOption {
+  id: number;
+  name: string;
+  description: string | null;
+  /** The clip on Valve's CDN. Offered as a link, never embedded. */
+  video: string | null;
+  /** "MOUZ vs Vitality". */
+  matchup: string | null;
+  charmId: number;
+  /** In a souvenir source: the two team ids this highlight fixes. */
+  teams?: number[];
+}
+export interface SouvenirSource {
+  eventId: number;
+  name: string;
+  image: string | null;
+  /** A package drops one map's sticker; a crafted souvenir picks any. */
+  fixedMap: boolean;
+  event: number[];
+  maps: number[];
+  teams: { id: number; sticker: number; autographs: number[] }[];
+  highlights: HighlightOption[];
+}
+export interface SouvenirOptions {
+  /** Newest event first. */
+  sources: SouvenirSource[];
+  /** Every sticker the sources name, once. */
+  stickers: Record<number, SouvenirSticker>;
+}
+/**
+ * Cached per id for the session: it is catalog data, and the editor asks on
+ * every open (every charm pick, for highlights). The backend answers an EMPTY
+ * list for "nothing to offer", so an answer is always cacheable; a FAILED
+ * request resolves null and leaves the cache, so the next open asks again.
+ */
+function cachedById<T>(cache: Map<number, Promise<T | null>>, id: number, path: string): Promise<T | null> {
+  let hit = cache.get(id);
+  if (!hit) {
+    hit = request<T>(path).catch(() => {
+      cache.delete(id);
+      return null;
+    });
+    cache.set(id, hit);
+  }
+  return hit;
+}
+const souvenirCache = new Map<number, Promise<SouvenirOptions | null>>();
+export const fetchSouvenirOptions = (itemId: number) =>
+  cachedById(souvenirCache, itemId, `/catalog/souvenir/${itemId}`);
+const highlightCache = new Map<number, Promise<HighlightOption[] | null>>();
+export const fetchCharmHighlights = (charmId: number) =>
+  cachedById(highlightCache, charmId, `/catalog/highlights/${charmId}`);
+
 export const craftItem = (body: {
   item_id: number;
   wear?: number | null;
   seed?: number | null;
   stattrak?: boolean;
+  souvenir?: boolean;
+  highlight?: number | null;
   nametag?: string | null;
   style?: number | null;
   upgrade_level?: number | null;
   stickers?: AttachSpec[];
   patches?: AttachSpec[];
   charm_id?: number | null;
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; highlight?: number | null } | null;
   sticker_group?: StickerGroupSpec | null;
 }) =>
   request<InventoryItem>("/inventory/craft", {
@@ -930,13 +1011,15 @@ export const updateInstance = (
     wear?: number | null;
     seed?: number | null;
     stattrak?: boolean;
+    souvenir?: boolean;
+    highlight?: number | null;
     nametag?: string | null;
     style?: number | null;
     upgrade_level?: number | null;
     stickers?: AttachSpec[];
     patches?: AttachSpec[];
     charm_id?: number | null;
-    charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+    charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; highlight?: number | null } | null;
     sticker_group?: StickerGroupSpec | null;
   },
 ) =>
@@ -1256,9 +1339,9 @@ export interface PriceDetail {
   version: string | null;
   history: SaleWindow[];
 }
-export const fetchPriceDetail = (itemId: number, wear: number | null, stattrak: boolean) =>
+export const fetchPriceDetail = (itemId: number, wear: number | null, stattrak: boolean, souvenir = false) =>
   request<PriceDetail>(
-    `/prices/detail?item_id=${itemId}&wear=${wear ?? ""}&stattrak=${stattrak ? 1 : 0}`,
+    `/prices/detail?item_id=${itemId}&wear=${wear ?? ""}&stattrak=${stattrak ? 1 : 0}${souvenir ? "&souvenir=1" : ""}`,
   );
 
 /** The window a spread is worth showing from. Widest first would bury a fresh,
@@ -1296,6 +1379,7 @@ export const quoteCraft = (body: {
   item_id: number;
   wear?: number | null;
   stattrak?: boolean | null;
+  souvenir?: boolean | null;
   stickers?: unknown[] | null;
   patches?: unknown[] | null;
   charm_id?: number | null;
@@ -1539,6 +1623,8 @@ export const fetchDraftInspectLink = (body: {
   wear?: number | null;
   seed?: number | null;
   stattrak?: boolean;
+  souvenir?: boolean;
+  highlight?: number | null;
   /** Kills for the StatTrak module. Comes off the owned row, not the form. */
   stattrak_count?: number | null;
   nametag?: string | null;
@@ -1547,7 +1633,7 @@ export const fetchDraftInspectLink = (body: {
   stickers?: AttachSpec[];
   patches?: AttachSpec[];
   charm_id?: number | null;
-  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null } | null;
+  charm_offset?: { x?: number | null; y?: number | null; z?: number | null; seed?: number | null; highlight?: number | null } | null;
 }) =>
   request<{ inspect: string }>("/inspect/preview", {
     method: "POST",
