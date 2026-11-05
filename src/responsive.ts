@@ -19,6 +19,10 @@ function mediaRef(query: string): Ref<boolean> {
  *  rather than letting it scroll sideways. */
 export const isCompact = mediaRef("(max-width: 860px)");
 
+/** A phone, not a portrait tablet: the width where a two-across loadout card is
+ *  too narrow to share one row between a skin name, its badges and the wear bar. */
+export const isPhone = mediaRef("(max-width: 640px)");
+
 /** Touch/stylus primary input. Distinct from isCompact on purpose: a tablet is
  *  coarse but roomy, a narrow desktop window is fine but precise. Layout keys
  *  off isCompact, interaction affordances key off this. */

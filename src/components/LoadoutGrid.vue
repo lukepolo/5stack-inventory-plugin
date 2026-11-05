@@ -145,7 +145,7 @@ const LIFT_SPACER_PAD = 12;
           @pointercancel="cancelLongPress"
           @click.capture="onSlotClickCapture"
         >
-          <nav class="flex flex-none gap-1 overflow-x-auto border-b border-border px-2 py-0.5" data-role="compact-rail">
+          <nav class="flex flex-none gap-1 overflow-x-auto overflow-y-hidden border-b border-border px-2 py-0.5" data-role="compact-rail">
             <button
               v-for="c in compactCats"
               :key="c.key"
