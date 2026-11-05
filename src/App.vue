@@ -8747,8 +8747,10 @@ const crumbTrail = computed<HostCrumb[]>(() => {
   const r = route.value;
   const named = (label: string): HostCrumb[] => (label ? [{ label }] : []);
   switch (r.name) {
+    // Named, not left as the bare plugin title: "Inventory" alone read as
+    // the breadcrumbs not working at all.
     case "loadout":
-      return [];
+      return [{ label: "Loadout" }];
     case "focus":
       return [{ label: "Loadout", to: "/" }, ...named(itemName(focusRow.value?.item))];
     // "Items", not the tab's "Inventory": the plugin's own title already is.
