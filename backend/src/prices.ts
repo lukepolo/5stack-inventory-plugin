@@ -200,17 +200,18 @@ export function wearTierSql(column: string): string {
 /** How one owned item is addressed when a batch of prices comes back from the
  *  database. Keyed on what was ASKED for — the id-collapse happens in the join,
  *  so collapsing here too would make the two halves disagree. */
-export const priceTargetKey = (itemId: number, wear: number | null | undefined, stattrak: boolean) =>
-  `${itemId}:${wearTierIndex(wearTierOf(wear))}:${stattrak ? 1 : 0}`;
+export const priceTargetKey = (itemId: number, wear: number | null | undefined, stattrak: boolean, souvenir = false) =>
+  `${itemId}:${wearTierIndex(wearTierOf(wear))}:${stattrak ? 1 : 0}${souvenir ? ":sv" : ""}`;
 
 /** The key for an OWNED item: collapse the id the way the feed's names collapse,
- *  and put the float back in its bracket. `souvenir` is always false — we don't
- *  model souvenirs, though the mirror keeps their rows for when we do. */
+ *  and put the float back in its bracket. A souvenir is its own listing — a
+ *  Souvenir Dragon Lore trades nothing like a plain one. */
 export const ownedPriceKey = (
   itemId: number,
   wear: number | null | undefined,
   stattrak: boolean,
-) => priceKey(priceGroupId(itemId), wearTierIndex(wearTierOf(wear)), stattrak, false);
+  souvenir = false,
+) => priceKey(priceGroupId(itemId), wearTierIndex(wearTierOf(wear)), stattrak, souvenir);
 
 export interface MappedFeed {
   prices: PriceRow[];
@@ -572,6 +573,7 @@ export interface QuoteSpec {
   itemId: number;
   wear?: number | null;
   stattrak?: boolean | null;
+  souvenir?: boolean | null;
   stickers?: ({ id: number } | null | undefined)[] | null;
   patches?: ({ id: number } | null | undefined)[] | null;
   charmId?: number | null;
@@ -616,16 +618,16 @@ export interface Quote {
  */
 export function quoteItem(
   spec: QuoteSpec,
-  lookup: (itemId: number, wear: number | null, stattrak: boolean) => PricePoint | null,
+  lookup: (itemId: number, wear: number | null, stattrak: boolean, souvenir: boolean) => PricePoint | null,
   nameOf: (itemId: number) => string | null,
 ): Quote {
-  const line = (kind: QuoteKind, itemId: number, wear: number | null, stattrak: boolean): QuoteLine => ({
+  const line = (kind: QuoteKind, itemId: number, wear: number | null, stattrak: boolean, souvenir = false): QuoteLine => ({
     kind,
     itemId,
     name: nameOf(itemId),
-    price: lookup(itemId, wear, stattrak),
+    price: lookup(itemId, wear, stattrak, souvenir),
   });
-  const base = line("base", spec.itemId, spec.wear ?? null, spec.stattrak === true);
+  const base = line("base", spec.itemId, spec.wear ?? null, spec.stattrak === true, spec.souvenir === true);
   const attachments: QuoteLine[] = [];
   for (const sticker of spec.stickers ?? []) {
     // A sticker's own scratch wear is NOT a market wear bracket — scraped

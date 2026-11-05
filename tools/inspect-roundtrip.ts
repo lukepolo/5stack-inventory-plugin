@@ -22,7 +22,7 @@ import { buildInspectLink } from "../backend/src/inspect.ts";
 // From catalog.ts, not main.ts: main boots a Fastify server on import. This is
 // the same function the craft save, the equipped v5 feed and the inspect link
 // all run every rotation through. Importing it also loads the economy.
-import { normStickerRotation } from "../backend/src/catalog.ts";
+import { normStickerRotation, souvenirStickersError, highlightFor } from "../backend/src/catalog.ts";
 
 // Economy ids, not kit indexes: the adapter speaks cs2-lib's own item shape.
 const AK47_REDLINE = 222;
@@ -247,6 +247,48 @@ check("pet name survives",
 const egg = new Map(decode(body(buildInspectLink({ id: PET_EGG }))).map((f) => [f.field, f]));
 check("egg says it is an egg", egg.get(F.upgrade_level)?.value === 0,
       egg.has(F.upgrade_level) ? `got ${egg.get(F.upgrade_level)?.value}` : "field absent");
+
+// ---- souvenirs and highlight reels (cs2-lib 9.10, cs2-lib-inspect 9.6) -------
+// The same two facts the equipped v5 feed sends as `souvenir: true` and
+// `keychains[].highlight` — the inspect link is their second output path, and
+// it has to show the gun the server builds.
+console.log("\nSouvenirs and highlight reels");
+const AWP_DRAGON_LORE = 307;
+// Boston 2018 Cobblestone package: two team logos and the map, then an autograph.
+const BOSTON_2018_SET = [4075, 4079, 4171];
+const BOSTON_2018_AUTOGRAPH = 4174;
+const CHARM_AUSTIN_2025_HIGHLIGHT = 14163;
+const HIGHLIGHT_FLAMEZ_DUST2 = 28549; // variant index 379
+const Q = { quality: 6, killeatervalue: 10 } as const;
+const SF_HIGHLIGHT_REEL = 11;
+
+const souv = new Map(decode(body(buildInspectLink({ id: AWP_DRAGON_LORE, wear: 0.03, souvenir: true }))).map((f) => [f.field, f]));
+check("a souvenir is quality 12", souv.get(Q.quality)?.value === 12, `got ${souv.get(Q.quality)?.value}`);
+check("a souvenir carries no kill counter", !souv.has(Q.killeatervalue));
+
+check("the event's own stickers pass as a souvenir", souvenirStickersError(AWP_DRAGON_LORE, BOSTON_2018_SET) === null);
+check("one autograph on top still passes", souvenirStickersError(AWP_DRAGON_LORE, [...BOSTON_2018_SET, BOSTON_2018_AUTOGRAPH]) === null);
+check("a Katowice Crown is no souvenir sticker", souvenirStickersError(AWP_DRAGON_LORE, [...BOSTON_2018_SET, STICKER_RUSH_ATL17]) !== null);
+
+const reelOf = (keychain: { id: number; highlight?: number }) => {
+  const kcs = decode(body(buildInspectLink({ id: AK47_REDLINE, keychains: { 0: keychain } }))).filter(
+    (f) => f.field === F_KEYCHAINS && f.wire === 2,
+  );
+  return kcs.length ? new Map(decode(kcs[0].value as Uint8Array).map((f) => [f.field, f])) : null;
+};
+const picked = reelOf({ id: CHARM_AUSTIN_2025_HIGHLIGHT, highlight: HIGHLIGHT_FLAMEZ_DUST2 });
+check("a highlight charm keeps its keychain", picked !== null);
+check("its reel is the highlight's variant index", picked?.get(SF_HIGHLIGHT_REEL)?.value === 379,
+      `got ${picked?.get(SF_HIGHLIGHT_REEL)?.value}`);
+// The trap the fallback exists for: cs2-lib 9.10's repair DELETES a highlight
+// charm with no highlight, so a charm saved before the bump would vanish off
+// its gun's link. highlightFor gives it the charm's first reel instead.
+const fallback = highlightFor(CHARM_AUSTIN_2025_HIGHLIGHT, undefined);
+check("a highlight charm saved without one falls back to a real highlight", fallback != null);
+const legacy = fallback != null ? reelOf({ id: CHARM_AUSTIN_2025_HIGHLIGHT, highlight: fallback }) : null;
+check("…and that keeps it on the inspect link", legacy !== null && legacy.has(SF_HIGHLIGHT_REEL));
+check("a stranger's highlight is not kept", highlightFor(CHARM_AUSTIN_2025_HIGHLIGHT, 999_999) === fallback);
+check("an ordinary charm has no highlight", highlightFor(SLAB_RUSH_ATL17, HIGHLIGHT_FLAMEZ_DUST2) === undefined);
 
 console.log(`\n${failures ? `${failures} FAILED` : "all checks passed"}`);
 process.exit(failures ? 1 : 0);

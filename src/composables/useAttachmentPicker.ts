@@ -94,6 +94,8 @@ export type PickerRow = {
   /** The owned row's own scratch / pattern, so picking it previews truthfully. */
   wear?: number | null;
   seed?: number | null;
+  /** An owned highlight charm's highlight, which IS which one it is. */
+  highlight?: number | null;
 };
 
 export interface AttachmentPickerOptions {
@@ -336,6 +338,7 @@ export function useAttachmentPicker(opts: AttachmentPickerOptions) {
         capsule: i.item?.capsule ?? null,
         wear: i.wear,
         seed: i.seed,
+        highlight: i.highlight ?? null,
       }))
       // Spares first: the whole reason to open this shelf is to find one that
       // isn't already spoken for, and burying those under the applied ones would

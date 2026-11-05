@@ -216,6 +216,13 @@ const label = "w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foregro
     </div>
 
     <div
+      v-if="inst.souvenir"
+      :class="[box, 'flex items-center']"
+      :style="still ? {} : { '--i': 4 }"
+    >
+      <span class="text-f10 uppercase tracking-cs1 text-[hsl(var(--tac-souvenir))]">{{ tr('inventory.badges.souvenir', 'Souvenir') }}</span>
+    </div>
+    <div
       v-if="inst.stattrak"
       :class="[box, 'flex flex-col']"
       :style="still ? {} : { '--i': 4 }"

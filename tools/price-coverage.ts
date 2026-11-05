@@ -226,9 +226,10 @@ check(
 console.log("\nCraft quote");
 const lookupFrom = (rows: PriceRow[]) => {
   const index = new Map(rows.map((r) => [priceKey(r.itemId, r.wearTier, r.stattrak, r.souvenir), r]));
-  return (itemId: number, wear: number | null, stattrak: boolean) => {
-    const found = index.get(ownedPriceKey(itemId, wear, stattrak));
-    return found ? pickPrice(found, "last_7d") : null;
+  return (itemId: number, wear: number | null, stattrak: boolean, souvenir = false) => {
+    const found = index.get(ownedPriceKey(itemId, wear, stattrak, souvenir));
+    // last_90d as the widest window: the souvenir fixture only carries that one.
+    return found ? pickPrice(found, "last_7d") ?? pickPrice(found, "last_90d") : null;
   };
 };
 const lookup = lookupFrom(mapped.prices);
@@ -248,6 +249,17 @@ check("nothing unpriced in a fully covered quote", quote.unpriced === 0, `got ${
 const partial = quoteItem({ itemId: akRedlineFt.itemId, wear: 0.25, stickers: [{ id: 999999 }] }, lookup, nameOf);
 check("an unpriced line is COUNTED, not silently dropped", partial.unpriced === 1 && partial.lines === 2, `unpriced=${partial.unpriced} lines=${partial.lines}`);
 check("a StatTrak quote reads the StatTrak row", quoteItem({ itemId: akRedlineFt.itemId, wear: 0.25, stattrak: true }, lookup, nameOf).baseTotal === 33.1);
+// Souvenirs price off their OWN listing, never the plain finish's: the two are
+// different markets, a Souvenir Dragon Lore being worth several plain ones.
+check(
+  "a Souvenir quote reads the Souvenir row",
+  quoteItem({ itemId: dragonLore.itemId, wear: 0.03, souvenir: true }, lookup, nameOf).baseTotal === 180000,
+  `got ${quoteItem({ itemId: dragonLore.itemId, wear: 0.03, souvenir: true }, lookup, nameOf).baseTotal}`,
+);
+check(
+  "a plain quote never reads a Souvenir row",
+  quoteItem({ itemId: dragonLore.itemId, wear: 0.03 }, lookup, nameOf).base.price === null,
+);
 
 // ---- 4b. a market order book -------------------------------------------------
 // The default source. Same names, different numbers: a live market has a

@@ -93,6 +93,8 @@ export interface ItemFacts {
   wear: number | null;
   seed: number | null;
   stattrak: boolean;
+  /** Optional: a draft link carries no souvenir flag, and reads as plain. */
+  souvenir?: boolean;
   nametag: string | null;
 }
 
@@ -115,7 +117,7 @@ export function itemTitle(facts: ItemFacts): string | null {
   // none of the three. A share card is worse than a form here, because a link is
   // hand-editable: `?st=1` on a Service Medal must not mint a "StatTrak™" title
   // for an item the economy says can never be one.
-  const st = facts.stattrak && item.hasStatTrak ? "StatTrak™ " : "";
+  const st = facts.souvenir && item.hasSouvenir ? "Souvenir " : facts.stattrak && item.hasStatTrak ? "StatTrak™ " : "";
   const alt = item.altName ? ` ${item.altName}` : "";
   // `hasWear`, not itemStoresWear: a STICKER stores a value in the wear column
   // too, but that is its scratch, and scratch has no Steam wear bracket at all.
