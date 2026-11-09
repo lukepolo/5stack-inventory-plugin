@@ -57,7 +57,9 @@ import {
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
 import { GRID_SLOT_IDS, GRID_SLOTS, resolveGrid } from "./loadoutGrid.ts";
-import { compositeStem } from "./compositeStore.ts";
+import { compositeDirIn } from "./compositeStore.ts";
+import { registerSharedStores, type CompositeClaim } from "./sharedStores.ts";
+import { sameServerKey } from "./serverKey.ts";
 import {
   CARD_FILE_RE,
   CARD_FORMATS,
@@ -513,42 +515,34 @@ app.post<{ Params: { id: string }; Querystring: { v?: string } }>("/api/render/c
 // given skin uploads the result and every client after that skips the inputs
 // entirely. See src/compositeStore.ts for the client half.
 //
-// Storage is generational: `<dir>/<shaderHash-assetVersion>/<stem>.<kind>.<ext>`.
+// Storage is generational: `<dir>/<shaderHash-assetVersion>.s<salt>/<stem>.<kind>.<ext>`,
+// the salt being a random value kept in inventory.settings (`composite_salt`).
 // The generation is DERIVED from the shader source, so a compositor fix
 // invalidates every stored bake by itself — the opposite of renderKeyForRow's
 // hand-bumped "-v7", which is a version suffix nobody remembers to bump.
 const COMPOSITES_DIR = process.env.COMPOSITES_DIR ?? "/cs2-models/composites";
-/**
- * A generation is ONE directory name under the composites root, never a path.
- *
- * The first character must be alphanumeric, which is the whole point: the old
- * `^[\w.-]{1,64}$` accepted `..` (dots are in that class), and every route below
- * joins the generation straight onto the root. That made `..` mean the shared
- * asset mount itself — readable through the GET route, writable through the
- * upload, and, worst of the three, pruneComposites would then delete every
- * sibling generation and LRU-delete files directly out of /cs2-models, i.e.
- * extracted game textures.
- */
-const GEN_RE = /^[A-Za-z0-9][\w.-]{0,63}$/;
-/**
- * Resolved directory for a generation, or null if the name is malformed or
- * would land outside the root. Belt and braces on purpose: the regex alone is
- * what failed here, so the containment is also checked after resolution, and
- * every caller must go through this rather than path.join the raw parameter.
- */
-function compositeDir(gen: string): string | null {
-  if (!GEN_RE.test(gen)) return null;
-  const root = path.resolve(COMPOSITES_DIR);
-  const dir = path.resolve(root, gen);
-  return dir.startsWith(root + path.sep) ? dir : null;
+let compositeSaltPending: Promise<string> | null = null;
+function compositeSalt(): Promise<string> {
+  compositeSaltPending ??= (async () => {
+    await pool.query(
+      `INSERT INTO inventory.settings (key, value) VALUES ('composite_salt', $1) ON CONFLICT (key) DO NOTHING`,
+      [randomBytes(16).toString("hex")],
+    );
+    const { rows } = await pool.query<{ value: string }>(`SELECT value FROM inventory.settings WHERE key = 'composite_salt'`);
+    return rows[0].value;
+  })().catch((error) => {
+    compositeSaltPending = null;
+    throw error;
+  });
+  return compositeSaltPending;
+}
+async function compositeDir(gen: string): Promise<string | null> {
+  return compositeDirIn(COMPOSITES_DIR, gen, await compositeSalt());
 }
 // A generous default: composites are a few MB each and the mount is a node disk,
 // but an unbounded cache on a busy instance would eventually eat the partition
 // the game install lives on.
 const COMPOSITE_CACHE_BYTES = Number(process.env.COMPOSITE_CACHE_BYTES ?? 20 * 1024 * 1024 * 1024);
-// A lossless 4096 projected style is the worst case; 48MB leaves headroom over
-// the largest PNG that can legitimately arrive.
-const COMPOSITE_MAX_BYTES = 48 * 1024 * 1024;
 
 const PAINTS_DIR = process.env.PAINTS_DIR ?? "/cs2-models/paints";
 const IMAGES_DIR = process.env.IMAGES_DIR ?? "/cs2-models/images";
@@ -1203,15 +1197,8 @@ app.get("/api/share/unfurl", async (request, reply) => {
 });
 
 // ---- Composite store routes ---------------------------------------------------
-// The filename builder (compositeStem) lives in ./compositeStore.ts, so the
-// standalone mock checks uploads with the same code. It MUST agree with
-// compositeKey() in src/compositeStore.ts.
-// Only the caps the client can actually composite at (see MAX_COMPOSITE_SIZE and
-// MAX_COMPOSITE_SIZE_PROJECTED). Bounded so a client cannot invent an unlimited
-// number of variants of the same skin.
-const COMPOSITE_CAPS = new Set([1024, 2048, 4096]);
-
-type CompositeClaim = { model: string; legacy: boolean; material: string; wear: number; seed: number };
+// The routes themselves are in ./sharedStores.ts; main.ts supplies Postgres, the
+// catalog and ImageMagick.
 /** Does this user own an item that composites to this tuple? The wear/seed pair
  *  is effectively unique per instance, so it is matched first in SQL. */
 async function ownedBy(steamId: string, c: CompositeClaim): Promise<boolean> {
@@ -1224,96 +1211,6 @@ async function ownedBy(steamId: string, c: CompositeClaim): Promise<boolean> {
     (i) => i.model === c.model && i.paintMaterial === c.material && !!i.legacyPaint === c.legacy,
   );
 }
-
-// Fastify's default bodyLimit is 1MB, which silently 413s every composite
-// before the handler ever runs — a lossless 2k pair is a few MB and a 4k
-// projected style more. Raised per route rather than globally so nothing else
-// gains the right to accept a 48MB body.
-//
-// The same limit exists OUTSIDE the pod: ingress-nginx also defaults to 1MB, and
-// the `inventory-api` Ingress carries no proxy-body-size annotation. That one
-// cannot be fixed from this repo — the deploy manifests live in the panel repo.
-app.post<{ Params: { gen: string; file: string } }>("/api/composite/:gen/:file", {
-  bodyLimit: COMPOSITE_MAX_BYTES,
-}, async (request, reply) => {
-  const identity = await getIdentity(request);
-  if (!identity) return reply.status(401).send({ error: "not signed in" });
-
-  const gen = request.params.gen;
-  const q = request.query as Record<string, string | undefined>;
-  const kind = q.kind;
-  const cap = Number(q.cap);
-  const wear = Number(q.wear);
-  const seed = Number(q.seed);
-  const model = q.model ?? "";
-  const material = q.material ?? "";
-  const legacy = q.legacy === "1";
-  const dir = compositeDir(gen);
-  if (
-    !dir ||
-    (kind !== "albedo" && kind !== "rm") ||
-    !COMPOSITE_CAPS.has(cap) ||
-    !Number.isFinite(wear) || wear < 0 || wear > 1 ||
-    !Number.isInteger(seed) || seed < 0 ||
-    !model || !material
-  ) {
-    return reply.status(400).send({ error: "bad composite identity" });
-  }
-
-  const body = request.body as Buffer;
-  const ext = /^\x89PNG/.test(body?.subarray?.(0, 4).toString("latin1") ?? "")
-    ? "png"
-    : body?.subarray?.(0, 4).toString("latin1") === "RIFF" &&
-      body.subarray(8, 12).toString("latin1") === "WEBP"
-      ? "webp"
-      : null;
-  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > COMPOSITE_MAX_BYTES || !ext) {
-    return reply.status(400).send({ error: "bad composite" });
-  }
-
-  // The store is SHARED, so a client does not get to choose which skin its
-  // pixels land on. Every uploaded tuple has to describe an item the caller
-  // actually owns: the wear/seed pair is effectively unique per instance, so
-  // this bounds the blast radius of a doctored client to its own items rather
-  // than to every viewer of that skin.
-  const owns = await ownedBy(identity.steamId, { model, legacy, material, wear, seed });
-  if (!owns) return reply.status(403).send({ error: "not your item" });
-
-  const stem = compositeStem({ model, legacy, material, wear, seed, cap });
-  try {
-    await fs.mkdir(dir, { recursive: true });
-    // A client that could not produce lossless WebP fell back to PNG (see
-    // encoderFormat in src/compositeStore.ts). Transcode it here so the store
-    // does not end up permanently holding a ~3x larger file just because the
-    // first viewer of that skin used a browser with a lossy WebP encoder.
-    // LOSSLESS, so this re-encode cannot change a pixel. ImageMagick is already
-    // in the image for the econ icons; without it the PNG is kept as-is.
-    let out = body;
-    let outExt = ext;
-    if (ext === "png" && (await magickAvailable())) {
-      const converted = await pngToLosslessWebp(body, dir);
-      if (converted) {
-        out = converted;
-        outExt = "webp";
-      }
-    }
-    const file = `${stem}.${kind}.${outExt}`;
-    const dest = path.join(dir, file);
-    // First write wins: re-uploading is pure cost, and leaving the original in
-    // place means a client that somehow produces different pixels cannot
-    // overwrite a bake other viewers are already caching hard.
-    if (await fs.access(dest).then(() => true, () => false)) return { ok: true, file, existed: true };
-    // Write-then-rename so a reader never sees a half-written image — the same
-    // discipline the extractor uses for textures.
-    const tmp = `${dest}.${process.pid}.tmp`;
-    await fs.writeFile(tmp, out);
-    await fs.rename(tmp, dest);
-    void pruneComposites();
-    return { ok: true, file };
-  } catch {
-    return reply.status(500).send({ error: "composite store unavailable" });
-  }
-});
 
 let magickChecked: Promise<boolean> | null = null;
 function magickAvailable(): Promise<boolean> {
@@ -1346,28 +1243,6 @@ async function pngToLosslessWebp(png: Buffer, dir: string): Promise<Buffer | nul
     await fs.rm(src, { force: true }).catch(() => {});
     await fs.rm(dst, { force: true }).catch(() => {});
   }
-}
-
-// Served under both paths for the same reason renders are: /api/* provably
-// reaches this pod, bare /composites/* backs nginx's static-miss fallback.
-for (const route of ["/api/composites/:gen/:file", "/composites/:gen/:file"]) {
-  app.get<{ Params: { gen: string; file: string } }>(route, async (request, reply) => {
-    const { gen, file } = request.params;
-    const dir = compositeDir(gen);
-    if (!dir || !/^[\w.-]+\.(png|webp)$/.test(file)) {
-      return reply.status(404).send({ error: "not found" });
-    }
-    try {
-      const buf = await fs.readFile(path.join(dir, file));
-      // Genuinely immutable: the generation directory covers the shader and the
-      // extraction, and the stem covers the item — so this URL can never change
-      // meaning. No ?v= dance needed, unlike the paint materials.
-      reply.header("Cache-Control", "public, max-age=31536000, immutable");
-      return reply.type(file.endsWith(".webp") ? "image/webp" : "image/png").send(buf);
-    } catch {
-      return reply.status(404).send({ error: "not found" });
-    }
-  });
 }
 
 // Trim the whole composites tree to COMPOSITE_CACHE_BYTES, least-recently-used
@@ -1429,6 +1304,23 @@ function pruneComposites(): Promise<void> {
   })();
   return prunePending;
 }
+
+registerSharedStores(app, {
+  identity: getIdentity,
+  compositeDir,
+  ownsComposite: ownedBy,
+  losslessWebp: async (png, dir) => ((await magickAvailable()) ? pngToLosslessWebp(png, dir) : null),
+  composited: () => void pruneComposites(),
+  isWeapon: (model) => !!weaponNameOf(model),
+  weaponOutline: normOutline,
+  saveWeaponOutline: async (model, outline) => {
+    await pool.query(
+      `INSERT INTO inventory.weapon_outlines (model, extract_version, outline) VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (model) DO UPDATE SET extract_version = EXCLUDED.extract_version, outline = EXCLUDED.outline, updated_at = now()`,
+      [model, await renderVersion(), JSON.stringify(outline)],
+    );
+  },
+});
 
 // ---- Skin test suite --------------------------------------------------------
 // A dev/QA harness that renders EVERY painted finish (weapon/knife/glove) so a
@@ -3474,8 +3366,8 @@ app.post<{ Params: { id: string }; Body: { vote?: number } }>("/api/sticker-craf
 
 /**
  * A gun's traced outline for the mat (normOutline), or 404 when none is stored
- * for this extraction — the mat then traces it from the model itself and PUTs
- * it here, so the next player to pick that gun gets it straight away.
+ * for this extraction — the mat then traces it from the model itself, and an
+ * administrator's mat stores it (sharedStores.ts) for every later player.
  */
 app.get<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", async (request, reply) => {
   const { rows } = await pool.query<{ outline: unknown }>(
@@ -3489,40 +3381,6 @@ app.get<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", asy
   }
   return { outline };
 });
-/**
- * First trace per extraction wins: a second upload for the same version changes
- * nothing — except an administrator's, which replaces it (a bad trace is never
- * stuck until the next extraction), and one in a newer trace format (`v`: the
- * mat traces an older one again). DELETE clears one for re-tracing.
- */
-app.put<{ Params: { model: string }; Body: unknown }>(
-  "/api/catalog/weapon-outline/:model",
-  { bodyLimit: 200_000 },
-  async (request, reply) => {
-    const identity = await getIdentity(request);
-    if (!identity) {
-      return reply.status(401).send({ error: "unauthorized" });
-    }
-    const model = request.params.model;
-    if (!weaponNameOf(model)) {
-      return reply.status(400).send({ error: "That isn't a weapon." });
-    }
-    const outline = normOutline(request.body, model);
-    if (!outline) {
-      return reply.status(400).send({ error: "That isn't a weapon outline." });
-    }
-    const version = await renderVersion();
-    const admin = identity.role === "administrator";
-    await pool.query(
-      `INSERT INTO inventory.weapon_outlines (model, extract_version, outline) VALUES ($1, $2, $3::jsonb)
-       ON CONFLICT (model) DO UPDATE SET extract_version = EXCLUDED.extract_version, outline = EXCLUDED.outline, updated_at = now()
-         WHERE $4::boolean OR inventory.weapon_outlines.extract_version <> EXCLUDED.extract_version
-            OR COALESCE((inventory.weapon_outlines.outline->>'v')::int, 1) < COALESCE((EXCLUDED.outline->>'v')::int, 1)`,
-      [model, version, JSON.stringify(outline), admin],
-    );
-    return { ok: true };
-  },
-);
 /** Clear a gun's stored outline (administrators): the next player to pick it traces it again. */
 app.delete<{ Params: { model: string } }>("/api/catalog/weapon-outline/:model", async (request, reply) => {
   const identity = await getIdentity(request);
@@ -7446,7 +7304,7 @@ app.post<{ Body: { apiKey?: string; targetUid?: number; userId?: string } }>(
   async (request, reply) => {
     const key = await getServerApiKey();
     const { apiKey, targetUid, userId } = request.body;
-    if (!key || apiKey !== key) {
+    if (!sameServerKey(apiKey, key)) {
       return reply.status(401).send({ error: "invalid api key" });
     }
     if (targetUid == null || !userId || !/^\d{17}$/.test(userId)) {

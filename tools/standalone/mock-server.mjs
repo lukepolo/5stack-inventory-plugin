@@ -36,7 +36,7 @@
 // it), then kept, and reads (/api/composites/...) serve only what was uploaded.
 // /api/admin/cache gets fake sizes so the Asset Cache tab renders. GET
 // /__mock/composites lists what is stored. MOCK_ADMIN=0 answers every admin
-// route 403.
+// route, composite upload and weapon outline upload 403.
 // MOCK_COMPOSITES=keep also lets a composite this mock does not hold fall
 // through to the real backend's store (read only), for timing a store HIT
 // on skins someone already opened against the dev mount.
@@ -57,6 +57,7 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const cat = await import(join(REPO, "backend/src/catalog.ts"));
 const { cardFormatOf, CARD_FORMATS, findCard, readCard, storeCard } = await import(join(REPO, "backend/src/cardStore.ts"));
 const store = await import(join(REPO, "backend/src/compositeStore.ts"));
+const shared = await import(join(REPO, "backend/src/sharedStores.ts"));
 const crafts = await import(join(REPO, "backend/src/stickerCrafts.ts"));
 const DIST = process.argv[2];
 if (!DIST) {
@@ -308,6 +309,7 @@ createServer(async (req, res) => {
         console.log(`[mock] composite KEY DRIFT: client ${file} vs backend ${name}`);
         return status(res, 400, { error: `key drift: the backend names it ${name}` });
       }
+      if (!ADMIN) return status(res, 403, { error: shared.SHARED_WRITE_REFUSAL, admin_only: true });
       if (!ownsComposite(id)) return status(res, 403, { error: "not your item" });
       const g = COMPOSITES.get(gen) ?? new Map();
       COMPOSITES.set(gen, g);
@@ -336,11 +338,10 @@ createServer(async (req, res) => {
     if (outlineAt) {
       const model = decodeURIComponent(outlineAt[1]);
       if (req.method === "PUT") {
+        if (!ADMIN) return status(res, 403, { error: shared.SHARED_WRITE_REFUSAL, admin_only: true });
         const o = crafts.normOutline(JSON.parse((await readBody(req)).toString() || "null"), model);
         if (!o || !weaponNameOf(model)) return status(res, 400, { error: "That isn't a weapon outline." });
-        // First trace wins, as on the backend — but one in a newer format
-        // (`v`) replaces an older one.
-        if (!OUTLINES.has(model) || (OUTLINES.get(model).v ?? 1) < (o.v ?? 1)) OUTLINES.set(model, o);
+        OUTLINES.set(model, o);
         return json(res, { ok: true });
       }
       return OUTLINES.has(model) ? json(res, { outline: OUTLINES.get(model) }) : status(res, 404, { error: "not traced yet" });

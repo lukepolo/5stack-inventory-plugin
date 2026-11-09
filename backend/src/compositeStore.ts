@@ -6,11 +6,12 @@
  * the device's resolution cap. The upload route re-derives that name from the
  * identity it verified (compositeStem below).
  *
- * Deliberately free of Postgres and the filesystem, the same split share.ts
+ * Deliberately free of Postgres and file I/O, the same split share.ts
  * makes: main.ts owns both. That is also what lets
  * tools/standalone/mock-server.mjs import this file and check uploads with the
  * backend's own code.
  */
+import path from "node:path";
 
 // ---- Naming --------------------------------------------------------------------
 // MUST agree with compositeKey() in src/compositeStore.ts.
@@ -55,5 +56,35 @@ export function compositeStemBase(id: CompositeIdentityKey): string {
 
 export function compositeStem(id: CompositeIdentityKey & { cap: number }): string {
   return `${compositeStemBase(id)}__c${id.cap}`;
+}
+
+/**
+ * A generation is ONE directory name under the composites root, never a path.
+ *
+ * The first character must be alphanumeric, which is the whole point: the old
+ * `^[\w.-]{1,64}$` accepted `..` (dots are in that class), and every route
+ * joins the generation straight onto the root. That made `..` mean the shared
+ * asset mount itself — readable through the GET route, writable through the
+ * upload, and, worst of the three, pruneComposites would then delete every
+ * sibling generation and LRU-delete files directly out of /cs2-models, i.e.
+ * extracted game textures.
+ */
+const GEN_RE = /^[A-Za-z0-9][\w.-]{0,63}$/;
+
+/**
+ * The directory a generation is stored in, or null if the name is malformed or
+ * would land outside the root (checked again after resolution, on purpose).
+ *
+ * The client derives the generation from public inputs, so the server adds a
+ * random salt it never hands out: nothing uploaded before this instance first
+ * stored that generation, or by an older build, is ever read from it.
+ */
+export function compositeDirIn(root: string, gen: string, salt: string): string | null {
+  if (!GEN_RE.test(gen) || !/^[0-9a-f]{32}$/.test(salt)) {
+    return null;
+  }
+  const base = path.resolve(root);
+  const dir = path.resolve(base, `${gen}.s${salt}`);
+  return dir.startsWith(base + path.sep) ? dir : null;
 }
 

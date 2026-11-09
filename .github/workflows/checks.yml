@@ -154,6 +154,15 @@ jobs:
       - name: Guidelines turned off by 5stack Ranks count as off
         run: npm run check:guidelines
 
+      - name: Only an administrator fills the shared composite store
+        run: npm run check:composite-store
+
+      - name: The sign-in cache stays bounded
+        run: npm run check:identity-cache
+
+      - name: The StatTrak key is compared in constant time
+        run: npm run check:server-key
+
   # NOT in the job above: tools/charmsim-check.ts needs a directory of
   # *.phys.json from the extracted CS2 assets, which no clean runner has. Run it
   # by hand against a mount with `npm run check:charmsim -- <dir>`. Splitting it
