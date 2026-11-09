@@ -28,8 +28,11 @@ function remember(key: string, identity: Identity | null) {
       }
     }
   }
-  if (cache.size >= CACHE_MAX) {
-    cache.clear();
+  for (const oldest of cache.keys()) {
+    if (cache.size < CACHE_MAX) {
+      break;
+    }
+    cache.delete(oldest);
   }
   cache.set(key, { identity, expires: now + CACHE_TTL_MS });
 }

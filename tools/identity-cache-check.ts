@@ -42,11 +42,21 @@ for (let i = 0; i < 60; i++) {
 }
 check("expired entries go before live ones", identityCacheSize() <= before + 60 && identityCacheSize() >= 60, true);
 
-asked = 0;
-const first = await ask("new=59");
-check("a live entry still answers without asking the panel", [first?.steamId, asked], ["new=59", 0]);
 now += 6_000;
-await ask("new=59");
+for (let i = 0; i < 201; i++) {
+  await ask(`live=${i}`);
+}
+asked = 0;
+await ask("live=1");
+check("a full cache drops only its oldest entry", [identityCacheSize(), asked], [200, 0]);
+await ask("live=0");
+check("which is the one asked for again", asked, 1);
+
+asked = 0;
+const first = await ask("live=200");
+check("a live entry still answers without asking the panel", [first?.steamId, asked], ["live=200", 0]);
+now += 6_000;
+await ask("live=200");
 check("an expired one asks again", asked, 1);
 
 if (failures) {

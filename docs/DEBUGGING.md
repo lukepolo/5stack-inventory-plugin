@@ -558,7 +558,11 @@ route only accepts a skin the uploader owns. Anyone else's upload is refused
 (`admin_only`), and their client stops trying for the session: craft takes any
 wear and seed, so owning a matching item doesn't make a shared slot safe.
 `EXTRACT_VERSION` is in the composite generation, so a new extraction starts an
-empty store.
+empty store. On the mount a generation is `<generation>.s<salt>`: the salt is
+random, kept in `inventory.settings` as `composite_salt` and never sent to a
+client, so nothing can be uploaded into a generation ahead of the server.
+Weapon outlines for the sticker mat follow the same rule: only an
+administrator's trace is stored.
 
 - `?compositelog=1` logs every lookup, upload and refusal (`[composite] …`).
   A `key drift` line means `compositeKey` and `compositeStem` disagree, and
