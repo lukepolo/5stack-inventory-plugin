@@ -57,7 +57,8 @@ import {
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
 import { GRID_SLOT_IDS, GRID_SLOTS, resolveGrid } from "./loadoutGrid.ts";
-import { compositeStem } from "./compositeStore.ts";
+import { compositeStem, compositeUploadRefusal } from "./compositeStore.ts";
+import { sameServerKey } from "./serverKey.ts";
 import {
   CARD_FILE_RE,
   CARD_FORMATS,
@@ -1238,6 +1239,10 @@ app.post<{ Params: { gen: string; file: string } }>("/api/composite/:gen/:file",
 }, async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) return reply.status(401).send({ error: "not signed in" });
+  const refused = compositeUploadRefusal(identity.role);
+  if (refused) {
+    return reply.status(403).send({ error: refused, admin_only: true });
+  }
 
   const gen = request.params.gen;
   const q = request.query as Record<string, string | undefined>;
@@ -1271,11 +1276,9 @@ app.post<{ Params: { gen: string; file: string } }>("/api/composite/:gen/:file",
     return reply.status(400).send({ error: "bad composite" });
   }
 
-  // The store is SHARED, so a client does not get to choose which skin its
-  // pixels land on. Every uploaded tuple has to describe an item the caller
-  // actually owns: the wear/seed pair is effectively unique per instance, so
-  // this bounds the blast radius of a doctored client to its own items rather
-  // than to every viewer of that skin.
+  // The store is SHARED, so even an administrator's client does not get to
+  // choose which skin its pixels land on: the tuple has to describe an item the
+  // caller owns.
   const owns = await ownedBy(identity.steamId, { model, legacy, material, wear, seed });
   if (!owns) return reply.status(403).send({ error: "not your item" });
 
@@ -7446,7 +7449,7 @@ app.post<{ Body: { apiKey?: string; targetUid?: number; userId?: string } }>(
   async (request, reply) => {
     const key = await getServerApiKey();
     const { apiKey, targetUid, userId } = request.body;
-    if (!key || apiKey !== key) {
+    if (!sameServerKey(apiKey, key)) {
       return reply.status(401).send({ error: "invalid api key" });
     }
     if (targetUid == null || !userId || !/^\d{17}$/.test(userId)) {

@@ -550,12 +550,15 @@ freshness, ranges, HEAD).
 
 ### 4.13 Checking the composite store
 
-The composite store fills as people open skins in 3D: the first viewer of a
-skin composites it and uploads the pair, and every later viewer and card bake
-of that skin loads the pair instead of the weapon's composite inputs. Card
-bakes read the store but never write it, and the upload route only accepts a
-skin the uploader owns. `EXTRACT_VERSION` is in the composite generation, so a
-new extraction starts an empty store.
+The composite store fills as administrators open skins in 3D: the first
+administrator to view a skin composites it and uploads the pair, and every later
+viewer and card bake of that skin loads the pair instead of the weapon's
+composite inputs. Card bakes read the store but never write it, and the upload
+route only accepts a skin the uploader owns. Anyone else's upload is refused
+(`admin_only`), and their client stops trying for the session: craft takes any
+wear and seed, so owning a matching item doesn't make a shared slot safe.
+`EXTRACT_VERSION` is in the composite generation, so a new extraction starts an
+empty store.
 
 - `?compositelog=1` logs every lookup, upload and refusal (`[composite] …`).
   A `key drift` line means `compositeKey` and `compositeStem` disagree, and
@@ -568,7 +571,8 @@ new extraction starts an empty store.
 - Locally, against the mock: build with `VITE_INVENTORY_API`, start
   `mock-server.mjs` with an inventory that has the items you care about, and
   open them in 3D. The mock rejects any upload whose filename is not the
-  backend's stem, and `GET /__mock/composites` lists what landed.
+  backend's stem, refuses every upload under `MOCK_ADMIN=0`, and
+  `GET /__mock/composites` lists what landed.
 - To prove a stored pair is bit-identical to a fresh render, open the skin with
   `?compositeverify=1` ([§4.9](#49-it-works-in-chrome-but-not-in-safari)
   explains why that matters for Safari).

@@ -57,3 +57,12 @@ export function compositeStem(id: CompositeIdentityKey & { cap: number }): strin
   return `${compositeStemBase(id)}__c${id.cap}`;
 }
 
+// Craft takes any in-range wear and seed, so owning a matching item proves nothing about a slot every
+// viewer reads with an immutable cache header; only an administrator fills the shared store.
+export function compositeUploadRefusal(role: string): string | null {
+  if (role !== "administrator") {
+    return "Only an administrator stores shared composites.";
+  }
+  return null;
+}
+

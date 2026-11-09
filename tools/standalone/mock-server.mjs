@@ -36,7 +36,7 @@
 // it), then kept, and reads (/api/composites/...) serve only what was uploaded.
 // /api/admin/cache gets fake sizes so the Asset Cache tab renders. GET
 // /__mock/composites lists what is stored. MOCK_ADMIN=0 answers every admin
-// route 403.
+// route and every composite upload 403.
 // MOCK_COMPOSITES=keep also lets a composite this mock does not hold fall
 // through to the real backend's store (read only), for timing a store HIT
 // on skins someone already opened against the dev mount.
@@ -308,6 +308,7 @@ createServer(async (req, res) => {
         console.log(`[mock] composite KEY DRIFT: client ${file} vs backend ${name}`);
         return status(res, 400, { error: `key drift: the backend names it ${name}` });
       }
+      if (!ADMIN) return status(res, 403, { error: store.compositeUploadRefusal("user"), admin_only: true });
       if (!ownsComposite(id)) return status(res, 403, { error: "not your item" });
       const g = COMPOSITES.get(gen) ?? new Map();
       COMPOSITES.set(gen, g);

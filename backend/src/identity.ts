@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { FastifyRequest } from "fastify";
 
 export interface Identity {
@@ -11,7 +12,27 @@ const AUTH_URL =
   "http://api.5stack.svc.cluster.local:5585/plugins/authorize";
 
 const CACHE_TTL_MS = 5_000;
+const CACHE_MAX = 200;
 const cache = new Map<string, { identity: Identity | null; expires: number }>();
+
+export function identityCacheSize() {
+  return cache.size;
+}
+
+function remember(key: string, identity: Identity | null) {
+  const now = Date.now();
+  if (cache.size >= CACHE_MAX) {
+    for (const [k, v] of cache) {
+      if (v.expires <= now) {
+        cache.delete(k);
+      }
+    }
+  }
+  if (cache.size >= CACHE_MAX) {
+    cache.clear();
+  }
+  cache.set(key, { identity, expires: now + CACHE_TTL_MS });
+}
 
 // The plugin never decodes the 5stack session cookie -- it hands it back to the
 // panel, which is the only thing that can validate the signature. Anything but a
@@ -24,9 +45,13 @@ export async function getIdentity(
     return devIdentity();
   }
 
-  const cached = cache.get(cookie);
+  const key = createHash("sha256").update(cookie).digest("hex");
+  const cached = cache.get(key);
   if (cached && cached.expires > Date.now()) {
     return cached.identity;
+  }
+  if (cached) {
+    cache.delete(key);
   }
 
   let identity: Identity | null = null;
@@ -48,7 +73,7 @@ export async function getIdentity(
     return devIdentity();
   }
 
-  cache.set(cookie, { identity, expires: Date.now() + CACHE_TTL_MS });
+  remember(key, identity);
   return identity ?? devIdentity();
 }
 
