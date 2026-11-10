@@ -8733,7 +8733,7 @@ if (MDEBUG) {
 // ---- the panel's breadcrumbs -----------------------------------------------
 //
 // The host shows "<plugin title> › <this trail>" in its top bar, so pages are
-// named by what they ARE — "Inventory › Settings › 3D Models", "Inventory ›
+// named by what they ARE — "Loadout › Settings › 3D Models", "Loadout ›
 // AWP | Dragon Lore" — instead of the URL's "apps › inventory › admin ›
 // models" or an item id. It is why the settings console no longer needs a page
 // header of its own.
@@ -8747,15 +8747,15 @@ const crumbTrail = computed<HostCrumb[]>(() => {
   const r = route.value;
   const named = (label: string): HostCrumb[] => (label ? [{ label }] : []);
   switch (r.name) {
-    // Named, not left as the bare plugin title: "Inventory" alone read as
-    // the breadcrumbs not working at all.
+    // Named by the build on screen, not left as the bare plugin title:
+    // "Loadout" alone read as the breadcrumbs not working at all, and the
+    // tab's own name would repeat it.
     case "loadout":
-      return [{ label: "Loadout" }];
+      return [{ label: activePresetName.value }];
     case "focus":
-      return [{ label: "Loadout", to: "/" }, ...named(itemName(focusRow.value?.item))];
-    // "Items", not the tab's "Inventory": the plugin's own title already is.
+      return [{ label: activePresetName.value, to: "/" }, ...named(itemName(focusRow.value?.item))];
     case "inventory":
-      return [{ label: "Items" }];
+      return [{ label: "Inventory" }];
     case "armory":
       return [{ label: "Craft" }];
     case "stickerCrafts":
