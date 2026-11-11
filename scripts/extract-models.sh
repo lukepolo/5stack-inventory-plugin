@@ -12,9 +12,10 @@
 # and no tarball is produced. WORK_DIR points scratch space at an emptyDir.
 #
 # Windows: download cli-windows-x64.zip from
-# https://github.com/ValveResourceFormat/ValveResourceFormat/releases/tag/19.2
-# (the version pinned in step 1, not the latest) and run the same
-# Source2Viewer-CLI flags from step 2 in PowerShell.
+# https://github.com/ValveResourceFormat/ValveResourceFormat/releases/tag/20.1
+# (the version pinned in step 1, not the latest), run the same
+# Source2Viewer-CLI flags from step 2 in PowerShell, then
+# `node scripts/glb-source-space.mjs <output dir>`.
 set -euo pipefail
 
 # ---- Pipeline version --------------------------------------------------------
@@ -240,9 +241,11 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
-# v40 (2026-11-11): Source 2 Viewer CLI pinned to 19.2 (was releases/latest).
-# A mount made with 20.x has GLBs in metres with no root node; animated pets
-# tear apart on it because their clips are in inches. Needs a full run.
+# v40 (2026-11-11): Source 2 Viewer CLI pinned to 20.1 (was releases/latest).
+# 19.2 cannot read the AUG and R8 models or most reload clips of the current
+# build, and 20.x GLBs come out in metres with no root node, which tears
+# animated pets apart. scripts/glb-source-space.mjs puts them back in the 19.x
+# layout. Needs a full run.
 # v39 (2026-10-21): LIGHTER ASSETS, same pixels (scripts/lighten-assets.mjs).
 #   inputs-2048  every composite input over 2048px gets a 2048 copy beside it
 #                (`<name>.2048.png`, listed in meta.json as `textures2048`). The
@@ -617,15 +620,16 @@ mkdir -p "$RAW" "$DEST/knives" "$DEST/extra" "$CLI_DIR"
 find "$DEST" -type f -name '*.gz' -delete 2>/dev/null || true
 
 # ---- 1. Fetch Source 2 Viewer CLI (linux-x64) --------------------------------
-# Pinned. From 20.0 the glTF export bakes the Source-to-glTF conversion into
-# bones and vertices instead of a root node, so its GLBs are in metres while the
-# clips we decode from .vnmclip_c stay in inches. The cached CLI is identified
-# by the SHA-256 of its binary, so a 19.2 cached before the pin is kept and
-# anything else is replaced. S2V_CLI runs your own build instead.
-S2V_VERSION="${S2V_VERSION:-19.2}"
-if [[ "$S2V_VERSION" == 19.2 ]]; then
-  S2V_CLI_SHA256="${S2V_CLI_SHA256:-9f651e032b5fec4a0d45c9398e5c1dc37a790e81759fe1fbdc4e9ef95ea2d565}"
+# Pinned. 20.x bakes the Source-to-glTF conversion into bones and vertices
+# instead of a root node, which glb-source-space.mjs undoes after each export;
+# a newer release may change the export again. The cached CLI is identified by
+# the SHA-256 of its binary and anything else is replaced. S2V_CLI runs your
+# own build instead.
+S2V_VERSION="${S2V_VERSION:-20.1}"
+if [[ "$S2V_VERSION" == 20.1 ]]; then
+  S2V_CLI_SHA256="${S2V_CLI_SHA256:-3aaa77568beaf6b130d974993a42088d8ce58b2e001fdda42a2fd8aae58ffb4d}"
 fi
+GLB_SOURCE_SPACE="$(dirname "$0")/glb-source-space.mjs"
 cli_sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 if [[ -n "${S2V_CLI:-}" ]]; then
   CLI="$S2V_CLI"
@@ -733,6 +737,7 @@ if (( ${#WEAPON_DIRS[@]} == 0 )); then
     --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
     --gltf_export_animations
   done
+  node "$GLB_SOURCE_SPACE" "$RAW"
 else
   echo "--- Sharding ${#WEAPON_DIRS[@]} model dirs (weapons, charms, agents, gloves), starting at $(read_jobs) worker(s)…"
   # Each shard touches a marker on completion, which is both the progress count
@@ -745,10 +750,15 @@ else
   # shard. Dumping it all buried everything; dumping none of it also threw away
   # real decompile failures, which is the only thing here worth reading. Keep
   # the rest, tagged with the weapon so parallel shards stay legible.
-  SHARD_NOISE='Only VCS file versions|^Preloading vpk|^Added folder|^Found "Counter-Strike 2"|^--- Dumping decompiled|^--- Creating mesh|^--- Loading material|^--- Dump written to|^$'
+  SHARD_NOISE='Only VCS file versions|^glTF animation filter matched no|^Preloading vpk|^Added folder|^Found "Counter-Strike 2"|^--- Dumping decompiled|^--- Creating mesh|^--- Loading material|^--- Dump written to|^$'
   shard_one() {
-    local dir="$1" tag
+    local dir="$1" tag only=()
     tag="${dir//\//_}"
+    # 20.x writes every animation-graph clip into the GLB: 2,190 of them and
+    # 1.2GB for one agent. The viewer plays only these two.
+    if [[ "$dir" == agents/models/* && "$dir" != agents/models/shared/ ]]; then
+      only=(--gltf_animation_list tools_preview,eye_test)
+    fi
     # grep returns 1 when every line was expected noise. That is harmless;
     # a nonzero decompiler exit is not. Preserve the pipeline statuses before
     # another command overwrites PIPESTATUS, and let the pool report failure.
@@ -756,7 +766,7 @@ else
     set +e
     "$CLI" -i "$VPK" -o "$SHARDS/$tag" -d -f "$dir" -e "vmdl_c" \
       --gltf_export_format glb --gltf_export_materials --gltf_textures_adapt \
-      --gltf_export_animations 2>&1 |
+      --gltf_export_animations ${only[@]+"${only[@]}"} 2>&1 |
       grep -vE "$SHARD_NOISE" |
       sed "s|^|    [$(basename "$dir")] |"
     status=("${PIPESTATUS[@]}")
@@ -803,6 +813,7 @@ else
     sleep 2
   done
   wait
+  node "$GLB_SOURCE_SPACE" "$SHARDS"
   for shard in "$SHARDS"/*/; do
     [[ -d "$shard" ]] && cp -rn "$shard". "$RAW/" 2>/dev/null || true
   done
@@ -1073,7 +1084,8 @@ if step_if "pet-models"; then
 echo ""
 echo "--- Extracting pets…"
 PET_RAW="$WORK/raw_pets"
-CLI="$CLI" VPK="$VPK" DEST="$DEST" PET_RAW="$PET_RAW" ITEMS_GAME="$ITEMS_GAME" python3 - <<'PYEOF'
+CLI="$CLI" VPK="$VPK" DEST="$DEST" PET_RAW="$PET_RAW" ITEMS_GAME="$ITEMS_GAME" \
+  GLB_SOURCE_SPACE="$GLB_SOURCE_SPACE" python3 - <<'PYEOF'
 import json, os, re, shutil, struct, subprocess, sys
 
 CLI, VPK, DEST, RAW = (os.environ[k] for k in ("CLI", "VPK", "DEST", "PET_RAW"))
@@ -1166,6 +1178,8 @@ for n, m in enumerate(models, 1):
     cli("-o", RAW, "-d", "-f", m + ".vmdl_c", "--gltf_export_format", "glb",
         "--gltf_export_materials", "--gltf_textures_adapt", "--gltf_export_animations")
     src = os.path.join(RAW, m + ".glb")
+    if os.path.exists(src):
+        subprocess.run(["node", os.environ["GLB_SOURCE_SPACE"], src], check=True)
     doc = glb_json(src) if os.path.exists(src) else None
     if doc is None:
         print(f"!! {m}: no GLB came out of the decompile")
@@ -1356,6 +1370,7 @@ if not have_cwebp:
     print("!!  `cwebp` not found — pet style textures stay PNG (see model-textures for why "
           "there is no ImageMagick fallback).", file=sys.stderr)
 TEX_RAW = os.path.join(RAW, "tex")
+os.makedirs(TEX_RAW, exist_ok=True)
 by_dir = {}
 for tex in uses:
     by_dir.setdefault(os.path.dirname(tex), []).append(tex)
@@ -5183,6 +5198,7 @@ def recover_unsupported(paths):
     """Decode what the batch could not, into the same place it would have."""
     work = raw + ".recover"
     shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
     subprocess.run([cli, "-i", vpk, "-o", work, "-f", ",".join(paths)], capture_output=True)
     done = []
     for t in paths:

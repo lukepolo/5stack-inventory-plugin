@@ -70,6 +70,9 @@ jobs:
       - name: Model decompile failures stop before merge and stamping
         run: npm run check:extract-shards
 
+      - name: Source 2 Viewer 20.x models go back to the 19.x layout
+        run: npm run check:glb-source-space
+
       - name: Typecheck
         run: npm run typecheck
 
