@@ -370,21 +370,20 @@ fi
 # ---- Parallelism -------------------------------------------------------------
 # Sized in WORKERS, and the unit that matters is memory, not cores. Every
 # fan-out here is a Source2Viewer or ImageMagick process, and the CLI's peak RSS
-# is set by the textures it decodes WHOLE, not by how long it runs. Measured on
-# a 12-core node:
+# is set by what it decodes WHOLE, not by how long it runs. Measured on a
+# 12-core node with Source 2 Viewer 20.1:
 #
-#   decompile one weapon dir  -> 1.3 GB anon RSS (a single 4K-textured AK is
-#                                0.8 GB on its own; the knife dir, 22 models
-#                                with smaller maps, is only 0.5 GB)
+#   decompile one agent dir   -> 3.2 GB peak RSS. 20.1 loads every
+#                                animation-graph clip of the rig even when
+#                                --gltf_animation_list drops them, and the agent
+#                                dirs sort first, so N workers start on N of them
+#   decompile one weapon dir  -> 1.5 GB (the knife dir, 22 models with smaller
+#                                maps, is 0.8 GB)
 #   extract a texture batch   -> ~0.12 GB per process
 #
 # .NET GC knobs do nothing about that (tried: gcServer=0, GCConserveMemory=9,
 # GCHeapHardLimit — all within noise), because the memory is live decoded
-# pixels, not GC slack. How many run at once is the only lever. Measured over
-# the full 41-dir decompile on that node:
-#
-#   -P 12 -> 13.5 GB peak, 79s        -P 3 -> 3.7 GB peak,  86s
-#   -P  6 ->  7.0 GB peak, 78s        -P 2 -> 2.4 GB peak, 106s
+# data, not GC slack. How many run at once is the only lever.
 #
 # THE DEFAULT IS ONE. This step used to run `-P $(nproc)`, which asked for up to
 # 13.5 GB and OOM-killed people's machines — not the extraction, the box. The
@@ -396,7 +395,7 @@ fi
 # loop), so raising it in the panel spins up more workers in a run ALREADY IN
 # PROGRESS. That is the intended workflow: start at one, watch the memory, add
 # workers if the box has room.
-DECOMPILE_WORKER_MB=1400   # measured peak RSS of one decompile shard
+DECOMPILE_WORKER_MB=3300   # measured peak RSS of one decompile shard
 EXTRACT_WORKER_MB=120      # …and of one texture extract/convert worker
 JOBS_FILE="${EXTRACT_JOBS_FILE:-${OUT_DIR:-$WORK}/extract-jobs}"
 CORES=$(nproc 2>/dev/null || echo 4)
