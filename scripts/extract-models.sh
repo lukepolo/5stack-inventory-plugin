@@ -239,6 +239,9 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v40 (2026-11-11): Source 2 Viewer CLI pinned to 19.2 (was releases/latest).
+# A mount made with 20.x has GLBs in metres with no root node; animated pets
+# tear apart on it because their clips are in inches. Needs a full run.
 # v39 (2026-10-21): LIGHTER ASSETS, same pixels (scripts/lighten-assets.mjs).
 #   inputs-2048  every composite input over 2048px gets a 2048 copy beside it
 #                (`<name>.2048.png`, listed in meta.json as `textures2048`). The
@@ -337,7 +340,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=39
+EXTRACT_VERSION=40
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the
@@ -613,15 +616,21 @@ mkdir -p "$RAW" "$DEST/knives" "$DEST/extra" "$CLI_DIR"
 find "$DEST" -type f -name '*.gz' -delete 2>/dev/null || true
 
 # ---- 1. Fetch Source 2 Viewer CLI (linux-x64) --------------------------------
+# Pinned. From 20.0 the glTF export bakes the Source-to-glTF conversion into
+# bones and vertices instead of a root node, so its GLBs are in metres while the
+# clips we decode from .vnmclip_c stay in inches. A cached CLI of another
+# version is replaced.
+S2V_VERSION="${S2V_VERSION:-19.2}"
 CLI="$CLI_DIR/Source2Viewer-CLI"
-if [[ ! -x "$CLI" ]]; then
-  echo "--- Downloading Source 2 Viewer CLI…"
-  url=$(curl -s https://api.github.com/repos/ValveResourceFormat/ValveResourceFormat/releases/latest |
-    grep browser_download_url | grep 'cli-linux-x64.zip' | cut -d '"' -f4)
-  curl -sL "$url" -o "$WORK/cli.zip"
+if [[ ! -x "$CLI" || "$(cat "$CLI_DIR/.version" 2>/dev/null)" != "$S2V_VERSION" ]]; then
+  echo "--- Downloading Source 2 Viewer CLI $S2V_VERSION…"
+  rm -rf "$CLI_DIR"
+  mkdir -p "$CLI_DIR"
+  curl -fsSL "https://github.com/ValveResourceFormat/ValveResourceFormat/releases/download/$S2V_VERSION/cli-linux-x64.zip" -o "$WORK/cli.zip"
   unzip -o -q "$WORK/cli.zip" -d "$CLI_DIR"
   CLI="$(find "$CLI_DIR" -maxdepth 2 -type f -name '*CLI*' ! -name '*.zip' | head -1)"
   chmod +x "$CLI"
+  echo "$S2V_VERSION" >"$CLI_DIR/.version"
 fi
 echo "--- CLI: $CLI"
 
