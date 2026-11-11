@@ -12,8 +12,9 @@
 # and no tarball is produced. WORK_DIR points scratch space at an emptyDir.
 #
 # Windows: download cli-windows-x64.zip from
-# https://github.com/ValveResourceFormat/ValveResourceFormat/releases and run
-# the same Source2Viewer-CLI flags from step 2 in PowerShell.
+# https://github.com/ValveResourceFormat/ValveResourceFormat/releases/tag/19.2
+# (the version pinned in step 1, not the latest) and run the same
+# Source2Viewer-CLI flags from step 2 in PowerShell.
 set -euo pipefail
 
 # ---- Pipeline version --------------------------------------------------------
@@ -618,21 +619,41 @@ find "$DEST" -type f -name '*.gz' -delete 2>/dev/null || true
 # ---- 1. Fetch Source 2 Viewer CLI (linux-x64) --------------------------------
 # Pinned. From 20.0 the glTF export bakes the Source-to-glTF conversion into
 # bones and vertices instead of a root node, so its GLBs are in metres while the
-# clips we decode from .vnmclip_c stay in inches. A cached CLI of another
-# version is replaced.
+# clips we decode from .vnmclip_c stay in inches. The cached CLI is identified
+# by the SHA-256 of its binary, so a 19.2 cached before the pin is kept and
+# anything else is replaced. S2V_CLI runs your own build instead.
 S2V_VERSION="${S2V_VERSION:-19.2}"
-CLI="$CLI_DIR/Source2Viewer-CLI"
-if [[ ! -x "$CLI" || "$(cat "$CLI_DIR/.version" 2>/dev/null)" != "$S2V_VERSION" ]]; then
-  echo "--- Downloading Source 2 Viewer CLI $S2V_VERSION…"
-  rm -rf "$CLI_DIR"
-  mkdir -p "$CLI_DIR"
-  curl -fsSL "https://github.com/ValveResourceFormat/ValveResourceFormat/releases/download/$S2V_VERSION/cli-linux-x64.zip" -o "$WORK/cli.zip"
-  unzip -o -q "$WORK/cli.zip" -d "$CLI_DIR"
-  CLI="$(find "$CLI_DIR" -maxdepth 2 -type f -name '*CLI*' ! -name '*.zip' | head -1)"
-  chmod +x "$CLI"
-  echo "$S2V_VERSION" >"$CLI_DIR/.version"
+if [[ "$S2V_VERSION" == 19.2 ]]; then
+  S2V_CLI_SHA256="${S2V_CLI_SHA256:-9f651e032b5fec4a0d45c9398e5c1dc37a790e81759fe1fbdc4e9ef95ea2d565}"
 fi
-echo "--- CLI: $CLI"
+cli_sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+if [[ -n "${S2V_CLI:-}" ]]; then
+  CLI="$S2V_CLI"
+  S2V_VERSION="S2V_CLI"
+else
+  if [[ -z "${S2V_CLI_SHA256:-}" ]]; then
+    echo "!! S2V_VERSION=$S2V_VERSION needs S2V_CLI_SHA256: unzip -p cli-linux-x64.zip Source2Viewer-CLI | sha256sum" >&2
+    exit 1
+  fi
+  CLI="$CLI_DIR/Source2Viewer-CLI"
+  if [[ ! -x "$CLI" || "$(cli_sha "$CLI")" != "$S2V_CLI_SHA256" ]]; then
+    echo "--- Downloading Source 2 Viewer CLI $S2V_VERSION…"
+    curl -fsSL --retry 3 --retry-connrefused "https://github.com/ValveResourceFormat/ValveResourceFormat/releases/download/$S2V_VERSION/cli-linux-x64.zip" -o "$WORK/cli.zip"
+    rm -rf "$CLI_DIR.new"
+    unzip -o -q "$WORK/cli.zip" -d "$CLI_DIR.new"
+    rm -f "$WORK/cli.zip"
+    got="$(cli_sha "$CLI_DIR.new/Source2Viewer-CLI")"
+    if [[ "$got" != "$S2V_CLI_SHA256" ]]; then
+      rm -rf "$CLI_DIR.new"
+      echo "!! Source2Viewer-CLI $S2V_VERSION has SHA-256 ${got:-<missing>}, expected $S2V_CLI_SHA256" >&2
+      exit 1
+    fi
+    chmod +x "$CLI_DIR.new/Source2Viewer-CLI"
+    rm -rf "$CLI_DIR"
+    mv "$CLI_DIR.new" "$CLI_DIR"
+  fi
+fi
+echo "--- CLI: $CLI ($S2V_VERSION)"
 
 # One listing of the archive, reused by every step below (model sharding,
 # sticker markup, icons, paints). Cheap, and it keeps the matching rules in one
