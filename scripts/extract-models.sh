@@ -519,6 +519,13 @@ step() { # step "Name" — closes the previous step and opens this one
   prog "$1" running
 }
 
+# Steam patches CS2 in place, so a run that spans an update reads two builds:
+# every decode during the rewrite fails, and what came before mixes with what
+# comes after. RUN_REF is touched before the first read of the archive.
+cs2_changed() {
+  [[ -n "${RUN_REF:-}" && -n "$(find "$(dirname "$VPK")" -maxdepth 1 \( -name '*.vpk' -o -name steam.inf \) -newer "$RUN_REF" -print -quit 2>/dev/null)" ]]
+}
+
 # ---- Step selection (DEVELOPMENT ONLY) ---------------------------------------
 # A full run is hours, and most work on this script touches exactly one step —
 # so iterating on, say, the glove branch of rename-models meant re-decompiling
@@ -594,6 +601,9 @@ step_if() { # step_if <id>
 # has moved on under the current assets (Valve shipped a patch since the last
 # extract) — a softer signal than the pipeline stamp, since most patches don't
 # touch weapon models. A missing/odd file just leaves these empty.
+mkdir -p "$WORK"
+RUN_REF="$WORK/.run-start"
+touch "$RUN_REF"
 STEAM_INF="$CS2_DIR/game/csgo/steam.inf"
 GAME_BUILD=""; GAME_PATCH=""; GAME_DATE=""
 if [[ -f "$STEAM_INF" ]]; then
@@ -5430,6 +5440,15 @@ if unresolved:
           f"(those skins render white), e.g. {', '.join(unresolved[:4])}")
 if failed:
     print(f"!!! {len(failed)} paint assets failed: {failed[:5]}")
+
+
+def publishable(failed_count, total):
+    return failed_count * 50 <= total
+
+
+if not publishable(len(failed), len(textures)):
+    raise SystemExit(f"!! {len(failed)} of {len(textures)} paint textures failed to decode, "
+                     "so the live paints are kept. Run the extraction again.")
 PYEOF
 
   # ---- swap staging into place ------------------------------------------------
@@ -5447,6 +5466,10 @@ PYEOF
   # the asset routes handing those 404s a year-long immutable Cache-Control (see
   # serveAssetDir); they no longer do, so a request unlucky enough to land in it
   # retries and succeeds instead of caching the miss forever.
+  if cs2_changed; then
+    echo "!! CS2 was updated while the paints were built, so the live paints are kept. Run the extraction again." >&2
+    exit 1
+  fi
   echo "--- Swapping paints into place…"
   rm -rf "$PAINT_LIVE.old"
   mv "$PAINT_LIVE" "$PAINT_LIVE.old"
@@ -5767,6 +5790,10 @@ fi
 json_num() { [[ "$1" =~ ^[0-9]+$ ]] && printf '%s' "$1" || printf 'null'; }
 json_str() { [[ -n "$1" ]] && printf '"%s"' "$1" || printf 'null'; }
 step "stamp"          # closes the last real step so its time is reported
+if cs2_changed; then
+  echo "!! CS2 was updated during this run, so its output mixes two builds. Not stamping: run the extraction again." >&2
+  exit 1
+fi
 RUN_SECONDS=$(( $(date +%s) - RUN_START ))
 # Per-step seconds as a JSON object, so the panel can show where the time went
 # rather than just a total that nobody can act on.
