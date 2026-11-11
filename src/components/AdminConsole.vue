@@ -639,7 +639,7 @@ async function doStartExtract() {
 }
 
 // ---- workers ----------------------------------------------------------------
-// A memory dial. Each decompile worker peaks around 1.4 GB (measured — see the
+// A memory dial. Each decompile worker peaks at up to 3.3 GB (measured — see the
 // script's "Parallelism" note), which is why this defaults to 1 and why the
 // projection below is stated in GB rather than as an abstract "parallelism"
 // number: running this at core count is what OOM-killed people's machines.
@@ -654,7 +654,7 @@ const fmtGb = (gb: number) => `${gb >= 10 ? Math.round(gb) : gb.toFixed(1)} GB`;
  *  first band — an operator needs to see that the extraction stacks on top of
  *  a box that is already doing something, not into an empty machine. The
  *  projection is a RANGE for the same reason the backend reports one: a worker
- *  drawing the knife directory takes 0.5 GB and one drawing an AK takes 1.3, so
+ *  drawing the knife directory takes 0.8 GB and one drawing an agent takes 3.2, so
  *  a single number would be a guess dressed as a measurement. */
 const memPlan = computed(() => {
   const w = workers.value;

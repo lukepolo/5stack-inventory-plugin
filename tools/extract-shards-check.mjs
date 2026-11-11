@@ -54,6 +54,7 @@ WORK=${quote(dir)}
 RAW="$WORK/raw"; mkdir -p "$RAW"
 VPK="$WORK/fixture.vpk"
 CLI=${quote(fakeCli)}
+GLB_SOURCE_SPACE=${quote(new URL('../scripts/glb-source-space.mjs', import.meta.url).pathname)}
 WEAPON_DIRS=(weapons/models/first/ weapons/models/second/ ${mode === 'concurrent' ? 'weapons/models/third/' : ''})
 read_jobs() { echo ${mode === 'concurrent' ? 2 : 1}; }
 prog() { :; }

@@ -59,6 +59,18 @@ export function readClip(buf) {
   const clip = doc.elements.find((e) => e.type === "DmeChannelsClip");
   if (!clip) throw new Error("no DmeChannelsClip in this DMX — not an animation?");
 
+  // ONLY THE CLIP'S OWN SKELETON. Source 2 Viewer 20.x appends the clip's
+  // secondary skeleton (a viewmodel's `weapon` tree) as a second root under the
+  // model; those tracks are read from the DATA block instead (propTracks).
+  const model = doc.elements.find((e) => e.type === "DmeModel");
+  const primary = (model?.attrs.children ?? []).find((c) => c.type === "DmeJoint");
+  const own = new Set();
+  const collect = (el) => {
+    if (el?.type === "DmeJoint") own.add(el.name);
+    for (const c of el?.attrs.children ?? []) collect(c);
+  };
+  collect(primary);
+
   const bones = {};
   for (const ch of clip.attrs.channels ?? []) {
     // `<bone>_p` is position, `<bone>_o` is orientation. The suffix is the only
@@ -68,6 +80,7 @@ export function readClip(buf) {
     const m = /^(.*)_([po])$/.exec(ch.name ?? "");
     if (!m) continue;
     const [, bone, kind] = m;
+    if (own.size && !own.has(bone)) continue;
     const attr = ch.attrs?.toAttribute;
     if (kind === "p" && attr !== "position") continue;
     if (kind === "o" && attr !== "orientation") continue;
@@ -88,13 +101,29 @@ export function readClip(buf) {
   const walk = (el, parentName) => {
     if (!el) return;
     const isJoint = el.type === "DmeJoint";
-    if (isJoint && parentName != null) parents[el.name] = parentName;
+    if (isJoint && parentName != null && (!own.size || own.has(el.name))) parents[el.name] = parentName;
     for (const c of el.attrs.children ?? []) walk(c, isJoint ? el.name : parentName);
   };
   walk(
     doc.elements.find((e) => e.type === "DmeModel"),
     null,
   );
+
+  // 20.x moved the skeleton's axis swap onto `root_motion`: its bind and its
+  // keys carry it while every child track is unchanged, so played as written
+  // the whole rig turns 120 degrees. Its keys are taken relative to that bind,
+  // which is identity on 19.x.
+  const bind = primary?.attrs.transform?.attrs.orientation;
+  const rootRot = primary ? bones[primary.name]?.rot : null;
+  if (Array.isArray(bind) && rootRot) {
+    const [bx, by, bz, bw] = [-bind[0], -bind[1], -bind[2], bind[3]];
+    rootRot.values = rootRot.values.map(([x, y, z, w]) => [
+      bw * x + bx * w + by * z - bz * y,
+      bw * y - bx * z + by * w + bz * x,
+      bw * z + bx * y - by * x + bz * w,
+      bw * w - bx * x - by * y - bz * z,
+    ]);
+  }
 
   const tf = clip.attrs.timeFrame?.attrs ?? {};
   return {

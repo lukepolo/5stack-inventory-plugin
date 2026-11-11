@@ -6297,13 +6297,13 @@ const EXTRACT_LOG_LINES = 200;
 const EXTRACT_JOBS_FILE = path.join(MODELS_ROOT, "extract-jobs");
 // Measured peak RSS of ONE decompile worker (see "Parallelism" in the script,
 // where the full measurements live). A range, not a number, because it depends
-// entirely on the weapon a worker draws: the knife directory peaked at 0.5 GB,
-// a single 4K-textured AK at 1.3 GB. Full-run aggregates landed between those
-// per worker (12 workers -> 13.5 GB, 3 -> 3.7 GB), so the band is honest rather
-// than padded. The panel multiplies it out to warn before someone OOMs their
-// box — which is exactly what `-P $(nproc)` used to do here.
-const EXTRACT_WORKER_MIN_MB = 500;
-const EXTRACT_WORKER_MAX_MB = 1400;
+// entirely on the directory a worker draws: the knife directory peaks at 0.8 GB,
+// an agent directory at 3.2 GB (Source 2 Viewer 20.1 loads every
+// animation-graph clip of the rig). The agent dirs go first, so a run's opening
+// minutes sit at the top of the band. The panel multiplies it out to warn before
+// someone OOMs their box — which is exactly what `-P $(nproc)` used to do here.
+const EXTRACT_WORKER_MIN_MB = 800;
+const EXTRACT_WORKER_MAX_MB = 3300;
 // Headroom the panel tells operators to leave. This plugin runs INSIDE a 5stack
 // deployment, so the box is normally also serving the panel, its database and
 // possibly game servers; an extraction that fits only by consuming every free
