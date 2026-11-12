@@ -190,7 +190,7 @@ import { gloveLegacySeedMoves, loadGlovePaintDef } from "./gloveComposite";
 import { glovePlacementAt, glovePlacementTable, glovePlacementTraits } from "./glovePattern";
 import { isCompact, isCoarse, reducedMotion } from "./responsive";
 import { slotsText } from "./craftPlanText";
-import { revealInScroller, scrollFade, scrollPanelToTop } from "./dom";
+import { scrollFade, scrollPanelToTop } from "./dom";
 import { hasModel, hasModelSync } from "./modelAvailability";
 import { INCOMPLETE } from "./viewerSentinel";
 import { snapshotModel, viewersIdle, viewerStats } from "./viewer3dLazy";
@@ -5730,35 +5730,16 @@ function resetSheetFilters() {
   sheetDir.value = sheetSortCtl.loadDir(DEFAULT_SORT);
 }
 
-// ---- desktop: the lifting picker sheet --------------------------------------
-// The picker used to be a fixed 34vh strip below the loadout. Browsing skins in
-// it is cramped, and the only lever for more room — shrinking the loadout —
-// reflows three column scrollers and squeezes every slot card down to its
-// min-height.
-//
-// So on desktop the sheet comes OUT OF FLOW and floats over the loadout. The
-// loadout half reserves the collapsed height as padding and then never moves
-// again: lifting changes nothing but the sheet's own height, which also means
-// the 3D canvas up there never gets resized by a lift. The cost is occlusion —
-// the slot you're editing can end up underneath — and `revealSelectedSlot`
-// below is what pays it off.
-//
-// Explicitly toggled, never automatic. An earlier build raised it on pointer-in
-// and lowered it on pointer-out, which read as the panel deciding things on its
-// own — a half-second of hesitation over the wrong pixel resized the screen.
-//
-// Compact keeps its drag-to-snap sheet; none of this applies there.
-const SHEET_COLLAPSED_MIN = 210; // was min-h-[210px]
-const SHEET_COLLAPSED_VH = 34; // was h-[34vh]
-const SHEET_LIFT_PCT = 60; // of the loadout column, NOT of the viewport
-const SHEET_LIFT_MS = 240; // height transition; the reveal below waits it out
+// ---- desktop: the picker sheet ----------------------------------------------
+// On desktop the picker docks beside the loadout (see `docked` below). The
+// collapsed strip height survives only in the visitor's loading skeleton, which
+// still draws the old below-the-loadout layout.
+const SHEET_COLLAPSED_MIN = 210;
+const SHEET_COLLAPSED_VH = 34;
 const SHEET_COLLAPSED_CSS = `max(${SHEET_COLLAPSED_MIN}px, ${SHEET_COLLAPSED_VH}vh)`;
 
-const sheetLift = usePersistedBool("cs2inv.sheetLift", false);
-
-// The sheet only floats on desktop, and only when it's on screen at all — the
-// 3D viewer route replaces it entirely (`v-if="!viewerId"`), and reserving
-// space for a sheet that isn't rendered would leave a dead strip.
+// The picker is on desktop only when it's on screen at all — a visitor's view
+// (`?player=`) has none, and reserving room for it would leave a dead strip.
 const canLift = computed(() => !isCompact.value && !viewerId.value);
 
 // Tap-to-equip is a desktop affordance: it leans on hover to preview what the
@@ -5768,20 +5749,9 @@ const canLift = computed(() => !isCompact.value && !viewerId.value);
 // exactly where the phone layout gets tested, and there a stray tap silently
 // re-equipped the slot with no menu and no undo.
 const tapOpensMenu = computed(() => isCoarse.value || isCompact.value);
-const lifted = computed(() => canLift.value && sheetLift.value && !docked.value);
 
 const loadoutEl = ref<HTMLElement | null>(null);
 const loadoutH = ref(0);
-const viewportH = ref(typeof window === "undefined" ? 0 : window.innerHeight);
-// Collapsed height stays viewport-derived (that's what 34vh meant) while the
-// lifted one is a fraction of the loadout column, so CSS can resolve both on
-// its own. Only their DIFFERENCE has to be a real number here, because that's
-// how far the sheet reaches over the loadout — the band the slot columns have
-// to be able to scroll out from under.
-const collapsedPx = computed(() => Math.max(SHEET_COLLAPSED_MIN, (SHEET_COLLAPSED_VH / 100) * viewportH.value));
-const liftIntrusion = computed(() =>
-  lifted.value ? Math.max(0, Math.round((loadoutH.value * SHEET_LIFT_PCT) / 100 - collapsedPx.value)) : 0,
-);
 
 // Reserved on the loadout side so the collapsed layout is exactly what it was
 // when the sheet still took its space in flow.
@@ -6341,43 +6311,10 @@ async function mountSpot3d(key: string) {
 const loadoutPadStyle = computed(() =>
   isCompact.value
     ? { paddingBottom: `${Math.round(sheetPeekPx.value || loadoutH.value * PEEK_FRAC)}px` }
-    : canLift.value
-      ? docked.value
-        ? dockSmall.value
-          ? {}
-          : { paddingRight: `${dockGeo.value.dockW}px` }
-        : { paddingBottom: SHEET_COLLAPSED_CSS }
+    : canLift.value && !dockSmall.value
+      ? { paddingRight: `${dockGeo.value.dockW}px` }
       : {},
 );
-// Every loadout scroller gets the same pair: a spacer in the template gives it
-// somewhere to scroll TO, and scroll-padding keeps browser-driven scrolls (tab
-// focus, mostly) from landing under the sheet.
-const liftScrollStyle = computed(() => (liftIntrusion.value ? { scrollPaddingBottom: `${liftIntrusion.value}px` } : {}));
-
-// The whole point of the reserve above: with the sheet lifted, the slot being
-// edited has to stay visible in the strip that's left. Every loadout scroller
-// carries a spacer exactly `liftIntrusion` tall while lifted, so there is
-// always a scroll position that clears the sheet.
-async function revealSelectedSlot(smooth = true) {
-  if (!lifted.value || view.value !== "grid") return;
-  await nextTick(); // the spacer has to be in the DOM before there's anywhere to go
-  const el = loadoutEl.value?.querySelector<HTMLElement>(`[data-slot="${CSS.escape(selected.value)}"]`);
-  if (!el) return;
-  const inset = liftIntrusion.value;
-  // Two passes, and the second is the one that's actually load-bearing. A
-  // scroll issued while the sheet is still animating its own height lands
-  // short — measured ~50px shy — and on the toggle-up that starts it the
-  // scroller may not even have the range yet, making the first pass a silent
-  // no-op. The settle pass runs once the transition is over and is itself a
-  // no-op whenever the first one already arrived.
-  revealInScroller(el, inset, smooth && !reducedMotion.value);
-  clearTimeout(revealSettleTimer);
-  revealSettleTimer = setTimeout(() => revealInScroller(el, inset, false), SHEET_LIFT_MS + 80);
-}
-let revealSettleTimer: ReturnType<typeof setTimeout> | undefined;
-// liftIntrusion is in here for the resize case: the free strip changes size and
-// what used to be visible may not be any more.
-watch([lifted, selected, liftIntrusion], () => void revealSelectedSlot());
 
 let loadoutRO: ResizeObserver | null = null;
 // The loadout column mounts and unmounts with the view swap, so the observer
@@ -6389,10 +6326,7 @@ watch(loadoutEl, (el) => {
   loadoutRO = null;
   if (!el || typeof ResizeObserver === "undefined") return;
   loadoutH.value = el.clientHeight;
-  loadoutRO = new ResizeObserver(() => {
-    loadoutH.value = el.clientHeight;
-    viewportH.value = window.innerHeight;
-  });
+  loadoutRO = new ResizeObserver(() => (loadoutH.value = el.clientHeight));
   loadoutRO.observe(el);
 });
 
@@ -6509,37 +6443,27 @@ const sheetRestHiddenPx = computed(() =>
 
 const sheetStyle = computed(() => {
   if (!isCompact.value) {
-    if (docked.value) {
-      const base = {
-        top: "0",
-        left: "auto",
-        height: "auto",
-        width: `${dockPickerW.value}px`,
-        borderTopWidth: "0",
-        borderLeftWidth: "1px",
-      };
-      if (!dockSmall.value) return base;
-      const open = dockOpen.value && dockSlid.value;
-      const ms = reducedMotion.value ? 0 : open ? DOCK_OPEN_MS : DOCK_CLOSE_MS;
-      return {
-        ...base,
-        transform: open ? "translate3d(0, 0, 0)" : "translate3d(100%, 0, 0)",
-        transition: `transform ${ms}ms ${SHEET_EASE}`,
-        willChange: "transform",
-        pointerEvents: open ? ("auto" as const) : ("none" as const),
-        // Always on: it is off screen while closed, and switching a 64px blur
-        // on at the start of the slide repainted the whole layer in that frame.
-        boxShadow: "-32px 0 64px -32px rgba(0, 0, 0, 0.75)",
-      };
-    }
-    // Desktop: absolutely positioned, so the height IS the whole interaction.
-    // The percentage resolves against the loadout column, which is what makes
-    // "60% of the loadout area" mean that on every screen.
+    // Desktop: docked beside the loadout.
+    const base = {
+      top: "0",
+      left: "auto",
+      height: "auto",
+      width: `${dockPickerW.value}px`,
+      borderTopWidth: "0",
+      borderLeftWidth: "1px",
+    };
+    if (!dockSmall.value) return base;
+    const open = dockOpen.value && dockSlid.value;
+    const ms = reducedMotion.value ? 0 : open ? DOCK_OPEN_MS : DOCK_CLOSE_MS;
     return {
-      height: lifted.value ? `${SHEET_LIFT_PCT}%` : SHEET_COLLAPSED_CSS,
-      transition: reducedMotion.value ? "none" : `height ${SHEET_LIFT_MS}ms cubic-bezier(0.22,1,0.36,1)`,
-      // Reads as a layer above the loadout rather than a taller panel.
-      boxShadow: lifted.value ? "0 -18px 40px -22px hsl(var(--background))" : "none",
+      ...base,
+      transform: open ? "translate3d(0, 0, 0)" : "translate3d(100%, 0, 0)",
+      transition: `transform ${ms}ms ${SHEET_EASE}`,
+      willChange: "transform",
+      pointerEvents: open ? ("auto" as const) : ("none" as const),
+      // Always on: it is off screen while closed, and switching a 64px blur
+      // on at the start of the slide repainted the whole layer in that frame.
+      boxShadow: "-32px 0 64px -32px rgba(0, 0, 0, 0.75)",
     };
   }
   return {
@@ -8746,7 +8670,6 @@ watch([focus3d, fpvOn], ([on, held], [was3d]) => {
 onBeforeUnmount(() => {
   clearTimeout(pulseTimer);
   clearTimeout(pendingDeleteTimer);
-  clearTimeout(revealSettleTimer);
   loadoutRO?.disconnect();
   // Don't let unmount abandon a staged delete — fire the API calls now.
   const batch = pendingDelete.value;
@@ -8929,11 +8852,6 @@ function onGlobalKey(e: KeyboardEvent) {
     } else if (dockOpenNow.value) {
       dockOpen.value = false;
       e.stopPropagation();
-    } else if (lifted.value) {
-      // Topmost non-modal layer: it's covering the loadout, so it's what
-      // Escape should get you out from under.
-      sheetLift.value = false;
-      e.stopPropagation();
     } else if (view.value === "focus") {
       go("/");
     }
@@ -8994,9 +8912,6 @@ onMounted(() => {
       .then((s) => (extractWarn.value = extractWarnFrom(s)))
       .catch(() => { /* older backend or no mount — nothing to warn about */ });
   }
-  // Loading straight into a remembered lift never trips the watcher below, so
-  // the slot a deep link selected would start out under the sheet.
-  void revealSelectedSlot(false);
 });
 
 // The host may resolve the session after we mount, handing `user` down late. We
@@ -10079,12 +9994,11 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
       <div v-else ref="loadoutEl" key="loadout" class="relative flex min-h-0 flex-1 flex-col overflow-hidden" :data-dock="docked && canLift ? '' : undefined" :style="dockVars">
       <!-- Stacks on compact so the focus rail can sit above the stage as a
            strip rather than beside it as a fixed 122px column.
-           The padding is the space the sheet used to occupy in flow: reserving
-           it here means the collapsed layout is unchanged and a lift moves
-           nothing but the sheet. -->
+           The padding is the room the picker takes: beside the loadout when
+           docked, the peek height on compact. -->
       <!-- `isolate` keeps this half's z-indexes to itself — the focus-view 3D
            cursor overlay sits at z-20 and would otherwise punch up through the
-           lifted sheet. With a stacking context here the sheet only has to
+           picker. With a stacking context here the sheet only has to
            out-rank one element, so it can stay at a low enough z to lose to the
            host's drawers. -->
       <div class="relative isolate flex min-h-0 flex-1 overflow-hidden" :class="isCompact && 'flex-col'" :style="loadoutPadStyle">
@@ -10203,8 +10117,6 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           :on-slot-pointer-move="onSlotPointerMove"
           :cancel-long-press="cancelLongPress"
           :on-slot-click-capture="onSlotClickCapture"
-          :lift-intrusion="liftIntrusion"
-          :lift-scroll-style="liftScrollStyle"
           @slot-drag-leave="slotDragLeave"
         />
 
