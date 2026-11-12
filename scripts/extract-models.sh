@@ -3547,9 +3547,11 @@ if not charms:
           "flat art. Check that scripts/items/items_game.txt extracted.")
 PYEOF
 
+fi
+
 # ---- 3f. Sticker kit -> archive FOLDER ---------------------------------------
-# Read here because this is where items_game.txt already is; consumed by steps 4
-# and 5.
+# Built outside the step guards because steps 4 and 5 read it: a run scoped to
+# econ-icons or paint-chain would otherwise die on an unset STICKER_KITS.
 #
 # Decal art is filed by EVENT and cs2-lib keeps only the basename, so
 # `ibuypower` names three different stickers (emskatowice2014, cologne2014,
@@ -3656,8 +3658,6 @@ if not patches:
     print("!!! No patch materials recovered — patches have no paintMaterial in cs2-lib, "
           "so this file is the ONLY way their art reaches the paint chain.")
 PYEOF
-
-fi
 
 # ---- 3g. Charm cloth simulation ----------------------------------------------
 if step_if "charm-physics"; then
