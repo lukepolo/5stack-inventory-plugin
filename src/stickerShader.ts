@@ -531,13 +531,17 @@ export async function applyStickerSfx(
          stkGlint = vec3(0.0);
          stkEmissive = vec3(0.0);
          stkMetal = uMetallic ? 1.0 : 0.0;
-         stkRawA = diffuseColor.a;
+         // The texel's own alpha: the material's opacity (the viewer's fade-on
+         // as a sticker lands) is divided out here and applied after the
+         // expansion below, or 12.75x would snap the fade to opaque. Identical
+         // at opacity 1.
+         stkRawA = diffuseColor.a / max(opacity, 1e-4);
          // sticker.glsl:420 — saturate(a * 12.75). Bytes 0-20 of the art's
          // alpha are the coverage ramp; everything above encodes wear order and
          // must still DISPLAY as opaque. The raw byte stays in stkRawA for the
          // wear remap. Gated: icon-fallback art has ordinary alpha, and
          // expanding that would hard-clip its soft edges.
-         if (uExpandAlpha) diffuseColor.a = clamp(stkRawA * 12.75, 0.0, 1.0);
+         if (uExpandAlpha) diffuseColor.a = clamp(stkRawA * 12.75, 0.0, 1.0) * opacity;
          stkExpandedA = diffuseColor.a;
          ${WEAR_GLSL}`,
       )

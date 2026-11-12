@@ -3788,6 +3788,14 @@ export interface ViewerOpts {
    * what is actually visible rather than half under the item's spec panel.
    */
   frameInset?: { right?: number };
+  /**
+   * A pane narrower than it is tall (the docked layout's focus
+   * stage) keeps the whole weapon across it: no inset shift once the room left
+   * of the panel is narrower than the pane is tall (the gun sits below the
+   * panel, and the shift pushed it off the left edge), and a zoom out by the
+   * aspect once the pane itself is.
+   */
+  narrowFit?: boolean;
   stickers?: StickerPlacement[];
   /**
    * Patches on an AGENT, slot-ordered, by inventory image — `kind: "agent"`.
@@ -5573,10 +5581,11 @@ async function buildViewer(
    * unchanged at every window size it reaches, and a pane that narrows below
    * the reference crops its sides rather than shrinking the weapon, as before.
    */
-  const frameHalfH = (aspect: number) =>
-    opts?.frame === "fit"
-      ? halfH
-      : Math.max(halfH * Math.min(1, FRAME_REF_ASPECT / Math.max(aspect, 1e-3)), Math.min(halfH, extentUp * FRAME_MIN_SLACK));
+  const frameHalfH = (aspect: number) => {
+    if (opts?.frame === "fit") return halfH;
+    const h = Math.max(halfH * Math.min(1, FRAME_REF_ASPECT / Math.max(aspect, 1e-3)), Math.min(halfH, extentUp * FRAME_MIN_SLACK));
+    return opts?.narrowFit && aspect < 1 ? Math.max(h, halfH / Math.max(aspect, 1e-3)) : h;
+  };
   // The standoff is arbitrary under a parallel projection — it changes nothing
   // about what is drawn. It is picked far enough out that no orbit can push
   // geometry through the near plane, and so that `camera.position` still reads
@@ -5721,14 +5730,15 @@ async function buildViewer(
     panPx.y = clamp(panPx.y, -maxPx, maxPx);
     // Cheap enough to call every frame from the zoom re-clamp below, because
     // rebuilding the projection is skipped whenever nothing actually moved.
-    if (panPx.x === panApplied.x && panPx.y === panApplied.y && frameInsetRight === insetApplied) return;
+    const inset = opts?.narrowFit && cssW - frameInsetRight < cssH ? 0 : frameInsetRight;
+    if (panPx.x === panApplied.x && panPx.y === panApplied.y && inset === insetApplied) return;
     panApplied.copy(panPx);
-    insetApplied = frameInsetRight;
+    insetApplied = inset;
     // Negated: setViewOffset picks the sub-window's top-left out of the full
     // image, so shifting the window left is what moves the content right. The
     // inset is NOT negated for exactly that reason — moving the window right is
     // what walks the weapon out from under the panel.
-    const dx = -panPx.x + frameInsetRight / 2;
+    const dx = -panPx.x + inset / 2;
     if (dx === 0 && panPx.y === 0) camera.clearViewOffset();
     else camera.setViewOffset(cssW, cssH, dx, -panPx.y, cssW, cssH);
   };
@@ -6940,6 +6950,21 @@ async function buildViewer(
   };
   type DecalEntry = { key: string; seq: number };
   const decals = new Map<number, DecalEntry>();
+  // A sticker fades on when it first lands in its slot, not popping in as
+  // its art arrives. A drag reuses its mesh and never fades; a still (a bake)
+  // and reduced motion never fade at all.
+  const DECAL_FADE_MS = 380;
+  const decalFade = new Map<import("three").Mesh, number>();
+  function stepDecalFade(now: number) {
+    for (const [mesh, start] of decalFade) {
+      const t = Math.min(1, (now - start) / DECAL_FADE_MS);
+      (mesh.material as import("three").Material).opacity = 1 - (1 - t) ** 3;
+      if (t >= 1) decalFade.delete(mesh);
+    }
+  }
+  // The stickers a viewer opens with are already on the item: they arrive
+  // quietly, without the "it's over here" flash a sticker you place gets.
+  const quietDecalSlots = new Set<number>();
   // Rendered decal meshes live in a separate registry: async builds supersede
   // each other via `decals`, but the on-screen mesh must be disposed exactly
   // once regardless of how many in-flight builds got aborted.
@@ -6954,6 +6979,7 @@ async function buildViewer(
       m.geometry.dispose();
       (m.material as import("three").Material).dispose();
       liveMesh.delete(slot);
+      decalFade.delete(m);
     }
     // A flash outlives its mesh otherwise, and would then re-target whatever
     // mesh next lands in this slot.
@@ -7721,6 +7747,10 @@ async function buildViewer(
       mesh.userData.stickerImage = st.image;
       mesh.userData.stickerWear = st.w ?? 0;
       mesh.renderOrder = 10 + st.slot;
+      if (!opts?.still && !reducedMotion.value) {
+        mat.opacity = 0;
+        decalFade.set(mesh, performance.now());
+      }
       scene.add(mesh);
       liveMesh.set(st.slot, mesh);
     }
@@ -7749,7 +7779,7 @@ async function buildViewer(
       mesh.matrixAutoUpdate = true;
       mesh.matrixWorldNeedsUpdate = true;
     }
-    if (isNew) flashSticker(st.slot);
+    if (isNew && !quietDecalSlots.delete(st.slot)) flashSticker(st.slot);
     if (STICKER_LOG) {
       const end = performance.now();
       stickerCost.rebuilds++;
@@ -12773,6 +12803,7 @@ async function buildViewer(
   // glove they are not "wrong-looking", they are a raycast into geometry that
   // has no such space. A silent no-op is the only sane answer.
   if (pres.attachments) {
+    for (const st of opts?.stickers ?? []) quietDecalSlots.add(st.slot);
     setStickers(opts?.stickers ?? []);
     mt.mark("stickers");
     // NOT awaited — the charm's GLB, its cloth sidecar and its tint masks are
@@ -15305,6 +15336,7 @@ async function buildViewer(
     updateRing();
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
+    stepDecalFade(performance.now());
     stepStickerHolo();
     // Split the first frame's cost in two: `wait` is everything from the last
     // build stage to the draw call (the rAF wait, controls, the charm's first
