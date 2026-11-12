@@ -743,8 +743,8 @@
    150ms), and when the picture lands the two crossfade: the glow fades out
    while the picture fades in and sharpens. App marks each picture data-art-in
    on load, "fast" when it was already on hand and "slow" when it kept you
-   waiting. */
-[data-dock] [data-role="picker-sheet"] .min-h-\[40px\]:has(> img)::before {
+   waiting. The Inventory grid (data-inv-art) does the same. */
+:is([data-dock] [data-role="picker-sheet"], [data-inv-art]) .min-h-\[40px\]:has(> img)::before {
   content: "";
   position: absolute;
   inset: 12% 18%;
@@ -755,13 +755,13 @@
   transition: opacity 650ms cubic-bezier(0.22, 1, 0.36, 1);
   pointer-events: none;
 }
-[data-dock] [data-role="picker-sheet"] .min-h-\[40px\]:has(> img:not([data-art-in]))::before {
+:is([data-dock] [data-role="picker-sheet"], [data-inv-art]) .min-h-\[40px\]:has(> img:not([data-art-in]))::before {
   animation: dockArtWait 1.6s ease-in-out 150ms infinite;
 }
-[data-dock] [data-role="picker-sheet"] img[data-art-in="fast"] {
+:is([data-dock] [data-role="picker-sheet"], [data-inv-art]) img[data-art-in="fast"] {
   animation: dockArtIn 200ms ease-out backwards;
 }
-[data-dock] [data-role="picker-sheet"] img[data-art-in="slow"] {
+:is([data-dock] [data-role="picker-sheet"], [data-inv-art]) img[data-art-in="slow"] {
   animation: dockArtInSlow 650ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
 }
 @keyframes dockArtWait {
@@ -775,8 +775,14 @@
   from { opacity: 0; scale: 0.96; filter: blur(6px); }
 }
 @media (prefers-reduced-motion: reduce) {
-  [data-dock] [data-role="picker-sheet"] .min-h-\[40px\]:has(> img)::before { transition: none; animation: none; }
-  [data-dock] [data-role="picker-sheet"] img[data-art-in] { animation: none; }
+  :is([data-dock] [data-role="picker-sheet"], [data-inv-art]) .min-h-\[40px\]:has(> img)::before { transition: none; animation: none; }
+  :is([data-dock] [data-role="picker-sheet"], [data-inv-art]) img[data-art-in] { animation: none; }
+}
+
+/* A colour deck on the Inventory page slides in whole, so its cards don't
+   cascade in one by one (InventoryScreen sets data-inv-drill for the slide). */
+[data-inv-drill] .animate-cell-in {
+  animation: none !important;
 }
 
 /* While the picker is arriving every tile renders up front, in the frames

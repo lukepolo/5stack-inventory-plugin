@@ -14,7 +14,7 @@
 // What leaves as an emit is every verb a card offers — opening, editing,
 // inspecting, deleting — because each of those ends in a route change or a
 // mutation, and both belong to App.
-import { computed } from "vue";
+import { computed, inject, nextTick, onMounted, ref, watch } from "vue";
 import { cn } from "@5stack/ui";
 import {
   Check,
@@ -44,6 +44,7 @@ import PillTabs from "./PillTabs.vue";
 import PriceTag from "./PriceTag.vue";
 import SortDirection from "./SortDirection.vue";
 import Tooltip from "./Tooltip.vue";
+import { reducedMotion } from "../responsive";
 
 const props = defineProps<{
   /** The screen's own state, created once in App.vue. See useInventoryView. */
@@ -121,6 +122,97 @@ const {
   allVisibleSelected,
   toggleSelectAllVisible,
 } = props.inv;
+
+// Colour decks open the way the picker's do: hovering one warms
+// its pictures, the click waits for them (160ms at most), the list slides in
+// whole instead of cascading, Back slides it out and puts the scroll back, and
+// pictures glow while they load and fade in when they land.
+const itemArt = inject<{ renderSrc: (i: InventoryItem) => string } | null>("itemArt", null);
+const gridGroup = ref<{ $el: HTMLElement } | null>(null);
+const deckHeader = ref<HTMLElement | null>(null);
+const gridEl = () => gridGroup.value?.$el ?? null;
+const drill = ref<"in" | "out" | null>(null);
+const warmed = new Map<string, Promise<boolean>>();
+function warmArt(url?: string | null): Promise<boolean> {
+  if (!url) return Promise.resolve(false);
+  let p = warmed.get(url);
+  if (!p) {
+    const img = new Image();
+    img.decoding = "async";
+    img.src = url;
+    p = img.decode().then(
+      () => true,
+      () => false,
+    );
+    warmed.set(url, p);
+  }
+  return p;
+}
+// The baked render first; an item that has none yet shows its catalogue picture
+// (ItemArt's fallback), so that is the one to have on hand.
+const warmItem = (v: InventoryItem) =>
+  warmArt(itemArt ? itemArt.renderSrc(v) : null).then((ok) => ok || warmArt(v.item?.image));
+const warmDeck = (vs: readonly InventoryItem[]) => Promise.all(vs.slice(0, 24).map(warmItem));
+let warmTimer: ReturnType<typeof setTimeout> | undefined;
+function deckHover(vs: readonly InventoryItem[] | null) {
+  clearTimeout(warmTimer);
+  if (!vs) return;
+  warmTimer = setTimeout(() => void warmDeck(vs), 80);
+}
+let deckReturn: { n: number; top: number; sig: string } | null = null;
+async function openDeck(design: number | null, vs: readonly InventoryItem[]) {
+  if (design == null) return void (invDesign.value = design);
+  const sig = invFilterSig.value;
+  await Promise.race([warmDeck(vs), new Promise((r) => setTimeout(r, 160))]);
+  if (sig !== invFilterSig.value) return;
+  deckReturn = { n: inventoryWindow.items.value.length, top: gridEl()?.scrollTop ?? 0, sig };
+  invDesign.value = design;
+}
+watch(invDesign, async (now, was) => {
+  if (reducedMotion.value || (now === null) === (was === null)) return;
+  const dir = now !== null ? "in" : "out";
+  drill.value = dir;
+  await nextTick();
+  const el = gridEl();
+  if (dir === "out" && deckReturn && deckReturn.sig === invFilterSig.value) {
+    inventoryWindow.reveal(deckReturn.n);
+    await nextTick();
+    if (el) el.scrollTop = deckReturn.top;
+  }
+  if (dir === "out") deckReturn = null;
+  const kf = [
+    { opacity: 0, transform: `translateX(${dir === "in" ? 16 : -16}px)` },
+    { opacity: 1, transform: "none" },
+  ];
+  const o = { duration: 200, easing: "cubic-bezier(0.23, 1, 0.32, 1)" };
+  deckHeader.value?.animate(kf, o);
+  const a = el?.animate(kf, o);
+  void (a?.finished ?? Promise.resolve()).catch(() => {}).finally(() => {
+    if (drill.value === dir) drill.value = null;
+  });
+});
+// Leaving cards are removed without Vue reading each one's computed style to
+// see whether it has a leave animation (it never does — see .inv-leave). Two
+// hundred of those reads cost ~4s when a colour list opened from deep in the grid.
+function leaveNow(_el: Element, done: () => void) {
+  queueMicrotask(done);
+}
+let gridAt = 0;
+watch(invFilterSig, () => (gridAt = performance.now()));
+onMounted(() => (gridAt = performance.now()));
+function artLanded(e: Event) {
+  const t = e.target;
+  if (!(t instanceof HTMLImageElement) || t.hasAttribute("data-art-in")) return;
+  if (e.type === "error") {
+    // ItemArt may swap in the catalogue picture; only a picture that stays
+    // hidden is finished.
+    requestAnimationFrame(() => {
+      if (t.style.visibility === "hidden" && !t.hasAttribute("data-art-in")) t.setAttribute("data-art-in", "done");
+    });
+    return;
+  }
+  t.setAttribute("data-art-in", performance.now() - gridAt < 150 ? "fast" : "slow");
+}
 
 // BROWSE and SELECT are two toolbars that swap in the same place, and they used
 // to size to their own content — so entering select mode nudged the whole grid.
@@ -623,6 +715,7 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
              whole card-tall row for an 8px button. -->
         <div
           v-if="invDesign !== null"
+          ref="deckHeader"
           class="flex flex-none items-center gap-3 border-b border-border px-6 py-2.5"
         >
           <button
@@ -635,6 +728,7 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
           >
             <ChevronLeft class="h-4 w-4" />
             Back
+            <kbd v-if="!isCompact" class="ml-1 rounded border border-border/70 px-1 font-mono text-f8 font-normal normal-case tracking-normal text-muted-foreground">Esc</kbd>
           </button>
           <span class="min-w-0 truncate text-f11 uppercase tracking-cs2 text-foreground">{{ invDesignName }}</span>
           <span class="flex-none text-f9 uppercase tracking-cs1 text-muted-foreground">
@@ -643,7 +737,10 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
           </span>
         </div>
         <TransitionGroup
+          ref="gridGroup"
           data-scroller
+          data-inv-art
+          :data-inv-drill="drill ?? undefined"
           tag="div"
           class="min-h-0 min-w-0 flex-1 auto-rows-min content-start gap-3 overflow-y-auto p-6"
           :style="invGridStyle"
@@ -655,6 +752,9 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
           leave-from-class="inv-leave"
           leave-to-class="inv-leave"
           @scroll.passive="invFade.onScroll"
+          @load.capture="artLanded"
+          @error.capture="artLanded"
+          @leave="leaveNow"
         >
           <div v-if="!inventory.length" key="empty" class="col-span-full grid place-items-center gap-2 py-20 text-center text-muted-foreground">
             <Package class="h-8 w-8 opacity-40" />
@@ -704,7 +804,9 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
               :count="st.variants.length"
               role="inv-item"
               :strip-suffix="TINT_SUFFIX"
-              @open="invDesign = st.face.item?.design ?? null"
+              @open="openDeck(st.face.item?.design ?? null, st.variants)"
+              @pointerenter="deckHover(st.variants)"
+              @pointerleave="deckHover(null)"
             />
             <ItemTile
               v-else

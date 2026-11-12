@@ -6954,10 +6954,17 @@ async function buildViewer(
   // its art arrives. A drag reuses its mesh and never fades; a still (a bake)
   // and reduced motion never fade at all.
   const DECAL_FADE_MS = 380;
-  const decalFade = new Map<import("three").Mesh, number>();
+  // The fade advances at most FADE_STEP_MAX per frame, not by the clock.
+  // Opening a gun runs several slow frames in a row (its shaders, textures, the
+  // charm: 868ms then 288ms, measured), and a clock-driven fade was over before
+  // any of them finished, so the stickers still popped. Clamped, it waits them out.
+  const FADE_STEP_MAX = 32;
+  const decalFade = new Map<import("three").Mesh, { e: number; last: number }>();
   function stepDecalFade(now: number) {
-    for (const [mesh, start] of decalFade) {
-      const t = Math.min(1, (now - start) / DECAL_FADE_MS);
+    for (const [mesh, f] of decalFade) {
+      if (f.last) f.e += Math.min(now - f.last, FADE_STEP_MAX);
+      f.last = now;
+      const t = Math.min(1, f.e / DECAL_FADE_MS);
       (mesh.material as import("three").Material).opacity = 1 - (1 - t) ** 3;
       if (t >= 1) decalFade.delete(mesh);
     }
@@ -7749,7 +7756,7 @@ async function buildViewer(
       mesh.renderOrder = 10 + st.slot;
       if (!opts?.still && !reducedMotion.value) {
         mat.opacity = 0;
-        decalFade.set(mesh, performance.now());
+        decalFade.set(mesh, { e: 0, last: 0 });
       }
       scene.add(mesh);
       liveMesh.set(st.slot, mesh);
@@ -9016,6 +9023,88 @@ async function buildViewer(
     (charm.line.material as import("three").Material).dispose();
     charm = null;
     charmLastT = 0;
+    charmFadeAt = 0;
+  }
+
+  // The charm fades on as it lands, on the stickers' 380ms and clamp.
+  //
+  // Fading needs `transparent`, and turning it on or off swaps the shader. The
+  // swap back at the end must not compile, so the first frame draws the charm
+  // as it really is, opaque, with colour and depth writes off — invisible, but
+  // its real program now exists. The next frame turns transparent on (that
+  // program compiles there, at opacity 0), and the clock starts the frame after,
+  // so no part of the fade is spent inside a slow frame. renderer.compile() was
+  // tried and missed: its key differs from the draw's, so the end still linked.
+  //
+  // charmFadeAt: 0 idle, -1 drawing opaque, -2 going transparent, -3 start
+  // the clock, else the last frame's time (charmFadeE holds the progress).
+  let charmFadeAt = 0;
+  let charmFadeE = 0;
+  type FadeInfo = { op: number; tr: boolean; at: number; cw: boolean; dw: boolean };
+  type FadeMat = import("three").Material & { __fade?: FadeInfo };
+  function charmFadeMats(fn: (m: FadeMat) => void) {
+    if (!charm) return;
+    const visit = (o: import("three").Object3D) => {
+      const mat = (o as import("three").Mesh).material;
+      if (!mat) return;
+      for (const m of Array.isArray(mat) ? mat : [mat]) fn(m as FadeMat);
+    };
+    charm.sprite.traverse(visit);
+    visit(charm.line);
+  }
+  function beginCharmFade() {
+    if (!charm || opts?.still || reducedMotion.value) return;
+    charmFadeMats((m) => {
+      m.__fade = { op: m.opacity, tr: m.transparent, at: m.alphaTest, cw: m.colorWrite, dw: m.depthWrite };
+      m.colorWrite = false;
+      m.depthWrite = false;
+    });
+    charmFadeAt = -1;
+  }
+  function stepCharmFade(now: number) {
+    if (!charmFadeAt) return;
+    if (charmFadeAt === -1) {
+      charmFadeAt = -2;
+      return;
+    }
+    if (charmFadeAt === -2) {
+      charmFadeMats((m) => {
+        const f = m.__fade;
+        if (!f) return;
+        m.colorWrite = f.cw;
+        m.depthWrite = f.dw;
+        m.transparent = true;
+        m.opacity = 0;
+        if (f.at > 0) m.alphaTest = 1e-3;
+        m.needsUpdate = true;
+      });
+      charmFadeAt = -3;
+      return;
+    }
+    if (charmFadeAt === -3) {
+      charmFadeAt = now;
+      charmFadeE = 0;
+    } else charmFadeE += Math.min(now - charmFadeAt, FADE_STEP_MAX);
+    charmFadeAt = now;
+    const t = Math.min(1, charmFadeE / DECAL_FADE_MS);
+    const k = 1 - (1 - t) ** 3;
+    charmFadeMats((m) => {
+      const f = m.__fade;
+      if (!f) return;
+      if (t < 1) {
+        m.opacity = f.op * k;
+        if (f.at > 0) m.alphaTest = Math.max(1e-3, f.at * k);
+        return;
+      }
+      m.opacity = f.op;
+      m.alphaTest = f.at;
+      if (m.transparent !== f.tr) {
+        m.transparent = f.tr;
+        m.needsUpdate = true;
+      }
+      delete m.__fade;
+    });
+    if (t >= 1) charmFadeAt = 0;
   }
 
   // Cast upward from below the body to find the ACTUAL underside surface at
@@ -10432,6 +10521,7 @@ async function buildViewer(
     line.visible = false;
     scene.add(line);
     charm = { sprite, line, pivot, pos, prev: pos.clone(), key, side: 1, cy: c.y ?? 0, cz: c.z ?? 0, w: cw, h: ch, d: cd, off: cOff, sim, shading: found?.shading ?? null, masks: found?.masks ?? null };
+    beginCharmFade();
     // Face the flank it is actually clipped to, before the first frame draws.
     orientCharmToFlank(charm);
     if (sim) {
@@ -15337,6 +15427,7 @@ async function buildViewer(
     const tCharm = perfHud ? performance.now() : 0;
     stepDecalGlow(performance.now());
     stepDecalFade(performance.now());
+    stepCharmFade(performance.now());
     stepStickerHolo();
     // Split the first frame's cost in two: `wait` is everything from the last
     // build stage to the draw call (the rAF wait, controls, the charm's first
