@@ -241,6 +241,12 @@ set -euo pipefail
 # texture channels and csgo_weapon.vfx does not use them raw: Charm | Sasquatch
 # authors its eyes metalness 1 but declares g_vMetalnessRemapRange [0, 0.5], and
 # its roughness channel (max 0.51) is scaled by brightness 1.9 / contrast 0.7.
+# v41 (2026-11-11): anisotropic-gloss materials are matte again: agent hair and
+# the chicken's feathers, 64 materials. 20.x reads their roughness from the
+# metalness texture, which is 0 in all of them, so v40 drew them as glass.
+# glb-source-space.mjs gives them 19.x's fully rough, non-metallic finish. Every
+# other character material keeps the roughness and metalness 20.x reads; 19.x
+# exported neither, so v39 had them all matte. Needs a full run.
 # v40 (2026-11-11): Source 2 Viewer CLI pinned to 20.1 (was releases/latest).
 # 19.2 cannot read the AUG and R8 models or most reload clips of the current
 # build, and 20.x GLBs come out in metres with no root node, which tears
@@ -344,7 +350,7 @@ set -euo pipefail
 # so resolving the model from the item's image name found nothing for them and
 # they rendered as flat art. The named materials ride the paint chain, so their
 # textures land alongside every other one.
-EXTRACT_VERSION=40
+EXTRACT_VERSION=41
 
 # Default is the node's CS2 dedicated-server install — the same tree the
 # game-server pods mount, present on every 5stack game node. Its root IS the

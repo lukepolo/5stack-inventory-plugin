@@ -35,6 +35,15 @@ function quatMul([ax, ay, az, aw], [bx, by, bz, bw]) {
   ];
 }
 
+function material(name, IntParams, TextureParams) {
+  return {
+    name,
+    pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicRoughnessTexture: { index: 1 } },
+    occlusionTexture: { index: 1 },
+    extras: { vmat: { ShaderName: "csgo_character.vfx", IntParams, TextureParams: { g_tMetalness: "metal.vtex", ...TextureParams } } },
+  };
+}
+
 function model(baked) {
   const floats = [];
   const views = [];
@@ -104,6 +113,9 @@ function model(baked) {
       { primitives: [{ attributes: { POSITION: p, NORMAL: n } }] },
     ],
     skins: [{ joints: [1, 2], inverseBindMatrices: ib }],
+    materials: [material("hair", { F_ANISOTROPIC_GLOSS: 1 }, { g_tAnisoGloss: "hair_gloss.vtex" }), material("skin", { F_ANISOTROPIC_GLOSS: 0 }, { g_tAnisoGloss: "unused.vtex" })],
+    textures: [{ source: 0 }, { source: 1 }],
+    images: [{ uri: "color.png" }, { uri: "orm.png" }],
     animations,
     accessors,
     bufferViews: views,
@@ -160,7 +172,7 @@ try {
 
   const run = spawnSync("node", [script, dir], { encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr);
-  assert.match(run.stdout, /1 converted, 1 already in source space, 1 graph clips dropped/);
+  assert.match(run.stdout, /1 converted, 1 already in source space, 1 graph clips dropped .*, 1 anisotropic-gloss materials made matte/);
   assert(fs.readFileSync(oldFile).equals(oldBytes), "a 19.x file must be left byte for byte");
 
   const got = read(bakedFile);
@@ -172,6 +184,10 @@ try {
   close(got.doc.nodes[1].translation, want.doc.nodes[1].translation, "root bone translation");
   close(got.doc.nodes[1].rotation, want.doc.nodes[1].rotation, "root bone rotation");
   close(got.doc.nodes[2].translation, want.doc.nodes[2].translation, "child bone translation");
+  const [hair, skin] = got.doc.materials;
+  assert.deepEqual(hair.pbrMetallicRoughness, { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 1 }, "anisotropic gloss is matte, as 19.x wrote it");
+  assert.deepEqual(hair.occlusionTexture, { index: 1 }, "anisotropic gloss keeps its occlusion");
+  assert.deepEqual(skin, want.doc.materials[1], "other materials keep the roughness 20.x reads");
 
   const w = read(oldFile);
   const prim = (d, m) => d.doc.meshes[m].primitives[0].attributes;
@@ -189,7 +205,7 @@ try {
   const again = spawnSync("node", [script, dir], { encoding: "utf8" });
   assert.equal(again.status, 0, again.stderr);
   assert.match(again.stdout, /0 converted, 2 already in source space/);
-  console.log("glb-source-space: a 20.x bake comes back to the 19.x layout, graph clips dropped, 19.x output untouched");
+  console.log("glb-source-space: a 20.x bake comes back to the 19.x layout, graph clips dropped, anisotropic gloss matte, 19.x output untouched");
 } finally {
   fs.rmSync(dir, { recursive: true, force: true });
 }
