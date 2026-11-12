@@ -6135,32 +6135,40 @@ function dockTileClick(inst: InventoryItem) {
 // on hand: hovering a deck warms them, and the click waits for the first screen
 // of them to decode (160ms at most) so the list arrives whole, not as empty
 // cards filling in one by one.
-const dockArtWarm = new Map<string, Promise<unknown>>();
-function dockWarm(url?: string | null) {
-  if (!url) return Promise.resolve();
+const dockArtWarm = new Map<string, Promise<boolean>>();
+function dockWarm(url?: string | null): Promise<boolean> {
+  if (!url) return Promise.resolve(false);
   let p = dockArtWarm.get(url);
   if (!p) {
     const img = new Image();
     img.decoding = "async";
     img.src = url;
-    p = img.decode().catch(() => undefined);
+    p = img.decode().then(
+      () => true,
+      () => false,
+    );
     dockArtWarm.set(url, p);
   }
   return p;
 }
-const dockDeckUrls = (variants: readonly (Skin | InventoryItem)[]) =>
-  variants.slice(0, 24).map((v) => ("item" in v ? renderSrc(v as InventoryItem) : catalogArt.value[v.id] ?? (v as Skin).image));
+// An owned item shows its baked render; one with no render yet shows its
+// catalogue picture instead (onRenderError), so that is the one to have on hand.
+const dockWarmVariant = (v: Skin | InventoryItem) =>
+  "item" in v
+    ? dockWarm(renderSrc(v as InventoryItem)).then((ok) => ok || dockWarm((v as InventoryItem).item?.image))
+    : dockWarm(catalogArt.value[v.id] ?? (v as Skin).image);
+const dockWarmDeck = (variants: readonly (Skin | InventoryItem)[]) => Promise.all(variants.slice(0, 24).map(dockWarmVariant));
 let dockWarmTimer: ReturnType<typeof setTimeout> | undefined;
 function dockDeckHover(variants: readonly (Skin | InventoryItem)[] | null) {
   clearTimeout(dockWarmTimer);
   if (!docked.value || !variants || variants.length < 2) return;
-  dockWarmTimer = setTimeout(() => dockDeckUrls(variants).forEach(dockWarm), 80);
+  dockWarmTimer = setTimeout(() => void dockWarmDeck(variants), 80);
 }
 const dockDrill = ref<"in" | "out" | null>(null);
 async function dockOpenDeck(design: number | null, variants: readonly (Skin | InventoryItem)[]) {
   if (!docked.value || design == null) return void (sheetDesign.value = design);
   const at = `${sheetMode.value}|${sheetKey.value}`;
-  await Promise.race([Promise.all(dockDeckUrls(variants).map(dockWarm)), new Promise((r) => setTimeout(r, 160))]);
+  await Promise.race([dockWarmDeck(variants), new Promise((r) => setTimeout(r, 160))]);
   if (at !== `${sheetMode.value}|${sheetKey.value}`) return;
   dockDeckReturnN = dockSheetWindow().items.value.length;
   dockDrill.value = "in";
