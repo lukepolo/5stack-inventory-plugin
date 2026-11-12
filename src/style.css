@@ -662,3 +662,148 @@
   color: hsl(var(--foreground));
   opacity: 1;
 }
+
+/* ---- Docked picker ------------------------------------------------------- */
+
+/* Dock: every loadout cell one shape (1.25 : 1) sized off the screen's height;
+   equipment rides the same five rows — knife, gloves, agent across two, extras.
+   The px values come from App (dockGeo). */
+[data-dock] aside {
+  flex: none !important;
+  width: calc(var(--dock-aside-w) + 20px) !important;
+  min-width: 0 !important;
+  max-width: none !important;
+}
+[data-dock] aside .min-h-full {
+  gap: 8px !important;
+}
+[data-dock] :is([data-role="weapon"], [data-role="rail"][data-slot="knife"], [data-role="rail"][data-slot="gloves"]) {
+  flex: none !important;
+  min-height: 0 !important;
+  height: var(--dock-cell-h) !important;
+}
+[data-dock] [data-role="agent"] {
+  flex: none !important;
+  min-height: 0 !important;
+  height: calc(2 * var(--dock-cell-h) + 8px) !important;
+}
+[data-dock] aside .grid-cols-2 {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  gap: 8px !important;
+}
+[data-dock] aside .grid-cols-2 > [data-role="rail"] {
+  height: calc((var(--dock-cell-h) - 8px) / 2) !important;
+}
+
+/* Loadout cell art: crossfades to whatever the slot now shows. The leaving art
+   is pinned in place (LoadoutCell pinLeaving) so the two overlap instead of
+   blinking through an empty well. --d staggers it only on a team/preset flip. */
+[data-cs2-inventory] .animate-cell-swap-in {
+  animation: dockCellSwapIn 280ms cubic-bezier(0.23, 1, 0.32, 1) both;
+  animation-delay: var(--d, 0ms);
+}
+[data-cs2-inventory] .animate-cell-swap-out {
+  animation: dockCellSwapOut 160ms cubic-bezier(0.4, 0, 1, 1) both;
+  animation-delay: var(--d, 0ms);
+}
+@keyframes dockCellSwapIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.94); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes dockCellSwapOut {
+  to { opacity: 0; transform: translateY(-6px) scale(0.97); }
+}
+
+/* Press feedback on the loadout's cells and the Spotlight rail. Not on the
+   picker's cards: a deck shrank its whole stack on press and sprang back while
+   it opened. */
+[data-dock] :is([data-role="weapon"], [data-role="rail"], [data-role="agent"], [data-role="fnav"]) {
+  transition-property: color, background-color, border-color, box-shadow, scale;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (hover: hover) and (pointer: fine) {
+  [data-dock] :is([data-role="weapon"], [data-role="rail"], [data-role="agent"]):active { scale: 0.985; }
+  [data-dock] [data-role="fnav"]:active { scale: 0.96; }
+}
+
+/* Switching slots happens constantly: the picker's cards don't cascade in
+   one by one, the grid fades in as a whole (App's content Transition). */
+[data-cs2-inventory] [data-dock] .animate-sheet-in {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-dock] :is([data-role="weapon"], [data-role="rail"], [data-role="agent"], [data-role="fnav"]) { transition: none; }
+  [data-dock] :is(*):active { scale: none !important; }
+}
+
+/* Picker art can take a second to arrive. A quiet glow breathes behind the
+   well while it's on its way (only if it's actually waiting: it starts after
+   150ms), and when the picture lands the two crossfade: the glow fades out
+   while the picture fades in and sharpens. App marks each picture data-art-in
+   on load, "fast" when it was already on hand and "slow" when it kept you
+   waiting. */
+[data-dock] [data-role="picker-sheet"] .min-h-\[40px\]:has(> img)::before {
+  content: "";
+  position: absolute;
+  inset: 12% 18%;
+  z-index: -1;
+  border-radius: 9999px;
+  background: radial-gradient(closest-side, hsl(var(--foreground) / 0.1), transparent);
+  opacity: 0;
+  transition: opacity 650ms cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+[data-dock] [data-role="picker-sheet"] .min-h-\[40px\]:has(> img:not([data-art-in]))::before {
+  animation: dockArtWait 1.6s ease-in-out 150ms infinite;
+}
+[data-dock] [data-role="picker-sheet"] img[data-art-in="fast"] {
+  animation: dockArtIn 200ms ease-out backwards;
+}
+[data-dock] [data-role="picker-sheet"] img[data-art-in="slow"] {
+  animation: dockArtInSlow 650ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+@keyframes dockArtWait {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+@keyframes dockArtIn {
+  from { opacity: 0; }
+}
+@keyframes dockArtInSlow {
+  from { opacity: 0; scale: 0.96; filter: blur(6px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-dock] [data-role="picker-sheet"] .min-h-\[40px\]:has(> img)::before { transition: none; animation: none; }
+  [data-dock] [data-role="picker-sheet"] img[data-art-in] { animation: none; }
+}
+
+/* While the picker is arriving every tile renders up front, in the frames
+   before it moves — content-visibility would otherwise draw each one as it
+   slides into view, in the middle of the animation. */
+[data-dock-opening] .cv-tile {
+  content-visibility: visible !important;
+}
+
+/* Picker toolbar as two deliberate rows: what you're looking at + find + close
+   on top, the filters and card size underneath. */
+[data-dock] [data-dock-toolbar] > * {
+  order: 2;
+}
+[data-dock] [data-dock-toolbar] > :first-child {
+  order: 0;
+}
+[data-dock] [data-dock-toolbar] > [data-dock-tb] {
+  order: 1;
+}
+[data-dock] [data-dock-toolbar] > [data-dock-tb="search"] {
+  margin-left: auto;
+  width: auto !important;
+  flex: 0 1 320px;
+}
+[data-dock] [data-dock-toolbar] > [data-dock-tb="break"] {
+  flex-basis: 100%;
+  height: 0;
+  margin-top: -10px;
+}

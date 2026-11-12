@@ -77,4 +77,8 @@ export interface LoadoutCellProps {
   showWear?: boolean;
   showPrice?: boolean;
   showBadges?: boolean;
+  /** Crossfade the art to what the cell now shows. */
+  swap?: boolean;
+  /** The whole loadout is turning over; stagger by `index`. */
+  wave?: boolean;
 }
