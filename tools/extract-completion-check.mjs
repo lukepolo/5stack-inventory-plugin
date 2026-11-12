@@ -1,6 +1,6 @@
 // Exercise the real schema loader and final progress/stamp code in Bash.
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -53,7 +53,7 @@ if [[ "$MODE" == empty ]]; then : >"$file"; else printf '"items_game" { "pet_def
     }
     console.log(`ok schema ${mode}`);
   }
-  for (const mode of ['full', 'scoped', 'bundle', 'stamp-fails', 'bundle-fails']) {
+  for (const mode of ['full', 'scoped', 'bundle', 'stamp-fails', 'bundle-fails', 'cs2-update-fails']) {
     const dir = path.join(root, mode); mkdirSync(dir);
     const dest = path.join(dir, 'models'); mkdirSync(dest);
     const stamp = path.join(dest, 'extract-version.json');
@@ -61,11 +61,19 @@ if [[ "$MODE" == empty ]]; then : >"$file"; else printf '"items_game" { "pet_def
     else writeFileSync(stamp, '{"version":17}\n');
     const bin = path.join(dir, 'bin'); mkdirSync(bin);
     if (mode === 'bundle-fails') writeFileSync(path.join(bin, 'tar'), '#!/usr/bin/env bash\nexit 9\n', { mode: 0o755 });
+    const game = path.join(dir, 'csgo'); mkdirSync(game);
+    const runRef = path.join(dir, '.run-start');
+    const now = Date.now() / 1000;
+    for (const f of ['pak01_dir.vpk', 'pak01_000.vpk', 'steam.inf']) { writeFileSync(path.join(game, f), ''); utimesSync(path.join(game, f), now - 600, now - 600); }
+    writeFileSync(runRef, ''); utimesSync(runRef, now - 60, now - 60);
+    if (mode === 'cs2-update-fails') utimesSync(path.join(game, 'steam.inf'), now, now);
     const out = ['bundle', 'bundle-fails'].includes(mode) ? '' : dir;
     const result = run(`cd ${quote(dir)}
 WORK=${quote(dir)}
 OUT_DIR=${quote(out)}
 DEST=${quote(dest)}
+VPK=${quote(path.join(game, 'pak01_dir.vpk'))}
+RUN_REF=${quote(runRef)}
 RUN_START=$(date +%s)
 STEP_START=$RUN_START
 STEP_NAME=''
@@ -92,8 +100,12 @@ echo COMPLETION_REACHED
       assert.notEqual(result.status, 0, mode);
       assert.doesNotMatch(result.stdout, /COMPLETION_REACHED/);
       assert.equal(final.state, 'running');
+      if (mode === 'cs2-update-fails') {
+        assert.match(result.stderr, /CS2 was updated during this run/);
+        assert.equal(JSON.parse(readFileSync(stamp, 'utf8')).version, 17);
+      }
     }
     console.log(`ok completion ${mode}`);
   }
-  console.log('all 10 actual schema/completion checks pass');
+  console.log('all 11 actual schema/completion checks pass');
 } finally { rmSync(root, { recursive: true, force: true }); }
