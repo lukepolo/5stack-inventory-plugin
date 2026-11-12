@@ -9024,9 +9024,19 @@ async function buildViewer(
     charm = null;
     charmLastT = 0;
     charmFadeAt = 0;
+    charmFadeList = [];
   }
 
   // The charm fades on as it lands, on the stickers' 380ms and clamp.
+  //
+  // ONLY ON MATERIALS THIS CHARM OWNS. A charm's untuned parts (the clasp, the
+  // chain, a whole untuned charm) wear the gltf cache's own materials, shared
+  // with every other viewer and every bake on the page, so fading those in place
+  // left them see-through or invisible for all of them whenever a fade was cut
+  // short (a charm swapped or a viewer closed mid-fade). Each shared one is
+  // swapped for a private copy first; tuned ones are already this mesh's own
+  // (tuneCharmShading clones them). The copies stay on afterwards and go with
+  // the charm in removeCharm.
   //
   // Fading needs `transparent`, and turning it on or off swaps the shader. The
   // swap back at the end must not compile, so the first frame draws the charm
@@ -9035,30 +9045,61 @@ async function buildViewer(
   // program compiles there, at opacity 0), and the clock starts the frame after,
   // so no part of the fade is spent inside a slow frame. renderer.compile() was
   // tried and missed: its key differs from the draw's, so the end still linked.
+  // Depth writes stay off until the end, or the see-through charm would hide
+  // the stickers behind it.
   //
   // charmFadeAt: 0 idle, -1 drawing opaque, -2 going transparent, -3 start
   // the clock, else the last frame's time (charmFadeE holds the progress).
   let charmFadeAt = 0;
   let charmFadeE = 0;
-  type FadeInfo = { op: number; tr: boolean; at: number; cw: boolean; dw: boolean };
-  type FadeMat = import("three").Material & { __fade?: FadeInfo };
-  function charmFadeMats(fn: (m: FadeMat) => void) {
-    if (!charm) return;
-    const visit = (o: import("three").Object3D) => {
-      const mat = (o as import("three").Mesh).material;
-      if (!mat) return;
-      for (const m of Array.isArray(mat) ? mat : [mat]) fn(m as FadeMat);
-    };
-    charm.sprite.traverse(visit);
-    visit(charm.line);
+  type FadeEntry = { m: import("three").Material; op: number; tr: boolean; at: number; cw: boolean; dw: boolean };
+  let charmFadeList: FadeEntry[] = [];
+  /** A private copy of a shared material that compiles to the same program. */
+  function charmOwnCopy(m: import("three").Material) {
+    // Material.copy round-trips userData through JSON, which flattens anything
+    // a patch keeps there. Shared by reference instead, as the original has it.
+    const ud = m.userData;
+    let c: import("three").Material;
+    m.userData = {};
+    try {
+      c = m.clone();
+    } finally {
+      m.userData = ud;
+    }
+    c.userData = ud;
+    c.name = m.name;
+    // clone() drops onBeforeCompile, and the key has to stay the original's or
+    // three would build the copy a program of its own.
+    const patch = m.onBeforeCompile;
+    c.onBeforeCompile = (shader, renderer) => patch.call(c, shader, renderer);
+    c.customProgramCacheKey = () => m.customProgramCacheKey();
+    return c;
   }
   function beginCharmFade() {
     if (!charm || opts?.still || reducedMotion.value) return;
-    charmFadeMats((m) => {
-      m.__fade = { op: m.opacity, tr: m.transparent, at: m.alphaTest, cw: m.colorWrite, dw: m.depthWrite };
-      m.colorWrite = false;
-      m.depthWrite = false;
-    });
+    const copies = new Map<import("three").Material, import("three").Material>();
+    const own = (mesh: import("three").Object3D, m: import("three").Material) => {
+      if (mesh === charm!.line || mesh.userData.charmTuned === m) return m;
+      let c = copies.get(m);
+      if (!c) copies.set(m, (c = charmOwnCopy(m)));
+      return c;
+    };
+    const seen = new Set<import("three").Material>();
+    charmFadeList = [];
+    const visit = (o: import("three").Object3D) => {
+      const mesh = o as import("three").Mesh;
+      if (!mesh.material) return;
+      mesh.material = Array.isArray(mesh.material) ? mesh.material.map((m) => own(mesh, m)) : own(mesh, mesh.material);
+      for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+        if (seen.has(m)) continue;
+        seen.add(m);
+        charmFadeList.push({ m, op: m.opacity, tr: m.transparent, at: m.alphaTest, cw: m.colorWrite, dw: m.depthWrite });
+        m.colorWrite = false;
+        m.depthWrite = false;
+      }
+    };
+    charm.sprite.traverse(visit);
+    visit(charm.line);
     charmFadeAt = -1;
   }
   function stepCharmFade(now: number) {
@@ -9068,16 +9109,13 @@ async function buildViewer(
       return;
     }
     if (charmFadeAt === -2) {
-      charmFadeMats((m) => {
-        const f = m.__fade;
-        if (!f) return;
-        m.colorWrite = f.cw;
-        m.depthWrite = f.dw;
-        m.transparent = true;
-        m.opacity = 0;
-        if (f.at > 0) m.alphaTest = 1e-3;
-        m.needsUpdate = true;
-      });
+      for (const f of charmFadeList) {
+        f.m.colorWrite = f.cw;
+        f.m.transparent = true;
+        f.m.opacity = 0;
+        if (f.at > 0) f.m.alphaTest = 1e-3;
+        f.m.needsUpdate = true;
+      }
       charmFadeAt = -3;
       return;
     }
@@ -9088,23 +9126,24 @@ async function buildViewer(
     charmFadeAt = now;
     const t = Math.min(1, charmFadeE / DECAL_FADE_MS);
     const k = 1 - (1 - t) ** 3;
-    charmFadeMats((m) => {
-      const f = m.__fade;
-      if (!f) return;
+    for (const f of charmFadeList) {
       if (t < 1) {
-        m.opacity = f.op * k;
-        if (f.at > 0) m.alphaTest = Math.max(1e-3, f.at * k);
-        return;
+        f.m.opacity = f.op * k;
+        if (f.at > 0) f.m.alphaTest = Math.max(1e-3, f.at * k);
+        continue;
       }
-      m.opacity = f.op;
-      m.alphaTest = f.at;
-      if (m.transparent !== f.tr) {
-        m.transparent = f.tr;
-        m.needsUpdate = true;
+      f.m.opacity = f.op;
+      f.m.alphaTest = f.at;
+      f.m.depthWrite = f.dw;
+      if (f.m.transparent !== f.tr) {
+        f.m.transparent = f.tr;
+        f.m.needsUpdate = true;
       }
-      delete m.__fade;
-    });
-    if (t >= 1) charmFadeAt = 0;
+    }
+    if (t >= 1) {
+      charmFadeAt = 0;
+      charmFadeList = [];
+    }
   }
 
   // Cast upward from below the body to find the ACTUAL underside surface at

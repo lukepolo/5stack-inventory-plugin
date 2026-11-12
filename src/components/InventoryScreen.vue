@@ -14,7 +14,7 @@
 // What leaves as an emit is every verb a card offers — opening, editing,
 // inspecting, deleting — because each of those ends in a route change or a
 // mutation, and both belong to App.
-import { computed, inject, nextTick, onMounted, ref, watch } from "vue";
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { cn } from "@5stack/ui";
 import {
   Check,
@@ -160,18 +160,24 @@ function deckHover(vs: readonly InventoryItem[] | null) {
   warmTimer = setTimeout(() => void warmDeck(vs), 80);
 }
 let deckReturn: { n: number; top: number; sig: string } | null = null;
+// A click still waiting on its pictures when the screen goes away must not open
+// the deck behind your back (the deck state outlives this component).
+let mounted = true;
+onBeforeUnmount(() => (mounted = false));
 async function openDeck(design: number | null, vs: readonly InventoryItem[]) {
   if (design == null) return void (invDesign.value = design);
   const sig = invFilterSig.value;
   await Promise.race([warmDeck(vs), new Promise((r) => setTimeout(r, 160))]);
-  if (sig !== invFilterSig.value) return;
+  if (!mounted || sig !== invFilterSig.value) return;
   deckReturn = { n: inventoryWindow.items.value.length, top: gridEl()?.scrollTop ?? 0, sig };
   invDesign.value = design;
 }
 watch(invDesign, async (now, was) => {
-  if (reducedMotion.value || (now === null) === (was === null)) return;
+  if ((now === null) === (was === null)) return;
   const dir = now !== null ? "in" : "out";
-  drill.value = dir;
+  // Reduced motion skips the slide, never the way back to where you were.
+  const slide = !reducedMotion.value;
+  if (slide) drill.value = dir;
   await nextTick();
   const el = gridEl();
   if (dir === "out" && deckReturn && deckReturn.sig === invFilterSig.value) {
@@ -180,6 +186,7 @@ watch(invDesign, async (now, was) => {
     if (el) el.scrollTop = deckReturn.top;
   }
   if (dir === "out") deckReturn = null;
+  if (!slide) return;
   const kf = [
     { opacity: 0, transform: `translateX(${dir === "in" ? 16 : -16}px)` },
     { opacity: 1, transform: "none" },
