@@ -9,6 +9,11 @@
 // animations never contain "/". A file that already has the conversion on a node
 // (19.x output, or the _physics.glb 20.x still writes the old way) is skipped.
 //
+// And it makes anisotropic-gloss materials (agent hair, the chicken's feathers)
+// matte again. 20.x reads their roughness from the metalness texture, which is
+// 0 in all 64 of them, so they rendered as glass; the game takes their gloss
+// from g_tAnisoGloss, which no version exports. 19.x left them fully rough.
+//
 //   node scripts/glb-source-space.mjs <file.glb|dir>...
 import fs from "node:fs";
 import path from "node:path";
@@ -233,6 +238,21 @@ function compact(doc, bin) {
   return out;
 }
 
+function matteAnisoGloss(doc) {
+  let n = 0;
+  for (const m of doc.materials ?? []) {
+    const pbr = m.pbrMetallicRoughness;
+    if (!m.extras?.vmat?.IntParams?.F_ANISOTROPIC_GLOSS || !pbr?.metallicRoughnessTexture) {
+      continue;
+    }
+    delete pbr.metallicRoughnessTexture;
+    pbr.metallicFactor = 0;
+    pbr.roughnessFactor = 1;
+    n++;
+  }
+  return n;
+}
+
 function toSourceSpace(buf) {
   const { doc, bin } = readGlb(buf);
   const nodes = doc.nodes ?? [];
@@ -346,8 +366,9 @@ function toSourceSpace(buf) {
     convertAccessor(doc, bin, index, kind);
   }
 
+  const matte = matteAnisoGloss(doc);
   const outBin = dropped ? compact(doc, bin) : bin;
-  return { glb: writeGlb(doc, outBin), dropped };
+  return { glb: writeGlb(doc, outBin), dropped, matte };
 }
 
 function walk(target, out) {
@@ -368,6 +389,7 @@ function walk(target, out) {
   let skipped = 0;
   let clips = 0;
   let saved = 0;
+  let matte = 0;
   const failed = [];
   for (const f of files) {
     try {
@@ -381,12 +403,13 @@ function walk(target, out) {
       fs.renameSync(`${f}.tmp`, f);
       converted++;
       clips += res.dropped;
+      matte += res.matte;
       saved += before - res.glb.length;
     } catch (e) {
       failed.push(`${f}: ${e.message}`);
     }
   }
-  console.log(`--- glb-source-space: ${converted} converted, ${skipped} already in source space, ${clips} graph clips dropped (${(saved / 1048576).toFixed(0)}MB)`);
+  console.log(`--- glb-source-space: ${converted} converted, ${skipped} already in source space, ${clips} graph clips dropped (${(saved / 1048576).toFixed(0)}MB), ${matte} anisotropic-gloss materials made matte`);
   for (const f of failed) {
     console.error(`!! glb-source-space: ${f}`);
   }
