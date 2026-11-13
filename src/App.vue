@@ -49,6 +49,8 @@ import {
   unequip,
   fetchPresets,
   fetchPlayerPresets,
+  fetchLoadoutSettings,
+  saveLoadoutSettings,
   createPreset,
   renamePreset,
   deletePreset,
@@ -1366,6 +1368,48 @@ async function refreshAll() {
 // makes them interesting.
 const presets = ref<LoadoutPreset[]>([]);
 const presetBusy = ref(false);
+
+const IN_GAME_MODES = ["default", "grid"] as const;
+const gridInGame = ref(false);
+// Frontend and backend ship as separate images: on a backend without the route
+// the read fails and the switch stays hidden, rather than offering a save that 404s.
+const gridInGameReady = ref(false);
+const gridInGameBusy = ref(false);
+const inGameLabel = (mode: string) =>
+  mode === "grid" ? tr("inventory.in_game.grid", "This grid") : tr("inventory.in_game.default", "Default");
+const inGameTip = (mode: string) =>
+  mode === "grid"
+    ? tr("inventory.in_game.grid_tip", "This grid: you spawn with the 15 guns on this page.")
+    : tr("inventory.in_game.default_tip", "Default: you keep the guns from your CS2 loadout. Skins show on the ones you carry.");
+
+async function loadLoadoutSettings() {
+  if (!canEdit.value) {
+    gridInGameReady.value = false;
+    return;
+  }
+  try {
+    gridInGame.value = (await fetchLoadoutSettings()).grid_in_game === true;
+    gridInGameReady.value = true;
+  } catch {
+    gridInGameReady.value = false;
+  }
+}
+
+async function setGridInGame(on: boolean) {
+  if (gridInGameBusy.value || gridInGame.value === on) {
+    return;
+  }
+  gridInGameBusy.value = true;
+  gridInGame.value = on;
+  try {
+    await saveLoadoutSettings({ grid_in_game: on });
+  } catch (e) {
+    gridInGame.value = !on;
+    fail(e);
+  } finally {
+    gridInGameBusy.value = false;
+  }
+}
 /** Cursor anchor for the preset menu — same contract as the slot/item menus. */
 const presetCtx = ref<{ x: number; y: number } | null>(null);
 /**
@@ -8788,6 +8832,7 @@ async function load() {
       // already looking at is not worth a slower first paint, and a backend
       // that has never heard of presets must still render a loadout.
       void loadPresets();
+      void loadLoadoutSettings();
     }
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e);
@@ -9579,6 +9624,28 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           <SlideReveal :open="view === 'focus'">ed</SlideReveal>
         </span>
       </button>
+      <!-- order-1 on compact: row one has room between the side toggle and the
+           value, row two is already full. -->
+      <div
+        v-if="canEdit && gridInGameReady && (view === 'grid' || view === 'focus')"
+        data-role="in-game-switch"
+        class="flex flex-none items-center"
+        :class="isCompact ? 'order-1' : 'gap-2'"
+      >
+        <span v-if="!isCompact" class="text-f10 uppercase tracking-widest text-muted-foreground/70">
+          {{ tr("inventory.in_game.label", "In game") }}
+        </span>
+        <PillTabs
+          :items="IN_GAME_MODES"
+          :item-key="(m) => m"
+          :item-title="inGameTip"
+          :active="gridInGame ? 'grid' : 'default'"
+          :button-class="`touch-hit relative z-[1] flex h-7 items-center rounded-md font-semibold uppercase tracking-wider transition-colors ${isCompact ? 'px-2.5 text-f10' : 'px-3 text-f11'}`"
+          @select="(m) => setGridInGame(m === 'grid')"
+        >
+          <template #default="{ item }">{{ inGameLabel(item) }}</template>
+        </PillTabs>
+      </div>
       <!-- The headline figure for whatever screen you're on: the side's loadout
            on the loadout screens, the whole collection on the inventory. ONE
            chip rather than two, so the two screens cannot drift apart — the
