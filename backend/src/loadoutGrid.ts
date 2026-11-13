@@ -83,3 +83,26 @@ export function resolveGrid(team: GridTeam, picks: Record<string, string | undef
   }
   return out;
 }
+
+export interface GridRow {
+  team: string;
+  slot: string;
+  model: string | undefined;
+}
+
+export function feedGrids(rows: GridRow[]): Partial<Record<GridTeam, Record<string, string>>> {
+  const out: Partial<Record<GridTeam, Record<string, string>>> = {};
+  for (const team of ["CT", "T"] as const) {
+    const picks: Record<string, string | undefined> = {};
+    for (const row of rows) {
+      if (row.team !== team || !GRID_SLOTS.includes(row.slot) || !row.model) {
+        continue;
+      }
+      picks[row.slot] = row.model;
+    }
+    if (Object.keys(picks).length) {
+      out[team] = resolveGrid(team, picks);
+    }
+  }
+  return out;
+}

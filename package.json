@@ -11,7 +11,7 @@
     "dev:api": "cd backend && npm install && node --watch --experimental-strip-types src/server.ts",
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
-    "check": "npm run typecheck && npm run check:slots && npm run check:inspect && npm run check:stattrak && npm run check:steam-sync && npm run check:prices && npm run check:sfc && npm run check:schema && npm run check:i18n && npm run check:sorts && npm run check:origin && npm run check:auto-extract && npm run check:guidelines && npm run check:extract-state && npm run check:extract-shards && npm run check:glb-source-space && npm run check:extract-workers && npm run check:machine-memory && npm run check:steam-cooldown && npm run check:model-textures && npm run check:extract-completion && npm run check:paint-inputs && npm run check:assets && npm run check:prefetch && npm run check:composite-store && npm run check:identity-cache && npm run check:server-key",
+    "check": "npm run typecheck && npm run check:slots && npm run check:inspect && npm run check:stattrak && npm run check:steam-sync && npm run check:prices && npm run check:sfc && npm run check:schema && npm run check:i18n && npm run check:sorts && npm run check:origin && npm run check:auto-extract && npm run check:guidelines && npm run check:extract-state && npm run check:extract-shards && npm run check:glb-source-space && npm run check:extract-workers && npm run check:machine-memory && npm run check:steam-cooldown && npm run check:model-textures && npm run check:extract-completion && npm run check:paint-inputs && npm run check:assets && npm run check:prefetch && npm run check:composite-store && npm run check:identity-cache && npm run check:server-key && npm run check:loadout-feed",
     "check:slots": "node --experimental-strip-types tools/slot-whitelist-check.ts",
     "check:inspect": "node --experimental-strip-types tools/inspect-roundtrip.ts",
     "check:stattrak": "node --experimental-strip-types tools/stattrak-digits.ts",
@@ -38,7 +38,8 @@
     "check:prefetch": "node --experimental-strip-types tools/prefetch-check.ts",
     "check:composite-store": "node --experimental-strip-types tools/composite-store-check.ts",
     "check:identity-cache": "node --experimental-strip-types tools/identity-cache-check.ts",
-    "check:server-key": "node --experimental-strip-types tools/server-key-check.ts"
+    "check:server-key": "node --experimental-strip-types tools/server-key-check.ts",
+    "check:loadout-feed": "node --experimental-strip-types tools/loadout-feed-check.ts"
   },
   "dependencies": {
     "@5stack/ui": "^0.2.0",

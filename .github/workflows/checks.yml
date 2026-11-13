@@ -166,6 +166,9 @@ jobs:
       - name: The StatTrak key is compared in constant time
         run: npm run check:server-key
 
+      - name: A player keeps their CS2 guns unless they ask for the grid in game
+        run: npm run check:loadout-feed
+
   # NOT in the job above: tools/charmsim-check.ts needs a directory of
   # *.phys.json from the extracted CS2 assets, which no clean runner has. Run it
   # by hand against a mount with `npm run check:charmsim -- <dir>`. Splitting it

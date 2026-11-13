@@ -56,7 +56,7 @@ import {
   getPatchMaterials,
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
-import { GRID_SLOT_IDS, GRID_SLOTS, resolveGrid } from "./loadoutGrid.ts";
+import { GRID_SLOT_IDS, feedGrids } from "./loadoutGrid.ts";
 import { compositeDirIn } from "./compositeStore.ts";
 import { registerSharedStores, type CompositeClaim } from "./sharedStores.ts";
 import { sameServerKey } from "./serverKey.ts";
@@ -7278,18 +7278,19 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
   // entirely and keeps their own CS2 loadout, so nobody joins a match with a
   // default loadout forced on them.
   const loadout: Record<string, Record<string, number>> = {};
-  for (const team of ["CT", "T"] as const) {
-    const picks: Record<string, string | undefined> = {};
-    for (const row of rows) {
+  const grids = feedGrids(
+    rows.map((row) => {
       const id = row.item_id ?? row.base_item_id;
-      if (row.team !== team || !GRID_SLOTS.includes(row.slot) || id == null) continue;
-      picks[row.slot] = getItem(id)?.model as string | undefined;
-    }
-    if (!Object.values(picks).some(Boolean)) continue;
+      return { team: row.team, slot: row.slot, model: id == null ? undefined : (getItem(id)?.model as string | undefined) };
+    }),
+  );
+  for (const [team, grid] of Object.entries(grids)) {
     const slots: Record<string, number> = {};
-    for (const [slot, model] of Object.entries(resolveGrid(team, picks))) {
+    for (const [slot, model] of Object.entries(grid)) {
       const def = WEAPON_DEF_BY_MODEL.get(model);
-      if (def != null) slots[String(GRID_SLOT_IDS[slot])] = def;
+      if (def != null) {
+        slots[String(GRID_SLOT_IDS[slot])] = def;
+      }
     }
     loadout[TEAM_BYTE[team]] = slots;
   }
