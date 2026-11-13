@@ -6990,20 +6990,16 @@ app.post("/api/admin/game-config", async (request, reply) => {
   }
 });
 
-async function gridInGame(steamId: string): Promise<boolean> {
-  const { rows } = await pool.query<{ grid_in_game: boolean }>(
-    `SELECT grid_in_game FROM inventory.player_settings WHERE steam_id = $1`,
-    [steamId],
-  );
-  return rows[0]?.grid_in_game === true;
-}
-
 app.get("/api/loadout/settings", async (request, reply) => {
   const identity = await getIdentity(request);
   if (!identity) {
     return reply.status(401).send({ error: "unauthorized" });
   }
-  return { grid_in_game: await gridInGame(identity.steamId) };
+  const { rows } = await pool.query<{ grid_in_game: boolean }>(
+    `SELECT grid_in_game FROM inventory.player_settings WHERE steam_id = $1`,
+    [identity.steamId],
+  );
+  return { grid_in_game: rows[0]?.grid_in_game === true };
 });
 
 app.put<{ Body: { grid_in_game?: unknown } }>("/api/loadout/settings", async (request, reply) => {
@@ -7150,12 +7146,14 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     patches: unknown[] | null;
     charm_id: number | null;
     charm_offset: { x?: number; y?: number; z?: number; seed?: number; highlight?: number } | null;
+    grid_in_game: boolean | null;
   }>(
     `SELECT l.team, l.slot, l.item_id AS base_item_id, i.id AS uid, i.item_id, i.wear, i.seed, i.stattrak,
             i.stattrak_count, i.souvenir, i.nametag, i.style, i.upgrade_level,
-            i.stickers, i.patches, i.charm_id, i.charm_offset
+            i.stickers, i.patches, i.charm_id, i.charm_offset, s.grid_in_game
      FROM inventory.loadout l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+     LEFT JOIN inventory.player_settings s ON s.steam_id = l.steam_id
      WHERE l.steam_id = $1`,
     [steamId],
   );
@@ -7318,7 +7316,7 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
       const id = row.item_id ?? row.base_item_id;
       return { team: row.team, slot: row.slot, model: id == null ? undefined : (getItem(id)?.model as string | undefined) };
     }),
-    await gridInGame(steamId),
+    rows.some((row) => row.grid_in_game === true),
   );
   for (const [team, grid] of Object.entries(grids)) {
     const slots: Record<string, number> = {};

@@ -465,7 +465,7 @@ function rowFor(pos: string, t: Team = team.value): LoadoutEntry | undefined {
 }
 const weaponByModel = computed(() => new Map(weapons.value.map((w) => [w.model, w])));
 // Every grid position's gun per team, defaults included. The same resolver
-// /api/equipped/v5 sends the game server, so a default you displaced by
+// /api/equipped/v5 uses for a player with the grid on in game, so a default you displaced by
 // placing its gun elsewhere moves over instead of showing twice.
 const gridModels = computed(() => {
   const forTeam = (t: Team) => {
