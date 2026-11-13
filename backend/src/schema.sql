@@ -296,6 +296,13 @@ CREATE TABLE IF NOT EXISTS inventory.steam_sync (
   synced_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- No row reads as off: the player keeps their CS2 loadout in game.
+CREATE TABLE IF NOT EXISTS inventory.player_settings (
+  steam_id bigint PRIMARY KEY,
+  grid_in_game boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- ---- Market prices ---------------------------------------------------------
 -- A mirror of a Steam market price feed, resolved onto catalog ids. Rebuilt
 -- wholesale on each sync (the feed is a full snapshot, not a delta), which is

@@ -90,8 +90,11 @@ export interface GridRow {
   model: string | undefined;
 }
 
-export function feedGrids(rows: GridRow[]): Partial<Record<GridTeam, Record<string, string>>> {
+export function feedGrids(rows: GridRow[], gridInGame: boolean): Partial<Record<GridTeam, Record<string, string>>> {
   const out: Partial<Record<GridTeam, Record<string, string>>> = {};
+  if (!gridInGame) {
+    return out;
+  }
   for (const team of ["CT", "T"] as const) {
     const picks: Record<string, string | undefined> = {};
     for (const row of rows) {
