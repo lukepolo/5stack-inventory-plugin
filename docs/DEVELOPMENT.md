@@ -336,8 +336,12 @@ failure modes rather than cosmetic mismatches:
 - **`loadout`** (`{ team: { loadout_slot_t: weaponDef } }`) replaces the
   player's gun slots with the grid. Without it the plugin keeps the player's own
   CS2 loadout and swaps skins in by def alone, so a skin on a gun that loadout
-  doesn't carry (an M4A1-S for someone on the M4A4, an R8, a CZ) never showed
-  ([cs2-ss2-inventory-simulator#60][invsim-loadout]). A team the player has set
+  doesn't carry (an M4A1-S for someone on the M4A4, an R8, a CZ) doesn't show
+  ([cs2-ss2-inventory-simulator#60][invsim-loadout]). It is sent only for a
+  player who turned it on (`inventory.player_settings.grid_in_game`, read and
+  set through `GET`/`PUT /api/loadout/settings`, off by default): the feed can't
+  see a player's CS2 loadout, and sent uninvited it put a stock P2000 over the
+  USP-S of anyone who equipped one skin. On, a team the player has set
   up here (any grid row, skin or free default) goes out whole: all 15 positions
   (`sp`/`p1-p4` → 2-6, `m1-m5` → 8-12, `r1-r5` → 14-18), with empty ones filled
   from Valve's defaults in `backend/src/loadoutGrid.ts`, the same table the

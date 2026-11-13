@@ -94,8 +94,8 @@ export function catsForPos(pos: string): string[] {
   return ["rifle"];
 }
 // CS2 default loadouts (cs2-lib model names). The grid half is Valve's own
-// table, shared with the backend: /api/equipped/v5 tells the game server the
-// same guns, so a cell and the buy menu can't disagree.
+// table, shared with the backend: with the grid on in game, /api/equipped/v5
+// tells the game server the same guns, so a cell and the buy menu can't disagree.
 export const DEFAULTS: Record<Team, Record<string, string>> = {
   CT: { ...GRID_DEFAULTS.CT, knife: "knife" },
   // Without the knife the slot falls through to the literal pos ("knife"),

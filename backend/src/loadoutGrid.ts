@@ -2,9 +2,9 @@
 //
 // The panel draws an empty position as the gun CS2 would put there, and since
 // the plugin's "Add loadouts" (cs2-ss2-inventory-simulator#60) the feed tells the
-// game server which gun sits in every position of a team the player has set up.
-// Both read this one table, so what a player sees in a cell is what the buy menu
-// hands them. Two copies is how they drifted before: the panel showed MP7/UMP-45
+// game server which gun sits in every position of a team the player has set up,
+// for a player who turned the grid on in game. Both read this one table, so what
+// that player sees in a cell is what the buy menu hands them. Two copies is how they drifted before: the panel showed MP7/UMP-45
 // in the mid tier and an M4A4 in r2 while the game gave a Nova, an XM1014 and an
 // M4A1-S.
 //
@@ -80,6 +80,32 @@ export function resolveGrid(team: GridTeam, picks: Record<string, string | undef
     open.forEach((slot, i) => {
       if (leftover[i]) out[slot] = leftover[i];
     });
+  }
+  return out;
+}
+
+export interface GridRow {
+  team: string;
+  slot: string;
+  model: string | undefined;
+}
+
+export function feedGrids(rows: GridRow[], gridInGame: boolean): Partial<Record<GridTeam, Record<string, string>>> {
+  const out: Partial<Record<GridTeam, Record<string, string>>> = {};
+  if (!gridInGame) {
+    return out;
+  }
+  for (const team of ["CT", "T"] as const) {
+    const picks: Record<string, string | undefined> = {};
+    for (const row of rows) {
+      if (row.team !== team || !GRID_SLOTS.includes(row.slot) || !row.model) {
+        continue;
+      }
+      picks[row.slot] = row.model;
+    }
+    if (Object.keys(picks).length) {
+      out[team] = resolveGrid(team, picks);
+    }
   }
   return out;
 }

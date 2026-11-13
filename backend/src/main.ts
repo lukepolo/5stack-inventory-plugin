@@ -56,7 +56,7 @@ import {
   getPatchMaterials,
 } from "./stickerMarkup.ts";
 import { patchSlotsFor, warmPatchSlots } from "./agentPatchSlots.ts";
-import { GRID_SLOT_IDS, GRID_SLOTS, resolveGrid } from "./loadoutGrid.ts";
+import { GRID_SLOT_IDS, feedGrids } from "./loadoutGrid.ts";
 import { compositeDirIn } from "./compositeStore.ts";
 import { registerSharedStores, type CompositeClaim } from "./sharedStores.ts";
 import { sameServerKey } from "./serverKey.ts";
@@ -6990,6 +6990,35 @@ app.post("/api/admin/game-config", async (request, reply) => {
   }
 });
 
+app.get("/api/loadout/settings", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const { rows } = await pool.query<{ grid_in_game: boolean }>(
+    `SELECT grid_in_game FROM inventory.player_settings WHERE steam_id = $1`,
+    [identity.steamId],
+  );
+  return { grid_in_game: rows[0]?.grid_in_game === true };
+});
+
+app.put<{ Body: { grid_in_game?: unknown } }>("/api/loadout/settings", async (request, reply) => {
+  const identity = await getIdentity(request);
+  if (!identity) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const value = request.body?.grid_in_game;
+  if (typeof value !== "boolean") {
+    return reply.status(400).send({ error: "grid_in_game must be true or false." });
+  }
+  await pool.query(
+    `INSERT INTO inventory.player_settings (steam_id, grid_in_game) VALUES ($1, $2)
+     ON CONFLICT (steam_id) DO UPDATE SET grid_in_game = EXCLUDED.grid_in_game, updated_at = now()`,
+    [identity.steamId, value],
+  );
+  return { grid_in_game: value };
+});
+
 // ---- Game-server API (ianlucas/cs2-css-inventory-simulator compatible) ------
 // The CS2 server plugin polls this for a player's equipped loadout. Public by
 // design (game servers can't do Steam forward-auth), same as upstream.
@@ -7117,12 +7146,14 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
     patches: unknown[] | null;
     charm_id: number | null;
     charm_offset: { x?: number; y?: number; z?: number; seed?: number; highlight?: number } | null;
+    grid_in_game: boolean | null;
   }>(
     `SELECT l.team, l.slot, l.item_id AS base_item_id, i.id AS uid, i.item_id, i.wear, i.seed, i.stattrak,
             i.stattrak_count, i.souvenir, i.nametag, i.style, i.upgrade_level,
-            i.stickers, i.patches, i.charm_id, i.charm_offset
+            i.stickers, i.patches, i.charm_id, i.charm_offset, s.grid_in_game
      FROM inventory.loadout l
      LEFT JOIN inventory.owned_items i ON i.id = l.item_instance_id
+     LEFT JOIN inventory.player_settings s ON s.steam_id = l.steam_id
      WHERE l.steam_id = $1`,
     [steamId],
   );
@@ -7272,24 +7303,28 @@ app.get<{ Params: { steamId: string } }>("/api/equipped/v5/:steamId", async (req
   // alone, so a skin on a gun that loadout doesn't carry — an M4A1-S for someone
   // on the M4A4, an R8, a CZ — never showed.
   //
-  // A team the player has arranged here (any grid row, skin or free default) is
-  // sent WHOLE, defaults included, so the buy menu is exactly the grid the panel
-  // draws and no gun can turn up twice. A team they never touched is left out
-  // entirely and keeps their own CS2 loadout, so nobody joins a match with a
-  // default loadout forced on them.
+  // Only for a player who turned it on. The feed can't see their CS2 loadout,
+  // so a grid sent uninvited put a stock P2000 over the USP-S they carry the
+  // moment they equipped one skin. Off, skins land on the guns they carry.
+  //
+  // On, a team with any grid row is sent WHOLE, defaults included, so the buy
+  // menu is exactly the grid the panel draws and no gun can turn up twice. A
+  // team they never touched is left out and keeps their own CS2 loadout.
   const loadout: Record<string, Record<string, number>> = {};
-  for (const team of ["CT", "T"] as const) {
-    const picks: Record<string, string | undefined> = {};
-    for (const row of rows) {
+  const grids = feedGrids(
+    rows.map((row) => {
       const id = row.item_id ?? row.base_item_id;
-      if (row.team !== team || !GRID_SLOTS.includes(row.slot) || id == null) continue;
-      picks[row.slot] = getItem(id)?.model as string | undefined;
-    }
-    if (!Object.values(picks).some(Boolean)) continue;
+      return { team: row.team, slot: row.slot, model: id == null ? undefined : (getItem(id)?.model as string | undefined) };
+    }),
+    rows.some((row) => row.grid_in_game === true),
+  );
+  for (const [team, grid] of Object.entries(grids)) {
     const slots: Record<string, number> = {};
-    for (const [slot, model] of Object.entries(resolveGrid(team, picks))) {
+    for (const [slot, model] of Object.entries(grid)) {
       const def = WEAPON_DEF_BY_MODEL.get(model);
-      if (def != null) slots[String(GRID_SLOT_IDS[slot])] = def;
+      if (def != null) {
+        slots[String(GRID_SLOT_IDS[slot])] = def;
+      }
     }
     loadout[TEAM_BYTE[team]] = slots;
   }

@@ -1708,6 +1708,13 @@ export interface PresetPreviewItem {
 
 export const fetchPresets = () => request<LoadoutPreset[]>("/loadout/presets");
 
+export interface LoadoutSettings {
+  grid_in_game: boolean;
+}
+export const fetchLoadoutSettings = () => request<LoadoutSettings>("/loadout/settings");
+export const saveLoadoutSettings = (body: LoadoutSettings) =>
+  request<LoadoutSettings>("/loadout/settings", { method: "PUT", body: JSON.stringify(body) });
+
 /** `copy: true` seeds the new preset from the loadout you are wearing now.
  *  It does NOT duplicate the owned items — both presets point at the same
  *  crafted instances, because crafting is the gate and a preset is only an
