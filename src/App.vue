@@ -9624,15 +9624,15 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           <SlideReveal :open="view === 'focus'">ed</SlideReveal>
         </span>
       </button>
-      <!-- order-1 on compact: row one has room between the side toggle and the
-           value, row two is already full. -->
+      <!-- Its own row on compact: rows one and two are already full at 376px,
+           so anywhere else it pushes the screen tabs or the tools onto a new line. -->
       <div
         v-if="canEdit && gridInGameReady && (view === 'grid' || view === 'focus')"
         data-role="in-game-switch"
-        class="flex flex-none items-center"
-        :class="isCompact ? 'order-1' : 'gap-2'"
+        class="flex flex-none items-center gap-2"
+        :class="isCompact ? 'order-8 w-full justify-between' : ''"
       >
-        <span v-if="!isCompact" class="text-f10 uppercase tracking-widest text-muted-foreground/70">
+        <span class="text-f10 uppercase tracking-widest text-muted-foreground/70">
           {{ tr("inventory.in_game.label", "In game") }}
         </span>
         <PillTabs
