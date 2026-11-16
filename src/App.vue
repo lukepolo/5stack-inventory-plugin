@@ -6582,7 +6582,7 @@ const invViewer = useViewerMount({
 const invTarget = computed<ViewerTarget | null>(() => (invPin.value?.item ? resolveViewerModelSync(invPin.value.item) ?? null : null));
 const inv3dKey = computed(() =>
   invPanelOn.value && spot3d.value && invTarget.value && invPin.value
-    ? `${invTarget.value.model}|${invPin.value.id}|${renderSrc(invPin.value)}`
+    ? `${invTarget.value.model}|${invPin.value.id}|${renderUrlFor(invPin.value)}`
     : "",
 );
 let inv3dMounted = "";
@@ -6663,11 +6663,12 @@ const spotTarget = computed<ViewerTarget | null>(() => {
   const key = occupantModel(selected.value);
   return key ? { model: key, kind: "weapon" } : null;
 });
-// Its render URL changes with an edit (wear, pattern, a rebake), so a saved
-// edit remounts the model; equipping the item on show keeps the same URL.
+// The item's look (wear, pattern, StatTrak, style...) as its render key, not
+// the displayed source: a saved edit remounts the model, a finished bake or
+// equipping the item on show does not.
 const spot3dLook = computed(() => {
   const inst = spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value) ?? null);
-  return inst ? renderSrc(inst) : "";
+  return inst ? renderUrlFor(inst) : "";
 });
 const spot3dKey = computed(() => {
   const t = spotTarget.value;
