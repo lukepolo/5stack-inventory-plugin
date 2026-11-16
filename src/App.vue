@@ -8964,6 +8964,9 @@ function onGlobalKey(e: KeyboardEvent) {
     if (view.value === "inventory") {
       invSearchEl.value?.focus();
     } else {
+      if (loading.value) {
+        return;
+      }
       // The picker is inert until Spotlight opens on a slot.
       if (dockSmall.value && !dockOpen.value) {
         dockSelectPos(selected.value);

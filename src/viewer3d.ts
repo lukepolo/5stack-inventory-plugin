@@ -5816,9 +5816,9 @@ async function buildViewer(
       zoomWheel = zoomLocal(e);
       zoomFrom = camera.zoom;
     },
-    { capture: true, passive: true },
+    { capture: true, passive: true, signal: hostListeners.signal },
   );
-  container.addEventListener("wheel", () => (zoomWheel = null), { passive: true });
+  container.addEventListener("wheel", () => (zoomWheel = null), { passive: true, signal: hostListeners.signal });
   container.addEventListener(
     "pointerdown",
     (e) => {
@@ -5827,7 +5827,7 @@ async function buildViewer(
         zoomFrom = camera.zoom;
       }
     },
-    { capture: true },
+    { capture: true, signal: hostListeners.signal },
   );
   container.addEventListener(
     "pointermove",
@@ -5836,11 +5836,11 @@ async function buildViewer(
         zoomPointers.set(e.pointerId, zoomLocal(e));
       }
     },
-    { capture: true },
+    { capture: true, signal: hostListeners.signal },
   );
   const zoomPointerUp = (e: PointerEvent) => zoomPointers.delete(e.pointerId);
-  container.addEventListener("pointerup", zoomPointerUp, { capture: true });
-  container.addEventListener("pointercancel", zoomPointerUp, { capture: true });
+  container.addEventListener("pointerup", zoomPointerUp, { capture: true, signal: hostListeners.signal });
+  container.addEventListener("pointercancel", zoomPointerUp, { capture: true, signal: hostListeners.signal });
   controls.addEventListener("change", () => {
     const z = camera.zoom;
     if (z === zoomFrom) {
