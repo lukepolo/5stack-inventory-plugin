@@ -3938,14 +3938,18 @@ export async function mountViewer(
   // the exotic one — every remount (2D/3D flip, wear/seed edit, model switch)
   // cancels the build in flight, and on a cold cache that lands mid-load, long
   // after the canvas went in.
-  const mounted: { view?: HTMLCanvasElement; listeners?: AbortController } = {};
+  const mounted: { view?: HTMLCanvasElement; undo: Array<() => void> } = { undo: [] };
   try {
     return await queueBuild(opts?.priority ?? "interactive", opts?.signal, (signal) =>
       buildViewer(container, model, opts, signal, mounted),
     );
   } catch (e) {
+    // Before the canvas comes out: OrbitControls finds the document it listens
+    // on through the canvas's root node.
+    for (const undo of mounted.undo.reverse()) {
+      undo();
+    }
     mounted.view?.remove();
-    mounted.listeners?.abort();
     throw e;
   }
 }
@@ -3959,7 +3963,7 @@ async function buildViewer(
   signal: AbortSignal,
   // Write-only channel back to mountViewer, so a build that dies after its
   // canvas is in the DOM can still have that canvas taken out again.
-  mounted: { view?: HTMLCanvasElement; listeners?: AbortController } = {},
+  mounted: { view?: HTMLCanvasElement; undo: Array<() => void> } = { undo: [] },
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
   // A studio rig (every card bake among them) starts its HDRI download now, so
@@ -4087,7 +4091,7 @@ async function buildViewer(
   // The container and window outlive the viewer, so what the build hangs on
   // them goes with dispose(), or with mountViewer's catch when the build throws.
   const hostListeners = new AbortController();
-  mounted.listeners = hostListeners;
+  mounted.undo.push(() => hostListeners.abort());
 
   const scene = new THREE.Scene();
   // Prefiltered once for the whole app — see getSharedGL. Ambient stays tiny;
@@ -4883,6 +4887,10 @@ async function buildViewer(
   }
   // Frees the glove composite's render targets on dispose — see below.
   let gloveRelease: (() => void) | null = null;
+  mounted.undo.push(() => {
+    gloveRelease?.();
+    gloveRelease = null;
+  });
   /**
    * The tint masks of a charm that IS the mounted model.
    *
@@ -5102,6 +5110,10 @@ async function buildViewer(
   // the hd/legacy body prune, and the holster cull.
   mt.mark("pose");
   let releaseComposite: (() => void) | null = null;
+  mounted.undo.push(() => {
+    releaseComposite?.();
+    releaseComposite = null;
+  });
   /**
    * Everything a RE-composite needs, kept so the pattern can be changed on a
    * live viewer instead of by rebuilding it.
@@ -5633,6 +5645,7 @@ async function buildViewer(
   // canvas is offscreen and shared, so pointer events must come from the
   // element the user is actually looking at.
   const controls = new OrbitControls(camera, view);
+  mounted.undo.push(() => controls.dispose());
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   // autoRotate is NOT set here: it depends on whether this model turned out to
@@ -16398,9 +16411,11 @@ async function buildViewer(
       // reopening the same weapon now finds its composite already resident
       // instead of re-fetching and re-decoding two 2k textures.
       releaseComposite?.();
+      releaseComposite = null;
       // The glove composite owns its render targets outright (no shared LRU), so
       // the viewer that made them is the only thing that can free them.
       gloveRelease?.();
+      gloveRelease = null;
       // Same for the patched agent maps. The SOURCE texture underneath them is
       // the shared glTF one and is deliberately not touched — see agentPatches.
       patchDispose?.();
