@@ -1,5 +1,6 @@
-// Do wheel and pinch zoom keep the point under the pointer still, and does the
-// Spotlight's "Loading 3D model…" pill sit just under the 2D picture?
+// Do wheel and pinch zoom keep the point under the pointer still, does the
+// Spotlight's "Loading 3D model…" pill sit just under the 2D picture, and do the
+// team chips aim Equip at a side the item is missing?
 //
 // Run: node --experimental-strip-types tools/spotlight-check.ts
 //
@@ -8,6 +9,7 @@
 // the foot of a tall stage, out of sight on a tall screen.
 import { panAfterZoom, pointerMidpoint, type Vec2 } from "../src/viewerZoom.ts";
 import { belowContainedArt } from "../src/containedArt.ts";
+import { defaultEquipSides, onEverySide } from "../src/teamSides.ts";
 
 let failures = 0;
 function check(label: string, got: unknown, want: unknown) {
@@ -45,6 +47,17 @@ check("under a picture in a tall stage", belowContainedArt({ top: 0, width: 352,
 check("under a picture offset in its stage", belowContainedArt({ top: 30, width: 352, height: 600 }, { width: 512, height: 384 }, 700, 12, 40), 474);
 check("a picture that fills the height", belowContainedArt({ top: 0, width: 800, height: 300 }, { width: 512, height: 384 }, 300, 12, 40), 260);
 check("not loaded yet", belowContainedArt({ top: 0, width: 352, height: 900 }, { width: 0, height: 0 }, 900, 12, 40), null);
+
+// The team chips: where Equip goes before anyone picks, and when it reads Equipped.
+check("not equipped anywhere: your side", defaultEquipSides(["CT", "T"], [], "CT"), ["CT"]);
+check("not equipped anywhere, viewing T: T", defaultEquipSides(["CT", "T"], [], "T"), ["T"]);
+check("on T only, viewing CT: CT", defaultEquipSides(["CT", "T"], ["T"], "CT"), ["CT"]);
+check("on CT only, viewing CT: the missing T", defaultEquipSides(["CT", "T"], ["CT"], "CT"), ["T"]);
+check("on both: nothing left", defaultEquipSides(["CT", "T"], ["CT", "T"], "CT"), []);
+check("a CT-only gun already on CT: nothing", defaultEquipSides(["CT"], ["CT"], "CT"), []);
+check("a T-only gun viewed from CT: T", defaultEquipSides(["T"], [], "CT"), ["T"]);
+check("on both reads Equipped", onEverySide(["CT", "T"], ["CT", "T"]), true);
+check("on one side does not", onEverySide(["CT", "T"], ["T"]), false);
 
 if (failures) {
   console.error(`\n${failures} failed`);
