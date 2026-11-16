@@ -11,7 +11,7 @@
 // a <button> (tile, slot), and a nested button is invalid HTML that browsers
 // silently reparent, which drops the click handlers.
 import { computed, inject } from "vue";
-import { Box, Copy, Crosshair, ExternalLink, Pencil, Trash2 } from "lucide-vue-next";
+import { Copy, Crosshair, ExternalLink, Maximize2, Pencil, Trash2 } from "lucide-vue-next";
 import type { InventoryItem } from "../api";
 import { canInspect, isCustomizable, isReadOnly } from "../itemVisuals";
 import { resolveViewerModelSync } from "../viewerModel";
@@ -35,8 +35,10 @@ const props = withDefaults(
      * had that the component didn't, and it was the excuse for the copy existing.
      */
     focus?: boolean;
+    /** The Spotlight head's size: the 2D / 3D tabs' height, always shown. */
+    stage?: boolean;
   }>(),
-  { compact: false, focus: false },
+  { compact: false, focus: false, stage: false },
 );
 
 const emit = defineEmits<{ (e: "focus" | "view3d" | "inspect" | "edit" | "duplicate" | "remove"): void }>();
@@ -66,11 +68,12 @@ const canInspectItem = computed(() => !!props.inst && canInspect(props.inst.item
 // the transition — see style.css. It's the same treatment the header tools and
 // the modal actions wear, which is the point: an action looks like an action
 // wherever it turns up.
-const BTN = computed(
-  () =>
-    `tac-action rounded border border-border/60 bg-background/70 text-muted-foreground ${props.compact ? "p-0.5" : "p-1"}`,
+const BTN = computed(() =>
+  props.stage
+    ? "flex h-full aspect-square items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-background/70 hover:text-foreground"
+    : `tac-action rounded border border-border/60 bg-background/70 text-muted-foreground ${props.compact ? "p-0.5" : "p-1"}`,
 );
-const ICON = computed(() => (props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
+const ICON = computed(() => (props.stage ? "h-3.5 w-3.5" : props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
 </script>
 
 <template>
@@ -88,20 +91,19 @@ const ICON = computed(() => (props.compact ? "h-2.5 w-2.5" : "h-3 w-3"));
        glyphs without darkening the cell further. -->
   <span
     v-if="!isCoarse && (inst || focus)"
-    class="absolute z-[3] flex rounded-md border border-border/50 bg-background/80 opacity-0 backdrop-blur-[2px] transition-opacity duration-100 group-hover:opacity-100"
-    :class="compact ? 'right-1 top-1 gap-0.5 p-0.5' : 'right-1.5 top-1.5 gap-1 p-1'"
+    :class="stage ? 'inline-flex h-8 items-center gap-0.5 rounded-lg bg-muted p-1' : ['absolute z-[3] flex rounded-md border border-border/50 bg-background/80 opacity-0 backdrop-blur-[2px] transition-opacity duration-100 group-hover:opacity-100', compact ? 'right-1 top-1 gap-0.5 p-0.5' : 'right-1.5 top-1.5 gap-1 p-1']"
   >
     <span v-if="focus" :class="BTN" :title="tr('inventory.actions.focus', 'Focus')" @click.stop="emit('focus')"><Crosshair :class="ICON" /></span>
-    <span v-if="can3d" :class="BTN" :title="tr('inventory.actions.view3d', 'View in 3D')" @click.stop="emit('view3d')"><Box :class="ICON" /></span>
+    <span v-if="can3d" :class="BTN" :title="tr('inventory.actions.fullscreen', 'Open full screen')" @click.stop="emit('view3d')"><Maximize2 :class="ICON" /></span>
     <!-- steam:// can't launch CS2 from a phone — hide the dead-end on touch. -->
     <span v-if="canInspectItem" :class="BTN" :title="tr('inventory.actions.inspect', 'Inspect in game')" @click.stop="emit('inspect')"><ExternalLink :class="ICON" /></span>
     <span
-      v-if="readOnly"
+      v-if="readOnly && !stage"
       :class="BTN"
       :title="tr('inventory.actions.duplicate', 'Synced from Steam and read-only — craft your own copy of it')"
       @click.stop="emit('duplicate')"
     ><Copy :class="ICON" /></span>
-    <span v-else-if="canEditItem" :class="BTN" :title="tr('inventory.actions.edit', 'Edit item')" @click.stop="emit('edit')"><Pencil :class="ICON" /></span>
+    <span v-else-if="canEditItem && !stage" :class="BTN" :title="tr('inventory.actions.edit', 'Edit item')" @click.stop="emit('edit')"><Pencil :class="ICON" /></span>
     <!-- Guarded like the rest: with no instance there is nothing to delete, and
          a default weapon offering a bin was the one action that used to escape
          the null check. -->

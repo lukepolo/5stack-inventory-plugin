@@ -66,6 +66,8 @@ const props = defineProps<{
   valueByOrigin: Record<OriginFilter, number>;
   /** "on the AK-47 | Redline" for a sticker/charm that is applied to something. */
   attachedName: (inst?: InventoryItem | null) => string | null;
+  /** The item the desktop preview panel shows (outlined, actions hidden). */
+  pinnedId?: string | number | null;
 }>();
 
 defineEmits<{
@@ -817,7 +819,7 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
             />
             <ItemTile
               v-else
-              class="cv-tile"
+              :class="['cv-tile', pinnedId != null && String(pinnedId) === String(st.face.id) && 'outline outline-2 -outline-offset-2 outline-[hsl(var(--tac-amber,33_94%_58%))]']"
               :style="{ '--i': invCellDelay(i), '--cis': cardSize + CARD_CHROME_PX + 'px' }"
               :inst="st.face"
               :attached-name="attachedName(st.face)"
@@ -826,7 +828,7 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
               :price-source="priceSourceLabel"
               show-header
               :selected="selectMode && selectedIds.has(st.face.id)"
-              :hide-actions="selectMode"
+              :hide-actions="selectMode || (pinnedId != null && String(pinnedId) === String(st.face.id))"
               :title="selectMode ? 'Toggle selection' : itemName(st.face.item) || 'View item'"
               @click="selectMode ? toggleSelected(st.face.id) : $emit('detail', st.face)"
               @contextmenu.prevent="$emit('item-ctx', st.face, $event)"
@@ -854,6 +856,7 @@ const INV_CHIP_OFF = "border-border/60 text-muted-foreground";
           class="pointer-events-none absolute inset-x-0 bottom-0 z-[2] h-12 bg-gradient-to-t from-background via-background/70 to-transparent"
         ></div>
         </div>
+        <slot name="aside" />
         </div>
       </div>
 </template>

@@ -178,6 +178,7 @@
     "actions": {
       "focus": "Focus",
       "view3d": "View in 3D",
+      "fullscreen": "Open full screen",
       "inspect": "Inspect in game",
       "duplicate": "Synced from Steam and read-only — craft your own copy of it",
       "edit": "Edit item",

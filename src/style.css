@@ -818,3 +818,52 @@
   height: 0;
   margin-top: -10px;
 }
+
+/* ---- Spotlight preview ----------------------------------------------------
+   A previewed picture stays hidden until it has loaded, then fades in, instead
+   of popping in or arriving late. */
+[data-cs2-inventory] [data-art-fade] {
+  transition: opacity 260ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+[data-cs2-inventory] [data-art-fade]:not([data-art-loaded]) {
+  opacity: 0;
+}
+/* A picture with a model on the way holds back a beat: a model that is already
+   cached lands inside it and the picture never flashes up just to leave. */
+[data-cs2-inventory] [data-art-fade][data-art-hold][data-art-loaded] {
+  transition-delay: 180ms;
+}
+/* 2D to 3D: the picture settles out (fade + a slight shrink, since the model
+   usually frames smaller) while the model resolves in from a soft blur, so the
+   size change reads as one motion instead of a pop. */
+[data-cs2-inventory] .spot-2d {
+  transition:
+    opacity 320ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 420ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+[data-cs2-inventory] .spot-2d-out {
+  opacity: 0 !important;
+  transform: scale(0.94);
+}
+[data-cs2-inventory] .spot-3d-in {
+  transition:
+    opacity 420ms cubic-bezier(0.23, 1, 0.32, 1),
+    filter 420ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 520ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+[data-cs2-inventory] .spot-3d-out {
+  filter: blur(8px);
+  transform: scale(1.04);
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-cs2-inventory] [data-art-fade],
+  [data-cs2-inventory] .spot-2d,
+  [data-cs2-inventory] .spot-3d-in {
+    transition: none;
+  }
+  [data-cs2-inventory] .spot-2d-out,
+  [data-cs2-inventory] .spot-3d-out {
+    transform: none;
+    filter: none;
+  }
+}
