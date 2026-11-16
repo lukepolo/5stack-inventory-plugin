@@ -48,6 +48,7 @@ import { isQuadModel } from "./viewerModel";
 import { hasModel, modelUrlFor } from "./modelAvailability";
 import { gltfUseKey, notePrefetchUse, prefetchedFetch, prefetchedUrlSync, settlePrefetched } from "./prefetchStore";
 import { INCOMPLETE } from "./viewerSentinel";
+import { CARD_CROP_MARGIN } from "./containedArt";
 // The one media query the viewer answers to. Everything else about layout is a
 // component's business, but "should this move on its own" is the renderer's.
 import { reducedMotion } from "./responsive";
@@ -2290,7 +2291,7 @@ const wrapRotation = (deg: number) => ((((deg + 180) % 360) + 360) % 360) - 180;
 const MAX_CROP_ASPECT = 3.6;
 async function cropToContent(
   blob: Blob,
-  margin = 0.03,
+  margin = CARD_CROP_MARGIN,
   /** Filled with how many visible pixels there are and how many of them are
    *  lit at all — see BLANK_BAKE_LIT. */
   stats?: { visible: number; lit: number },
@@ -2881,6 +2882,13 @@ export interface ViewerHandle {
    * framing, not whatever pose was handed in at mount. See the implementation.
    */
   resetCamera: (side?: "home" | "front" | "back") => void;
+  /**
+   * Open on the item's baked card: the home pose, zoomed and panned so the
+   * silhouette is `w` CSS px wide and centred on (`cx`, `cy`) in this pane's
+   * CSS px. After `holdMs` it eases to the home framing over `easeMs`; 0 keeps
+   * the card's framing. Reduced motion never eases. False when there is nothing to measure.
+   */
+  openOn: (rect: { cx: number; cy: number; w: number }, holdMs: number, easeMs: number) => boolean;
   /**
    * The camera onto the gun's sticker surface, for a Sticker Craft waiting to
    * be dragged on — at the whole-gun view a craft over the gun was a few
@@ -3797,6 +3805,13 @@ export interface ViewerOpts {
    * aspect once the pane itself is.
    */
   narrowFit?: boolean;
+  /**
+   * This mount takes over from the item's baked card, which already shows the
+   * stickers and the charm. They start at full strength instead of fading in,
+   * or they blink out and back across the handover. Applies to every sticker
+   * and charm this mount ever builds, not just the opening ones.
+   */
+  fromCard?: boolean;
   /**
    * An onscreen viewer that does NOT hold back background card bakes. For a
    * preview that stays up while the page it sits on is still baking its tiles
@@ -5979,6 +5994,9 @@ async function buildViewer(
    */
   const resetCamera = (side: "home" | "front" | "back" = "home") => {
     if (disposed) return;
+    // A flight still under way (openOn's ease) would carry on from here and
+    // undo a front/back pick.
+    camFlight = null;
     camera.position.copy(homeCamPos);
     controls.target.copy(homeTarget);
     if (side === "back") {
@@ -6782,7 +6800,7 @@ async function buildViewer(
   const stepCamFlight = () => {
     const f = camFlight;
     if (!f) return;
-    const t = Math.min(1, (performance.now() - f.t0) / f.ms);
+    const t = Math.max(0, Math.min(1, (performance.now() - f.t0) / f.ms));
     const k = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
     controls.target.lerpVectors(f.from.target, f.to.target, k);
     // Round the target, not through it: the direction turns, the standoff eases.
@@ -7006,6 +7024,78 @@ async function buildViewer(
       from: poseNow(),
       to: { pos: homeCamPos.clone(), target: homeTarget.clone(), zoom, pan: new THREE.Vector2(-cx / wpp, cy / wpp) },
     };
+  }
+  /**
+   * Measured off the vertices rather than the bounding box: the card is cropped
+   * to what was drawn, and a box seen at three quarters is wider than the item
+   * inside it. The charm counts because the bake drew it.
+   */
+  function openOn(rect: { cx: number; cy: number; w: number }, holdMs: number, easeMs: number): boolean {
+    if (disposed || !(rect.w > 0) || !Number.isFinite(rect.cx) || !Number.isFinite(rect.cy)) {
+      return false;
+    }
+    camera.position.copy(homeCamPos);
+    controls.target.copy(homeTarget);
+    camera.lookAt(homeTarget);
+    camera.updateMatrixWorld();
+    const toView = camera.matrixWorldInverse;
+    const t = homeTarget.clone().applyMatrix4(toView);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    const v = new THREE.Vector3();
+    const measure = (root: import("three").Object3D) => {
+      root.updateMatrixWorld(true);
+      root.traverseVisible((o) => {
+        if (!(o as unknown as { isMesh?: boolean }).isMesh) {
+          return;
+        }
+        const mesh = o as import("three").Mesh;
+        const pos = mesh.geometry?.getAttribute("position");
+        if (!pos) {
+          return;
+        }
+        for (let i = 0; i < pos.count; i++) {
+          mesh.getVertexPosition(i, v).applyMatrix4(mesh.matrixWorld).applyMatrix4(toView);
+          minX = Math.min(minX, v.x);
+          maxX = Math.max(maxX, v.x);
+          minY = Math.min(minY, v.y);
+          maxY = Math.max(maxY, v.y);
+        }
+      });
+    };
+    measure(object);
+    if (charm) {
+      measure(charm.sprite);
+      measure(charm.line);
+    }
+    if (!(maxX > minX) || !(maxY >= minY)) {
+      return false;
+    }
+    const span = camera.top - camera.bottom;
+    const zoom = clamp((rect.w * span) / (Math.max(1, cssH) * (maxX - minX)), controls.minZoom, controls.maxZoom);
+    camera.zoom = zoom;
+    camera.updateProjectionMatrix();
+    // panPx is the picture's own move in CSS px (x right, y down), and the
+    // inset already moves it left by half the inset — see applyPan.
+    const wpp = span / zoom / Math.max(1, cssH);
+    const inset = Number.isFinite(insetApplied) ? insetApplied : 0;
+    const sx = (minX + maxX) / 2 - t.x;
+    const sy = (minY + maxY) / 2 - t.y;
+    panPx.set(rect.cx - cssW / 2 - sx / wpp + inset / 2, rect.cy - cssH / 2 + sy / wpp);
+    applyPan();
+    controls.update();
+    camFlight = null;
+    if (easeMs > 0 && !reducedMotion.value) {
+      camFlight = {
+        t0: performance.now() + Math.max(0, holdMs),
+        ms: easeMs,
+        from: poseNow(),
+        to: { pos: homeCamPos.clone(), target: homeTarget.clone(), zoom: 1, pan: new THREE.Vector2() },
+      };
+    }
+    return true;
   }
 
   // ---- Sticker decals ----------------------------------------------------------
@@ -7855,7 +7945,7 @@ async function buildViewer(
       mesh.userData.stickerImage = st.image;
       mesh.userData.stickerWear = st.w ?? 0;
       mesh.renderOrder = 10 + st.slot;
-      if (!opts?.still && !reducedMotion.value) {
+      if (!opts?.still && !opts?.fromCard && !reducedMotion.value) {
         mat.opacity = 0;
         decalFade.set(mesh, { e: 0, last: 0 });
       }
@@ -9181,7 +9271,7 @@ async function buildViewer(
     return c;
   }
   function beginCharmFade() {
-    if (!charm || opts?.still || reducedMotion.value) return;
+    if (!charm || opts?.still || opts?.fromCard || reducedMotion.value) return;
     const copies = new Map<import("three").Material, import("three").Material>();
     const own = (mesh: import("three").Object3D, m: import("three").Material) => {
       if (mesh === charm!.line || mesh.userData.charmTuned === m) return m;
@@ -15723,6 +15813,7 @@ async function buildViewer(
       target: controls.target.toArray() as [number, number, number],
     }),
     resetCamera: (side) => resetCamera(side),
+    openOn: (rect, holdMs, easeMs) => openOn(rect, holdMs, easeMs),
     frameStickers: (mode, slots) => frameStickers(mode, slots),
     sideOutline: () => sideOutline(),
     setSuspended: (on) => {

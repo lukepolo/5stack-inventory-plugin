@@ -867,3 +867,12 @@
     filter: none;
   }
 }
+/* A model that opens on its card's silhouette needs no settle: the geometry
+   already lines up, and the settle's scale and blur would put it 4-6% off. */
+[data-cs2-inventory] [data-card-match] .spot-2d-out {
+  transform: none;
+}
+[data-cs2-inventory] [data-card-match] .spot-3d-out {
+  filter: none;
+  transform: none;
+}

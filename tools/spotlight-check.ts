@@ -8,7 +8,7 @@
 // wheel step dragged the view back toward the centre. The pill used to sit at
 // the foot of a tall stage, out of sight on a tall screen.
 import { panAfterZoom, pointerMidpoint, type Vec2 } from "../src/viewerZoom.ts";
-import { belowContainedArt } from "../src/containedArt.ts";
+import { belowContainedArt, containedRect } from "../src/containedArt.ts";
 import { defaultEquipSides, onEverySide } from "../src/teamSides.ts";
 
 let failures = 0;
@@ -47,6 +47,11 @@ check("under a picture in a tall stage", belowContainedArt({ top: 0, width: 352,
 check("under a picture offset in its stage", belowContainedArt({ top: 30, width: 352, height: 600 }, { width: 512, height: 384 }, 700, 12, 40), 474);
 check("a picture that fills the height", belowContainedArt({ top: 0, width: 800, height: 300 }, { width: 512, height: 384 }, 300, 12, 40), 260);
 check("not loaded yet", belowContainedArt({ top: 0, width: 352, height: 900 }, { width: 0, height: 0 }, 900, 12, 40), null);
+
+// Where the 3D opens: the card's drawn rect inside its object-contain box.
+check("a wide card in a tall box", containedRect({ top: 0, left: 0, width: 352, height: 900 }, { width: 512, height: 384 }), { x: 0, y: 318, w: 352, h: 264 });
+check("a tall card in a wide box", containedRect({ top: 10, left: 20, width: 800, height: 300 }, { width: 384, height: 512 }), { x: 307.5, y: 10, w: 225, h: 300 });
+check("an unloaded card has no rect", containedRect({ top: 0, left: 0, width: 352, height: 900 }, { width: 0, height: 0 }), null);
 
 // The team chips: where Equip goes before anyone picks, and when it reads Equipped.
 check("not equipped anywhere: your side", defaultEquipSides(["CT", "T"], [], "CT"), ["CT"]);
