@@ -6723,10 +6723,13 @@ watch([spot3dKey, dockOpening], ([key, opening]) => {
     return;
   }
   if (opening || key === spot3dMounted) return;
-  // Only a model that is on screen is held: under a hover preview the model is
-  // faded out, and holding it put the previous skin back up for a moment.
+  // Only a model that is on screen is held: under a hover preview it is faded
+  // out, and holding it put the previous skin back up for a moment. Read from
+  // the DOM, which still shows the state before this change; dockHover and
+  // dockShow3d already show the state after the click here.
   const host = spotHostEl.value;
-  if (spotlight.value && spot3dMounted && spot3dReady.value && host && Number(getComputedStyle(host).opacity) > 0.5) {
+  const onScreen = !!host && !host.classList.contains("spot-3d-out") && Number(getComputedStyle(host).opacity) > 0.5;
+  if (spotlight.value && spot3dMounted && spot3dReady.value && onScreen) {
     freezeSpot3d();
   }
   spot3dReady.value = false;
