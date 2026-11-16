@@ -76,6 +76,7 @@ import {
   type StatTrakAnchor,
 } from "./stattrakModule";
 import { createViewerCursor, type CursorMode } from "./viewerCursor";
+import { panAfterZoom, pointerMidpoint, type Vec2 } from "./viewerZoom";
 // Bundled, not fetched from anyone's CDN: CC0 from Poly Haven, see
 // src/assets/README.md. `?url` so Vite emits it as an asset and hands back a
 // base-correct URL instead of trying to parse Radiance HDR as a module.
@@ -5774,11 +5775,6 @@ async function buildViewer(
     if (dx === 0 && panPx.y === 0) camera.clearViewOffset();
     else camera.setViewOffset(cssW, cssH, dx, -panPx.y, cssW, cssH);
   };
-  // Zooming OUT shrinks the leash — a pan made at full zoom is a long way in
-  // world units — so re-clamp as the distance changes rather than only while
-  // dragging. Without this, zooming out after a deep pan leaves the weapon
-  // stranded off-frame.
-  controls.addEventListener("change", applyPan);
   // TOUCHING THE MODEL STOPS IT DEAD; LETTING GO STARTS THE WAIT.
   //
   // Two events, not one, and the split is the whole point. `start` (pointer
@@ -5800,6 +5796,72 @@ async function buildViewer(
     panPx.y += dy;
     applyPan();
   };
+  // Wheel and pinch zoom about the pointer (OrbitControls zooms about the
+  // weapon, so after a pan each step pulled the view back to the middle).
+  // On the container, so capture runs before OrbitControls' canvas listeners
+  // and bubble after them: the zoom is read before it changes (flights move it
+  // without a "change"), and the wheel's synchronous "change" lands in between.
+  // Registered ahead of the leash re-clamp below, so it anchors the pan the
+  // user actually had.
+  const zoomPointers = new Map<number, Vec2>();
+  let zoomFrom = camera.zoom;
+  let zoomWheel: Vec2 | null = null;
+  const zoomLocal = (e: { clientX: number; clientY: number }): Vec2 => {
+    const r = view.getBoundingClientRect();
+    return { x: e.clientX - (r.left + r.width / 2), y: e.clientY - (r.top + r.height / 2) };
+  };
+  container.addEventListener(
+    "wheel",
+    (e) => {
+      zoomWheel = zoomLocal(e);
+      zoomFrom = camera.zoom;
+    },
+    { capture: true, passive: true, signal: hostListeners.signal },
+  );
+  container.addEventListener("wheel", () => (zoomWheel = null), { passive: true, signal: hostListeners.signal });
+  container.addEventListener(
+    "pointerdown",
+    (e) => {
+      zoomPointers.set(e.pointerId, zoomLocal(e));
+      if (zoomPointers.size >= 2) {
+        zoomFrom = camera.zoom;
+      }
+    },
+    { capture: true, signal: hostListeners.signal },
+  );
+  container.addEventListener(
+    "pointermove",
+    (e) => {
+      if (zoomPointers.has(e.pointerId)) {
+        zoomPointers.set(e.pointerId, zoomLocal(e));
+      }
+    },
+    { capture: true, signal: hostListeners.signal },
+  );
+  const zoomPointerUp = (e: PointerEvent) => zoomPointers.delete(e.pointerId);
+  container.addEventListener("pointerup", zoomPointerUp, { capture: true, signal: hostListeners.signal });
+  container.addEventListener("pointercancel", zoomPointerUp, { capture: true, signal: hostListeners.signal });
+  controls.addEventListener("change", () => {
+    const z = camera.zoom;
+    if (z === zoomFrom) {
+      return;
+    }
+    const ratio = z / zoomFrom;
+    zoomFrom = z;
+    const anchor = zoomPointers.size >= 2 ? pointerMidpoint(zoomPointers.values()) : zoomWheel;
+    if (!anchor) {
+      return;
+    }
+    const next = panAfterZoom(anchor, panPx, Number.isFinite(insetApplied) ? insetApplied : 0, ratio);
+    panPx.x = next.x;
+    panPx.y = next.y;
+    applyPan();
+  });
+  // Zooming OUT shrinks the leash — a pan made at full zoom is a long way in
+  // world units — so re-clamp as the distance changes rather than only while
+  // dragging. Without this, zooming out after a deep pan leaves the weapon
+  // stranded off-frame.
+  controls.addEventListener("change", applyPan);
 
   // ---- Placement space ---------------------------------------------------------
   // Weapons lie along their longest axis; height is Y unless Y IS the length.
@@ -13147,8 +13209,9 @@ async function buildViewer(
    * against the game's 41% / 66%, and the Karambit's two hands within a few
    * percent of the game's. The 3 degrees is a deliberate nudge above that
    * reference, which was taken with a viewmodel set lower than the default.
-   * The field of view stays the shared one (54): a narrower one made both
-   * knives larger than the game draws them.
+   * Those placements were measured at the guns' field of view (54). Knives
+   * now have their own (`fpvknifefov`, 46: about CS2's default viewmodel_fov
+   * of 60), and this tilt is a dial (`fpvknifepitch`).
    */
   const FPV_KNIFE_PITCH = -3;
   /**
@@ -13658,7 +13721,7 @@ async function buildViewer(
 
   const applyFpvTuning = () => {
     if (!fpvCamera || !arms) return;
-    const fov = debugNumber("fpvfov", 54);
+    const fov = fpvKnife ? debugNumber("fpvknifefov", 46) : debugNumber("fpvfov", 54);
     if (fpvCamera.fov !== fov) {
       fpvCamera.fov = fov;
       fpvCamera.updateProjectionMatrix();
@@ -13673,7 +13736,7 @@ async function buildViewer(
     // Knives take none of the gun dials — see FPV_KNIFE_PITCH.
     fpvTune.setFromEuler(
       fpvEuler.set(
-        ((fpvKnife ? FPV_KNIFE_PITCH : debugNumber("fpvpitch", 0)) * Math.PI) / 180,
+        ((fpvKnife ? debugNumber("fpvknifepitch", FPV_KNIFE_PITCH) : debugNumber("fpvpitch", 0)) * Math.PI) / 180,
         ((fpvKnife ? 0 : debugNumber("fpvyaw", 0)) * Math.PI) / 180,
         0,
         "YXZ",
@@ -13711,10 +13774,11 @@ async function buildViewer(
       // One line, space-separated `name=value` — the shape the dials take AND a
       // valid query string once the spaces become `&`, so a pasted readout can
       // be replayed either way.
-      const settings =
-        `fpvyaw=${n(debugNumber("fpvyaw", 80), 0)} fpvpitch=${n(debugNumber("fpvpitch", 0), 0)} ` +
-        `fpvfov=${n(debugNumber("fpvfov", 54), 0)} ` +
-        `fpvx=${n(debugNumber("fpvx", 0))} fpvy=${n(debugNumber("fpvy", 0))} fpvz=${n(debugNumber("fpvz", 0))}`;
+      const settings = fpvKnife
+        ? `fpvknifefov=${n(debugNumber("fpvknifefov", 46), 0)} fpvknifepitch=${n(debugNumber("fpvknifepitch", FPV_KNIFE_PITCH), 1)}`
+        : `fpvyaw=${n(debugNumber("fpvyaw", 80), 0)} fpvpitch=${n(debugNumber("fpvpitch", 0), 0)} ` +
+          `fpvfov=${n(debugNumber("fpvfov", 54), 0)} ` +
+          `fpvx=${n(debugNumber("fpvx", 0))} fpvy=${n(debugNumber("fpvy", 0))} fpvz=${n(debugNumber("fpvz", 0))}`;
       fpvHud.dataset.settings = settings;
       fpvHud.textContent =
         "drag aim · right-drag slide · click to copy\n" + settings;

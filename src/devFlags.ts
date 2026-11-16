@@ -316,21 +316,35 @@ export const NUMBERS: DevNumber[] = [
   {
     name: "fpvfov",
     label: "Viewmodel FOV",
-    hint: "Vertical field of view for the first-person camera, in degrees, letterboxed to 16:9 so it means the same thing whatever shape the pane is. CS2's viewmodel_fov is a HORIZONTAL angle measured at 4:3 and does not transfer directly: its 54-68 range works out as 44-54 here. Larger is wider and distorts more — 68 here is nearly 100 degrees across, which is what made the weapon look stretched.",
+    hint: "Vertical field of view for the first-person camera, in degrees, letterboxed to 16:9 so it means the same thing whatever shape the pane is. CS2's viewmodel_fov is a HORIZONTAL angle measured at 4:3 and does not transfer directly: its 54-68 range works out as 44-54 here. Larger is wider and distorts more — 68 here is nearly 100 degrees across, which is what made the weapon look stretched. Guns only: knives have Knife viewmodel FOV.",
     dflt: 54, min: 30, max: 90, step: 1,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvknifefov",
+    label: "Knife viewmodel FOV",
+    hint: "The first-person field of view for KNIVES, in the same vertical degrees as Viewmodel FOV. Knives have their own because the gun framing was tuned at 54, and at 54 a knife held at the clip's own eye reads smaller than in game; 46 is about CS2's default viewmodel_fov of 60.",
+    dflt: 46, min: 30, max: 90, step: 1,
+    group: "3D viewer", audience: "developer",
+  },
+  {
+    name: "fpvknifepitch",
+    label: "Knife viewmodel tilt",
+    hint: "Tips the first-person camera for KNIVES down (-) or up (+), in degrees. Down lifts the hands in the frame. Knives take none of the gun dials (yaw, pitch, offsets, shift): they keep the clip's own eye, tipped by this.",
+    dflt: -3, min: -30, max: 30, step: 0.5,
     group: "3D viewer", audience: "developer",
   },
   {
     name: "fpvx",
     label: "Viewmodel offset X",
-    hint: "Moves the eye right (+) or left (-), in metres, along the camera's own axis. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
+    hint: "Moves the eye right (+) or left (-), in metres, along the camera's own axis. Knives ignore it: they keep the clip's own eye, tipped by Knife viewmodel tilt.",
     dflt: 0.06, min: -1, max: 1, step: 0.01,
     group: "3D viewer", audience: "developer",
   },
   {
     name: "fpvy",
     label: "Viewmodel offset Y",
-    hint: "Raises (+) or lowers (-) the eye, in metres, along the camera's own up axis. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
+    hint: "Raises (+) or lowers (-) the eye, in metres, along the camera's own up axis. Knives ignore it: they keep the clip's own eye, tipped by Knife viewmodel tilt.",
     dflt: 0.01, min: -1, max: 1, step: 0.01,
     group: "3D viewer", audience: "developer",
   },
@@ -344,14 +358,14 @@ export const NUMBERS: DevNumber[] = [
   {
     name: "fpvyaw",
     label: "Viewmodel yaw",
-    hint: "Turns the first-person view left or right, in degrees, FROM the framing the viewer works out for itself. Zero is that framing — these dials trim it, they no longer have to find it. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
+    hint: "Turns the first-person view left or right, in degrees, FROM the framing the viewer works out for itself. Zero is that framing — these dials trim it, they no longer have to find it. Knives ignore it: they keep the clip's own eye, tipped by Knife viewmodel tilt.",
     dflt: -7, min: -180, max: 180, step: 1,
     group: "3D viewer", audience: "developer",
   },
   {
     name: "fpvpitch",
     label: "Viewmodel pitch",
-    hint: "Tilts the first-person camera up (+) or down (-), in degrees. Knives ignore it: they keep the clip's own eye, tipped 3 degrees (FPV_KNIFE_PITCH in viewer3d.ts).",
+    hint: "Tilts the first-person camera up (+) or down (-), in degrees. Knives ignore it: they keep the clip's own eye, tipped by Knife viewmodel tilt.",
     dflt: -12, min: -90, max: 90, step: 1,
     group: "3D viewer", audience: "developer",
   },
@@ -400,7 +414,7 @@ const FPV_POSE_VERSION = "3";
 // earlier frame land the weapon somewhere else in the current one. The shipped
 // defaults ARE the tuned pose; stored leftovers from the tuning sessions are
 // what a reset clears.
-const FPV_DIALS = ["fpvyaw", "fpvpitch", "fpvfov", "fpvx", "fpvy", "fpvz", "fpvshiftx", "fpvshifty"];
+const FPV_DIALS = ["fpvyaw", "fpvpitch", "fpvfov", "fpvx", "fpvy", "fpvz", "fpvshiftx", "fpvshifty", "fpvknifefov", "fpvknifepitch"];
 try {
   if (localStorage.getItem(key("fpvpose")) !== FPV_POSE_VERSION) {
     for (const n of FPV_DIALS) localStorage.removeItem(key(n));

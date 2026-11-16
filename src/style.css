@@ -694,6 +694,11 @@
 [data-dock] aside .grid-cols-2 > [data-role="rail"] {
   height: calc((var(--dock-cell-h) - 8px) / 2) !important;
 }
+/* A slot click opens Spotlight over the grid and nothing docks beside it, so
+   the weapon columns take the whole pane. */
+[data-dock] [data-role="column"] {
+  max-width: none !important;
+}
 
 /* Loadout cell art: crossfades to whatever the slot now shows. The leaving art
    is pinned in place (LoadoutCell pinLeaving) so the two overlap instead of
