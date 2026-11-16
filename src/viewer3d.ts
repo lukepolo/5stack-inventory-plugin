@@ -76,6 +76,7 @@ import {
   type StatTrakAnchor,
 } from "./stattrakModule";
 import { createViewerCursor, type CursorMode } from "./viewerCursor";
+import { panAfterZoom, pointerMidpoint, type Vec2 } from "./viewerZoom";
 // Bundled, not fetched from anyone's CDN: CC0 from Poly Haven, see
 // src/assets/README.md. `?url` so Vite emits it as an asset and hands back a
 // base-correct URL instead of trying to parse Radiance HDR as a module.
@@ -5800,6 +5801,69 @@ async function buildViewer(
     panPx.y += dy;
     applyPan();
   };
+  // Wheel and pinch zoom about the pointer (OrbitControls zooms about the
+  // weapon, so after a pan each step pulled the view back to the middle). The
+  // capture listeners run before OrbitControls': they read the zoom before it
+  // changes, because flights move it without a "change". OrbitControls fires
+  // the wheel's "change" before the bubble listener clears zoomWheeling.
+  const zoomPointers = new Map<number, Vec2>();
+  let zoomHover: Vec2 | null = null;
+  let zoomFrom = camera.zoom;
+  let zoomWheeling = false;
+  const zoomLocal = (e: { clientX: number; clientY: number }): Vec2 => {
+    const r = view.getBoundingClientRect();
+    return { x: e.clientX - (r.left + r.width / 2), y: e.clientY - (r.top + r.height / 2) };
+  };
+  view.addEventListener(
+    "wheel",
+    (e) => {
+      zoomHover = zoomLocal(e);
+      zoomFrom = camera.zoom;
+      zoomWheeling = true;
+    },
+    { capture: true, passive: true },
+  );
+  view.addEventListener("wheel", () => (zoomWheeling = false), { passive: true });
+  view.addEventListener(
+    "pointerdown",
+    (e) => {
+      zoomPointers.set(e.pointerId, zoomLocal(e));
+      if (zoomPointers.size >= 2) {
+        zoomFrom = camera.zoom;
+      }
+    },
+    { capture: true },
+  );
+  view.addEventListener(
+    "pointermove",
+    (e) => {
+      const p = zoomLocal(e);
+      zoomHover = p;
+      if (zoomPointers.has(e.pointerId)) {
+        zoomPointers.set(e.pointerId, p);
+      }
+    },
+    { capture: true },
+  );
+  const zoomPointerUp = (e: PointerEvent) => zoomPointers.delete(e.pointerId);
+  view.addEventListener("pointerup", zoomPointerUp, { capture: true });
+  view.addEventListener("pointercancel", zoomPointerUp, { capture: true });
+  controls.addEventListener("change", () => {
+    const z = camera.zoom;
+    if (z === zoomFrom) {
+      return;
+    }
+    const ratio = z / zoomFrom;
+    zoomFrom = z;
+    const anchor = zoomPointers.size >= 2 ? pointerMidpoint(zoomPointers.values()) : zoomWheeling ? zoomHover : null;
+    if (!anchor) {
+      return;
+    }
+    const next = panAfterZoom(anchor, panPx, Number.isFinite(insetApplied) ? insetApplied : 0, ratio);
+    panPx.x = next.x;
+    panPx.y = next.y;
+    applyPan();
+  });
 
   // ---- Placement space ---------------------------------------------------------
   // Weapons lie along their longest axis; height is Y unless Y IS the length.
@@ -13147,8 +13211,8 @@ async function buildViewer(
    * against the game's 41% / 66%, and the Karambit's two hands within a few
    * percent of the game's. The 3 degrees is a deliberate nudge above that
    * reference, which was taken with a viewmodel set lower than the default.
-   * The field of view stays the shared one (54): a narrower one made both
-   * knives larger than the game draws them.
+   * Knives have their own field of view (`fpvknifefov`, 46: about CS2's
+   * default viewmodel_fov of 60), and this tilt is a dial (`fpvknifepitch`).
    */
   const FPV_KNIFE_PITCH = -3;
   /**
@@ -13658,7 +13722,7 @@ async function buildViewer(
 
   const applyFpvTuning = () => {
     if (!fpvCamera || !arms) return;
-    const fov = debugNumber("fpvfov", 54);
+    const fov = fpvKnife ? debugNumber("fpvknifefov", 46) : debugNumber("fpvfov", 54);
     if (fpvCamera.fov !== fov) {
       fpvCamera.fov = fov;
       fpvCamera.updateProjectionMatrix();
@@ -13673,7 +13737,7 @@ async function buildViewer(
     // Knives take none of the gun dials — see FPV_KNIFE_PITCH.
     fpvTune.setFromEuler(
       fpvEuler.set(
-        ((fpvKnife ? FPV_KNIFE_PITCH : debugNumber("fpvpitch", 0)) * Math.PI) / 180,
+        ((fpvKnife ? debugNumber("fpvknifepitch", FPV_KNIFE_PITCH) : debugNumber("fpvpitch", 0)) * Math.PI) / 180,
         ((fpvKnife ? 0 : debugNumber("fpvyaw", 0)) * Math.PI) / 180,
         0,
         "YXZ",

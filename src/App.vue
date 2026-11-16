@@ -137,6 +137,7 @@ import { DEFAULT_PET_CLIP, loadPetClipIndex, petWanderPool } from "./petAnim";
 import ItemBadges from "./components/ItemBadges.vue";
 const PatternScoreRail = defineAsyncComponent(() => import("./components/PatternScoreRail.vue"));
 import { SCAN_READ_SIZE } from "./patternScan";
+import { belowContainedArt } from "./containedArt";
 import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
 import ViewerControls from "./components/ViewerControls.vue";
 import ItemStage from "./components/ItemStage.vue";
@@ -240,7 +241,7 @@ const router = usePluginRouter(props);
 const weapons = ref<CatalogWeapon[]>([]);
 const specialDefaults = ref<DefaultsMap | null>(null);
 const loadout = ref<LoadoutEntry[]>([]);
-/** Small desktops: the picker is out (a slot was clicked). */
+/** Desktop: the picker is out (a slot was clicked). */
 const dockOpen = ref(false);
 /** Spotlight: the picker card under the pointer, previewed on the left. */
 const dockHover = ref<{ src: string; name: string; rarity?: string | null; equipped?: boolean } | null>(null);
@@ -5806,7 +5807,6 @@ const loadoutH = ref(0);
 // mid-animation and reintroduce exactly the jank the transform is avoiding.
 const DOCK_ASPECT = 1.25;
 const DOCK_ART = 0.75;
-const DOCK_MIN_DOCK = 760;
 // Column chrome above/below the five cells (padding, header, rule) + four 8px gaps.
 const DOCK_COL_CHROME = 94;
 const DOCK_SPOT_RAIL_W = 212;
@@ -5846,10 +5846,10 @@ const dockGeo = computed(() => {
   const cellW = clampTo(212, Math.round(cellH * DOCK_ASPECT), 460);
   const asideW = clampTo(220, cellW, 360);
   const dockW = Math.max(420, W - (asideW + 20) - 3 * cellW - 56);
-  return { W, cellH, cellW, asideW, dockW, cramped: dockW < DOCK_MIN_DOCK };
+  return { W, cellH, cellW, asideW, dockW };
 });
 const dockSmall = computed(
-  () => docked.value && canLift.value && view.value === "grid" && dockGeo.value.cramped,
+  () => docked.value && canLift.value && view.value === "grid",
 );
 const dockOpenNow = computed(() => dockSmall.value && dockOpen.value);
 const spotlight = computed(() => dockOpenNow.value);
@@ -6298,12 +6298,14 @@ const dockShownId = computed(() => {
 // happens on a click, never on hover.
 const spot3d = usePersistedBool("cs2inv.spot3d", true);
 const spot3dReady = ref(false);
+const spot3dFailed = ref(false);
 const spotHostEl = ref<HTMLElement | null>(null);
 const spotViewer = useViewerMount({
   label: "spot",
   host: () => spotHostEl.value,
   onError: () => {
     spot3dReady.value = false;
+    spot3dFailed.value = true;
   },
 });
 const spotTarget = computed<ViewerTarget | null>(() => {
@@ -6318,6 +6320,41 @@ const spot3dKey = computed(() => {
   return t && spot3d.value ? `${t.model}|${dockShownId.value}|${team.value}` : "";
 });
 const dockShow3d = computed(() => spot3dReady.value && !!spot3dKey.value && !dockHover.value);
+const spot3dLoading = computed(() => !!spot3dKey.value && !spot3dReady.value && !spot3dFailed.value && !dockHover.value);
+const spotStageEl = ref<HTMLElement | null>(null);
+const spotLoadingTop = ref<number | null>(null);
+// Offsets, not getBoundingClientRect: the panel is still sliding in when the
+// load starts, and a rect would measure it mid-flight.
+function placeSpotLoading() {
+  const stage = spotStageEl.value;
+  const imgs = stage?.querySelectorAll<HTMLImageElement>("[data-spot-art] img");
+  const img = imgs?.length ? imgs[imgs.length - 1] : null;
+  if (!stage || !img) {
+    spotLoadingTop.value = null;
+    return;
+  }
+  let top = 0;
+  let el: HTMLElement | null = img;
+  while (el && el !== stage) {
+    top += el.offsetTop;
+    el = el.offsetParent as HTMLElement | null;
+  }
+  spotLoadingTop.value =
+    el === stage
+      ? belowContainedArt(
+          { top, width: img.offsetWidth, height: img.offsetHeight },
+          { width: img.naturalWidth, height: img.naturalHeight },
+          stage.clientHeight,
+          12,
+          40,
+        )
+      : null;
+}
+watch(spot3dLoading, (on) => {
+  if (on) {
+    void nextTick(placeSpotLoading);
+  }
+});
 let spot3dMounted = "";
 let spot3dTimer: ReturnType<typeof setTimeout> | undefined;
 watch([spot3dKey, dockOpening], ([key, opening]) => {
@@ -6330,6 +6367,7 @@ watch([spot3dKey, dockOpening], ([key, opening]) => {
   }
   if (opening || key === spot3dMounted) return;
   spot3dReady.value = false;
+  spot3dFailed.value = false;
   spot3dTimer = setTimeout(() => void mountSpot3d(key), 60);
 });
 async function mountSpot3d(key: string) {
@@ -6354,6 +6392,7 @@ async function mountSpot3d(key: string) {
       patches: t.kind === "agent" ? (att?.patches ?? []).map((x) => x?.image ?? null) : undefined,
       stattrak: att?.stattrak || row?.stattrak ? { count: att?.stattrak_count ?? row?.stattrak_count ?? 0 } : null,
       frameInset: { right: 0 },
+      narrowFit: true,
     }),
     () => {
       if (spot3dMounted === key) spot3dReady.value = true;
@@ -9894,7 +9933,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           </div>
         </div>
         <div class="flex flex-1 gap-3 overflow-hidden px-4 pb-4 pt-3">
-          <div v-for="c in 3" :key="'col' + c" class="flex min-w-[212px] max-w-[460px] flex-1 flex-col">
+          <div v-for="c in 3" :key="'col' + c" class="flex min-w-[212px] flex-1 flex-col">
             <div class="flex items-baseline border-b border-border/60 px-1 pb-2">
               <span class="animate-skeleton rounded bg-secondary/40 text-f11 font-semibold uppercase tracking-cs2 text-transparent" :style="{ '--i': c }">Pistols</span>
             </div>
@@ -10484,7 +10523,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
               </div>
             </div>
           </div>
-          <div class="relative z-[2] grid min-h-0 flex-1 place-items-center px-6">
+          <div ref="spotStageEl" class="relative z-[2] grid min-h-0 flex-1 place-items-center px-6">
             <Transition
               enter-active-class="transition duration-150 ease-out motion-reduce:transition-none"
               enter-from-class="opacity-0 scale-[0.985]"
@@ -10495,7 +10534,8 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
                 <img
                   :src="dockHover ? dockHover.src : spotSrc"
                   alt=""
-                  :class="cn('h-full min-h-0 w-[88%] object-contain transition-opacity duration-200', !dockHover && 'animate-float motion-reduce:animate-none', !dockHover && !isSkinned(focusRow) && 'opacity-50', dockShow3d && 'opacity-0')"
+                  :class="cn('h-full min-h-0 w-[88%] object-contain transition-opacity duration-200', !dockHover && !isSkinned(focusRow) && 'opacity-50', dockShow3d && 'opacity-0')"
+                  @load="spot3dLoading && placeSpotLoading()"
                   style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
                 />
               </div>
@@ -10506,6 +10546,23 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
               class="absolute inset-0 transition-opacity duration-200 motion-reduce:transition-none"
               :class="dockShow3d ? 'opacity-100' : 'pointer-events-none opacity-0'"
             ></div>
+            <Transition
+              enter-active-class="transition-opacity duration-200 delay-200 motion-reduce:transition-none"
+              enter-from-class="opacity-0"
+              leave-active-class="transition-opacity duration-150 motion-reduce:transition-none"
+              leave-to-class="opacity-0"
+            >
+              <div
+                v-if="spot3dLoading"
+                class="pointer-events-none absolute inset-x-0 z-[3] flex justify-center"
+                :style="spotLoadingTop === null ? { top: '50%', transform: 'translateY(-50%)' } : { top: `${spotLoadingTop}px` }"
+              >
+                <span class="flex items-center gap-2 rounded-full border border-border/60 bg-background/80 px-3 py-1.5 text-f10 uppercase tracking-cs2 text-muted-foreground backdrop-blur">
+                  <Loader2 class="h-3.5 w-3.5 animate-spin text-[color:var(--acc)]" />
+                  {{ tr("inventory.viewer.loading_3d", "Loading 3D model…") }}
+                </span>
+              </div>
+            </Transition>
           </div>
           <div data-spot="foot" class="relative z-[3] flex min-w-0 flex-col gap-2 px-6 pb-6">
             <span class="truncate text-f11 uppercase tracking-cs2 text-muted-foreground">{{ focusIdentityName.weapon }}</span>
@@ -11461,7 +11518,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
             </button>
           </div>
         </div>
-        <div class="flex min-h-0 flex-1 flex-wrap overflow-y-auto" :class="isCompact ? 'gap-3 p-2' : 'gap-5 p-5'">
+        <div class="flex min-h-0 flex-1" :class="isCompact ? 'flex-wrap overflow-y-auto gap-3 p-2' : viewOnly ? 'flex-wrap overflow-y-auto gap-5 p-5' : 'overflow-hidden gap-5 p-5'">
           <!-- THE SAME SCREEN THE FOCUS VIEW IS. Identity, actions, stage,
                footer — in that order, decided by ItemScreen rather than here,
                which is the only way two surfaces stay one surface. -->
@@ -11649,7 +11706,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           <div
             v-if="craftHasOptions && !viewOnly"
             class="flex w-full flex-none flex-col gap-2.5"
-            :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px]']"
+            :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px] min-h-0 overflow-y-auto overscroll-contain pr-1 [&>*]:flex-none']"
           >
             <!-- Inspect, share and reset, at the top of the form rather than in
                  the screen's actions row — see CraftActions. Editing is work
