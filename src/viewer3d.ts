@@ -3938,12 +3938,15 @@ export async function mountViewer(
   // the exotic one — every remount (2D/3D flip, wear/seed edit, model switch)
   // cancels the build in flight, and on a cold cache that lands mid-load, long
   // after the canvas went in.
-  const mounted: { view?: HTMLCanvasElement } = {};
+  const mounted: { view?: HTMLCanvasElement; undo: Array<() => void> } = { undo: [] };
   try {
     return await queueBuild(opts?.priority ?? "interactive", opts?.signal, (signal) =>
       buildViewer(container, model, opts, signal, mounted),
     );
   } catch (e) {
+    for (const undo of mounted.undo.reverse()) {
+      undo();
+    }
     mounted.view?.remove();
     throw e;
   }
@@ -3958,7 +3961,7 @@ async function buildViewer(
   signal: AbortSignal,
   // Write-only channel back to mountViewer, so a build that dies after its
   // canvas is in the DOM can still have that canvas taken out again.
-  mounted: { view?: HTMLCanvasElement } = {},
+  mounted: { view?: HTMLCanvasElement; undo: Array<() => void> } = { undo: [] },
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
   // A studio rig (every card bake among them) starts its HDRI download now, so
@@ -4083,6 +4086,10 @@ async function buildViewer(
   for (const stale of container.querySelectorAll("canvas")) stale.remove();
   container.appendChild(view);
   mounted.view = view;
+  // The container and window outlive the viewer, so what the build hangs on
+  // them goes with dispose(), or with mountViewer's catch when the build throws.
+  const hostListeners = new AbortController();
+  mounted.undo.push(() => hostListeners.abort());
 
   const scene = new THREE.Scene();
   // Prefiltered once for the whole app — see getSharedGL. Ambient stays tiny;
@@ -4878,6 +4885,10 @@ async function buildViewer(
   }
   // Frees the glove composite's render targets on dispose — see below.
   let gloveRelease: (() => void) | null = null;
+  mounted.undo.push(() => {
+    gloveRelease?.();
+    gloveRelease = null;
+  });
   /**
    * The tint masks of a charm that IS the mounted model.
    *
@@ -5097,6 +5108,10 @@ async function buildViewer(
   // the hd/legacy body prune, and the holster cull.
   mt.mark("pose");
   let releaseComposite: (() => void) | null = null;
+  mounted.undo.push(() => {
+    releaseComposite?.();
+    releaseComposite = null;
+  });
   /**
    * Everything a RE-composite needs, kept so the pattern can be changed on a
    * live viewer instead of by rebuilding it.
@@ -5628,6 +5643,23 @@ async function buildViewer(
   // canvas is offscreen and shared, so pointer events must come from the
   // element the user is actually looking at.
   const controls = new OrbitControls(camera, view);
+  // OrbitControls removes its document key listeners from the canvas's root
+  // node at dispose time. Once the host pane has left the page that root is the
+  // pane itself, so the listeners would stay on the document holding this
+  // viewer; take them off the root they went on. (Private names: if three
+  // renames them this does nothing.)
+  const controlsRoot = view.getRootNode();
+  const disposeControls = () => {
+    controls.dispose();
+    const keys = controls as unknown as { _interceptControlDown?: EventListener; _interceptControlUp?: EventListener };
+    if (keys._interceptControlDown) {
+      controlsRoot.removeEventListener("keydown", keys._interceptControlDown, { capture: true });
+    }
+    if (keys._interceptControlUp) {
+      controlsRoot.removeEventListener("keyup", keys._interceptControlUp, { capture: true });
+    }
+  };
+  mounted.undo.push(disposeControls);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   // autoRotate is NOT set here: it depends on whether this model turned out to
@@ -7958,6 +7990,10 @@ async function buildViewer(
           applyPaintSfx(THREE, m, ctx.paint, next.rm, ctx.weaponInputs?.uvScale ?? ctx.paint.uvScale),
         ),
       );
+      if (disposed) {
+        next.release();
+        return true;
+      }
     }
     paintWasIncomplete = !!next.incomplete;
     // Released only once the new one is on the materials: the composite cache is
@@ -11594,6 +11630,9 @@ async function buildViewer(
   // on-screen viewer, and only the sticker/charm hover states need placement to
   // be enabled. `still` viewers are offscreen snapshot rigs with no user at all.
   const cursor = opts?.still ? null : createViewerCursor(container, el);
+  if (cursor) {
+    hostListeners.signal.addEventListener("abort", () => cursor.destroy(), { once: true });
+  }
   let orbiting = false;
   let panning = false;
   let shiftHeld = false;
@@ -11798,7 +11837,7 @@ async function buildViewer(
   // means first: a press that claims an attachment now disables the controls
   // before they ever see it.
   if (!opts?.still) {
-    container.addEventListener("pointerdown", onPointerDown, { capture: true });
+    container.addEventListener("pointerdown", onPointerDown, { capture: true, signal: hostListeners.signal });
     el.addEventListener("pointermove", onPointerMove);
     el.addEventListener("pointerup", onPointerUp);
     el.addEventListener("pointercancel", onPointerUp);
@@ -11812,10 +11851,10 @@ async function buildViewer(
     el.addEventListener("wheel", onCursorWheel, { passive: true });
     // Releases land wherever the pointer ended up — OrbitControls captures to
     // its own target, so a listener on the canvas would miss half of them.
-    window.addEventListener("pointerup", onCursorUp);
-    window.addEventListener("pointercancel", onCursorUp);
-    window.addEventListener("keydown", onCursorKey);
-    window.addEventListener("keyup", onCursorKey);
+    window.addEventListener("pointerup", onCursorUp, { signal: hostListeners.signal });
+    window.addEventListener("pointercancel", onCursorUp, { signal: hostListeners.signal });
+    window.addEventListener("keydown", onCursorKey, { signal: hostListeners.signal });
+    window.addEventListener("keyup", onCursorKey, { signal: hostListeners.signal });
   }
 
   // ---- StatTrak module ---------------------------------------------------------
@@ -16353,8 +16392,8 @@ async function buildViewer(
       composer?.dispose();
       composer = null;
       bloomPass = null;
+      hostListeners.abort();
       if (!opts?.still) {
-        container.removeEventListener("pointerdown", onPointerDown, { capture: true });
         el.removeEventListener("pointermove", onPointerMove);
         el.removeEventListener("pointerup", onPointerUp);
         el.removeEventListener("pointercancel", onPointerUp);
@@ -16365,17 +16404,12 @@ async function buildViewer(
         el.removeEventListener("pointerenter", onCursorEnter);
         el.removeEventListener("pointerleave", onCursorLeave);
         el.removeEventListener("wheel", onCursorWheel);
-        window.removeEventListener("pointerup", onCursorUp);
-        window.removeEventListener("pointercancel", onCursorUp);
-        window.removeEventListener("keydown", onCursorKey);
-        window.removeEventListener("keyup", onCursorKey);
       }
       cancelAnimationFrame(hoverRaf);
       cancelAnimationFrame(dragRaf);
       dragPending = hoverPending = null;
       // The decal projection proxy carries a geometry of its own between builds.
       proxyMesh.mesh?.geometry.dispose();
-      cursor?.destroy();
       for (const slot of new Set([...decals.keys(), ...liveMesh.keys()])) removeDecal(slot);
       removeCharm();
       removeStatTrak();
@@ -16389,15 +16423,17 @@ async function buildViewer(
         charmMap.geo.dispose();
         charmMap.mat.dispose();
       }
-      controls.dispose();
+      disposeControls();
       // Drops this viewer's REFERENCE to the composite; the pair itself stays in
       // the renderer-wide LRU. That is the point of sharing the renderer —
       // reopening the same weapon now finds its composite already resident
       // instead of re-fetching and re-decoding two 2k textures.
       releaseComposite?.();
+      releaseComposite = null;
       // The glove composite owns its render targets outright (no shared LRU), so
       // the viewer that made them is the only thing that can free them.
       gloveRelease?.();
+      gloveRelease = null;
       // Same for the patched agent maps. The SOURCE texture underneath them is
       // the shared glTF one and is deliberately not touched — see agentPatches.
       patchDispose?.();
