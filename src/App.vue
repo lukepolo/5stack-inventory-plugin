@@ -6128,8 +6128,6 @@ function spotLeave(el: Element, done: () => void) {
   if (flyer) {
     flyer.style.transition = "none";
     flyer.classList.remove("opacity-0");
-    // Frozen where it is, not reset: resetting the bob jumped it up to 4px.
-    for (const a of flyer.getAnimations()) a.pause();
     if (spotSrc.value && flyer.getAttribute("src") !== spotSrc.value) flyer.src = spotSrc.value;
   }
   const img = view.value === "grid" ? dockCellImg(selected.value) : null;
@@ -6320,7 +6318,9 @@ const spot3dKey = computed(() => {
   return t && spot3d.value ? `${t.model}|${dockShownId.value}|${team.value}` : "";
 });
 const dockShow3d = computed(() => spot3dReady.value && !!spot3dKey.value && !dockHover.value);
-const spot3dLoading = computed(() => !!spot3dKey.value && !spot3dReady.value && !spot3dFailed.value && !dockHover.value);
+const spot3dLoading = computed(
+  () => !!spot3dKey.value && !dockOpening.value && !spot3dReady.value && !spot3dFailed.value && !dockHover.value,
+);
 const spotStageEl = ref<HTMLElement | null>(null);
 const spotLoadingTop = ref<number | null>(null);
 // Offsets, not getBoundingClientRect: the panel is still sliding in when the
@@ -8961,7 +8961,15 @@ function onGlobalKey(e: KeyboardEvent) {
     // "/" drops you into the search that's on screen: inventory's own box
     // there, the sheet's box everywhere else.
     e.preventDefault();
-    (view.value === "inventory" ? invSearchEl.value : sheetSearchEl.value)?.focus();
+    if (view.value === "inventory") {
+      invSearchEl.value?.focus();
+    } else {
+      // The picker is inert until Spotlight opens on a slot.
+      if (dockSmall.value && !dockOpen.value) {
+        dockSelectPos(selected.value);
+      }
+      void nextTick(() => sheetSearchEl.value?.focus({ preventScroll: true }));
+    }
     // Matches the header pill: no visible toggle, no shortcut for it.
   } else if ((e.key === "t" || e.key === "T") && (view.value === "grid" || view.value === "focus")) {
     switchTeam(team.value === "CT" ? "T" : "CT");
@@ -10547,7 +10555,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
               :class="dockShow3d ? 'opacity-100' : 'pointer-events-none opacity-0'"
             ></div>
             <Transition
-              enter-active-class="transition-opacity duration-200 delay-200 motion-reduce:transition-none"
+              enter-active-class="transition-opacity duration-200 delay-200 motion-reduce:duration-0"
               enter-from-class="opacity-0"
               leave-active-class="transition-opacity duration-150 motion-reduce:transition-none"
               leave-to-class="opacity-0"
@@ -11706,7 +11714,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           <div
             v-if="craftHasOptions && !viewOnly"
             class="flex w-full flex-none flex-col gap-2.5"
-            :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px] min-h-0 overflow-y-auto overscroll-contain pr-1 [&>*]:flex-none']"
+            :class="[{ 'sheet-settled': craftSettled }, !isCompact && 'max-w-[300px] min-h-0']"
           >
             <!-- Inspect, share and reset, at the top of the form rather than in
                  the screen's actions row — see CraftActions. Editing is work
@@ -11722,587 +11730,591 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
               @inspect="openCraftInspect()"
               @reset="resetCraft"
             />
-            <!-- FIRST, above the attachment slots. The name is the one field
-                 that is pure text entry and it applies to the item itself
-                 rather than to a slot on it — buried under five sticker wells
-                 it read as an afterthought. -->
-            <label
-              v-if="craftHasNameTag"
-              class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5"
-              :style="{ '--i': 0 }"
-            >
-              <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
-              <input
-                :value="craft.nametag"
-                placeholder="Type a custom name…"
-                class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                @input="onNametagInput"
-              />
-            </label>
-            <!-- A pet's coat, life stage and animation, straight under its
-                 name: they are what the chicken IS, the way a finish is what a
-                 gun is. See PetControls for why each is shaped the way it is. -->
-            <PetControls
-              v-if="craftType === 'pet' && craftTarget && (craftHasStyle || craftHasStage || modal3d)"
-              class="animate-sheet-in"
-              :style="{ '--i': 1 }"
-              :model="craftTarget.model"
-              :coat="craft.style"
-              :stages="craftPet?.stages ?? []"
-              :stage="craft.stage"
-              :default-stage="craftPet?.defaultStage ?? null"
-              :clip="modal3d ? petClip : null"
-              :seed="Number(craft.seed ?? 0)"
-              @update:coat="craft!.style = $event"
-              @update:stage="craft!.stage = $event"
-              :wander="petWander != null"
-              :progress="petClipProgress"
-              @update:clip="pickPetClip"
-              @wander="setPetWanderByHand"
-              @update:seed="(s) => (craft!.seed = s)"
-              @preview-style="previewPetStyle"
-            />
-            <!-- An agent's pose and motion, where the pet keeps its clips: with
-                 the other controls for what is on the stage. They were pills
-                 over the model's top-left corner, on top of the item's name. -->
-            <AgentControls
-              v-if="craftType === 'agent' && modal3d"
-              class="animate-sheet-in"
-              :style="{ '--i': 1 }"
-              :pose="agentPose"
-              :motion="agentMotion"
-              @update:pose="setAgentPose"
-              @update:motion="setAgentMotion"
-            />
-            <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
-              <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
-              <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${patchSlotCount}, minmax(0, 1fr))` }">
-                <button
-                  v-for="(pt, idx) in craft.patches.slice(0, patchSlotCount)"
-                  :key="idx"
-                  class="group/pt relative grid h-10 place-items-center rounded border transition-colors"
-                  :class="pt ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]'"
-                  :title="pt ? pt.name + ' (slot ' + (idx + 1) + ')' : 'Add a patch in slot ' + (idx + 1)"
-                  @click="openPicker('patch', idx)"
-                >
-                  <span class="absolute bottom-0 right-0.5 z-[1] font-mono text-f8 text-muted-foreground/40">{{ idx + 1 }}</span>
-                  <img v-if="pt?.image" :src="pt.image" alt="" class="max-h-8 max-w-full object-contain" />
-                  <Plus v-else class="h-3.5 w-3.5" />
-                  <span
-                    v-if="pt"
-                    class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/pt:opacity-100"
-                    @click.stop="craft!.patches[idx] = null"
-                  ><X class="h-3 w-3" /></span>
-                  <span
-                    v-if="pt"
-                    class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/pt:opacity-100"
-                    :title="`View ${pt.name} in 3D`"
-                    @click.stop="openPreview3d(pt, 'patch', { slot: idx })"
-                  ><Box class="h-3 w-3" /></span>
-                </button>
-              </div>
-            </div>
-            <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
-              <div class="mb-1.5 flex items-baseline gap-2">
-                <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Stickers</span>
-                <!-- A souvenir's stickers are the event's: picked in the
-                     Souvenir box, still scratched and placed here. -->
-                <span v-if="craft.souvenir" class="ml-auto text-f9 text-[hsl(var(--tac-souvenir))]">Set by Souvenir</span>
-              </div>
-              <!-- A picked Sticker Craft, waiting to be dragged onto the gun —
-                   see useStickerCraftPlacement. The whole card is the handle. -->
-              <div
-                v-if="craftPending"
-                class="mb-2 flex cursor-grab flex-col gap-1.5 rounded-md border border-dashed border-[color:var(--acc)] bg-background/70 p-1.5"
-                style="touch-action: none"
-                :title="'Drag onto the gun to place ' + craftPending.entry.name"
-                @pointerdown="craftDrop.startDrag"
+            <!-- Only the form scrolls: Share's menu hangs off CraftActions and a
+                 scrolling box would clip it. -->
+            <div class="flex flex-col gap-2.5" :class="!isCompact && 'min-h-0 overflow-y-auto overscroll-contain pr-1 [&>*]:flex-none'">
+              <!-- FIRST, above the attachment slots. The name is the one field
+                   that is pure text entry and it applies to the item itself
+                   rather than to a slot on it — buried under five sticker wells
+                   it read as an afterthought. -->
+              <label
+                v-if="craftHasNameTag"
+                class="animate-sheet-in flex items-center gap-2 rounded-md bg-secondary/40 p-2.5"
+                :style="{ '--i': 0 }"
               >
-                <div class="flex items-center gap-2">
-                  <div class="grid h-10 w-20 flex-none place-items-center overflow-hidden rounded bg-[#183a31]">
-                    <img v-if="craftPending.entry.preview" :src="craftPending.entry.preview" alt="" class="h-full w-full object-cover" draggable="false" />
-                    <div v-else class="flex items-center justify-center gap-0.5 p-0.5">
-                      <img v-for="(cs, ci) in craftPending.entry.stickers" :key="ci" :src="cs.image" alt="" class="h-5 w-5 object-contain" draggable="false" />
+                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Name tag</span>
+                <input
+                  :value="craft.nametag"
+                  placeholder="Type a custom name…"
+                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  @input="onNametagInput"
+                />
+              </label>
+              <!-- A pet's coat, life stage and animation, straight under its
+                   name: they are what the chicken IS, the way a finish is what a
+                   gun is. See PetControls for why each is shaped the way it is. -->
+              <PetControls
+                v-if="craftType === 'pet' && craftTarget && (craftHasStyle || craftHasStage || modal3d)"
+                class="animate-sheet-in"
+                :style="{ '--i': 1 }"
+                :model="craftTarget.model"
+                :coat="craft.style"
+                :stages="craftPet?.stages ?? []"
+                :stage="craft.stage"
+                :default-stage="craftPet?.defaultStage ?? null"
+                :clip="modal3d ? petClip : null"
+                :seed="Number(craft.seed ?? 0)"
+                @update:coat="craft!.style = $event"
+                @update:stage="craft!.stage = $event"
+                :wander="petWander != null"
+                :progress="petClipProgress"
+                @update:clip="pickPetClip"
+                @wander="setPetWanderByHand"
+                @update:seed="(s) => (craft!.seed = s)"
+                @preview-style="previewPetStyle"
+              />
+              <!-- An agent's pose and motion, where the pet keeps its clips: with
+                   the other controls for what is on the stage. They were pills
+                   over the model's top-left corner, on top of the item's name. -->
+              <AgentControls
+                v-if="craftType === 'agent' && modal3d"
+                class="animate-sheet-in"
+                :style="{ '--i': 1 }"
+                :pose="agentPose"
+                :motion="agentMotion"
+                @update:pose="setAgentPose"
+                @update:motion="setAgentMotion"
+              />
+              <div v-if="attachKind === 'agent'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
+                <div class="mb-1.5 text-f10 uppercase tracking-cs1 text-muted-foreground">Patches</div>
+                <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${patchSlotCount}, minmax(0, 1fr))` }">
+                  <button
+                    v-for="(pt, idx) in craft.patches.slice(0, patchSlotCount)"
+                    :key="idx"
+                    class="group/pt relative grid h-10 place-items-center rounded border transition-colors"
+                    :class="pt ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]'"
+                    :title="pt ? pt.name + ' (slot ' + (idx + 1) + ')' : 'Add a patch in slot ' + (idx + 1)"
+                    @click="openPicker('patch', idx)"
+                  >
+                    <span class="absolute bottom-0 right-0.5 z-[1] font-mono text-f8 text-muted-foreground/40">{{ idx + 1 }}</span>
+                    <img v-if="pt?.image" :src="pt.image" alt="" class="max-h-8 max-w-full object-contain" />
+                    <Plus v-else class="h-3.5 w-3.5" />
+                    <span
+                      v-if="pt"
+                      class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/pt:opacity-100"
+                      @click.stop="craft!.patches[idx] = null"
+                    ><X class="h-3 w-3" /></span>
+                    <span
+                      v-if="pt"
+                      class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/pt:opacity-100"
+                      :title="`View ${pt.name} in 3D`"
+                      @click.stop="openPreview3d(pt, 'patch', { slot: idx })"
+                    ><Box class="h-3 w-3" /></span>
+                  </button>
+                </div>
+              </div>
+              <div v-if="attachKind === 'weapon'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 1 }">
+                <div class="mb-1.5 flex items-baseline gap-2">
+                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Stickers</span>
+                  <!-- A souvenir's stickers are the event's: picked in the
+                       Souvenir box, still scratched and placed here. -->
+                  <span v-if="craft.souvenir" class="ml-auto text-f9 text-[hsl(var(--tac-souvenir))]">Set by Souvenir</span>
+                </div>
+                <!-- A picked Sticker Craft, waiting to be dragged onto the gun —
+                     see useStickerCraftPlacement. The whole card is the handle. -->
+                <div
+                  v-if="craftPending"
+                  class="mb-2 flex cursor-grab flex-col gap-1.5 rounded-md border border-dashed border-[color:var(--acc)] bg-background/70 p-1.5"
+                  style="touch-action: none"
+                  :title="'Drag onto the gun to place ' + craftPending.entry.name"
+                  @pointerdown="craftDrop.startDrag"
+                >
+                  <div class="flex items-center gap-2">
+                    <div class="grid h-10 w-20 flex-none place-items-center overflow-hidden rounded bg-[#183a31]">
+                      <img v-if="craftPending.entry.preview" :src="craftPending.entry.preview" alt="" class="h-full w-full object-cover" draggable="false" />
+                      <div v-else class="flex items-center justify-center gap-0.5 p-0.5">
+                        <img v-for="(cs, ci) in craftPending.entry.stickers" :key="ci" :src="cs.image" alt="" class="h-5 w-5 object-contain" draggable="false" />
+                      </div>
                     </div>
+                    <div class="min-w-0 flex-1 truncate text-f11 text-foreground">{{ craftPending.entry.name }}</div>
+                    <button
+                      class="grid h-7 w-7 flex-none place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                      title="Put it back — nothing is placed (Esc)"
+                      @pointerdown.stop
+                      @click="craftDrop.cancel()"
+                    ><X class="h-3.5 w-3.5" /></button>
                   </div>
-                  <div class="min-w-0 flex-1 truncate text-f11 text-foreground">{{ craftPending.entry.name }}</div>
+                  <div class="flex items-center gap-2">
+                    <span class="min-w-0 flex-1 text-f10 uppercase tracking-cs1 text-[color:var(--acc)]">Drag onto the gun</span>
+                    <!-- No drag needed: it goes where its slots put a sticker, and
+                         can be dragged on from there. -->
+                    <button
+                      class="flex h-7 flex-none items-center gap-1 rounded-md border border-border px-2 text-f10 uppercase tracking-cs1 text-foreground tac-action"
+                      title="Put it on its slots without dragging — move it on the gun afterwards"
+                      @pointerdown.stop
+                      @click="craftDrop.placeHere()"
+                    >{{ tr("inventory.stickerCrafts.placeOn", "Place on") }} {{ slotsText(craftPending.slots) }}</button>
+                  </div>
+                </div>
+                <!-- A placed craft. Grouped, its stickers move and turn as one in
+                     3D; Ungroup lets each move on its own for fine adjustments,
+                     and Group binds them again as they then stand. -->
+                <div
+                  v-else-if="craftGroup"
+                  class="mb-1.5 flex items-center gap-1.5 text-f9 uppercase tracking-cs1"
+                  :class="craftGroup.linked ? 'text-[color:var(--acc)]' : 'text-muted-foreground'"
+                >
+                  <Link2 v-if="craftGroup.linked" class="h-3 w-3 flex-none" />
+                  <UngroupIcon v-else class="h-3 w-3 flex-none" />
+                  <span class="min-w-0 truncate text-f11 normal-case tracking-normal text-foreground">{{ craftGroup.name }}</span>
+                  <span class="flex-none">{{ craftGroup.linked ? 'moves as one' : 'moving singly' }}</span>
                   <button
-                    class="grid h-7 w-7 flex-none place-items-center rounded text-muted-foreground transition-colors hover:text-foreground"
-                    title="Put it back — nothing is placed (Esc)"
-                    @pointerdown.stop
-                    @click="craftDrop.cancel()"
-                  ><X class="h-3.5 w-3.5" /></button>
+                    class="ml-auto flex flex-none items-center gap-1 rounded border border-border px-1.5 py-0.5 uppercase tracking-cs1 text-muted-foreground tac-action"
+                    :title="craftGroup.linked ? 'Ungroup — move the stickers one at a time for fine adjustments' : 'Group again — the stickers move and turn as one from where they are now'"
+                    @click="craftGroup.linked ? craftDrop.ungroup() : craftDrop.regroup()"
+                  >
+                    <UngroupIcon v-if="craftGroup.linked" class="h-3 w-3" />
+                    <GroupIcon v-else class="h-3 w-3" />
+                    {{ craftGroup.linked ? 'Ungroup' : 'Group' }}
+                  </button>
+                </div>
+                <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
+                  <!-- Draggable onto each other: slot order is draw order, so this is
+                       how one overlapping sticker goes over another — see
+                       moveSticker. -->
+                  <button
+                    v-for="(st, idx) in craft.stickers.slice(0, stickerSlotCount)"
+                    :key="idx"
+                    class="group/st relative grid h-10 place-items-center rounded border transition-colors"
+                    :class="[
+                      st ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]',
+                      stickerDropOn === idx && stickerDragFrom !== idx && '!border-solid !border-[color:var(--acc)]',
+                      stickerDragFrom === idx && 'opacity-40',
+                      craftPendingSlots.has(idx) && '!border-dashed !border-[color:var(--acc)]',
+                      craftGroupSlots.has(idx) && (craftGroup?.linked ? 'shadow-[inset_0_-2px_0_var(--acc)]' : 'shadow-[inset_0_-2px_0_color-mix(in_srgb,var(--acc)_35%,transparent)]'),
+                    ]"
+                    :title="craftPending ? (craftPendingSlots.has(idx) ? 'Kept for ' : 'Waiting on ') + craftPending.entry.name + ' — place it or put it back first' : craft.souvenir ? (st ? st.name + ' — a souvenir sticker, chosen in Souvenir' : 'A souvenir carries only its event\'s stickers — choose them in Souvenir') : st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
+                    :draggable="!!st && !craftPending"
+                    @click="!craftPending && !craft.souvenir && openPicker('sticker', idx)"
+                    @dragstart="stickerDragFrom = idx; $event.dataTransfer?.setData('text/plain', String(idx))"
+                    @dragover.prevent="!craftPending && stickerDragFrom != null && (stickerDropOn = idx)"
+                    @dragleave="stickerDropOn === idx && (stickerDropOn = null)"
+                    @drop.prevent="!craftPending && onStickerTileDrop(idx)"
+                    @dragend="stickerDragFrom = null; stickerDropOn = null"
+                  >
+                    <span class="absolute bottom-0 right-0.5 z-[1] font-mono text-f8 text-muted-foreground/40">{{ idx + 1 }}</span>
+                    <img v-if="st?.image" :src="st.image" alt="" class="max-h-8 max-w-full object-contain" />
+                    <Plus v-else class="h-3.5 w-3.5" />
+                    <span
+                      v-if="st && !craft.souvenir"
+                      class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/st:opacity-100"
+                      @click.stop="!craftPending && (craft!.stickers[idx] = null)"
+                    ><X class="h-3 w-3" /></span>
+                    <!-- Inspect what is ALREADY on the weapon. Without it the only
+                         way to see a sticker in 3D was to re-open the picker and
+                         find it again, which is backwards once it is applied. -->
+                    <span
+                      v-if="st"
+                      class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/st:opacity-100"
+                      :title="`View ${st.name} in 3D`"
+                      @click.stop="openPreview3d(st, 'sticker', { slot: idx })"
+                    ><Box class="h-3 w-3" /></span>
+                  </button>
+                </div>
+                <!-- The applied stickers as a list, top-most first, the same rows
+                     as the Sticker Crafts mat (StickerRow): scratch wear always
+                     out, exact placement behind Advanced. Drag a row by its grip
+                     onto another to swap their slots — later slots draw on top,
+                     so this is how one sticker goes over another. -->
+                <div v-if="craft.stickers.some(Boolean)" class="mt-2 flex flex-col gap-1.5">
+                  <div v-if="stickerRowsTopFirst.length > 1" class="mb-0.5 text-right text-f9 text-muted-foreground/60">Top first · drag to reorder</div>
+                  <StickerRow
+                    v-for="(idx, pos) in stickerRowsTopFirst"
+                    :key="'row' + idx"
+                    data-sort-list="gun"
+                    :image="craft.stickers[idx]!.image"
+                    :name="stripName(craft.stickers[idx]!.name)"
+                    :label="String(idx + 1)"
+                    :wear="craft.stickers[idx]!.w ?? 0"
+                    :x="craft.stickers[idx]!.x"
+                    :y="craft.stickers[idx]!.y"
+                    :r="craft.stickers[idx]!.r"
+                    :step="0.05"
+                    :grip="stickerRowsTopFirst.length > 1 && !craftPending"
+                    :coarse="isCoarse"
+                    :class="[stickerRowsTopFirst.length > 1 && !craftPending && 'cursor-grab', craftGroupSlots.has(idx) && 'border-[color:var(--acc)]']"
+                    @pointerdown="(e: PointerEvent) => stickerRowsTopFirst.length > 1 && !craftPending && stickerSort.press(e, 'gun', pos)"
+                    @wear="(w: number) => setStickerWear(idx, w)"
+                    @place="(k: 'x' | 'y' | 'r', v: number) => placeSticker(idx, k, v)"
+                    @remove="!craftPending && !craft!.souvenir && (craft!.stickers[idx] = null)"
+                  />
+                </div>
+              </div>
+              <div v-if="attachTakesCharm" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
+                <div class="mb-1.5 flex items-baseline gap-2">
+                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Charm</span>
+                  <button
+                    v-if="craft.charm"
+                    class="ml-auto flex-none text-f9 uppercase tracking-cs1 text-muted-foreground/70 transition-colors hover:text-foreground"
+                    @click="advancedPlacement = !advancedPlacement"
+                  >{{ advancedPlacement ? 'Hide' : 'Advanced' }}</button>
                 </div>
                 <div class="flex items-center gap-2">
-                  <span class="min-w-0 flex-1 text-f10 uppercase tracking-cs1 text-[color:var(--acc)]">Drag onto the gun</span>
-                  <!-- No drag needed: it goes where its slots put a sticker, and
-                       can be dragged on from there. -->
                   <button
-                    class="flex h-7 flex-none items-center gap-1 rounded-md border border-border px-2 text-f10 uppercase tracking-cs1 text-foreground tac-action"
-                    title="Put it on its slots without dragging — move it on the gun afterwards"
-                    @pointerdown.stop
-                    @click="craftDrop.placeHere()"
-                  >{{ tr("inventory.stickerCrafts.placeOn", "Place on") }} {{ slotsText(craftPending.slots) }}</button>
+                    class="group/ch relative grid h-10 w-10 flex-none place-items-center rounded border transition-colors"
+                    :class="craft.charm ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]'"
+                    :title="craft.charm ? craft.charm.name : 'Add a charm'"
+                    @click="openPicker('charm')"
+                  >
+                    <img v-if="craft.charm?.image" :src="craft.charm.image" alt="" class="max-h-8 max-w-full object-contain" />
+                    <Plus v-else class="h-3.5 w-3.5" />
+                    <span
+                      v-if="craft.charm"
+                      class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/ch:opacity-100"
+                      @click.stop="craft!.charm = null"
+                    ><X class="h-3 w-3" /></span>
+                    <span
+                      v-if="craft.charm"
+                      class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/ch:opacity-100"
+                      :title="`View ${craft.charm.name} in 3D`"
+                      @click.stop="openPreview3d(craft!.charm, 'charm', { slot: 0 })"
+                    ><Box class="h-3 w-3" /></span>
+                  </button>
+                  <span v-if="craft.charm" class="truncate text-f10 text-muted-foreground">{{ craft.charm.name }}</span>
+                </div>
+                <!-- A charm carries its own pattern, exactly as the weapon does,
+                     and it is a tradeable attribute rather than a placement
+                     detail — so it sits with the charm itself and NOT behind
+                     Advanced with the x/y/z nudges.
+                     The number FIELD that used to be here is gone: a charm's
+                     pattern is a colour, and picking a colour by typing
+                     coordinates at it is the problem the rail solves. The rail
+                     owns the readout and it is still click-to-edit, so a pattern
+                     quoted from a trade site is no harder to enter than before. -->
+                <!-- A HIGHLIGHT charm (Austin 2025, Budapest 2025, Cologne 2026)
+                     has no pattern: which highlight it carries is its look, and
+                     the game shows a blank reel without one. -->
+                <HighlightPicker
+                  v-if="craft.charm && reelCharms.get(craft.charm.id)"
+                  class="mt-2"
+                  :charm-id="craft.charm.id"
+                  :model-value="craft.charm.highlight ?? null"
+                  auto-pick
+                  @update:model-value="craft!.charm!.highlight = $event"
+                />
+                <!-- `v-else`: an unanswered lookup (or a failed one) draws the rail,
+                     as before reels existed — only a known reel hides it. -->
+                <PatternRail
+                  v-else-if="craft.charm"
+                  class="mt-2"
+                  :model-value="craft.charm.seed ?? 0"
+                  :image="craft.charm.image"
+                  :albedo="charmAlbedo"
+                  :loading="charmRailLoading"
+                  @update:model-value="craft!.charm!.seed = $event"
+                />
+                <div v-if="craft.charm && advancedPlacement" class="mt-1.5 flex items-center gap-1.5">
+                  <span class="w-4 flex-none"></span>
+                  <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">X
+                    <input v-model.number="craft.charm.x" type="number" step="0.05" placeholder="0"
+                      class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
+                  </label>
+                  <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">Y
+                    <input v-model.number="craft.charm.y" type="number" step="0.05" placeholder="0"
+                      class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
+                  </label>
+                  <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">Z
+                    <input v-model.number="craft.charm.z" type="number" step="0.05" placeholder="0"
+                      class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
+                  </label>
                 </div>
               </div>
-              <!-- A placed craft. Grouped, its stickers move and turn as one in
-                   3D; Ungroup lets each move on its own for fine adjustments,
-                   and Group binds them again as they then stand. -->
+              <!-- A CHARM's pattern gets the rail, wherever the charm is.
+                   It was only wired up for a charm hanging off a weapon, so
+                   opening one on its own fell through to the weapon control
+                   below — a 1..1000 slider for an attribute that runs to 100,000,
+                   scrubbing a continuum for something that is really a colour.
+                   Same component, same reasoning as the attached case: you aim at
+                   a pattern, you don't scrub to it. -->
+              <!-- The panel goes with the rail when the charm has no pattern to
+                   pick. Hiding the control alone would leave an empty card. -->
               <div
-                v-else-if="craftGroup"
-                class="mb-1.5 flex items-center gap-1.5 text-f9 uppercase tracking-cs1"
-                :class="craftGroup.linked ? 'text-[color:var(--acc)]' : 'text-muted-foreground'"
+                v-if="craftSeedIsCharm && reelCharms.get(craft.skin.id)"
+                class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+                :style="{ '--i': 3 }"
               >
-                <Link2 v-if="craftGroup.linked" class="h-3 w-3 flex-none" />
-                <UngroupIcon v-else class="h-3 w-3 flex-none" />
-                <span class="min-w-0 truncate text-f11 normal-case tracking-normal text-foreground">{{ craftGroup.name }}</span>
-                <span class="flex-none">{{ craftGroup.linked ? 'moves as one' : 'moving singly' }}</span>
-                <button
-                  class="ml-auto flex flex-none items-center gap-1 rounded border border-border px-1.5 py-0.5 uppercase tracking-cs1 text-muted-foreground tac-action"
-                  :title="craftGroup.linked ? 'Ungroup — move the stickers one at a time for fine adjustments' : 'Group again — the stickers move and turn as one from where they are now'"
-                  @click="craftGroup.linked ? craftDrop.ungroup() : craftDrop.regroup()"
-                >
-                  <UngroupIcon v-if="craftGroup.linked" class="h-3 w-3" />
-                  <GroupIcon v-else class="h-3 w-3" />
-                  {{ craftGroup.linked ? 'Ungroup' : 'Group' }}
-                </button>
-              </div>
-              <div class="grid gap-1.5" :style="{ gridTemplateColumns: `repeat(${stickerSlotCount}, minmax(0, 1fr))` }">
-                <!-- Draggable onto each other: slot order is draw order, so this is
-                     how one overlapping sticker goes over another — see
-                     moveSticker. -->
-                <button
-                  v-for="(st, idx) in craft.stickers.slice(0, stickerSlotCount)"
-                  :key="idx"
-                  class="group/st relative grid h-10 place-items-center rounded border transition-colors"
-                  :class="[
-                    st ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]',
-                    stickerDropOn === idx && stickerDragFrom !== idx && '!border-solid !border-[color:var(--acc)]',
-                    stickerDragFrom === idx && 'opacity-40',
-                    craftPendingSlots.has(idx) && '!border-dashed !border-[color:var(--acc)]',
-                    craftGroupSlots.has(idx) && (craftGroup?.linked ? 'shadow-[inset_0_-2px_0_var(--acc)]' : 'shadow-[inset_0_-2px_0_color-mix(in_srgb,var(--acc)_35%,transparent)]'),
-                  ]"
-                  :title="craftPending ? (craftPendingSlots.has(idx) ? 'Kept for ' : 'Waiting on ') + craftPending.entry.name + ' — place it or put it back first' : craft.souvenir ? (st ? st.name + ' — a souvenir sticker, chosen in Souvenir' : 'A souvenir carries only its event\'s stickers — choose them in Souvenir') : st ? st.name + ' (slot ' + (idx + 1) + ') — drag onto another slot to reorder; later slots draw on top' : 'Add a sticker in slot ' + (idx + 1)"
-                  :draggable="!!st && !craftPending"
-                  @click="!craftPending && !craft.souvenir && openPicker('sticker', idx)"
-                  @dragstart="stickerDragFrom = idx; $event.dataTransfer?.setData('text/plain', String(idx))"
-                  @dragover.prevent="!craftPending && stickerDragFrom != null && (stickerDropOn = idx)"
-                  @dragleave="stickerDropOn === idx && (stickerDropOn = null)"
-                  @drop.prevent="!craftPending && onStickerTileDrop(idx)"
-                  @dragend="stickerDragFrom = null; stickerDropOn = null"
-                >
-                  <span class="absolute bottom-0 right-0.5 z-[1] font-mono text-f8 text-muted-foreground/40">{{ idx + 1 }}</span>
-                  <img v-if="st?.image" :src="st.image" alt="" class="max-h-8 max-w-full object-contain" />
-                  <Plus v-else class="h-3.5 w-3.5" />
-                  <span
-                    v-if="st && !craft.souvenir"
-                    class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/st:opacity-100"
-                    @click.stop="!craftPending && (craft!.stickers[idx] = null)"
-                  ><X class="h-3 w-3" /></span>
-                  <!-- Inspect what is ALREADY on the weapon. Without it the only
-                       way to see a sticker in 3D was to re-open the picker and
-                       find it again, which is backwards once it is applied. -->
-                  <span
-                    v-if="st"
-                    class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/st:opacity-100"
-                    :title="`View ${st.name} in 3D`"
-                    @click.stop="openPreview3d(st, 'sticker', { slot: idx })"
-                  ><Box class="h-3 w-3" /></span>
-                </button>
-              </div>
-              <!-- The applied stickers as a list, top-most first, the same rows
-                   as the Sticker Crafts mat (StickerRow): scratch wear always
-                   out, exact placement behind Advanced. Drag a row by its grip
-                   onto another to swap their slots — later slots draw on top,
-                   so this is how one sticker goes over another. -->
-              <div v-if="craft.stickers.some(Boolean)" class="mt-2 flex flex-col gap-1.5">
-                <div v-if="stickerRowsTopFirst.length > 1" class="mb-0.5 text-right text-f9 text-muted-foreground/60">Top first · drag to reorder</div>
-                <StickerRow
-                  v-for="(idx, pos) in stickerRowsTopFirst"
-                  :key="'row' + idx"
-                  data-sort-list="gun"
-                  :image="craft.stickers[idx]!.image"
-                  :name="stripName(craft.stickers[idx]!.name)"
-                  :label="String(idx + 1)"
-                  :wear="craft.stickers[idx]!.w ?? 0"
-                  :x="craft.stickers[idx]!.x"
-                  :y="craft.stickers[idx]!.y"
-                  :r="craft.stickers[idx]!.r"
-                  :step="0.05"
-                  :grip="stickerRowsTopFirst.length > 1 && !craftPending"
-                  :coarse="isCoarse"
-                  :class="[stickerRowsTopFirst.length > 1 && !craftPending && 'cursor-grab', craftGroupSlots.has(idx) && 'border-[color:var(--acc)]']"
-                  @pointerdown="(e: PointerEvent) => stickerRowsTopFirst.length > 1 && !craftPending && stickerSort.press(e, 'gun', pos)"
-                  @wear="(w: number) => setStickerWear(idx, w)"
-                  @place="(k: 'x' | 'y' | 'r', v: number) => placeSticker(idx, k, v)"
-                  @remove="!craftPending && !craft!.souvenir && (craft!.stickers[idx] = null)"
+                <HighlightPicker
+                  :charm-id="craft.skin.id"
+                  :model-value="craft.highlight"
+                  auto-pick
+                  @update:model-value="craft!.highlight = $event"
                 />
               </div>
-            </div>
-            <div v-if="attachTakesCharm" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 2 }">
-              <div class="mb-1.5 flex items-baseline gap-2">
-                <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Charm</span>
-                <button
-                  v-if="craft.charm"
-                  class="ml-auto flex-none text-f9 uppercase tracking-cs1 text-muted-foreground/70 transition-colors hover:text-foreground"
-                  @click="advancedPlacement = !advancedPlacement"
-                >{{ advancedPlacement ? 'Hide' : 'Advanced' }}</button>
+              <div
+                v-if="craftHasSeed && craftSeedIsCharm && !craftCharmInert && reelCharms.get(craft.skin.id) !== true"
+                class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+                :style="{ '--i': 3 }"
+              >
+                <PatternRail
+                  :model-value="craft.seed ?? 0"
+                  :image="craft.skin.image"
+                  :albedo="charmAlbedo"
+                  :loading="charmRailLoading"
+                  @update:model-value="craft!.seed = $event"
+                  @update:inert="craftCharmInert = $event"
+                />
               </div>
-              <div class="flex items-center gap-2">
-                <button
-                  class="group/ch relative grid h-10 w-10 flex-none place-items-center rounded border transition-colors"
-                  :class="craft.charm ? 'border-border bg-background' : 'border-dashed border-border/60 text-muted-foreground/50 hover:border-[color:var(--acc)] hover:text-[color:var(--acc)]'"
-                  :title="craft.charm ? craft.charm.name : 'Add a charm'"
-                  @click="openPicker('charm')"
-                >
-                  <img v-if="craft.charm?.image" :src="craft.charm.image" alt="" class="max-h-8 max-w-full object-contain" />
-                  <Plus v-else class="h-3.5 w-3.5" />
-                  <span
-                    v-if="craft.charm"
-                    class="absolute -right-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/ch:opacity-100"
-                    @click.stop="craft!.charm = null"
-                  ><X class="h-3 w-3" /></span>
-                  <span
-                    v-if="craft.charm"
-                    class="absolute -left-1 -top-1 z-[2] rounded-full bg-background p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-[color:var(--acc)] group-hover/ch:opacity-100"
-                    :title="`View ${craft.charm.name} in 3D`"
-                    @click.stop="openPreview3d(craft!.charm, 'charm', { slot: 0 })"
-                  ><Box class="h-3 w-3" /></span>
-                </button>
-                <span v-if="craft.charm" class="truncate text-f10 text-muted-foreground">{{ craft.charm.name }}</span>
-              </div>
-              <!-- A charm carries its own pattern, exactly as the weapon does,
-                   and it is a tradeable attribute rather than a placement
-                   detail — so it sits with the charm itself and NOT behind
-                   Advanced with the x/y/z nudges.
-                   The number FIELD that used to be here is gone: a charm's
-                   pattern is a colour, and picking a colour by typing
-                   coordinates at it is the problem the rail solves. The rail
-                   owns the readout and it is still click-to-edit, so a pattern
-                   quoted from a trade site is no harder to enter than before. -->
-              <!-- A HIGHLIGHT charm (Austin 2025, Budapest 2025, Cologne 2026)
-                   has no pattern: which highlight it carries is its look, and
-                   the game shows a blank reel without one. -->
-              <HighlightPicker
-                v-if="craft.charm && reelCharms.get(craft.charm.id)"
-                class="mt-2"
-                :charm-id="craft.charm.id"
-                :model-value="craft.charm.highlight ?? null"
-                auto-pick
-                @update:model-value="craft!.charm!.highlight = $event"
-              />
-              <!-- `v-else`: an unanswered lookup (or a failed one) draws the rail,
-                   as before reels existed — only a known reel hides it. -->
-              <PatternRail
-                v-else-if="craft.charm"
-                class="mt-2"
-                :model-value="craft.charm.seed ?? 0"
-                :image="craft.charm.image"
-                :albedo="charmAlbedo"
-                :loading="charmRailLoading"
-                @update:model-value="craft!.charm!.seed = $event"
-              />
-              <div v-if="craft.charm && advancedPlacement" class="mt-1.5 flex items-center gap-1.5">
-                <span class="w-4 flex-none"></span>
-                <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">X
-                  <input v-model.number="craft.charm.x" type="number" step="0.05" placeholder="0"
-                    class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
-                </label>
-                <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">Y
-                  <input v-model.number="craft.charm.y" type="number" step="0.05" placeholder="0"
-                    class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
-                </label>
-                <label class="flex items-center gap-1 font-mono text-f8 text-muted-foreground">Z
-                  <input v-model.number="craft.charm.z" type="number" step="0.05" placeholder="0"
-                    class="h-6 w-14 rounded border border-input bg-background px-1 text-f10 outline-none focus:border-[color:var(--acc)]" />
-                </label>
-              </div>
-            </div>
-            <!-- A CHARM's pattern gets the rail, wherever the charm is.
-                 It was only wired up for a charm hanging off a weapon, so
-                 opening one on its own fell through to the weapon control
-                 below — a 1..1000 slider for an attribute that runs to 100,000,
-                 scrubbing a continuum for something that is really a colour.
-                 Same component, same reasoning as the attached case: you aim at
-                 a pattern, you don't scrub to it. -->
-            <!-- The panel goes with the rail when the charm has no pattern to
-                 pick. Hiding the control alone would leave an empty card. -->
-            <div
-              v-if="craftSeedIsCharm && reelCharms.get(craft.skin.id)"
-              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
-              :style="{ '--i': 3 }"
-            >
-              <HighlightPicker
-                :charm-id="craft.skin.id"
-                :model-value="craft.highlight"
-                auto-pick
-                @update:model-value="craft!.highlight = $event"
-              />
-            </div>
-            <div
-              v-if="craftHasSeed && craftSeedIsCharm && !craftCharmInert && reelCharms.get(craft.skin.id) !== true"
-              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
-              :style="{ '--i': 3 }"
-            >
-              <PatternRail
-                :model-value="craft.seed ?? 0"
-                :image="craft.skin.image"
-                :albedo="charmAlbedo"
-                :loading="charmRailLoading"
-                @update:model-value="craft!.seed = $event"
-                @update:inert="craftCharmInert = $event"
-              />
-            </div>
-            <!-- The scored rail, which is the charm rail's twin: same drag,
-                 same needle, same click-to-edit readout — but plotting a
-                 MEASUREMENT of every pattern, because a weapon's pattern
-                 moves artwork rather than being a colour we can compute.
-                 It is only usable at all because the viewer re-composites in
-                 place now: the seed feeds six uniforms, so dragging re-runs
-                 two fullscreen passes over textures already on the GPU.
+              <!-- The scored rail, which is the charm rail's twin: same drag,
+                   same needle, same click-to-edit readout — but plotting a
+                   MEASUREMENT of every pattern, because a weapon's pattern
+                   moves artwork rather than being a colour we can compute.
+                   It is only usable at all because the viewer re-composites in
+                   place now: the seed feeds six uniforms, so dragging re-runs
+                   two fullscreen passes over textures already on the GPU.
 
-                 Shown only on a finish whose pattern can actually move the
-                 artwork — `=== true`, not `!== false`, so a finish still being
-                 resolved never appears and then vanishes. A fixed-pattern
-                 finish used to get the field back with a line explaining that
-                 it did nothing; the row is simply gone now.
+                   Shown only on a finish whose pattern can actually move the
+                   artwork — `=== true`, not `!== false`, so a finish still being
+                   resolved never appears and then vanishes. A fixed-pattern
+                   finish used to get the field back with a line explaining that
+                   it did nothing; the row is simply gone now.
 
-                 The tradeoff, stated: on those finishes the pattern can no
-                 longer be typed. It remains a real tradeable attribute and it
-                 still round-trips through save and share — there is just no
-                 longer a control for a number with nothing to show for it. -->
-            <div v-else-if="craftHasSeed && patternMoves === true" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
-              <!-- PLACEMENT: the pattern as where the artwork sits, draggable —
-                   the gun's half of what a pet's Traits do. Above the rail it
-                   drives, as a pet's sit above its Pattern field. -->
-              <div v-if="gunTraits.length" class="mb-3">
-                <div class="mb-1 flex items-baseline gap-2">
-                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Placement</span>
-                  <span class="ml-auto text-f10 text-muted-foreground/70">drag to place</span>
+                   The tradeoff, stated: on those finishes the pattern can no
+                   longer be typed. It remains a real tradeable attribute and it
+                   still round-trips through save and share — there is just no
+                   longer a control for a number with nothing to show for it. -->
+              <div v-else-if="craftHasSeed && patternMoves === true" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+                <!-- PLACEMENT: the pattern as where the artwork sits, draggable —
+                     the gun's half of what a pet's Traits do. Above the rail it
+                     drives, as a pet's sit above its Pattern field. -->
+                <div v-if="gunTraits.length" class="mb-3">
+                  <div class="mb-1 flex items-baseline gap-2">
+                    <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Placement</span>
+                    <span class="ml-auto text-f10 text-muted-foreground/70">drag to place</span>
+                  </div>
+                  <TraitBars :traits="gunTraits" :table="gunTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
                 </div>
-                <TraitBars :traits="gunTraits" :table="gunTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
-              </div>
-              <!-- The rail where it measures something or nothing else moves
-                   the pattern smoothly; otherwise the bars above are the way
-                   through and this is the number they land on (gunPatternRail). -->
-              <PatternScoreRail
-                v-if="gunPatternRail"
-                :model-value="craft.seed"
-                :paint-material="craft.skin.paintMaterial"
-                :model="craftTarget?.model ?? craftModel"
-                :legacy-paint="!!craft.skin.legacyPaint"
-                :weights-for="modal3d ? paintWeightsNow : null"
-                @update:model-value="craft!.seed = $event"
-                @preview="previewPattern"
-              />
-              <div v-else class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-                <input
-                  v-model.number="craft.seed"
-                  type="number" :min="1" :max="1000" step="1"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                <!-- The rail where it measures something or nothing else moves
+                     the pattern smoothly; otherwise the bars above are the way
+                     through and this is the number they land on (gunPatternRail). -->
+                <PatternScoreRail
+                  v-if="gunPatternRail"
+                  :model-value="craft.seed"
+                  :paint-material="craft.skin.paintMaterial"
+                  :model="craftTarget?.model ?? craftModel"
+                  :legacy-paint="!!craft.skin.legacyPaint"
+                  :weights-for="modal3d ? paintWeightsNow : null"
+                  @update:model-value="craft!.seed = $event"
+                  @preview="previewPattern"
                 />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
-              </div>
-            </div>
-            <!-- A PET's pattern. Neither rail fits: there is no paint to score
-                 and no colour band to aim at, and neighbouring numbers are
-                 unrelated birds. The Traits bars above are how to CHOOSE one;
-                 this is the plain number they land on, with the same die as the
-                 float. -->
-            <div v-else-if="craftHasSeed && craftType === 'pet'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
-              <div class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-                <input
-                  v-model.number="craft.seed"
-                  type="number" :min="craftPet?.seedMin ?? 1" :max="craftPet?.seedMax ?? 100000" step="1"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
-              </div>
-            </div>
-            <!-- A GLOVE's pattern: the gun's own controls, so the two read as the
-                 same tool. On the 22 Gen2 finishes the pattern rolls the
-                 artwork's placement: Placement bars, with the pattern number
-                 under them, preview it live (one composite dresses both hands,
-                 though CS2 rolls the second from a seed derived in game code).
-                 The older 73 roll nothing the data spells out: the scored rail
-                 still sets the number the equipped feed sends, but there is
-                 nothing to compare, and the line under it says the look is not
-                 previewed. -->
-            <div v-else-if="craftHasSeed && craftType === 'glove' && craftGloveSeedRange.known" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
-              <div v-if="gloveTraits.length" class="mb-3">
-                <div class="mb-1 flex items-baseline gap-2">
-                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Placement</span>
-                  <span class="ml-auto text-f10 text-muted-foreground/70">drag to place</span>
+                <div v-else class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                  <input
+                    v-model.number="craft.seed"
+                    type="number" :min="1" :max="1000" step="1"
+                    class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  />
+                  <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
                 </div>
-                <TraitBars :traits="gloveTraits" :table="gloveTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
               </div>
-              <!-- Same rule as the gun's (gunPatternRail): with placement bars
-                   to drag, the pattern is a number under them, not a rail of
-                   numbers that jumps the artwork around. -->
-              <PatternScoreRail
-                v-if="!gloveTraits.length"
-                glove
-                :compare="gloveSeedLive"
-                :model-value="craft.seed"
-                :paint-material="craft.skin.paintMaterial"
-                :model="craftTarget?.model ?? craftModel"
-                :min="craftGloveSeedRange.min"
-                :max="craftGloveSeedRange.max"
-                @update:model-value="craft!.seed = $event"
-                @preview="previewPattern"
-              />
-              <div v-else class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
-                <input
-                  v-model.number="craft.seed"
-                  type="number" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+              <!-- A PET's pattern. Neither rail fits: there is no paint to score
+                   and no colour band to aim at, and neighbouring numbers are
+                   unrelated birds. The Traits bars above are how to CHOOSE one;
+                   this is the plain number they land on, with the same die as the
+                   float. -->
+              <div v-else-if="craftHasSeed && craftType === 'pet'" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+                <div class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                  <input
+                    v-model.number="craft.seed"
+                    type="number" :min="craftPet?.seedMin ?? 1" :max="craftPet?.seedMax ?? 100000" step="1"
+                    class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  />
+                  <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+                </div>
+              </div>
+              <!-- A GLOVE's pattern: the gun's own controls, so the two read as the
+                   same tool. On the 22 Gen2 finishes the pattern rolls the
+                   artwork's placement: Placement bars, with the pattern number
+                   under them, preview it live (one composite dresses both hands,
+                   though CS2 rolls the second from a seed derived in game code).
+                   The older 73 roll nothing the data spells out: the scored rail
+                   still sets the number the equipped feed sends, but there is
+                   nothing to compare, and the line under it says the look is not
+                   previewed. -->
+              <div v-else-if="craftHasSeed && craftType === 'glove' && craftGloveSeedRange.known" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 3 }">
+                <div v-if="gloveTraits.length" class="mb-3">
+                  <div class="mb-1 flex items-baseline gap-2">
+                    <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">Placement</span>
+                    <span class="ml-auto text-f10 text-muted-foreground/70">drag to place</span>
+                  </div>
+                  <TraitBars :traits="gloveTraits" :table="gloveTable" :seed="Number(craft.seed ?? 1)" @seek="(s) => (craft!.seed = s)" />
+                </div>
+                <!-- Same rule as the gun's (gunPatternRail): with placement bars
+                     to drag, the pattern is a number under them, not a rail of
+                     numbers that jumps the artwork around. -->
+                <PatternScoreRail
+                  v-if="!gloveTraits.length"
+                  glove
+                  :compare="gloveSeedLive"
+                  :model-value="craft.seed"
+                  :paint-material="craft.skin.paintMaterial"
+                  :model="craftTarget?.model ?? craftModel"
+                  :min="craftGloveSeedRange.min"
+                  :max="craftGloveSeedRange.max"
+                  @update:model-value="craft!.seed = $event"
+                  @preview="previewPattern"
                 />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+                <div v-else class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Pattern</span>
+                  <input
+                    v-model.number="craft.seed"
+                    type="number" :min="craftGloveSeedRange.min" :max="craftGloveSeedRange.max" step="1"
+                    class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  />
+                  <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random pattern" @click="randomSeed">🎲</button>
+                </div>
+                <div v-if="!gloveSeedLive" class="mt-1 text-right font-mono text-f8 text-muted-foreground/60">Applies in game · not previewed here</div>
               </div>
-              <div v-if="!gloveSeedLive" class="mt-1 text-right font-mono text-f8 text-muted-foreground/60">Applies in game · not previewed here</div>
-            </div>
-            <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
-              <div class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
-                <input
-                  v-model.number="craft.wear"
-                  type="number" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+              <div v-if="craftHasWear" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
+                <div class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
+                  <input
+                    v-model.number="craft.wear"
+                    type="number" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001"
+                    class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  />
+                  <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random wear" @click="randomWear">🎲</button>
+                </div>
+                <!-- Inset from the box (px-1) and spaced off the caption, so the
+                     thumb's glow at either end doesn't sit on the box edge or on
+                     the figures under it. The track is the ramp for THIS finish's
+                     range (wearGradient), not CS2's whole 0–1 scale. -->
+                <div class="mt-3 flex items-center gap-2 px-1">
+                  <input
+                    v-model.number="craft.wear"
+                    type="range" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001"
+                    class="wear-range w-full"
+                    :style="{ background: wearGradient(craftWearRange.min, craftWearRange.max) }"
+                  />
+                </div>
+                <div class="mt-2 flex items-center justify-between px-1 font-mono text-f9 text-muted-foreground">
+                  <!-- Only worth saying when it ISN'T the full range, which is
+                       most finishes — otherwise it reads as noise on the few that
+                       genuinely go 0.00–1.00. -->
+                  <span v-if="craftWearRange.min > 0 || craftWearRange.max < 1" title="The floats this finish can have">
+                    Range {{ craftWearRange.min.toFixed(2) }}–{{ craftWearRange.max.toFixed(2) }}
+                  </span>
+                  <span v-else></span>
+                  <span>{{ wearTier(craft.wear) }}</span>
+                </div>
+              </div>
+              <!-- A sticker's scratch. Same box and rhythm as the weapon's Wear
+                   above but NO tier caption: "Factory New" is a float's vocabulary
+                   and a sticker doesn't have one — it's just how scuffed it is.
+                   Mutually exclusive with that box in practice (nothing has both a
+                   float and a scratch), so they can share the slot. -->
+              <div v-if="craftHasScratch" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
+                <div class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
+                  <input
+                    v-model.number="craft.wear"
+                    type="number" min="0" max="1" step="0.01"
+                    class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
+                  />
+                  <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random wear" @click="randomWear">🎲</button>
+                </div>
+                <div class="mt-2 flex items-center gap-2">
+                  <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
+                </div>
+                <div class="mt-1 text-right font-mono text-f9 text-muted-foreground">{{ (craft.wear ?? 0).toFixed(2) }} scratched</div>
+              </div>
+              <div
+                v-if="craftHasStatTrak"
+                class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+                :style="{ '--i': 5 }"
+              >
+                <div class="flex items-center justify-between">
+                  <span class="text-f10 uppercase tracking-cs1" :class="craft.stattrak ? 'text-[hsl(var(--tac-stattrak))]' : 'text-muted-foreground'">StatTrak™</span>
+                  <button
+                    role="switch"
+                    :aria-checked="craft.stattrak"
+                    class="relative h-5 w-9 flex-none rounded-full transition-colors"
+                    :class="craft.stattrak ? 'bg-[#e0a92e]' : 'bg-muted'"
+                    @click="setCraftStatTrak(!craft.stattrak)"
+                  >
+                    <span
+                      class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
+                      :class="craft.stattrak && 'translate-x-4'"
+                    ></span>
+                  </button>
+                </div>
+                <!-- The counter, read-only. Kills are the game server's to write:
+                     an editable count would let anyone claim any number. -->
+                <div v-if="craft.stattrak" class="mt-2 flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Kills</span>
+                  <span class="font-mono text-f13 tabular-nums text-foreground">{{ craftStatTrakCount().toLocaleString() }}</span>
+                </div>
+              </div>
+              <!-- SOUVENIR (cs2-lib 9.10): every painted gun can be one. Its
+                   stickers are an event's — two teams, the event, an autograph
+                   and the map — so switching it on hands the sticker slots to
+                   the panel below, and switching it off clears them. One quality
+                   in game: StatTrak goes off when this goes on, and back. -->
+              <div
+                v-if="craftHasSouvenir"
+                class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
+                :style="{ '--i': 5 }"
+              >
+                <div class="flex items-center justify-between">
+                  <span class="text-f10 uppercase tracking-cs1" :class="craft.souvenir ? 'text-[hsl(var(--tac-souvenir))]' : 'text-muted-foreground'">Souvenir</span>
+                  <button
+                    role="switch"
+                    :aria-checked="craft.souvenir"
+                    aria-label="Souvenir"
+                    class="relative h-5 w-9 flex-none rounded-full transition-colors"
+                    :class="craft.souvenir ? 'bg-[hsl(var(--tac-souvenir))]' : 'bg-muted'"
+                    @click="setCraftSouvenir(!craft.souvenir)"
+                  >
+                    <span
+                      class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
+                      :class="craft.souvenir && 'translate-x-4'"
+                    ></span>
+                  </button>
+                </div>
+                <SouvenirPanel
+                  v-if="craft.souvenir"
+                  class="mt-2.5"
+                  :item-id="craft.skin.id"
+                  :sticker-ids="craft.stickers.map((st) => st?.id ?? null)"
+                  :highlight-id="craft.charm?.highlight ?? null"
+                  @stickers="applySouvenirStickers"
+                  @charm="applySouvenirCharm"
                 />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random wear" @click="randomWear">🎲</button>
               </div>
-              <!-- Inset from the box (px-1) and spaced off the caption, so the
-                   thumb's glow at either end doesn't sit on the box edge or on
-                   the figures under it. The track is the ramp for THIS finish's
-                   range (wearGradient), not CS2's whole 0–1 scale. -->
-              <div class="mt-3 flex items-center gap-2 px-1">
-                <input
-                  v-model.number="craft.wear"
-                  type="range" :min="craftWearRange.min" :max="craftWearRange.max" step="0.0001"
-                  class="wear-range w-full"
-                  :style="{ background: wearGradient(craftWearRange.min, craftWearRange.max) }"
-                />
+              <!-- Music kits: the kit IS its sound, so the editor plays it — the
+                   full menu theme and, when the mount has it, the round-MVP
+                   anthem the game plays when you top a round. One volume for
+                   both, the same shared level as every other player. -->
+              <div
+                v-if="craftHasMusic"
+                class="animate-sheet-in flex flex-col gap-2 rounded-md bg-secondary/40 p-2.5"
+                :style="{ '--i': 6 }"
+              >
+                <div class="flex items-center justify-between">
+                  <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.preview', 'Preview') }}</span>
+                  <MusicVolume wide />
+                </div>
+                <div v-if="craft.skin.audio" class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.full_song', 'Full song') }}</span>
+                  <MusicPlayer :src="craft.skin.audio" :volume="false" class="min-w-0 flex-1" />
+                </div>
+                <div v-if="craft.skin.mvpAudio" class="flex items-center gap-2">
+                  <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.mvp', 'MVP') }}</span>
+                  <MusicPlayer :src="craft.skin.mvpAudio" :volume="false" class="min-w-0 flex-1" />
+                </div>
               </div>
-              <div class="mt-2 flex items-center justify-between px-1 font-mono text-f9 text-muted-foreground">
-                <!-- Only worth saying when it ISN'T the full range, which is
-                     most finishes — otherwise it reads as noise on the few that
-                     genuinely go 0.00–1.00. -->
-                <span v-if="craftWearRange.min > 0 || craftWearRange.max < 1" title="The floats this finish can have">
-                  Range {{ craftWearRange.min.toFixed(2) }}–{{ craftWearRange.max.toFixed(2) }}
-                </span>
-                <span v-else></span>
-                <span>{{ wearTier(craft.wear) }}</span>
-              </div>
-            </div>
-            <!-- A sticker's scratch. Same box and rhythm as the weapon's Wear
-                 above but NO tier caption: "Factory New" is a float's vocabulary
-                 and a sticker doesn't have one — it's just how scuffed it is.
-                 Mutually exclusive with that box in practice (nothing has both a
-                 float and a scratch), so they can share the slot. -->
-            <div v-if="craftHasScratch" class="animate-sheet-in rounded-md bg-secondary/40 p-2.5" :style="{ '--i': 4 }">
-              <div class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Wear</span>
-                <input
-                  v-model.number="craft.wear"
-                  type="number" min="0" max="1" step="0.01"
-                  class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 font-mono text-f13 outline-none transition-colors focus:border-[color:var(--acc)]"
-                />
-                <button class="grid h-9 w-9 flex-none place-items-center rounded-md border border-input text-f13 text-muted-foreground tac-action" title="Random wear" @click="randomWear">🎲</button>
-              </div>
-              <div class="mt-2 flex items-center gap-2">
-                <input v-model.number="craft.wear" type="range" min="0" max="1" step="0.0001" class="wear-range w-full" />
-              </div>
-              <div class="mt-1 text-right font-mono text-f9 text-muted-foreground">{{ (craft.wear ?? 0).toFixed(2) }} scratched</div>
-            </div>
-            <div
-              v-if="craftHasStatTrak"
-              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
-              :style="{ '--i': 5 }"
-            >
-              <div class="flex items-center justify-between">
-                <span class="text-f10 uppercase tracking-cs1" :class="craft.stattrak ? 'text-[hsl(var(--tac-stattrak))]' : 'text-muted-foreground'">StatTrak™</span>
-                <button
-                  role="switch"
-                  :aria-checked="craft.stattrak"
-                  class="relative h-5 w-9 flex-none rounded-full transition-colors"
-                  :class="craft.stattrak ? 'bg-[#e0a92e]' : 'bg-muted'"
-                  @click="setCraftStatTrak(!craft.stattrak)"
-                >
-                  <span
-                    class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
-                    :class="craft.stattrak && 'translate-x-4'"
-                  ></span>
-                </button>
-              </div>
-              <!-- The counter, read-only. Kills are the game server's to write:
-                   an editable count would let anyone claim any number. -->
-              <div v-if="craft.stattrak" class="mt-2 flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">Kills</span>
-                <span class="font-mono text-f13 tabular-nums text-foreground">{{ craftStatTrakCount().toLocaleString() }}</span>
-              </div>
-            </div>
-            <!-- SOUVENIR (cs2-lib 9.10): every painted gun can be one. Its
-                 stickers are an event's — two teams, the event, an autograph
-                 and the map — so switching it on hands the sticker slots to
-                 the panel below, and switching it off clears them. One quality
-                 in game: StatTrak goes off when this goes on, and back. -->
-            <div
-              v-if="craftHasSouvenir"
-              class="animate-sheet-in rounded-md bg-secondary/40 p-2.5"
-              :style="{ '--i': 5 }"
-            >
-              <div class="flex items-center justify-between">
-                <span class="text-f10 uppercase tracking-cs1" :class="craft.souvenir ? 'text-[hsl(var(--tac-souvenir))]' : 'text-muted-foreground'">Souvenir</span>
-                <button
-                  role="switch"
-                  :aria-checked="craft.souvenir"
-                  aria-label="Souvenir"
-                  class="relative h-5 w-9 flex-none rounded-full transition-colors"
-                  :class="craft.souvenir ? 'bg-[hsl(var(--tac-souvenir))]' : 'bg-muted'"
-                  @click="setCraftSouvenir(!craft.souvenir)"
-                >
-                  <span
-                    class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform"
-                    :class="craft.souvenir && 'translate-x-4'"
-                  ></span>
-                </button>
-              </div>
-              <SouvenirPanel
-                v-if="craft.souvenir"
-                class="mt-2.5"
-                :item-id="craft.skin.id"
-                :sticker-ids="craft.stickers.map((st) => st?.id ?? null)"
-                :highlight-id="craft.charm?.highlight ?? null"
-                @stickers="applySouvenirStickers"
-                @charm="applySouvenirCharm"
-              />
-            </div>
-            <!-- Music kits: the kit IS its sound, so the editor plays it — the
-                 full menu theme and, when the mount has it, the round-MVP
-                 anthem the game plays when you top a round. One volume for
-                 both, the same shared level as every other player. -->
-            <div
-              v-if="craftHasMusic"
-              class="animate-sheet-in flex flex-col gap-2 rounded-md bg-secondary/40 p-2.5"
-              :style="{ '--i': 6 }"
-            >
-              <div class="flex items-center justify-between">
-                <span class="text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.preview', 'Preview') }}</span>
-                <MusicVolume wide />
-              </div>
-              <div v-if="craft.skin.audio" class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.full_song', 'Full song') }}</span>
-                <MusicPlayer :src="craft.skin.audio" :volume="false" class="min-w-0 flex-1" />
-              </div>
-              <div v-if="craft.skin.mvpAudio" class="flex items-center gap-2">
-                <span class="w-16 flex-none text-f10 uppercase tracking-cs1 text-muted-foreground">{{ tr('inventory.music.mvp', 'MVP') }}</span>
-                <MusicPlayer :src="craft.skin.mvpAudio" :volume="false" class="min-w-0 flex-1" />
-              </div>
-            </div>
 
+            </div>
           </div>
         </div>
 

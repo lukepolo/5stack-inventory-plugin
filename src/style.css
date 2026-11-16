@@ -694,8 +694,8 @@
 [data-dock] aside .grid-cols-2 > [data-role="rail"] {
   height: calc((var(--dock-cell-h) - 8px) / 2) !important;
 }
-/* Nothing docks beside the grid now (a slot click opens Spotlight over it), so
-   the weapon columns take the whole pane instead of stopping at 460px. */
+/* A slot click opens Spotlight over the grid and nothing docks beside it, so
+   the weapon columns take the whole pane. */
 [data-dock] [data-role="column"] {
   max-width: none !important;
 }
