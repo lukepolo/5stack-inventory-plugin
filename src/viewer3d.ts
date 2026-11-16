@@ -3944,8 +3944,6 @@ export async function mountViewer(
       buildViewer(container, model, opts, signal, mounted),
     );
   } catch (e) {
-    // Before the canvas comes out: OrbitControls finds the document it listens
-    // on through the canvas's root node.
     for (const undo of mounted.undo.reverse()) {
       undo();
     }
@@ -5645,7 +5643,23 @@ async function buildViewer(
   // canvas is offscreen and shared, so pointer events must come from the
   // element the user is actually looking at.
   const controls = new OrbitControls(camera, view);
-  mounted.undo.push(() => controls.dispose());
+  // OrbitControls removes its document key listeners from the canvas's root
+  // node at dispose time. Once the host pane has left the page that root is the
+  // pane itself, so the listeners would stay on the document holding this
+  // viewer; take them off the root they went on. (Private names: if three
+  // renames them this does nothing.)
+  const controlsRoot = view.getRootNode();
+  const disposeControls = () => {
+    controls.dispose();
+    const keys = controls as unknown as { _interceptControlDown?: EventListener; _interceptControlUp?: EventListener };
+    if (keys._interceptControlDown) {
+      controlsRoot.removeEventListener("keydown", keys._interceptControlDown, { capture: true });
+    }
+    if (keys._interceptControlUp) {
+      controlsRoot.removeEventListener("keyup", keys._interceptControlUp, { capture: true });
+    }
+  };
+  mounted.undo.push(disposeControls);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   // autoRotate is NOT set here: it depends on whether this model turned out to
@@ -7976,6 +7990,10 @@ async function buildViewer(
           applyPaintSfx(THREE, m, ctx.paint, next.rm, ctx.weaponInputs?.uvScale ?? ctx.paint.uvScale),
         ),
       );
+      if (disposed) {
+        next.release();
+        return true;
+      }
     }
     paintWasIncomplete = !!next.incomplete;
     // Released only once the new one is on the materials: the composite cache is
@@ -16405,7 +16423,7 @@ async function buildViewer(
         charmMap.geo.dispose();
         charmMap.mat.dispose();
       }
-      controls.dispose();
+      disposeControls();
       // Drops this viewer's REFERENCE to the composite; the pair itself stays in
       // the renderer-wide LRU. That is the point of sharing the renderer —
       // reopening the same weapon now finds its composite already resident
