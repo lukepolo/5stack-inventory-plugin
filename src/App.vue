@@ -6196,10 +6196,12 @@ function spotLeave(el: Element, done: () => void) {
   const flyer = wrap?.querySelector("img");
   // The model can't fly, its picture can: swap to the picture in this frame
   // (no crossfade — a fading model left behind while its picture flew off).
-  const host3d = panel.querySelector<HTMLElement>("[data-spot-3d]");
-  if (host3d) {
-    host3d.style.transition = "none";
-    host3d.style.opacity = "0";
+  for (const sel of ["[data-spot-3d]", "[data-spot-frozen]"]) {
+    const el = panel.querySelector<HTMLElement>(sel);
+    if (el) {
+      el.style.transition = "none";
+      el.style.opacity = "0";
+    }
   }
   if (flyer) {
     flyer.style.transition = "none";
@@ -6299,7 +6301,13 @@ function spotEquipNow() {
     void spotEquip(p.length === 2 ? "both" : p[0]);
   }
 }
-const spotCanEquip = computed(() => spotShared.value || spotPending.value.length > 0);
+const spotCanEquip = computed(() => {
+  if (spotPinDefault.value) {
+    return true;
+  }
+  const inst = spotPinInst.value ?? cellInstance(selected.value) ?? null;
+  return !!inst && (spotShared.value || spotPending.value.length > 0);
+});
 const spotCanTeams = computed<Team[]>(() => {
   const inst = spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value) ?? null);
   const item = inst?.item as { teams?: string[]; model?: string } | null | undefined;
@@ -6347,6 +6355,7 @@ function spotPinClick(p: SpotPin) {
   dockHover.value = null;
   spotPin.value = p;
 }
+const spotPinId = (p: SpotPin | null) => (p ? ("inst" in p ? `i:${p.inst.id}` : "def") : null);
 async function spotEquip(side: "CT" | "T" | "both") {
   const pin = spotPin.value;
   const inst = pin ? ("inst" in pin ? pin.inst : null) : cellInstance(selected.value) ?? null;
@@ -6362,7 +6371,7 @@ async function spotEquip(side: "CT" | "T" | "both") {
     }
   } finally {
     spotBusy.value = false;
-    if (spotPin.value === pin) {
+    if (pin && spotPinId(spotPin.value) === spotPinId(pin)) {
       spotPin.value = null;
     }
   }
@@ -6571,7 +6580,11 @@ const invViewer = useViewerMount({
   },
 });
 const invTarget = computed<ViewerTarget | null>(() => (invPin.value?.item ? resolveViewerModelSync(invPin.value.item) ?? null : null));
-const inv3dKey = computed(() => (invPanelOn.value && spot3d.value && invTarget.value && invPin.value ? `${invTarget.value.model}|${invPin.value.id}` : ""));
+const inv3dKey = computed(() =>
+  invPanelOn.value && spot3d.value && invTarget.value && invPin.value
+    ? `${invTarget.value.model}|${invPin.value.id}|${renderSrc(invPin.value)}`
+    : "",
+);
 let inv3dMounted = "";
 let inv3dTimer: ReturnType<typeof setTimeout> | undefined;
 watch(inv3dKey, (key) => {
@@ -6614,7 +6627,9 @@ async function mountInv3d(key: string) {
       stattrak: inst.stattrak ? { count: inst.stattrak_count ?? 0 } : null,
       frameInset: { right: 0 },
       narrowFit: true,
-      yieldToBakes: true,
+      // Not on touch: there the idle release drops the whole composite cache,
+      // which would take the paint off a panel that is still drawing.
+      yieldToBakes: !isCoarse.value,
     }),
     () => {
       if (inv3dMounted === key) {
@@ -11068,6 +11083,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
             ></div>
             <canvas
               ref="spotFrozenEl"
+              data-spot-frozen
               aria-hidden="true"
               class="pointer-events-none absolute inset-0 h-full w-full"
               :class="spotFrozen ? 'opacity-100' : 'opacity-0 transition-opacity duration-[260ms] motion-reduce:transition-none'"
