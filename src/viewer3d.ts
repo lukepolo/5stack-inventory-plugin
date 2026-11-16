@@ -3938,13 +3938,14 @@ export async function mountViewer(
   // the exotic one — every remount (2D/3D flip, wear/seed edit, model switch)
   // cancels the build in flight, and on a cold cache that lands mid-load, long
   // after the canvas went in.
-  const mounted: { view?: HTMLCanvasElement } = {};
+  const mounted: { view?: HTMLCanvasElement; listeners?: AbortController } = {};
   try {
     return await queueBuild(opts?.priority ?? "interactive", opts?.signal, (signal) =>
       buildViewer(container, model, opts, signal, mounted),
     );
   } catch (e) {
     mounted.view?.remove();
+    mounted.listeners?.abort();
     throw e;
   }
 }
@@ -3958,7 +3959,7 @@ async function buildViewer(
   signal: AbortSignal,
   // Write-only channel back to mountViewer, so a build that dies after its
   // canvas is in the DOM can still have that canvas taken out again.
-  mounted: { view?: HTMLCanvasElement } = {},
+  mounted: { view?: HTMLCanvasElement; listeners?: AbortController } = {},
 ): Promise<ViewerHandle> {
   const mt = mountTimer();
   // A studio rig (every card bake among them) starts its HDRI download now, so
@@ -4083,6 +4084,10 @@ async function buildViewer(
   for (const stale of container.querySelectorAll("canvas")) stale.remove();
   container.appendChild(view);
   mounted.view = view;
+  // The container and window outlive the viewer, so what the build hangs on
+  // them goes with dispose(), or with mountViewer's catch when the build throws.
+  const hostListeners = new AbortController();
+  mounted.listeners = hostListeners;
 
   const scene = new THREE.Scene();
   // Prefiltered once for the whole app — see getSharedGL. Ambient stays tiny;
@@ -11594,6 +11599,9 @@ async function buildViewer(
   // on-screen viewer, and only the sticker/charm hover states need placement to
   // be enabled. `still` viewers are offscreen snapshot rigs with no user at all.
   const cursor = opts?.still ? null : createViewerCursor(container, el);
+  if (cursor) {
+    hostListeners.signal.addEventListener("abort", () => cursor.destroy(), { once: true });
+  }
   let orbiting = false;
   let panning = false;
   let shiftHeld = false;
@@ -11798,7 +11806,7 @@ async function buildViewer(
   // means first: a press that claims an attachment now disables the controls
   // before they ever see it.
   if (!opts?.still) {
-    container.addEventListener("pointerdown", onPointerDown, { capture: true });
+    container.addEventListener("pointerdown", onPointerDown, { capture: true, signal: hostListeners.signal });
     el.addEventListener("pointermove", onPointerMove);
     el.addEventListener("pointerup", onPointerUp);
     el.addEventListener("pointercancel", onPointerUp);
@@ -11812,10 +11820,10 @@ async function buildViewer(
     el.addEventListener("wheel", onCursorWheel, { passive: true });
     // Releases land wherever the pointer ended up — OrbitControls captures to
     // its own target, so a listener on the canvas would miss half of them.
-    window.addEventListener("pointerup", onCursorUp);
-    window.addEventListener("pointercancel", onCursorUp);
-    window.addEventListener("keydown", onCursorKey);
-    window.addEventListener("keyup", onCursorKey);
+    window.addEventListener("pointerup", onCursorUp, { signal: hostListeners.signal });
+    window.addEventListener("pointercancel", onCursorUp, { signal: hostListeners.signal });
+    window.addEventListener("keydown", onCursorKey, { signal: hostListeners.signal });
+    window.addEventListener("keyup", onCursorKey, { signal: hostListeners.signal });
   }
 
   // ---- StatTrak module ---------------------------------------------------------
@@ -16353,8 +16361,8 @@ async function buildViewer(
       composer?.dispose();
       composer = null;
       bloomPass = null;
+      hostListeners.abort();
       if (!opts?.still) {
-        container.removeEventListener("pointerdown", onPointerDown, { capture: true });
         el.removeEventListener("pointermove", onPointerMove);
         el.removeEventListener("pointerup", onPointerUp);
         el.removeEventListener("pointercancel", onPointerUp);
@@ -16365,17 +16373,12 @@ async function buildViewer(
         el.removeEventListener("pointerenter", onCursorEnter);
         el.removeEventListener("pointerleave", onCursorLeave);
         el.removeEventListener("wheel", onCursorWheel);
-        window.removeEventListener("pointerup", onCursorUp);
-        window.removeEventListener("pointercancel", onCursorUp);
-        window.removeEventListener("keydown", onCursorKey);
-        window.removeEventListener("keyup", onCursorKey);
       }
       cancelAnimationFrame(hoverRaf);
       cancelAnimationFrame(dragRaf);
       dragPending = hoverPending = null;
       // The decal projection proxy carries a geometry of its own between builds.
       proxyMesh.mesh?.geometry.dispose();
-      cursor?.destroy();
       for (const slot of new Set([...decals.keys(), ...liveMesh.keys()])) removeDecal(slot);
       removeCharm();
       removeStatTrak();
