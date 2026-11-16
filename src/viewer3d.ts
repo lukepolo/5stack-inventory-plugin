@@ -3797,6 +3797,13 @@ export interface ViewerOpts {
    * aspect once the pane itself is.
    */
   narrowFit?: boolean;
+  /**
+   * An onscreen viewer that does NOT hold back background card bakes. For a
+   * preview that stays up while the page it sits on is still baking its tiles
+   * (the Inventory page's panel); without this every unbaked tile waits until
+   * the preview closes.
+   */
+  yieldToBakes?: boolean;
   stickers?: StickerPlacement[];
   /**
    * Patches on an AGENT, slot-ordered, by inventory image — `kind: "agent"`.
@@ -15661,9 +15668,12 @@ async function buildViewer(
   // Only onscreen viewers hold back background bakes — a `still` viewer IS a
   // bake, and counting it would deadlock the queue against itself.
   let released = !!opts?.still;
+  const holdsBakes = !released && !opts?.yieldToBakes;
   if (!released) {
-    liveViewers++;
     drawingViewers.push(screen);
+  }
+  if (holdsBakes) {
+    liveViewers++;
     // Cancel any in-flight settle: the user came back inside the window, so the
     // wait restarts rather than expiring under a viewer that is now onscreen.
     clearTimeout(idleTimer);
@@ -15678,7 +15688,9 @@ async function buildViewer(
     if (released) return;
     released = true;
     leaveScreen();
-    releaseViewer();
+    if (holdsBakes) {
+      releaseViewer();
+    }
   };
 
   const handle: ViewerHandle = {

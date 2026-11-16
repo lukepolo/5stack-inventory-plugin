@@ -111,7 +111,6 @@ import Tooltip from "./components/Tooltip.vue";
 import { MDEBUG, mdebug, setMdebugAmbient, traceLayer } from "./mdebug";
 import ItemArt from "./components/ItemArt.vue";
 import ItemName from "./components/ItemName.vue";
-import SlotStatus from "./components/SlotStatus.vue";
 import WearBar from "./components/WearBar.vue";
 import ItemTile from "./components/ItemTile.vue";
 import MusicPlayer from "./components/MusicPlayer.vue";
@@ -140,7 +139,7 @@ import ItemBadges from "./components/ItemBadges.vue";
 const PatternScoreRail = defineAsyncComponent(() => import("./components/PatternScoreRail.vue"));
 import { SCAN_READ_SIZE } from "./patternScan";
 import { belowContainedArt } from "./containedArt";
-import { defaultEquipSides } from "./teamSides";
+import { defaultEquipSides, onEverySide } from "./teamSides";
 import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
 import ViewerControls from "./components/ViewerControls.vue";
 import ItemStage from "./components/ItemStage.vue";
@@ -151,7 +150,6 @@ import ViewerSettingsButton from "./components/ViewerSettingsButton.vue";
 import StageTabs from "./components/StageTabs.vue";
 import PillTabs from "./components/PillTabs.vue";
 import CollapseTabs from "./components/CollapseTabs.vue";
-import SlideReveal from "./components/SlideReveal.vue";
 import StickerRow from "./components/StickerRow.vue";
 import UndoToast from "./components/UndoToast.vue";
 import CraftDrawer from "./components/CraftDrawer.vue";
@@ -5930,7 +5928,11 @@ function dockCardHover(e: PointerEvent) {
     return;
   }
   const src = img.currentSrc || img.src;
-  if (dockHover.value?.src === src) return;
+  if (dockHover.value?.src === src) {
+    clearTimeout(spotHoverTimer);
+    spotHoverCard = card;
+    return;
+  }
   const name = card.querySelector(".font-medium, .font-semibold")?.textContent?.trim() ?? "";
   const edge = (card as HTMLElement).style.borderBottomColor || card.querySelector<HTMLElement>('[style*="border-bottom"]')?.style.borderBottomColor;
   const next = { src, name, rarity: edge || null };
@@ -6057,8 +6059,6 @@ const spotFacts = computed(() => cellFacts(selected.value));
 const dockPreviewing = computed(() => !!dockHover.value && !dockHover.value.equipped);
 const dockEquipped = ref(false);
 let dockEquippedTimer: ReturnType<typeof setTimeout> | undefined;
-// The cell's own source, drawn with a plain eager <img>: ItemArt is lazy and
-// decodes async, which left the stage blank for the first frames of the flight.
 type SpotPin = { inst: InventoryItem } | { def: () => unknown };
 const spotPin = shallowRef<SpotPin | null>(null);
 const spotPinInst = computed(() => (spotPin.value && "inst" in spotPin.value ? spotPin.value.inst : null));
@@ -6072,6 +6072,8 @@ const spotPinEquipped = computed(() =>
 const spotPinPreviewing = computed(() => !!spotPin.value && !spotPinEquipped.value);
 const spotPendingPick = ref<{ key: string; teams: Team[] } | null>(null);
 const spotBusy = ref(false);
+// The cell's own source, drawn with a plain eager <img>: ItemArt is lazy and
+// decodes async, which left the stage blank for the first frames of the flight.
 const spotSrc = computed(() => {
   if (spotPinInst.value) {
     return renderSrc(spotPinInst.value);
@@ -6146,7 +6148,7 @@ function spotEnter(el: Element, done: () => void) {
   if (reducedMotion.value) return done();
   for (const part of spotParts(panel)) {
     const spot = part.dataset.spot;
-    const lifts = spot === "head" || spot === "foot";
+    const lifts = spot === "head" || spot === "foot" || spot === "bar";
     part.animate(
       lifts ? [{ opacity: 0, transform: "translateY(8px)" }, {}] : [{ opacity: 0 }, {}],
       {
@@ -6185,6 +6187,7 @@ function spotEnter(el: Element, done: () => void) {
 function spotLeave(el: Element, done: () => void) {
   const panel = el as HTMLElement;
   dockStopFlight();
+  unfreezeSpot3d();
   if (reducedMotion.value) return done();
   for (const part of spotParts(panel)) {
     part.animate([{}, { opacity: 0 }], { duration: 160, easing: "ease-in", fill: "forwards" });
@@ -6200,7 +6203,7 @@ function spotLeave(el: Element, done: () => void) {
   }
   if (flyer) {
     flyer.style.transition = "none";
-    flyer.classList.remove("opacity-0");
+    flyer.classList.remove("opacity-0", "spot-2d-out");
     if (spotSrc.value && flyer.getAttribute("src") !== spotSrc.value) flyer.src = spotSrc.value;
   }
   const img = view.value === "grid" ? dockCellImg(selected.value) : null;
@@ -6253,10 +6256,21 @@ function dockTileClick(inst: InventoryItem) {
 watch([selected, spotlight, team], () => {
   spotPin.value = null;
 });
+// An edited item replaces its pinned snapshot; a deleted one clears the pin.
+watch(inventory, (list) => {
+  const pinned = spotPinInst.value;
+  if (!pinned) {
+    return;
+  }
+  const fresh = list.find((i) => String(i.id) === String(pinned.id));
+  if (!fresh) {
+    spotPin.value = null;
+  } else if (fresh !== pinned) {
+    spotPin.value = { inst: fresh };
+  }
+});
 const spotSideKey = computed(() => `${selected.value}|${team.value}|${spotPinInst.value?.id ?? (spotPinDefault.value ? "def" : "eq")}`);
-// The chips show where the item already is (filled) and where Equip will put it
-// (amber). Equip's sides default to your team if it isn't there yet, else the
-// side it is missing, so Equip stays live until it is on every side it can be.
+// The chips: filled where the item is, amber where Equip will put it.
 function pendingDefault(can: Team[], on: Team[]): Team[] {
   return defaultEquipSides(can, on, team.value);
 }
@@ -6267,9 +6281,13 @@ const spotPending = computed<Team[]>(() => {
 function spotPickPending(teams: Team[]) {
   spotPendingPick.value = { key: spotSideKey.value, teams };
 }
-const spotShared = computed(() => isShared(selected.value) || spotPinDefault.value);
+// No chips where there is nothing to pick a side for: shared slots, a default,
+// and an unpinned default occupant (the other side's row is a different gun).
+const spotShared = computed(
+  () => isShared(selected.value) || spotPinDefault.value || (!spotPin.value && !cellInstance(selected.value)),
+);
 const spotDone = computed(() =>
-  spotShared.value ? spotEquippedOn.value.includes(team.value) : spotCanTeams.value.every((t) => spotEquippedOn.value.includes(t)),
+  spotShared.value ? spotEquippedOn.value.includes(team.value) : onEverySide(spotCanTeams.value, spotEquippedOn.value),
 );
 function spotEquipNow() {
   if (spotShared.value) {
@@ -6297,7 +6315,10 @@ const spotEquippedOn = computed<Team[]>(() => {
   }
   return (["CT", "T"] as Team[]).filter((t) => !isSkinned(rowFor(pos, t)));
 });
-const spotCanEdit = computed(() => !!(spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value))));
+const spotCanEdit = computed(() => {
+  const inst = spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value) ?? null);
+  return !!inst && (isReadOnly(inst) || isCustomizable(inst.item));
+});
 const spotEditLabel = computed(() => {
   const inst = spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value) ?? null);
   return inst && isReadOnly(inst) ? "Craft a copy" : "Edit";
@@ -6341,7 +6362,9 @@ async function spotEquip(side: "CT" | "T" | "both") {
     }
   } finally {
     spotBusy.value = false;
-    spotPin.value = null;
+    if (spotPin.value === pin) {
+      spotPin.value = null;
+    }
   }
 }
 // A colour list (a sticker's nineteen colours) opens with its pictures already
@@ -6518,7 +6541,7 @@ function invPickPending(teams: Team[]) {
   invPendingPick.value = { key: `${invPin.value?.id ?? ""}|${team.value}`, teams };
 }
 const invDone = computed(() =>
-  invShared.value ? invEquippedOn.value.length > 0 : invCanTeams.value.every((t) => invEquippedOn.value.includes(t)),
+  invShared.value ? invEquippedOn.value.length > 0 : onEverySide(invCanTeams.value, invEquippedOn.value),
 );
 const invBusy = ref(false);
 async function invEquipNow() {
@@ -6591,6 +6614,7 @@ async function mountInv3d(key: string) {
       stattrak: inst.stattrak ? { count: inst.stattrak_count ?? 0 } : null,
       frameInset: { right: 0 },
       narrowFit: true,
+      yieldToBakes: true,
     }),
     () => {
       if (inv3dMounted === key) {
@@ -6624,9 +6648,15 @@ const spotTarget = computed<ViewerTarget | null>(() => {
   const key = occupantModel(selected.value);
   return key ? { model: key, kind: "weapon" } : null;
 });
+// Its render URL changes with an edit (wear, pattern, a rebake), so a saved
+// edit remounts the model; equipping the item on show keeps the same URL.
+const spot3dLook = computed(() => {
+  const inst = spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value) ?? null);
+  return inst ? renderSrc(inst) : "";
+});
 const spot3dKey = computed(() => {
   const t = spotTarget.value;
-  return t && spot3d.value ? `${t.model}|${dockShownId.value}|${team.value}` : "";
+  return t && spot3d.value ? `${t.model}|${dockShownId.value}|${team.value}|${spot3dLook.value}` : "";
 });
 const dockShow3d = computed(() => spot3dReady.value && !!spot3dKey.value && !dockHover.value);
 const spot3dLoading = computed(
@@ -6708,12 +6738,23 @@ function freezeSpot3d() {
   ctx.drawImage(view, 0, 0);
   spotFrozen.value = true;
   clearTimeout(spotFrozenTimer);
-  spotFrozenTimer = setTimeout(() => (spotFrozen.value = false), 200);
+  spotFrozenTimer = setTimeout(unfreezeSpot3d, 200);
+}
+// Fades the held frame, then lets its full-size bitmap go.
+function unfreezeSpot3d() {
+  clearTimeout(spotFrozenTimer);
+  spotFrozen.value = false;
+  spotFrozenTimer = setTimeout(() => {
+    const out = spotFrozenEl.value;
+    if (out && !spotFrozen.value) {
+      out.width = 0;
+      out.height = 0;
+    }
+  }, 300);
 }
 watch(spot3dReady, (ready) => {
   if (ready) {
-    clearTimeout(spotFrozenTimer);
-    spotFrozen.value = false;
+    unfreezeSpot3d();
   }
 });
 async function mountSpot3d(key: string) {
@@ -8202,6 +8243,13 @@ const equipSide = computed<EquipSide>(() => {
   const ok = (v: EquipSide) => opts.some((o) => o.value === v && !o.disabled);
   const pick = equipSidePick.value;
   if (pick && pick.key === equipSideKey.value && ok(pick.side)) return pick.side;
+  // Viewing an item, Equip aims at a side it is missing (see defaultEquipSides).
+  if (viewOnly.value) {
+    const missing = defaultEquipSides(modalTeams.value, modalEquippedOn.value, team.value);
+    if (missing.length === 1 && ok(missing[0])) {
+      return missing[0];
+    }
+  }
   // The side you picked before choosing the item: crafting from the CT
   // loadout equips on CT. It used to default to Both wherever both sides could
   // hold the item, which put a CT pick on T as well unless you caught the
@@ -8221,6 +8269,9 @@ const modalEquippedOn = computed<Team[]>(() => {
   const eq = (craftInst.value as { equipped?: { team: Team }[] } | null | undefined)?.equipped ?? [];
   return (["CT", "T"] as Team[]).filter((t) => eq.some((e) => e.team === t));
 });
+const modalOnEverySide = computed(
+  () => viewOnly.value && modalTeams.value.length > 0 && onEverySide(modalTeams.value, modalEquippedOn.value),
+);
 const modalPending = computed<Team[]>(() => (equipSide.value === "both" ? ["CT", "T"] : [equipSide.value as Team]));
 function modalPickTeams(teams: Team[]) {
   if (teams.length) {
@@ -9132,6 +9183,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onGlobalKey);
   teardownViewer();
   teardownModalViewer();
+  spotViewer.teardown();
+  invViewer.teardown();
   closeLoadout3d();
   // preview3d was the one viewer NOT torn down here — it relied on
   // watch([craft, picker]) firing, which unmount does not do. A live WebGL
@@ -10019,21 +10072,13 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
       <button
         v-if="(view === 'grid' || view === 'focus') && isCompact"
         class="tac-action touch-hit flex items-center gap-1.5 rounded-lg border text-f11 font-semibold uppercase tracking-wider"
-        :class="[isCompact ? 'order-6 h-8 px-2' : 'h-9 px-3.5', view === 'focus' ? 'tac-on' : 'border-border text-muted-foreground']"
+        :class="['order-6 h-8 px-2', view === 'focus' ? 'tac-on' : 'border-border text-muted-foreground']"
         :title="view === 'focus' ? 'Focused' : 'Focus'"
         @click="go(view === 'focus' ? '/' : '/focus')"
       >
         <!-- Icon-only on compact: the label costs ~54px of a ~376px header,
              and the crosshair plus its active accent already carry the state. -->
         <Crosshair class="h-3.5 w-3.5" />
-        <!-- "Focus" → "Focused": the suffix slides open rather than appearing.
-             It used to print one word or the other, so engaging focus grew the
-             button by two letters with no transition and shoved the value chip
-             beside it. -->
-        <span v-if="!isCompact" class="flex">
-          <span>Focus</span>
-          <SlideReveal :open="view === 'focus'">ed</SlideReveal>
-        </span>
       </button>
       <!-- Its own row on compact: rows one and two are already full at 376px,
            so anywhere else it pushes the screen tabs or the tools onto a new line. -->
@@ -10544,7 +10589,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
                   class="ml-auto"
                   :busy="invBusy"
                   :done="invDone"
-                  :can-edit="true"
+                  :can-edit="isReadOnly(invPin) || isCustomizable(invPin.item)"
                   :can-equip="!!invPos && (invShared || invPending.length > 0)"
                   :edit-label="isReadOnly(invPin) ? 'Craft a copy' : 'Edit'"
                   @equip="invEquipNow"
@@ -11005,7 +11050,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
                 <img
                   :src="dockHover ? dockHover.src : spotSrc"
                   alt=""
-                  :class="cn('h-full min-h-0 w-[88%] object-contain', 'spot-2d', !dockHover && !isSkinned(focusRow) && 'opacity-50', dockShow3d && 'spot-2d-out')"
+                  :class="cn('h-full min-h-0 w-[88%] object-contain', 'spot-2d', !dockHover && !spotPinInst && (spotPinDefault || !isSkinned(focusRow)) && 'opacity-50', dockShow3d && 'spot-2d-out')"
                   @load="artLanded($event); spot3dLoading && placeSpotLoading()"
                   @error="artLanded"
                   style="filter: drop-shadow(0 22px 30px rgba(0,0,0,0.55))"
@@ -11067,6 +11112,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
             </div>
           </div>
           <div
+            data-spot="bar"
             class="relative z-[3] flex items-center gap-2 border-t border-border bg-card/60 px-6 py-3 transition-opacity duration-150"
             :class="dockPreviewing && 'pointer-events-none opacity-40'"
           >
@@ -12842,11 +12888,11 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
           <button
             v-if="viewOnly && canEdit"
             class="tac-cta flex h-9 items-center gap-1.5 rounded-md border border-transparent px-4 text-f11 font-bold uppercase tracking-wider disabled:cursor-not-allowed disabled:opacity-40"
-            :disabled="!craftEquipTarget"
+            :disabled="!craftEquipTarget || modalOnEverySide"
             :title="craftEquipTarget ? 'Equip on ' + equipTeams.join(' + ') : 'This item is applied to things, not equipped'"
             @click="craftViewEquip"
           >
-            Equip
+            {{ modalOnEverySide ? "Equipped" : "Equip" }}
           </button>
           <!-- Signed out the editor stays fully live — only the commit is off.
                Disabled-with-a-reason rather than hidden, so it's clear up front
