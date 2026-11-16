@@ -9271,7 +9271,9 @@ async function buildViewer(
     return c;
   }
   function beginCharmFade() {
-    if (!charm || opts?.still || opts?.fromCard || reducedMotion.value) return;
+    if (!charm || opts?.still || opts?.fromCard || reducedMotion.value) {
+      return;
+    }
     const copies = new Map<import("three").Material, import("three").Material>();
     const own = (mesh: import("three").Object3D, m: import("three").Material) => {
       if (mesh === charm!.line || mesh.userData.charmTuned === m) return m;

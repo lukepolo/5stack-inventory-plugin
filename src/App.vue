@@ -6615,7 +6615,7 @@ async function mountInv3d(key: string) {
   }
   inv3dMounted = key;
   const isWeapon = (t.kind ?? "weapon") === "weapon";
-  const fromCard = CARD_BAKE_KINDS.has(t.kind ?? "weapon");
+  const fromCard = opensOnCard(t.kind);
   invFromCard.value = fromCard;
   await invViewer.mount(
     t.model,
@@ -6638,24 +6638,16 @@ async function mountInv3d(key: string) {
       yieldToBakes: !isCoarse.value,
       ...(fromCard ? { fromCard: true } : {}),
     }),
-    async () => {
-      if (inv3dMounted !== key) {
+    async (h) => {
+      const live = () => inv3dMounted === key && invViewer.current() === h;
+      if (!live()) {
         return;
       }
-      if (fromCard) {
-        await cardMatchCharm(invViewer.current());
-        if (inv3dMounted !== key) {
-          return;
-        }
+      const matched = fromCard ? await openOnCard(h, live, () => invStageEl.value, renderSrc(inst)).catch(() => false) : false;
+      if (live()) {
+        invFromCard.value = matched;
+        inv3dReady.value = true;
       }
-      const rect = fromCard ? await cardRectWhenLoaded(() => invStageEl.value, renderSrc(inst)) : null;
-      if (inv3dMounted !== key) {
-        return;
-      }
-      if (rect) {
-        invViewer.current()?.openOn(rect, CARD_MATCH_HOLD_MS, CARD_MATCH_EASE_MS);
-      }
-      inv3dReady.value = true;
     },
   );
 }
@@ -6833,13 +6825,27 @@ async function cardRectWhenLoaded(stage: () => HTMLElement | null, wanted: strin
     await new Promise((res) => requestAnimationFrame(res));
   }
 }
-function cardMatchCharm(h: { charmReady: () => Promise<void> } | null | undefined): Promise<unknown> {
-  return Promise.race([h?.charmReady() ?? Promise.resolve(), new Promise((r) => setTimeout(r, 800))]);
-}
-// The model opens on the card's silhouette, holds a beat, then eases out to its
-// own framing.
 const CARD_MATCH_HOLD_MS = 200;
 const CARD_MATCH_EASE_MS = 600;
+// Pets are left out: their follow camera is pulled off the pet while a flight
+// runs, and their live pose never matches the card anyway.
+function opensOnCard(kind: ViewerKind | undefined): boolean {
+  return CARD_BAKE_KINDS.has(kind ?? "weapon") && kind !== "pet";
+}
+// The charm is part of the outline, so it is measured once it hangs. `live` is
+// checked after every wait: the handle, not just the key, since A→B→A reuses
+// the key while the first A's callback is still waiting.
+async function openOnCard(h: ViewerHandle, live: () => boolean, stage: () => HTMLElement | null, src: string): Promise<boolean> {
+  await Promise.race([h.charmReady().catch(() => {}), new Promise((r) => setTimeout(r, 800))]);
+  if (!live()) {
+    return false;
+  }
+  const rect = await cardRectWhenLoaded(stage, src);
+  if (!rect || !live()) {
+    return false;
+  }
+  return h.openOn(rect, CARD_MATCH_HOLD_MS, CARD_MATCH_EASE_MS);
+}
 async function mountSpot3d(key: string) {
   const t = spotTarget.value;
   if (!t || key !== spot3dKey.value) return;
@@ -6850,7 +6856,10 @@ async function mountSpot3d(key: string) {
   const att: AttachSource | null = pin ?? (pinDef ? null : focusAttachments.value);
   const isWeapon = (t.kind ?? "weapon") === "weapon";
   const cardInst = pin ?? (pinDef ? null : cellInstance(selected.value) ?? null);
-  const fromCard = !!cardInst && CARD_BAKE_KINDS.has(t.kind ?? "weapon");
+  // Only when the stage shows that card: an unpinned knife, glove or pet slot
+  // shows the catalog picture instead.
+  const cardSrc = cardInst && artUrl(spotSrc.value) === artUrl(renderSrc(cardInst)) ? renderSrc(cardInst) : null;
+  const fromCard = !!cardSrc && opensOnCard(t.kind);
   spotFromCard.value = fromCard;
   await spotViewer.mount(
     t.model,
@@ -6870,25 +6879,16 @@ async function mountSpot3d(key: string) {
       narrowFit: true,
       ...(fromCard ? { fromCard: true } : {}),
     }),
-    async () => {
-      if (spot3dMounted !== key) {
+    async (h) => {
+      const live = () => spot3dMounted === key && spotViewer.current() === h;
+      if (!live()) {
         return;
       }
-      // The charm is part of the outline, so measure once it hangs.
-      if (fromCard) {
-        await cardMatchCharm(spotViewer.current());
-        if (spot3dMounted !== key) {
-          return;
-        }
+      const matched = fromCard && cardSrc && !dockHover.value ? await openOnCard(h, live, () => spotStageEl.value, cardSrc).catch(() => false) : false;
+      if (live()) {
+        spotFromCard.value = matched;
+        spot3dReady.value = true;
       }
-      const rect = fromCard && cardInst && !dockHover.value ? await cardRectWhenLoaded(() => spotStageEl.value, renderSrc(cardInst)) : null;
-      if (spot3dMounted !== key) {
-        return;
-      }
-      if (rect) {
-        spotViewer.current()?.openOn(rect, CARD_MATCH_HOLD_MS, CARD_MATCH_EASE_MS);
-      }
-      spot3dReady.value = true;
     },
   );
 }

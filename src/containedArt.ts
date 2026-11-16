@@ -3,7 +3,6 @@
 // on top of that, evenly, so only its WIDTH still says how big the item is.
 export const CARD_CROP_MARGIN = 0.03;
 
-// The rect an object-contain picture is actually drawn in, centred in its box.
 export function containedRect(
   img: { top: number; left: number; width: number; height: number },
   natural: { width: number; height: number },
