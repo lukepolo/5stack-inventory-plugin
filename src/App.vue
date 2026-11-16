@@ -6723,7 +6723,10 @@ watch([spot3dKey, dockOpening], ([key, opening]) => {
     return;
   }
   if (opening || key === spot3dMounted) return;
-  if (spotlight.value && spot3dMounted && spot3dReady.value) {
+  // Only a model that is on screen is held: under a hover preview the model is
+  // faded out, and holding it put the previous skin back up for a moment.
+  const host = spotHostEl.value;
+  if (spotlight.value && spot3dMounted && spot3dReady.value && host && Number(getComputedStyle(host).opacity) > 0.5) {
     freezeSpot3d();
   }
   spot3dReady.value = false;
