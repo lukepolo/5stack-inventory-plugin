@@ -40,13 +40,16 @@ check("plaintext panel is refused", allowed("http://5stack.gg"), false);
 check("opaque origin is refused", allowed("null"), false);
 check("bare TLD is never a parent", allowed("https://gg"), false);
 check("a child of this host is not a parent", allowed("https://x.inventory.5stack.gg"), false);
+check("only the direct parent counts", allowed("https://example.gg", "inventory.cs.example.gg"), false);
+check("direct parent of a nested host", allowed("https://cs.example.gg", "inventory.cs.example.gg"), true);
 check("localhost refused in production", allowed("http://localhost:3000"), false);
 check("IP host has no parents", allowed("https://4.15", "10.42.4.15"), false);
 
 // The 5stack API's own variables widen it the same way they widen the API.
-const web = originPolicyFromEnv({ NODE_ENV: "production", WEB_DOMAIN: "5stack.gg" });
-check("WEB_DOMAIN: sibling inside the cookie scope", allowed("https://other.5stack.gg", HOST, web), true);
-check("WEB_DOMAIN: still https only", allowed("http://other.5stack.gg", HOST, web), false);
+const web = originPolicyFromEnv({ NODE_ENV: "production", WEB_DOMAIN: "5stack.gg", AUTH_COOKIE_DOMAIN: ".5stack.gg" });
+check("WEB_DOMAIN: the panel itself", allowed("https://5stack.gg", "inventory-x.example.com", web), true);
+check("WEB_DOMAIN: a sibling inside the cookie scope is refused", allowed("https://tv.5stack.gg", HOST, web), false);
+check("WEB_DOMAIN: still https only", allowed("http://5stack.gg", "inventory-x.example.com", web), false);
 const extra = originPolicyFromEnv({ NODE_ENV: "production", EXTRA_CORS_ORIGINS: "https://panel.example.net, https://x.trycloudflare.com" });
 check("EXTRA_CORS_ORIGINS: named panel", allowed("https://panel.example.net", HOST, extra), true);
 check("EXTRA_CORS_ORIGINS: second entry", allowed("https://x.trycloudflare.com", HOST, extra), true);

@@ -9,15 +9,17 @@
 // an administrator there.
 //
 // The rule mirrors the 5stack API's own isAllowedOrigin (api/src/utilities):
+// exact origins only, never everything under the session cookie's domain.
 //
-//  - THIS HOST, and any PARENT DOMAIN of it. That is the panel in every
-//    working deployment, with no configuration: the session cookie is scoped to
-//    `.${WEB_DOMAIN}`, so the plugin only ever receives it on a subdomain of the
-//    panel (see the panel's inventory ingress.yaml). inventory.5stack.gg is
-//    reached from 5stack.gg; a page on some-other.5stack.gg is not let in.
-//  - Anything the operator names, for layouts outside that: WEB_DOMAIN and
-//    AUTH_COOKIE_DOMAIN (the API's own variables — anything https inside the
-//    cookie's scope), FIVESTACK_PANEL_URL, and EXTRA_CORS_ORIGINS.
+//  - THIS HOST, and its DIRECT PARENT. That is the panel in the default layout,
+//    with no configuration: the session cookie is scoped to `.${WEB_DOMAIN}`,
+//    so the plugin only ever receives it on a subdomain of the panel (see the
+//    panel's inventory ingress.yaml). inventory.5stack.gg is reached from
+//    5stack.gg; a page on some-other.5stack.gg, or on a grandparent, is not.
+//  - Origins the operator names, for layouts outside that: https://WEB_DOMAIN,
+//    FIVESTACK_PANEL_URL, and EXTRA_CORS_ORIGINS. AUTH_COOKIE_DOMAIN does not
+//    widen anything: every other host under the cookie domain (tv., demos.,
+//    another plugin) would otherwise act as the player.
 //  - localhost, outside production.
 //
 // Enforced twice in main.ts, because CORS alone is not a CSRF defence: CORS
@@ -31,8 +33,6 @@
 export interface OriginPolicy {
   /** Exact origins, scheme and all — the form a browser sends. */
   named: Set<string>;
-  /** Bare domain; anything https at or under it is allowed. "" for none. */
-  cookieDomain: string;
   allowLocalhost: boolean;
 }
 
@@ -52,7 +52,6 @@ export function originPolicyFromEnv(env: Record<string, string | undefined> = pr
   for (const o of (env.EXTRA_CORS_ORIGINS ?? "").split(",")) add(o.trim());
   return {
     named,
-    cookieDomain: (env.AUTH_COOKIE_DOMAIN || (web ? `.${web}` : "")).replace(/^\./, "").toLowerCase(),
     allowLocalhost: env.NODE_ENV !== "production",
   };
 }
@@ -91,12 +90,10 @@ export function isAllowedOrigin(policy: OriginPolicy, origin: string | undefined
   // http.
   if (url.protocol !== "https:") return false;
   if (host && name === host) return true;
-  // A PARENT of this host: the panel. Two labels at least, so a bare TLD never
-  // counts — and on the dot, so `evil-5stack.gg` is not a parent of anything.
-  // Not for a host reached by IP, where "parent" means nothing (4.15 / 10.42.4.15).
-  if (host && name.includes(".") && !/^[\d.]+$/.test(host) && host.endsWith(`.${name}`)) return true;
-  const domain = policy.cookieDomain;
-  return !!domain && (name === domain || name.endsWith(`.${domain}`));
+  // The DIRECT PARENT of this host: the panel. Two labels at least, so a bare
+  // TLD never counts. Not for a host reached by IP, where "parent" means
+  // nothing (4.15 / 10.42.4.15).
+  return !!host && name.includes(".") && !/^[\d.]+$/.test(host) && host.slice(host.indexOf(".") + 1) === name;
 }
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
