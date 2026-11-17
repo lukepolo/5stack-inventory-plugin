@@ -138,7 +138,7 @@ import { DEFAULT_PET_CLIP, loadPetClipIndex, petWanderPool } from "./petAnim";
 import ItemBadges from "./components/ItemBadges.vue";
 const PatternScoreRail = defineAsyncComponent(() => import("./components/PatternScoreRail.vue"));
 import { SCAN_READ_SIZE } from "./patternScan";
-import { belowContainedArt } from "./containedArt";
+import { belowContainedArt, CARD_CROP_MARGIN, containedRect } from "./containedArt";
 import { defaultEquipSides, onEverySide } from "./teamSides";
 import { useRenderWindow, WINDOW_FIRST } from "./composables/useRenderWindow";
 import ViewerControls from "./components/ViewerControls.vue";
@@ -6571,6 +6571,10 @@ async function invEquipNow() {
   }
 }
 const invHostEl = ref<HTMLElement | null>(null);
+const invStageEl = ref<HTMLElement | null>(null);
+// Set when the mount starts, so the model's hidden state already has no
+// settle blur to fade out of when it opens on its card.
+const invFromCard = ref(false);
 const inv3dReady = ref(false);
 const invViewer = useViewerMount({
   label: "invpanel",
@@ -6611,6 +6615,8 @@ async function mountInv3d(key: string) {
   }
   inv3dMounted = key;
   const isWeapon = (t.kind ?? "weapon") === "weapon";
+  const fromCard = opensOnCard(t.kind);
+  invFromCard.value = fromCard;
   await invViewer.mount(
     t.model,
     async () => ({
@@ -6630,9 +6636,16 @@ async function mountInv3d(key: string) {
       // Not on touch: there the idle release drops the whole composite cache,
       // which would take the paint off a panel that is still drawing.
       yieldToBakes: !isCoarse.value,
+      ...(fromCard ? { fromCard: true } : {}),
     }),
-    () => {
-      if (inv3dMounted === key) {
+    async (h) => {
+      const live = () => inv3dMounted === key && invViewer.current() === h;
+      if (!live()) {
+        return;
+      }
+      const matched = fromCard ? await openOnCard(h, live, () => invStageEl.value, renderSrc(inst)).catch(() => false) : false;
+      if (live()) {
+        invFromCard.value = matched;
         inv3dReady.value = true;
       }
     },
@@ -6640,6 +6653,7 @@ async function mountInv3d(key: string) {
 }
 const spot3dReady = ref(false);
 const spot3dFailed = ref(false);
+const spotFromCard = ref(false);
 const spotHostEl = ref<HTMLElement | null>(null);
 const spotViewer = useViewerMount({
   label: "spot",
@@ -6779,6 +6793,65 @@ watch(spot3dReady, (ready) => {
     unfreezeSpot3d();
   }
 });
+// Where the 2D card's silhouette is drawn in its stage, in
+// the stage's own offset px (the 3D host is inset-0 there, so they share an
+// origin). The card is cropped to the silhouette plus CARD_CROP_MARGIN a side.
+function cardRectIn(stage: HTMLElement | null, wanted: string): { cx: number; cy: number; w: number } | null {
+  if (!stage || !wanted) {
+    return null;
+  }
+  const imgs = [...stage.querySelectorAll<HTMLImageElement>("img")].filter((i) => artUrl(i.currentSrc || i.src) === artUrl(wanted));
+  const img = imgs[imgs.length - 1];
+  if (!img || !img.naturalWidth || !img.naturalHeight) {
+    return null;
+  }
+  let top = 0;
+  let left = 0;
+  let el: HTMLElement | null = img;
+  while (el && el !== stage) {
+    top += el.offsetTop;
+    left += el.offsetLeft;
+    el = el.offsetParent as HTMLElement | null;
+  }
+  if (el !== stage) {
+    return null;
+  }
+  const r = containedRect({ top, left, width: img.offsetWidth, height: img.offsetHeight }, { width: img.naturalWidth, height: img.naturalHeight });
+  return r ? { cx: r.x + r.w / 2, cy: r.y + r.h / 2, w: r.w / (1 + 2 * CARD_CROP_MARGIN) } : null;
+}
+// A cached model can be ready before its card has even loaded; give the card a
+// moment (it is the browser's copy) rather than falling back to no match.
+async function cardRectWhenLoaded(stage: () => HTMLElement | null, wanted: string): Promise<{ cx: number; cy: number; w: number } | null> {
+  const t0 = performance.now();
+  for (;;) {
+    const r = cardRectIn(stage(), wanted);
+    if (r || performance.now() - t0 > 400) {
+      return r;
+    }
+    await new Promise((res) => requestAnimationFrame(res));
+  }
+}
+const CARD_MATCH_HOLD_MS = 200;
+const CARD_MATCH_EASE_MS = 600;
+// Pets are left out: their follow camera is pulled off the pet while a flight
+// runs, and their live pose never matches the card anyway.
+function opensOnCard(kind: ViewerKind | undefined): boolean {
+  return CARD_BAKE_KINDS.has(kind ?? "weapon") && kind !== "pet";
+}
+// The charm is part of the outline, so it is measured once it hangs. `live` is
+// checked after every wait: the handle, not just the key, since A→B→A reuses
+// the key while the first A's callback is still waiting.
+async function openOnCard(h: ViewerHandle, live: () => boolean, stage: () => HTMLElement | null, src: string): Promise<boolean> {
+  await Promise.race([h.charmReady().catch(() => {}), new Promise((r) => setTimeout(r, 800))]);
+  if (!live()) {
+    return false;
+  }
+  const rect = await cardRectWhenLoaded(stage, src);
+  if (!rect || !live()) {
+    return false;
+  }
+  return h.openOn(rect, CARD_MATCH_HOLD_MS, CARD_MATCH_EASE_MS);
+}
 async function mountSpot3d(key: string) {
   const t = spotTarget.value;
   if (!t || key !== spot3dKey.value) return;
@@ -6788,6 +6861,12 @@ async function mountSpot3d(key: string) {
   const row = pin || pinDef ? null : focusRow.value;
   const att: AttachSource | null = pin ?? (pinDef ? null : focusAttachments.value);
   const isWeapon = (t.kind ?? "weapon") === "weapon";
+  const cardInst = pin ?? (pinDef ? null : cellInstance(selected.value) ?? null);
+  // Only when the stage shows that card: an unpinned knife, glove or pet slot
+  // shows the catalog picture instead.
+  const cardSrc = cardInst && artUrl(spotSrc.value) === artUrl(renderSrc(cardInst)) ? renderSrc(cardInst) : null;
+  const fromCard = !!cardSrc && opensOnCard(t.kind);
+  spotFromCard.value = fromCard;
   await spotViewer.mount(
     t.model,
     async () => ({
@@ -6804,9 +6883,18 @@ async function mountSpot3d(key: string) {
       stattrak: att?.stattrak || row?.stattrak ? { count: att?.stattrak_count ?? row?.stattrak_count ?? 0 } : null,
       frameInset: { right: 0 },
       narrowFit: true,
+      ...(fromCard ? { fromCard: true } : {}),
     }),
-    () => {
-      if (spot3dMounted === key) spot3dReady.value = true;
+    async (h) => {
+      const live = () => spot3dMounted === key && spotViewer.current() === h;
+      if (!live()) {
+        return;
+      }
+      const matched = fromCard && cardSrc && !dockHover.value ? await openOnCard(h, live, () => spotStageEl.value, cardSrc).catch(() => false) : false;
+      if (live()) {
+        spotFromCard.value = matched;
+        spot3dReady.value = true;
+      }
     },
   );
 }
@@ -10541,7 +10629,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
         @delete-selected="deleteSelected"
       >
         <template #aside>
-          <aside v-if="invPanelOn" class="flex w-[clamp(360px,30%,520px)] flex-none flex-col overflow-hidden border-l border-border bg-background">
+          <aside v-if="invPanelOn" :data-card-match="invFromCard ? '' : undefined" class="flex w-[clamp(360px,30%,520px)] flex-none flex-col overflow-hidden border-l border-border bg-background">
             <template v-if="invPin">
               <div class="relative flex min-h-0 flex-1 flex-col">
                 <div class="relative z-[3] flex items-start justify-between gap-3 pl-6 pr-4 pt-2.5">
@@ -10570,7 +10658,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
                     </button>
                   </div>
                 </div>
-                <div class="relative z-[2] grid min-h-0 flex-1 place-items-center px-6">
+                <div ref="invStageEl" class="relative z-[2] grid min-h-0 flex-1 place-items-center px-6">
                   <Transition
                     enter-active-class="transition duration-150 ease-out motion-reduce:transition-none"
                     enter-from-class="opacity-0 scale-[0.985]"
@@ -10988,6 +11076,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
         <div
           v-if="spotlight"
           data-spot-panel
+          :data-card-match="spotFromCard ? '' : undefined"
           class="absolute inset-y-0 z-[4] flex flex-col overflow-hidden border-r border-border"
           :style="{ left: DOCK_SPOT_RAIL_W + 'px', width: spotW + 'px' }"
         >
