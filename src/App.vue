@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, shallowRef, type ComputedRef, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, provide, reactive, ref, shallowRef, type ComputedRef, type Ref, watch } from "vue";
 import { cn } from "@5stack/ui";
 import { useI18n } from "./composables/useI18n";
 import {
@@ -6584,6 +6584,7 @@ const invViewer = useViewerMount({
   },
 });
 const invTarget = computed<ViewerTarget | null>(() => (invPin.value?.item ? resolveViewerModelSync(invPin.value.item) ?? null : null));
+const invLiveLook = computed(() => liveLook(invPin.value, invTarget.value?.kind));
 const inv3dKey = computed(() =>
   invPanelOn.value && spot3d.value && invTarget.value && invPin.value
     ? `${invTarget.value.model}|${invPin.value.id}|${renderUrlFor(invPin.value)}`
@@ -6629,8 +6630,7 @@ async function mountInv3d(key: string) {
       petStage: t.kind === "pet" ? inst.upgrade_level ?? null : null,
       ...(isWeapon ? await stickerGeom(t.model) : {}),
       ...(isWeapon ? instPlacements(inst) : {}),
-      patches: t.kind === "agent" ? (inst.patches ?? []).map((x) => x?.image ?? null) : undefined,
-      stattrak: inst.stattrak ? { count: inst.stattrak_count ?? 0 } : null,
+      ...invLiveLook.value,
       frameInset: { right: 0 },
       narrowFit: true,
       // Not on touch: there the idle release drops the whole composite cache,
@@ -6643,9 +6643,11 @@ async function mountInv3d(key: string) {
       if (!live()) {
         return;
       }
-      const matched = fromCard ? await openOnCard(h, live, () => invStageEl.value, renderSrc(inst)).catch(() => false) : false;
+      const matched = fromCard ? await openOnCard(h, live, () => invStageEl.value, () => renderSrc(inst)).catch(() => false) : false;
+      if (fromCard && !matched && live()) {
+        await dropCardMatch(invFromCard, invHostEl.value);
+      }
       if (live()) {
-        invFromCard.value = matched;
         inv3dReady.value = true;
       }
     },
@@ -6683,6 +6685,11 @@ const spotTarget = computed<ViewerTarget | null>(() => {
 const spot3dLook = computed(() => {
   const inst = spotPinInst.value ?? (spotPinDefault.value ? null : cellInstance(selected.value) ?? null);
   return inst ? renderUrlFor(inst) : "";
+});
+const spotLiveLook = computed(() => {
+  const pin = spotPinInst.value;
+  const pinDef = spotPinDefault.value;
+  return liveLook(pin ?? (pinDef ? null : focusAttachments.value), spotTarget.value?.kind, pin || pinDef ? null : focusRow.value);
 });
 const spot3dKey = computed(() => {
   const t = spotTarget.value;
@@ -6796,7 +6803,7 @@ watch(spot3dReady, (ready) => {
 // Where the 2D card's silhouette is drawn in its stage, in
 // the stage's own offset px (the 3D host is inset-0 there, so they share an
 // origin). The card is cropped to the silhouette plus CARD_CROP_MARGIN a side.
-function cardRectIn(stage: HTMLElement | null, wanted: string): { cx: number; cy: number; w: number } | null {
+function cardRectIn(stage: HTMLElement | null, wanted: string | null): { cx: number; cy: number; w: number } | null {
   if (!stage || !wanted) {
     return null;
   }
@@ -6820,11 +6827,12 @@ function cardRectIn(stage: HTMLElement | null, wanted: string): { cx: number; cy
   return r ? { cx: r.x + r.w / 2, cy: r.y + r.h / 2, w: r.w / (1 + 2 * CARD_CROP_MARGIN) } : null;
 }
 // A cached model can be ready before its card has even loaded; give the card a
-// moment (it is the browser's copy) rather than falling back to no match.
-async function cardRectWhenLoaded(stage: () => HTMLElement | null, wanted: string): Promise<{ cx: number; cy: number; w: number } | null> {
+// moment (it is the browser's copy) rather than falling back to no match. The
+// card is asked for each frame: a bake that lands meanwhile swaps its source.
+async function cardRectWhenLoaded(stage: () => HTMLElement | null, wanted: () => string | null): Promise<{ cx: number; cy: number; w: number } | null> {
   const t0 = performance.now();
   for (;;) {
-    const r = cardRectIn(stage(), wanted);
+    const r = cardRectIn(stage(), wanted());
     if (r || performance.now() - t0 > 400) {
       return r;
     }
@@ -6841,7 +6849,7 @@ function opensOnCard(kind: ViewerKind | undefined): boolean {
 // The charm is part of the outline, so it is measured once it hangs. `live` is
 // checked after every wait: the handle, not just the key, since A→B→A reuses
 // the key while the first A's callback is still waiting.
-async function openOnCard(h: ViewerHandle, live: () => boolean, stage: () => HTMLElement | null, src: string): Promise<boolean> {
+async function openOnCard(h: ViewerHandle, live: () => boolean, stage: () => HTMLElement | null, src: () => string | null): Promise<boolean> {
   await Promise.race([h.charmReady().catch(() => {}), new Promise((r) => setTimeout(r, 800))]);
   if (!live()) {
     return false;
@@ -6851,6 +6859,45 @@ async function openOnCard(h: ViewerHandle, live: () => boolean, stage: () => HTM
     return false;
   }
   return h.openOn(rect, CARD_MATCH_HOLD_MS, CARD_MATCH_EASE_MS);
+}
+// A model that misses its card takes the ordinary settle, so its hidden state
+// gets the settle's blur back first. Untransitioned: a transition would still
+// be on its way there when the model shows, and the model would only fade.
+async function dropCardMatch(fromCard: Ref<boolean>, host: HTMLElement | null) {
+  if (host) {
+    host.style.transition = "none";
+  }
+  fromCard.value = false;
+  await nextTick();
+  if (host) {
+    void getComputedStyle(host).filter;
+    host.style.transition = "";
+  }
+}
+// The kill count and the patches: a card's key leaves both out (the card shows
+// neither), so an edit to them lands on the mounted model in place.
+function liveLook(src: AttachSource | null | undefined, kind: ViewerKind | undefined, row?: LoadoutEntry | null) {
+  return {
+    stattrak: src?.stattrak || row?.stattrak ? { count: src?.stattrak_count ?? row?.stattrak_count ?? 0 } : null,
+    patches: kind === "agent" ? (src?.patches ?? []).map((x) => x?.image ?? null) : undefined,
+  };
+}
+function followLiveLook(viewer: { current: () => ViewerHandle | null }, key: () => string, mounted: () => string, look: () => ReturnType<typeof liveLook>) {
+  watch(
+    () => [key(), look()] as const,
+    ([k, now], [wasKey, was]) => {
+      const h = viewer.current();
+      if (!h || k !== wasKey || k !== mounted()) {
+        return;
+      }
+      if (now.stattrak?.count !== was.stattrak?.count) {
+        h.setStatTrak(now.stattrak);
+      }
+      if (now.patches?.join("\n") !== was.patches?.join("\n")) {
+        void h.setPatches(now.patches ?? []);
+      }
+    },
+  );
 }
 async function mountSpot3d(key: string) {
   const t = spotTarget.value;
@@ -6864,8 +6911,8 @@ async function mountSpot3d(key: string) {
   const cardInst = pin ?? (pinDef ? null : cellInstance(selected.value) ?? null);
   // Only when the stage shows that card: an unpinned knife, glove or pet slot
   // shows the catalog picture instead.
-  const cardSrc = cardInst && artUrl(spotSrc.value) === artUrl(renderSrc(cardInst)) ? renderSrc(cardInst) : null;
-  const fromCard = !!cardSrc && opensOnCard(t.kind);
+  const cardSrc = () => (cardInst && artUrl(spotSrc.value) === artUrl(renderSrc(cardInst)) ? renderSrc(cardInst) : null);
+  const fromCard = !!cardSrc() && opensOnCard(t.kind);
   spotFromCard.value = fromCard;
   await spotViewer.mount(
     t.model,
@@ -6879,8 +6926,7 @@ async function mountSpot3d(key: string) {
       petStage: t.kind === "pet" ? ((att as InventoryItem | null)?.upgrade_level ?? null) : null,
       ...(isWeapon ? await stickerGeom(t.model) : {}),
       ...(isWeapon ? instPlacements(att) : {}),
-      patches: t.kind === "agent" ? (att?.patches ?? []).map((x) => x?.image ?? null) : undefined,
-      stattrak: att?.stattrak || row?.stattrak ? { count: att?.stattrak_count ?? row?.stattrak_count ?? 0 } : null,
+      ...spotLiveLook.value,
       frameInset: { right: 0 },
       narrowFit: true,
       ...(fromCard ? { fromCard: true } : {}),
@@ -6890,9 +6936,11 @@ async function mountSpot3d(key: string) {
       if (!live()) {
         return;
       }
-      const matched = fromCard && cardSrc && !dockHover.value ? await openOnCard(h, live, () => spotStageEl.value, cardSrc).catch(() => false) : false;
+      const matched = fromCard && !dockHover.value ? await openOnCard(h, live, () => spotStageEl.value, cardSrc).catch(() => false) : false;
+      if (fromCard && !matched && live()) {
+        await dropCardMatch(spotFromCard, spotHostEl.value);
+      }
       if (live()) {
-        spotFromCard.value = matched;
         spot3dReady.value = true;
       }
     },
@@ -8922,6 +8970,10 @@ watch(
     }
   },
 );
+// Down here, not with their stages: the Spotlight's look reads focusAttachments,
+// and a watcher reads its source as it is created.
+followLiveLook(invViewer, () => inv3dKey.value, () => inv3dMounted, () => invLiveLook.value);
+followLiveLook(spotViewer, () => spot3dKey.value, () => spot3dMounted, () => spotLiveLook.value);
 /** Focus's title: a named pet by its name (namedPetTitle — the instance's tag,
  *  or a visitor's row's), else the slot's weapon over the finish. */
 const focusIdentityName = computed(() => {
