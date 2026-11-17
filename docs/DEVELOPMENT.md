@@ -430,9 +430,11 @@ Without the installer:
    `overlays/https` if your panel terminates TLS at the cluster.
 3. **Configure** (both files live in `k8s/base/`):
    - `inventory.env` → `INVENTORY_DOMAIN` (e.g. `inventory.yoursite.gg`), and
-     your panel's `WEB_DOMAIN` (e.g. `yoursite.gg`) plus `AUTH_COOKIE_DOMAIN`
-     if its api sets one. Without them, a panel beside the plugin's host
-     (`cs.yoursite.gg` next to `inventory-cs.yoursite.gg`) is refused.
+     your panel's `WEB_DOMAIN` (e.g. `yoursite.gg`). Without it, a panel beside
+     the plugin's host (`cs.yoursite.gg` next to `inventory-cs.yoursite.gg`) is
+     refused. Any other page that calls the plugin with a session goes in
+     `EXTRA_CORS_ORIGINS`; hosts under the cookie domain are not trusted by
+     themselves.
    - `inventory-secrets.env` (copy from `inventory-secrets.env.example`) →
      `DATABASE_URL`. The plugin creates and owns an **`inventory` schema** (not
      a separate database) and schema-qualifies every query, so this is normally
