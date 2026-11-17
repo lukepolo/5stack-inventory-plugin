@@ -6618,6 +6618,7 @@ async function mountInv3d(key: string) {
   const isWeapon = (t.kind ?? "weapon") === "weapon";
   const fromCard = opensOnCard(t.kind);
   invFromCard.value = fromCard;
+  let builtLook = invLiveLook.value;
   await invViewer.mount(
     t.model,
     async () => ({
@@ -6630,7 +6631,7 @@ async function mountInv3d(key: string) {
       petStage: t.kind === "pet" ? inst.upgrade_level ?? null : null,
       ...(isWeapon ? await stickerGeom(t.model) : {}),
       ...(isWeapon ? instPlacements(inst) : {}),
-      ...invLiveLook.value,
+      ...(builtLook = invLiveLook.value),
       frameInset: { right: 0 },
       narrowFit: true,
       // Not on touch: there the idle release drops the whole composite cache,
@@ -6639,10 +6640,11 @@ async function mountInv3d(key: string) {
       ...(fromCard ? { fromCard: true } : {}),
     }),
     async (h) => {
-      const live = () => inv3dMounted === key && invViewer.current() === h;
+      const live = () => inv3dMounted === key && inv3dKey.value === key && invViewer.current() === h;
       if (!live()) {
         return;
       }
+      applyLiveLook(h, builtLook, invLiveLook.value);
       const matched = fromCard ? await openOnCard(h, live, () => invStageEl.value, () => renderSrc(inst)).catch(() => false) : false;
       if (fromCard && !matched && live()) {
         await dropCardMatch(invFromCard, invHostEl.value);
@@ -6882,19 +6884,24 @@ function liveLook(src: AttachSource | null | undefined, kind: ViewerKind | undef
     patches: kind === "agent" ? (src?.patches ?? []).map((x) => x?.image ?? null) : undefined,
   };
 }
-function followLiveLook(viewer: { current: () => ViewerHandle | null }, key: () => string, mounted: () => string, look: () => ReturnType<typeof liveLook>) {
+type LiveLook = ReturnType<typeof liveLook>;
+function applyLiveLook(h: ViewerHandle, was: LiveLook, now: LiveLook) {
+  if (now.stattrak?.count !== was.stattrak?.count) {
+    h.setStatTrak(now.stattrak);
+  }
+  if (now.patches?.join("\n") !== was.patches?.join("\n")) {
+    void h.setPatches(now.patches ?? []);
+  }
+}
+// A change while the model loads has no handle to land on; the stage's
+// onReady catches it up against the look its build used.
+function followLiveLook(viewer: { current: () => ViewerHandle | null }, key: () => string, mounted: () => string, look: () => LiveLook) {
   watch(
     () => [key(), look()] as const,
     ([k, now], [wasKey, was]) => {
       const h = viewer.current();
-      if (!h || k !== wasKey || k !== mounted()) {
-        return;
-      }
-      if (now.stattrak?.count !== was.stattrak?.count) {
-        h.setStatTrak(now.stattrak);
-      }
-      if (now.patches?.join("\n") !== was.patches?.join("\n")) {
-        void h.setPatches(now.patches ?? []);
+      if (h && k === wasKey && k === mounted()) {
+        applyLiveLook(h, was, now);
       }
     },
   );
@@ -6914,6 +6921,7 @@ async function mountSpot3d(key: string) {
   const cardSrc = () => (cardInst && artUrl(spotSrc.value) === artUrl(renderSrc(cardInst)) ? renderSrc(cardInst) : null);
   const fromCard = !!cardSrc() && opensOnCard(t.kind);
   spotFromCard.value = fromCard;
+  let builtLook = spotLiveLook.value;
   await spotViewer.mount(
     t.model,
     async () => ({
@@ -6926,16 +6934,17 @@ async function mountSpot3d(key: string) {
       petStage: t.kind === "pet" ? ((att as InventoryItem | null)?.upgrade_level ?? null) : null,
       ...(isWeapon ? await stickerGeom(t.model) : {}),
       ...(isWeapon ? instPlacements(att) : {}),
-      ...spotLiveLook.value,
+      ...(builtLook = spotLiveLook.value),
       frameInset: { right: 0 },
       narrowFit: true,
       ...(fromCard ? { fromCard: true } : {}),
     }),
     async (h) => {
-      const live = () => spot3dMounted === key && spotViewer.current() === h;
+      const live = () => spot3dMounted === key && spot3dKey.value === key && spotViewer.current() === h;
       if (!live()) {
         return;
       }
+      applyLiveLook(h, builtLook, spotLiveLook.value);
       const matched = fromCard && !dockHover.value ? await openOnCard(h, live, () => spotStageEl.value, cardSrc).catch(() => false) : false;
       if (fromCard && !matched && live()) {
         await dropCardMatch(spotFromCard, spotHostEl.value);
