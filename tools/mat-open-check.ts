@@ -34,7 +34,6 @@ const AK: CraftCodeWire = {
   skipped: 1,
 };
 
-/** "My AWP" open on the mat, its gun chalked; reads and lays answered by hand. */
 function scene(opts: { empty?: boolean } = {}) {
   const name = ref<string | null>(null);
   const outline = ref("awp");

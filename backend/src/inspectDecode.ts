@@ -1,19 +1,7 @@
-// A pasted inspect code read back into the gun and stickers it names: the other
-// direction of inspect.ts, for the Sticker Crafts mat's Import.
-//
-// Only a MASKED code carries the item in itself (csinspect.com's "Code", the
-// bare `csgo_econ_action_preview <HEX>` command, or a steam:// link around one).
-// An unmasked link (S…A…D…) only points at an item in someone's inventory, and
-// reading that takes Steam's game coordinator.
-//
-// The text is a stranger's: it is bounded before any parsing, every length and
-// field is checked against what is left of the buffer, and nothing of it is
-// logged or sent back.
 import { crc32 } from "node:zlib";
 
 export const CODE_LIMITS = {
   maxChars: 2048,
-  /** Key byte, a defindex field, and the four-byte checksum. */
   minBytes: 1 + 2 + 4,
   maxAttachments: 32,
 } as const;
@@ -21,7 +9,6 @@ export const CODE_LIMITS = {
 export type CodeRefusal = "too-long" | "unmasked" | "not-a-code" | "unreadable";
 
 export interface CodeSticker {
-  /** The anchor it is measured from; null when the code leaves it out. */
   slot: number | null;
   /** The game's sticker kit index, not a catalog id. */
   kit: number;
@@ -40,7 +27,6 @@ export type CodeRead = { ok: true; code: InspectCode } | { ok: false; reason: Co
 const UNMASKED = /^(?:steam:\/\/rungame\/730\/\d{1,20}\/)?\+?csgo_econ_action_preview(?:%20|\s)+[SM]\d{1,20}A\d{1,20}D\d{1,20}$/i;
 const MASKED = /^(?:steam:\/\/rungame\/730\/\d{1,20}\/)?(?:\+?csgo_econ_action_preview(?:%20|\s)+)?([0-9a-f]+)$/i;
 
-/** CEconItemPreviewDataBlock and its Sticker message: the fields read here. */
 const F = { defindex: 3, paintindex: 4, stickers: 12 } as const;
 const SF = { slot: 1, id: 2, wear: 3, rotation: 5, offsetX: 7, offsetY: 8 } as const;
 const WIRE = { varint: 0, fixed64: 1, bytes: 2, fixed32: 5 } as const;
@@ -108,7 +94,6 @@ function readMessage(buf: Uint8Array): Field[] {
   return out;
 }
 
-/** The last value of a field, which is what protobuf keeps; a wrong wire type is unreadable. */
 function last(msg: Field[], field: number, wire: number): Field | undefined {
   const all = msg.filter((m) => m.field === field);
   if (all.some((m) => m.wire !== wire)) {

@@ -31,7 +31,7 @@ const emit = defineEmits<{ (e: "undo"): void; (e: "dismiss"): void }>();
       role="status"
     >
       <Trash2 class="h-3.5 w-3.5 flex-none text-muted-foreground" />
-      <span class="max-w-[380px] truncate">{{ label }}</span>
+      <span class="line-clamp-2 min-w-0 max-w-[380px]">{{ label }}</span>
       <button
         class="flex-none rounded-sm px-2 py-1 text-f11 font-bold uppercase tracking-cs1 text-[hsl(var(--tac-amber,33_94%_58%))] transition-colors hover:bg-muted"
         :title="undoTitle"

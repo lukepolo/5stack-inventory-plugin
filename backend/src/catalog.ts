@@ -17,6 +17,7 @@ import {
   CS2_STICKER_WEAR_FACTOR,
   CS2_WEAR_FACTOR,
   CS2_INVENTORY_RULES,
+  getNextStickerSchema,
   roundToFactor,
   truncateToFactor,
 } from "@ianlucas/cs2-lib";
@@ -2161,15 +2162,9 @@ export function stickerMaterialFor(image: string, patchMaterials?: Record<string
   return null;
 }
 
-// ---- Sticker Crafts' Import ----------------------------------------------------
-
-/** A gun's stickers read off an inspect code, in the catalog's terms: what the
- *  Sticker Crafts mat lays out, and how many it had to leave out. */
 export interface CodeCraft {
   model: string;
-  /** The finish's name, or the gun's when the code's finish isn't in the catalog. */
   name: string;
-  /** The finish renders on the gun's legacy body, which has its own anchors (as the editor decides: a legacy paint with a material). */
   legacy: boolean;
   stickers: { id: number; name: string; image: string | null; slot: number; x: number; y: number; r: number; w: number }[];
   skipped: number;
@@ -2178,12 +2173,10 @@ export interface CodeCraft {
 let stickersByKit: Map<number, (typeof items)[number]> | null = null;
 
 /**
- * The craft an inspect code describes, or null when it names no gun that takes
- * stickers. A sticker the catalog doesn't have, on an anchor the gun doesn't
- * have, or at a place that isn't a number is left out and counted; the gun's
- * own rules clamp the rest, as cs2-lib's parser does. A code carries float32s,
- * so each is rounded to its rule's step before the rule truncates it: 0.02
- * arrives as 0.0199999995 and must not become 0.0199.
+ * As cs2-lib's parseStickers, but a sticker the catalog lacks or with a place
+ * that isn't a number is left out and counted instead of failing the code. A
+ * code carries float32s, so each is rounded to its rule's step before the rule
+ * truncates it: 0.02 arrives as 0.0199999995 and must not become 0.0199.
  */
 export function craftFromCode(code: InspectCode): CodeCraft | null {
   const base = items.find((i) => i.type === "weapon" && i.definitionIndex === code.def && !i.variantIndex);
@@ -2206,12 +2199,15 @@ export function craftFromCode(code: InspectCode): CodeCraft | null {
   let skipped = 0;
   for (const s of code.stickers) {
     const item = stickersByKit.get(s.kit);
-    const slot = s.slot ?? stickers.length;
     const placed = [s.x, s.y, s.r].every((v) => v === null || Number.isFinite(v));
-    if (!item || !placed || !rules.stickerSchema.check(slot, gun) || stickers.length >= CS2_MAX_STICKERS) {
+    if (!item || !placed || stickers.length >= CS2_MAX_STICKERS) {
       skipped++;
       continue;
     }
+    const wanted = s.slot ?? stickers.length;
+    const slot = rules.stickerSchema.check(wanted, gun)
+      ? wanted
+      : getNextStickerSchema(stickers.map((st) => ({ id: st.id, schema: st.slot })), gun.getStickerSchemaCount());
     stickers.push({
       id: item.id,
       name: item.name,

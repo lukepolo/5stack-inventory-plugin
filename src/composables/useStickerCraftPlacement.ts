@@ -34,7 +34,7 @@
 import { computed, ref, watch, type Ref } from "vue";
 import { fetchStickerGeometry, type StickerBounds, type StickerGroupSpec, type StickerSlot } from "../api";
 import { STICKER_CM, type SavedCraft } from "../stickerCraftsModel";
-import { bodySlots, outlineProjection, projectPoint, projectVector, slotScale, type WeaponOutline } from "../outlineTrace";
+import { bodySlots, outlineProjection, projectPoint, projectVector, slotScale, unprojectPoint, type WeaponOutline } from "../outlineTrace";
 import type { StickerPlacement, ViewerHandle } from "../viewer3d";
 
 /** Where a craft sat on a weapon's chalked outline on the mat: its centre, in
@@ -67,7 +67,7 @@ type CraftForm = {
 /** Where each slot's offsets are measured from, on the body this finish uses
  *  (`body`); `exact` without the fallback to the first slot; `scale` is what
  *  mat centimetres convert at — one HD sticker (slotScale of the HD slots). */
-type Frame = {
+export type Frame = {
   anchorOf: (slot: number) => StickerSlot | undefined;
   exact: (slot: number) => StickerSlot | undefined;
   bounds: StickerBounds | null;
@@ -76,7 +76,7 @@ type Frame = {
 };
 /** One sticker bound to a slot: its offset from the group's centre in unwrap
  *  units and its rotation, both before any turn of the whole. */
-type Member = { slot: number; id: number; image: string; wear: number; ou: number; ov: number; r0: number };
+export type Member = { slot: number; id: number; image: string; wear: number; ou: number; ov: number; r0: number };
 
 export interface PendingCraft {
   entry: SavedCraft;
@@ -104,6 +104,116 @@ const round4 = (v: number) => Math.round(v * 1e4) / 1e4;
 /** ±180, in the game's half-degree steps. */
 const wrapDeg = (d: number) => Math.round(((((d + 180) % 360) + 360) % 360 - 180) * 2) / 2;
 
+/** The same anchor choice as moveSticker and the viewer's slotMarkup: this
+ *  finish's body, the exact anchor, else the first. */
+export function frameFrom(geo: { slots: StickerSlot[]; bounds: StickerBounds | null }, legacy: boolean): Frame | null {
+  const body = legacy ? "body_legacy" : "body_hd";
+  const mine = geo.slots.filter((s) => s.mesh === body);
+  const anchors = mine.length ? mine : geo.slots;
+  if (!anchors.length) {
+    return null;
+  }
+  const first = anchors.reduce((lo, s) => (s.index < lo.index ? s : lo));
+  const exact = (slot: number) => anchors.find((s) => s.index === slot);
+  // Mat centimetres go on at the HD body's sticker size whatever the body:
+  // a legacy body's stickers are smaller (scale 22 against 19.6 on the AWP)
+  // but its unwrap has the same density, so a place on the gun is the same
+  // distance in it. Converting at the legacy size shrank a layout ~11%.
+  return { anchorOf: (slot) => exact(slot) ?? first, exact, bounds: geo.bounds, body: mine.length ? body : "body_hd", scale: slotScale(bodySlots(geo.slots)) };
+}
+
+/** Each sticker of a craft bound to its slot, measured in unwrap units —
+ *  all at the gun's one scale, so the layout keeps its shape (slotScale). */
+export function membersOf(entry: SavedCraft, slots: number[], frame: Frame): Member[] {
+  const k = 1 / (STICKER_CM * frame.scale);
+  return slots.map((slot, i) => {
+    const s = entry.stickers[i];
+    return { slot, id: s.id, image: s.image, wear: s.wear, ou: s.x * k, ov: s.y * k, r0: wrapDeg(-s.rot) };
+  });
+}
+
+/** A member's offset from the centre once the whole group is turned. */
+function turned(m: Member, turn: number) {
+  // The art turns by STICKER_ROT_SIGN * r = -r on the unwrap; its place turns with it.
+  const a = (-turn * Math.PI) / 180;
+  const cos = Math.cos(a);
+  const sin = Math.sin(a);
+  return { du: m.ou * cos - m.ov * sin, dv: m.ou * sin + m.ov * cos };
+}
+
+/** Slot offsets for every member, the group centred at (cu, cv) and turned. */
+export function seat(members: Member[], frame: Frame, cu: number, cv: number, turn: number) {
+  const fit = (v: number, r?: [number, number]) => round4(r ? Math.min(r[1], Math.max(r[0], v)) : v);
+  return members.map((m) => {
+    const a = frame.anchorOf(m.slot);
+    const { du, dv } = turned(m, turn);
+    return {
+      m,
+      x: a ? fit(cu + du - a.offset[0], frame.bounds?.x) : null,
+      y: a ? fit(cv + dv - a.offset[1], frame.bounds?.y) : null,
+      r: wrapDeg(m.r0 + turn),
+    };
+  });
+}
+
+export function runCentre(slots: number[], frame: Frame): { u: number; v: number } | null {
+  const at = slots.map((s) => frame.anchorOf(s)).filter((a): a is NonNullable<typeof a> => !!a);
+  if (!at.length) {
+    return null;
+  }
+  return { u: at.reduce((sum, a) => sum + a.offset[0], 0) / at.length, v: at.reduce((sum, a) => sum + a.offset[1], 0) / at.length };
+}
+
+export function outlineSeat(entry: SavedCraft, members: Member[], at: OutlineSpot, frame: Frame) {
+  const proj = outlineProjection(at, frame.body, frame.exact, frame.scale);
+  if (!proj) {
+    return null;
+  }
+  // The layout through the same unwrap as its centre, so its spacing (and
+  // any turn the unwrap has against the side) matches the mat too.
+  return {
+    members: members.map((m, i) => {
+      const d = projectVector(proj, entry.stickers[i].x, entry.stickers[i].y);
+      return { ...m, ou: d.u, ov: d.v };
+    }),
+    centre: projectPoint(proj, at.x, at.y),
+  };
+}
+
+export type GunSticker = { slot: number; x: number; y: number; r: number };
+export type GunLayout = { stickers: { x: number; y: number; rot: number }[]; at: { x: number; y: number } | null };
+
+export function gunOnMat(stickers: GunSticker[], slots: StickerSlot[], legacy: boolean, outline?: WeaponOutline | null): GunLayout {
+  // The mat turns clockwise and the game the other way.
+  const turn = (s: GunSticker) => wrapDeg(-s.r);
+  if (!stickers.length) {
+    return { stickers: [], at: null };
+  }
+  const frame = frameFrom({ slots, bounds: null }, legacy);
+  if (!frame) {
+    const mid = (stickers.length - 1) / 2;
+    return { stickers: stickers.map((s, i) => ({ x: r2((i - mid) * (STICKER_CM + 1)), y: 0, rot: turn(s) })), at: null };
+  }
+  // An anchor the body lacks is its first, as the viewer draws it.
+  const places = stickers.map((s) => {
+    const a = frame.anchorOf(s.slot)!.offset;
+    return { u: a[0] + s.x, v: a[1] + s.y };
+  });
+  const proj = outline ? outlineProjection(outline, frame.body, frame.exact, frame.scale) : null;
+  const onOutline = proj ? places.map((p) => unprojectPoint(proj, p.u, p.v)) : [];
+  if (proj && onOutline.every((p) => p)) {
+    const pts = onOutline as { x: number; y: number }[];
+    const cx = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
+    const cy = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
+    return { stickers: pts.map((p, i) => ({ x: r2(p.x - cx), y: r2(p.y - cy), rot: turn(stickers[i]) })), at: { x: r2(cx), y: r2(cy) } };
+  }
+  const k = STICKER_CM * frame.scale;
+  const cu = places.reduce((sum, p) => sum + p.u, 0) / places.length;
+  const cv = places.reduce((sum, p) => sum + p.v, 0) / places.length;
+  return { stickers: places.map((p, i) => ({ x: r2((p.u - cu) * k), y: r2((p.v - cv) * k), rot: turn(stickers[i]) })), at: null };
+}
+const r2 = (v: number) => Math.round(v * 100) / 100;
+
 export function useStickerCraftPlacement(o: {
   craft: Ref<CraftForm | null>;
   /** The group the owned item in the editor was saved with (its sticker_group), if any. */
@@ -130,31 +240,10 @@ export function useStickerCraftPlacement(o: {
 
   async function frameFor(c: CraftForm): Promise<Frame | null> {
     const model = o.model();
-    if (!model) return null;
-    const geo = await fetchStickerGeometry(model);
-    // The same anchor choice as moveSticker and the viewer's slotMarkup: this
-    // finish's body, the exact anchor, else the first.
-    const body = c.skin.legacyPaint && c.skin.paintMaterial ? "body_legacy" : "body_hd";
-    const mine = geo.slots.filter((s) => s.mesh === body);
-    const anchors = mine.length ? mine : geo.slots;
-    if (!anchors.length) return null;
-    const first = anchors.reduce((lo, s) => (s.index < lo.index ? s : lo));
-    const exact = (slot: number) => anchors.find((s) => s.index === slot);
-    // Mat centimetres go on at the HD body's sticker size whatever the body:
-    // a legacy body's stickers are smaller (scale 22 against 19.6 on the AWP)
-    // but its unwrap has the same density, so a place on the gun is the same
-    // distance in it. Converting at the legacy size shrank a layout ~11%.
-    return { anchorOf: (slot) => exact(slot) ?? first, exact, bounds: geo.bounds, body: mine.length ? body : "body_hd", scale: slotScale(bodySlots(geo.slots)) };
-  }
-
-  /** Each sticker of a craft bound to its slot, measured in unwrap units —
-   *  all at the gun's one scale, so the layout keeps its shape (slotScale). */
-  function membersOf(entry: SavedCraft, slots: number[], frame: Frame): Member[] {
-    const k = 1 / (STICKER_CM * frame.scale);
-    return slots.map((slot, i) => {
-      const s = entry.stickers[i];
-      return { slot, id: s.id, image: s.image, wear: s.wear, ou: s.x * k, ov: s.y * k, r0: wrapDeg(-s.rot) };
-    });
+    if (!model) {
+      return null;
+    }
+    return frameFrom(await fetchStickerGeometry(model), !!(c.skin.legacyPaint && c.skin.paintMaterial));
   }
 
   /** A group of these slots as they stand on the form right now. */
@@ -180,29 +269,6 @@ export function useStickerCraftPlacement(o: {
     return { name, members, frame, cu, cv, turn: 0, linked };
   }
 
-  /** A member's offset from the centre once the whole group is turned. */
-  function turned(m: Member, turn: number) {
-    // The art turns by STICKER_ROT_SIGN * r = -r on the unwrap; its place turns with it.
-    const a = (-turn * Math.PI) / 180;
-    const cos = Math.cos(a);
-    const sin = Math.sin(a);
-    return { du: m.ou * cos - m.ov * sin, dv: m.ou * sin + m.ov * cos };
-  }
-
-  /** Slot offsets for every member, the group centred at (cu, cv) and turned. */
-  function seat(members: Member[], frame: Frame, cu: number, cv: number, turn: number) {
-    const fit = (v: number, r?: [number, number]) => round4(r ? Math.min(r[1], Math.max(r[0], v)) : v);
-    return members.map((m) => {
-      const a = frame.anchorOf(m.slot);
-      const { du, dv } = turned(m, turn);
-      return {
-        m,
-        x: a ? fit(cu + du - a.offset[0], frame.bounds?.x) : null,
-        y: a ? fit(cv + dv - a.offset[1], frame.bounds?.y) : null,
-        r: wrapDeg(m.r0 + turn),
-      };
-    });
-  }
 
   /** A form sticker moved to another slot WITHOUT moving on the gun: its
    *  offsets re-expressed against the new slot's anchor, as moveSticker does. */
@@ -347,13 +413,12 @@ export function useStickerCraftPlacement(o: {
    */
   function placeHere() {
     const p = pending.value;
-    if (!p) return;
-    const at = p.slots.map((s) => p.frame.anchorOf(s)).filter((a): a is NonNullable<typeof a> => !!a);
-    if (!at.length) return;
-    const u = at.reduce((sum, a) => sum + a.offset[0], 0) / at.length;
-    const v = at.reduce((sum, a) => sum + a.offset[1], 0) / at.length;
+    const centre = p && runCentre(p.slots, p.frame);
+    if (!p || !centre) {
+      return;
+    }
     ghost.value = null;
-    land(p, { u, v });
+    land(p, centre);
   }
 
   /**
@@ -364,17 +429,13 @@ export function useStickerCraftPlacement(o: {
   function placeOnOutline(at: OutlineSpot) {
     const p = pending.value;
     if (!p) return;
-    const proj = outlineProjection(at, p.frame.body, p.frame.exact, p.frame.scale);
-    if (!proj) return placeHere();
-    // The layout through the same unwrap as its centre, so its spacing (and
-    // any turn the unwrap has against the side) matches the mat too.
-    p.members = p.members.map((m, i) => {
-      const st = p.entry.stickers[i];
-      const d = projectVector(proj, st.x, st.y);
-      return { ...m, ou: d.u, ov: d.v };
-    });
+    const put = outlineSeat(p.entry, p.members, at, p.frame);
+    if (!put) {
+      return placeHere();
+    }
+    p.members = put.members;
     ghost.value = null;
-    land(p, projectPoint(proj, at.x, at.y));
+    land(p, put.centre);
   }
 
   /**

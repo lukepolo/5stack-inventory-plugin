@@ -283,6 +283,8 @@
       "importNotGun": "That code isn't for a gun that takes stickers.",
       "importNoStickers": "That code has no stickers this catalog knows.",
       "importFailed": "Couldn't read that code. Try again.",
+      "importSignedOut": "You're signed out. Sign in again, then import the code.",
+      "importOffline": "Couldn't reach the server. Check your connection and try again.",
       "importDone": "The code's stickers are on the mat. Save keeps them as your own craft.",
       "importedOne": "Imported 1 sticker.",
       "importedMany": "Imported {count} stickers.",

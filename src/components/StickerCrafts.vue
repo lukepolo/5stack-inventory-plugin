@@ -50,13 +50,14 @@ import {
   X,
 } from "lucide-vue-next";
 import {
-  ApiError,
+  IMPORT_MAX_CHARS,
   assetUrl,
   fetchStickerGeometry,
   fetchWeaponOutline,
   importCraftCode,
   saveWeaponOutline,
   type CatalogWeapon,
+  type CraftCodeWire,
   type InventoryItem,
 } from "../api";
 import { useAttachmentPicker, type PickerRow } from "../composables/useAttachmentPicker";
@@ -86,7 +87,8 @@ import {
 } from "../stickerCraftsModel";
 import type { StickerBoard } from "../stickerBoard";
 import type { WeaponOutline } from "../outlineTrace";
-import type { OutlineSpot } from "../composables/useStickerCraftPlacement";
+import { gunOnMat, type OutlineSpot } from "../composables/useStickerCraftPlacement";
+import { useMatOpen } from "../composables/useMatOpen";
 import AttachmentPicker from "./AttachmentPicker.vue";
 import ModelRail, { type RailItem } from "./ModelRail.vue";
 import CraftUseCase from "./CraftUseCase.vue";
@@ -1295,100 +1297,55 @@ const matCraftId = computed(() => {
   const only = from.size === 1 ? [...from][0] : "";
   return only && library.value.some((c) => c.id === only) ? only : null;
 });
-function openOnMat(entry: SavedCraft | StoreCraft, imported?: { at?: { x: number; y: number }; what: string }) {
+const mat = useMatOpen({
+  name: nameDraft,
+  outline: outlineModel,
+  clear: () => takeOff(() => false),
+  restore: putBack,
+  offerUndo,
+  say,
+  tr,
+  read: importCraftCode,
+  lay: layCode,
+});
+const { importOpen, importText, importBusy, importError, toggleImport, closeImport, importCode } = mat;
+function openOnMat(entry: SavedCraft | StoreCraft) {
   if (entry.stickers.length > MAX_ON_BOARD) return;
-  nameDraft.value = imported ? entry.name.slice(0, 40) : othersCraft(entry) ? `${entry.name} (my copy)`.slice(0, 40) : null;
-  const removed = takeOff(() => false);
-  placeSaved(entry, !!imported || othersCraft(entry), imported?.at);
-  galleryOpen.value = false;
-  const what = imported?.what ?? (othersCraft(entry) ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`);
-  if (!removed.stickers.length) return say(what);
-  offerUndo(what, () => {
-    takeOff(() => false);
-    putBack(removed);
-  });
+  const theirs = othersCraft(entry);
+  mat.replace(
+    () => {
+      nameDraft.value = theirs ? `${entry.name} (my copy)`.slice(0, 40) : null;
+      placeSaved(entry);
+      galleryOpen.value = false;
+    },
+    theirs ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`,
+  );
 }
 
-// ---- a craft from an inspect code -----------------------------------------------------
-// Import, beside the Craft Store: a pasted code read on the server, its gun
-// chalked, and its stickers laid where they sat on that gun (gunOnMat) as a
-// copy to save. It replaces the mat like opening any craft.
-const importOpen = ref(false);
-const importText = ref("");
-const importBusy = ref(false);
-const importError = ref<string | null>(null);
 const importPlaceholder = computed(() => tr("inventory.stickerCrafts.importPlaceholder", "Paste a craft's inspect code"));
-function toggleImport() {
-  importOpen.value = !importOpen.value;
-  importError.value = null;
-  galleryOpen.value = false;
-}
-function importRefusal(e: unknown): string {
-  switch (e instanceof ApiError ? e.reason : null) {
-    case "too-long":
-      return tr("inventory.stickerCrafts.importTooLong", "That's too long to be an inspect code.");
-    case "unmasked":
-      return tr(
-        "inventory.stickerCrafts.importUnmasked",
-        "That link points at an item in someone's inventory, so it can't be read here. Paste the craft's Code from csinspect.com instead.",
-      );
-    case "not-a-code":
-      return tr("inventory.stickerCrafts.importNotCode", "That isn't an inspect code. Paste the craft's Code from csinspect.com.");
-    case "unreadable":
-      return tr("inventory.stickerCrafts.importUnreadable", "That code couldn't be read. Copy it again; it may have been cut short.");
-    case "not-a-gun":
-      return tr("inventory.stickerCrafts.importNotGun", "That code isn't for a gun that takes stickers.");
-    case "no-stickers":
-      return tr("inventory.stickerCrafts.importNoStickers", "That code has no stickers this catalog knows.");
-    default:
-      return tr("inventory.stickerCrafts.importFailed", "Couldn't read that code. Try again.");
-  }
-}
-function importNote(count: number, skipped: number): string {
-  if (!skipped) {
-    return tr("inventory.stickerCrafts.importDone", "The code's stickers are on the mat. Save keeps them as your own craft.");
-  }
-  const done = count === 1
-    ? tr("inventory.stickerCrafts.importedOne", "Imported 1 sticker.")
-    : tr("inventory.stickerCrafts.importedMany", "Imported {count} stickers.", { count });
-  const left = skipped === 1
-    ? tr("inventory.stickerCrafts.leftOutOne", "1 couldn't be read and was left out.")
-    : tr("inventory.stickerCrafts.leftOutMany", "{count} couldn't be read and were left out.", { count: skipped });
-  return `${done} ${left}`;
-}
-async function importCode() {
-  const code = importText.value.trim();
-  if (!code || importBusy.value || !loaded.value) {
-    return;
-  }
-  importBusy.value = true;
-  importError.value = null;
-  try {
-    const got = await importCraftCode(code);
-    const [geo, lay] = await Promise.all([
-      fetchStickerGeometry(got.model).catch(() => null),
-      trace.value ?? import("../outlineTrace"),
-    ]);
+/** Nothing changes until the returned step runs, so an import closed while it loads leaves the mat alone. */
+async function layCode(got: CraftCodeWire): Promise<() => void> {
+  const [geo, o] = await Promise.all([
+    fetchStickerGeometry(got.model).catch(() => null),
+    outlines.value.get(got.model) ?? outlineFor(got.model).catch(() => null),
+  ]);
+  const laid = gunOnMat(got.stickers, geo?.slots ?? [], got.legacy, o);
+  const entry: SavedCraft = {
+    id: newId(),
+    name: got.name,
+    savedAt: Date.now(),
+    stickers: got.stickers.map((s, i) => ({ id: s.id, name: s.name, image: s.image ?? "", ...laid.stickers[i], wear: s.w })),
+  };
+  const at = laid.at && o ? { x: laid.at.x + GRID_W / 2 - o.w / 2, y: laid.at.y + GRID_H / 2 - o.h / 2 } : undefined;
+  return () => {
+    if (o) {
+      outlines.value = new Map(outlines.value).set(got.model, o);
+    }
     outlineModel.value = got.model;
-    await nextTick();
-    await outlineReady;
-    const o = outlines.value.get(got.model) ?? null;
-    const laid = lay.gunOnMat(got.stickers, geo?.slots ?? [], got.legacy ? "body_legacy" : "body_hd", o);
-    const entry: SavedCraft = {
-      id: newId(),
-      name: got.name,
-      savedAt: Date.now(),
-      stickers: got.stickers.map((s, i) => ({ id: s.id, name: s.name, image: s.image ?? "", ...laid.stickers[i], wear: s.w })),
-    };
-    const at = laid.at && o ? { x: laid.at.x + GRID_W / 2 - o.w / 2, y: laid.at.y + GRID_H / 2 - o.h / 2 } : undefined;
-    openOnMat(entry, { at, what: importNote(got.stickers.length, got.skipped) });
-    importOpen.value = false;
-    importText.value = "";
-  } catch (e) {
-    importError.value = importRefusal(e);
-  } finally {
-    importBusy.value = false;
-  }
+    nameDraft.value = entry.name.slice(0, 40);
+    placeSaved(entry, true, at);
+    galleryOpen.value = false;
+  };
 }
 
 /**
@@ -1594,7 +1551,7 @@ function onKey(e: KeyboardEvent) {
     return;
   }
   if (importOpen.value && e.key === "Escape") {
-    importOpen.value = false;
+    closeImport();
     e.stopPropagation();
     return;
   }
@@ -1644,6 +1601,7 @@ function onKey(e: KeyboardEvent) {
 onMounted(() => window.addEventListener("keydown", onKey));
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
+  closeImport();
   clearTimeout(justSavedTimer);
   // Leaving settles a delete still on its Undo: it was meant.
   settleUndo();
@@ -1887,7 +1845,7 @@ const FIELD =
             :disabled="!loaded"
             :aria-expanded="galleryOpen"
             :title="galleryOpen ? 'Close All crafts (Esc)' : 'Every craft you have saved'"
-            @click="galleryOpen = !galleryOpen; importOpen = false"
+            @click="galleryOpen = !galleryOpen; closeImport()"
           >
             <LayoutGrid class="h-3.5 w-3.5" /> {{ tr("inventory.stickerCrafts.allCrafts", "All crafts") }}
             <span class="font-mono text-f9 normal-case tracking-normal text-muted-foreground/70">{{ library.length }}</span>
@@ -1910,7 +1868,7 @@ const FIELD =
               :disabled="!loaded"
               :aria-expanded="importOpen"
               :aria-label="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')"
-              @click="toggleImport"
+              @click="galleryOpen = false; toggleImport()"
             >
               <ClipboardPaste class="h-3.5 w-3.5" />
             </button>
@@ -1947,6 +1905,7 @@ const FIELD =
                 :placeholder="importPlaceholder"
                 :aria-label="importPlaceholder"
                 :aria-invalid="!!importError"
+                :maxlength="IMPORT_MAX_CHARS"
                 :readonly="importBusy"
                 @input="importError = null"
               />

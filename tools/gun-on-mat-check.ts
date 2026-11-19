@@ -12,10 +12,10 @@ function check(label: string, got: unknown, want: unknown) {
     console.log(`ok   ${label}  ${JSON.stringify(got)}`);
   }
 }
-/** The mat keeps hundredths of a centimetre and a gun ten-thousandths of the unwrap, so a round trip is good to 1e-4. */
+/** The mat rounds to hundredths of a centimetre (5e-5 of the unwrap) and seat to ten-thousandths (5e-5), so a round trip is good to 1e-4 plus float error. */
 function near(label: string, got: number[][], want: number[][]) {
   const off = Math.max(0, ...got.flatMap((g, i) => g.map((v, j) => Math.abs(v - want[i][j]))));
-  check(label, got.length === want.length && off <= 1e-4 ? want : got, want);
+  check(label, got.length === want.length && off <= 1.5e-4 ? want : got, want);
 }
 
 const slot = (index: number, mesh: string, offset: [number, number], scale: number): StickerSlot => ({ index, mesh, offset, scale, rotation: 0 });

@@ -3097,11 +3097,6 @@ const CODE_REFUSALS: Record<CodeRefusal | "not-a-gun" | "no-stickers", string> =
   "no-stickers": "That code has no stickers this catalog knows.",
 };
 
-/**
- * A craft read off a pasted inspect code, for the mat's Import: the gun, its
- * finish's body, and each sticker on its anchor, with how many were left out.
- * Writes nothing; the mat lays it down as a copy to save.
- */
 app.post<{ Body: { code?: unknown } }>("/api/sticker-crafts/import", { bodyLimit: 16_384 }, async (request, reply) => {
   if (!(await getIdentity(request))) {
     return reply.status(401).send({ error: "unauthorized" });
