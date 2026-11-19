@@ -59,6 +59,7 @@ const { cardFormatOf, CARD_FORMATS, findCard, readCard, storeCard } = await impo
 const store = await import(join(REPO, "backend/src/compositeStore.ts"));
 const shared = await import(join(REPO, "backend/src/sharedStores.ts"));
 const crafts = await import(join(REPO, "backend/src/stickerCrafts.ts"));
+const codes = await import(join(REPO, "backend/src/inspectDecode.ts"));
 const DIST = process.argv[2];
 if (!DIST) {
   console.error("usage: node --experimental-strip-types tools/standalone/mock-server.mjs <dist dir>");
@@ -359,6 +360,12 @@ createServer(async (req, res) => {
       if (p === "/api/sticker-crafts/board" && req.method === "PUT") {
         MAT.board = crafts.normBoard(body(), isSticker);
         return json(res, { ok: true });
+      }
+      if (p === "/api/sticker-crafts/import" && req.method === "POST") {
+        const read = codes.readInspectCode(body()?.code);
+        const made = read.ok ? cat.craftFromCode(read.code) : null;
+        const reason = !read.ok ? read.reason : !made ? "not-a-gun" : !made.stickers.length ? "no-stickers" : null;
+        return reason ? status(res, 400, { error: reason, reason }) : json(res, made);
       }
       const pic = p.match(/^\/api\/sticker-crafts\/crafts\/([^/]+)\/picture\/(top|use)$/);
       if (pic && req.method === "PUT") {

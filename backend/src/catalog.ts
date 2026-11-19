@@ -16,11 +16,14 @@ import {
   CS2_STICKER_ROTATION_STEP,
   CS2_STICKER_WEAR_FACTOR,
   CS2_WEAR_FACTOR,
+  CS2_INVENTORY_RULES,
+  roundToFactor,
   truncateToFactor,
 } from "@ianlucas/cs2-lib";
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { patchSlotsSync } from "./agentPatchSlots.ts";
+import type { InspectCode } from "./inspectDecode.ts";
 import { english } from "@ianlucas/cs2-lib/translations/english";
 
 // Load the CS2 economy catalog once at startup (~27k items). This is the same
@@ -2156,4 +2159,75 @@ export function stickerMaterialFor(image: string, patchMaterials?: Record<string
     }
   }
   return null;
+}
+
+// ---- Sticker Crafts' Import ----------------------------------------------------
+
+/** A gun's stickers read off an inspect code, in the catalog's terms: what the
+ *  Sticker Crafts mat lays out, and how many it had to leave out. */
+export interface CodeCraft {
+  model: string;
+  /** The finish's name, or the gun's when the code's finish isn't in the catalog. */
+  name: string;
+  /** The finish renders on the gun's legacy body, which has its own anchors (as the editor decides: a legacy paint with a material). */
+  legacy: boolean;
+  stickers: { id: number; name: string; image: string | null; slot: number; x: number; y: number; r: number; w: number }[];
+  skipped: number;
+}
+
+let stickersByKit: Map<number, (typeof items)[number]> | null = null;
+
+/**
+ * The craft an inspect code describes, or null when it names no gun that takes
+ * stickers. A sticker the catalog doesn't have, on an anchor the gun doesn't
+ * have, or at a place that isn't a number is left out and counted; the gun's
+ * own rules clamp the rest, as cs2-lib's parser does. A code carries float32s,
+ * so each is rounded to its rule's step before the rule truncates it: 0.02
+ * arrives as 0.0199999995 and must not become 0.0199.
+ */
+export function craftFromCode(code: InspectCode): CodeCraft | null {
+  const base = items.find((i) => i.type === "weapon" && i.definitionIndex === code.def && !i.variantIndex);
+  if (!base?.hasStickers()) {
+    return null;
+  }
+  const finish = code.paint ? items.find((i) => i.type === "weapon" && i.definitionIndex === code.def && i.variantIndex === code.paint) : undefined;
+  const gun = finish ?? base;
+  if (!stickersByKit) {
+    stickersByKit = new Map();
+    for (const i of items) {
+      if (i.isSticker() && i.variantIndex != null && !stickersByKit.has(i.variantIndex)) {
+        stickersByKit.set(i.variantIndex, i);
+      }
+    }
+  }
+  const rules = CS2_INVENTORY_RULES;
+  const step = (v: number | null, factor: number) => (v === null ? undefined : roundToFactor(v, factor));
+  const stickers: CodeCraft["stickers"] = [];
+  let skipped = 0;
+  for (const s of code.stickers) {
+    const item = stickersByKit.get(s.kit);
+    const slot = s.slot ?? stickers.length;
+    const placed = [s.x, s.y, s.r].every((v) => v === null || Number.isFinite(v));
+    if (!item || !placed || !rules.stickerSchema.check(slot, gun) || stickers.length >= CS2_MAX_STICKERS) {
+      skipped++;
+      continue;
+    }
+    stickers.push({
+      id: item.id,
+      name: item.name,
+      image: img(item.imagePath),
+      slot,
+      x: rules.stickerX.repair(step(s.x, CS2_STICKER_OFFSET_FACTOR), gun) ?? 0,
+      y: rules.stickerY.repair(step(s.y, CS2_STICKER_OFFSET_FACTOR), gun) ?? 0,
+      r: s.r === null ? 0 : normStickerRotation(roundToFactor(s.r, CS2_STICKER_ROTATION_STEP)),
+      w: rules.stickerWear.repair(step(s.wear, CS2_STICKER_WEAR_FACTOR), gun) ?? 0,
+    });
+  }
+  return {
+    model: base.modelKey as string,
+    name: finish?.name ?? base.name,
+    legacy: !!finish?.isLegacyModel && !!finish.materialPath,
+    stickers,
+    skipped,
+  };
 }

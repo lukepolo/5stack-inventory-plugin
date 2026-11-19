@@ -22,6 +22,7 @@ import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, shallowRef
 import {
   BookmarkPlus,
   ChevronUp,
+  ClipboardPaste,
   CloudOff,
   Crosshair,
   Globe,
@@ -48,7 +49,16 @@ import {
   View,
   X,
 } from "lucide-vue-next";
-import { assetUrl, fetchStickerGeometry, fetchWeaponOutline, saveWeaponOutline, type CatalogWeapon, type InventoryItem } from "../api";
+import {
+  ApiError,
+  assetUrl,
+  fetchStickerGeometry,
+  fetchWeaponOutline,
+  importCraftCode,
+  saveWeaponOutline,
+  type CatalogWeapon,
+  type InventoryItem,
+} from "../api";
 import { useAttachmentPicker, type PickerRow } from "../composables/useAttachmentPicker";
 import { usePersistedBool, usePersistedString } from "../composables/usePersistedRef";
 import {
@@ -107,7 +117,7 @@ const emit = defineEmits<{
   (e: "put-on-gun", craftId: string, model: string, at: OutlineSpot | null): void;
 }>();
 
-const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 /** Snap step for dragging, in cm, and for turning, in degrees. */
 const SNAP_CM = 0.5;
@@ -903,21 +913,22 @@ const othersCraft = (entry: SavedCraft | StoreCraft) => "author" in entry && !(e
 /**
  * Lay a craft down on the mat, as a grouping again, selected. One of yours
  * stays linked to it (Update writes back); someone else's from the store is a
- * copy to make your own, named so. False when the mat has no room for it.
+ * copy to make your own, named so, and so is one read off an inspect code
+ * (`copy`). It goes where `at` says, else the first clear spot. False when the
+ * mat has no room for it.
  */
-function placeSaved(entry: SavedCraft | StoreCraft): boolean {
+function placeSaved(entry: SavedCraft | StoreCraft, copy = othersCraft(entry), at = craftSpot(entry.stickers)): boolean {
   if (stickers.value.length + entry.stickers.length > MAX_ON_BOARD) return false;
   const theirs = othersCraft(entry);
   const g = entry.stickers.length > 1 ? { id: newId(), name: theirs ? `${entry.name} (my copy)` : entry.name } : null;
   if (g) groups.value = [...groups.value, g];
-  const at = craftSpot(entry.stickers);
   const made = entry.stickers.map((s) => ({
     ...toRaw(s),
     uid: newId(),
     x: clampX(at.x + s.x),
     y: clampY(at.y + s.y),
     group: g?.id ?? null,
-    craft: theirs ? null : entry.id,
+    craft: copy ? null : entry.id,
   }));
   stickers.value = [...stickers.value, ...made];
   selected.value = new Set(made.map((s) => s.uid));
@@ -1284,18 +1295,100 @@ const matCraftId = computed(() => {
   const only = from.size === 1 ? [...from][0] : "";
   return only && library.value.some((c) => c.id === only) ? only : null;
 });
-function openOnMat(entry: SavedCraft | StoreCraft) {
+function openOnMat(entry: SavedCraft | StoreCraft, imported?: { at?: { x: number; y: number }; what: string }) {
   if (entry.stickers.length > MAX_ON_BOARD) return;
-  nameDraft.value = othersCraft(entry) ? `${entry.name} (my copy)`.slice(0, 40) : null;
+  nameDraft.value = imported ? entry.name.slice(0, 40) : othersCraft(entry) ? `${entry.name} (my copy)`.slice(0, 40) : null;
   const removed = takeOff(() => false);
-  placeSaved(entry);
+  placeSaved(entry, !!imported || othersCraft(entry), imported?.at);
   galleryOpen.value = false;
-  const what = othersCraft(entry) ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`;
+  const what = imported?.what ?? (othersCraft(entry) ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`);
   if (!removed.stickers.length) return say(what);
   offerUndo(what, () => {
     takeOff(() => false);
     putBack(removed);
   });
+}
+
+// ---- a craft from an inspect code -----------------------------------------------------
+// Import, beside the Craft Store: a pasted code read on the server, its gun
+// chalked, and its stickers laid where they sat on that gun (gunOnMat) as a
+// copy to save. It replaces the mat like opening any craft.
+const importOpen = ref(false);
+const importText = ref("");
+const importBusy = ref(false);
+const importError = ref<string | null>(null);
+const importPlaceholder = computed(() => tr("inventory.stickerCrafts.importPlaceholder", "Paste a craft's inspect code"));
+function toggleImport() {
+  importOpen.value = !importOpen.value;
+  importError.value = null;
+  galleryOpen.value = false;
+}
+function importRefusal(e: unknown): string {
+  switch (e instanceof ApiError ? e.reason : null) {
+    case "too-long":
+      return tr("inventory.stickerCrafts.importTooLong", "That's too long to be an inspect code.");
+    case "unmasked":
+      return tr(
+        "inventory.stickerCrafts.importUnmasked",
+        "That link points at an item in someone's inventory, so it can't be read here. Paste the craft's Code from csinspect.com instead.",
+      );
+    case "not-a-code":
+      return tr("inventory.stickerCrafts.importNotCode", "That isn't an inspect code. Paste the craft's Code from csinspect.com.");
+    case "unreadable":
+      return tr("inventory.stickerCrafts.importUnreadable", "That code couldn't be read. Copy it again; it may have been cut short.");
+    case "not-a-gun":
+      return tr("inventory.stickerCrafts.importNotGun", "That code isn't for a gun that takes stickers.");
+    case "no-stickers":
+      return tr("inventory.stickerCrafts.importNoStickers", "That code has no stickers this catalog knows.");
+    default:
+      return tr("inventory.stickerCrafts.importFailed", "Couldn't read that code. Try again.");
+  }
+}
+function importNote(count: number, skipped: number): string {
+  if (!skipped) {
+    return tr("inventory.stickerCrafts.importDone", "The code's stickers are on the mat. Save keeps them as your own craft.");
+  }
+  const done = count === 1
+    ? tr("inventory.stickerCrafts.importedOne", "Imported 1 sticker.")
+    : tr("inventory.stickerCrafts.importedMany", "Imported {count} stickers.", { count });
+  const left = skipped === 1
+    ? tr("inventory.stickerCrafts.leftOutOne", "1 couldn't be read and was left out.")
+    : tr("inventory.stickerCrafts.leftOutMany", "{count} couldn't be read and were left out.", { count: skipped });
+  return `${done} ${left}`;
+}
+async function importCode() {
+  const code = importText.value.trim();
+  if (!code || importBusy.value || !loaded.value) {
+    return;
+  }
+  importBusy.value = true;
+  importError.value = null;
+  try {
+    const got = await importCraftCode(code);
+    const [geo, lay] = await Promise.all([
+      fetchStickerGeometry(got.model).catch(() => null),
+      trace.value ?? import("../outlineTrace"),
+    ]);
+    outlineModel.value = got.model;
+    await nextTick();
+    await outlineReady;
+    const o = outlines.value.get(got.model) ?? null;
+    const laid = lay.gunOnMat(got.stickers, geo?.slots ?? [], got.legacy ? "body_legacy" : "body_hd", o);
+    const entry: SavedCraft = {
+      id: newId(),
+      name: got.name,
+      savedAt: Date.now(),
+      stickers: got.stickers.map((s, i) => ({ id: s.id, name: s.name, image: s.image ?? "", ...laid.stickers[i], wear: s.w })),
+    };
+    const at = laid.at && o ? { x: laid.at.x + GRID_W / 2 - o.w / 2, y: laid.at.y + GRID_H / 2 - o.h / 2 } : undefined;
+    openOnMat(entry, { at, what: importNote(got.stickers.length, got.skipped) });
+    importOpen.value = false;
+    importText.value = "";
+  } catch (e) {
+    importError.value = importRefusal(e);
+  } finally {
+    importBusy.value = false;
+  }
 }
 
 /**
@@ -1497,6 +1590,11 @@ function onKey(e: KeyboardEvent) {
   }
   if (galleryOpen.value && e.key === "Escape") {
     galleryOpen.value = false;
+    e.stopPropagation();
+    return;
+  }
+  if (importOpen.value && e.key === "Escape") {
+    importOpen.value = false;
     e.stopPropagation();
     return;
   }
@@ -1789,7 +1887,7 @@ const FIELD =
             :disabled="!loaded"
             :aria-expanded="galleryOpen"
             :title="galleryOpen ? 'Close All crafts (Esc)' : 'Every craft you have saved'"
-            @click="galleryOpen = !galleryOpen"
+            @click="galleryOpen = !galleryOpen; importOpen = false"
           >
             <LayoutGrid class="h-3.5 w-3.5" /> {{ tr("inventory.stickerCrafts.allCrafts", "All crafts") }}
             <span class="font-mono text-f9 normal-case tracking-normal text-muted-foreground/70">{{ library.length }}</span>
@@ -1805,6 +1903,18 @@ const FIELD =
               <Store class="h-3.5 w-3.5" />
             </button>
           </Tooltip>
+          <Tooltip :text="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')">
+            <button
+              class="grid place-items-center rounded-lg border border-border bg-card/80 text-muted-foreground backdrop-blur tac-action disabled:opacity-50"
+              :class="[compact ? 'h-7 w-7' : 'h-8 w-8', importOpen ? 'tac-on' : '']"
+              :disabled="!loaded"
+              :aria-expanded="importOpen"
+              :aria-label="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')"
+              @click="toggleImport"
+            >
+              <ClipboardPaste class="h-3.5 w-3.5" />
+            </button>
+          </Tooltip>
           <Tooltip v-if="stickers.length" :text="tr('inventory.stickerCrafts.clearHint', 'Clear the mat — you can undo it for a few seconds')">
             <button
               class="ml-1.5 grid place-items-center rounded-lg border border-border bg-card/80 text-muted-foreground backdrop-blur transition-colors hover:border-[#e04a3a] hover:bg-[#e04a3a]/10 hover:text-[#ff7a6a]"
@@ -1816,6 +1926,43 @@ const FIELD =
             </button>
           </Tooltip>
         </div>
+
+        <Transition enter-active-class="animate-pop-in motion-reduce:animate-none" leave-active-class="animate-pop-out motion-reduce:animate-none">
+          <form
+            v-if="importOpen"
+            class="absolute right-3 z-[7] flex w-[min(420px,calc(100%-1.5rem))] flex-col gap-1.5 rounded-lg border border-border bg-card/95 p-2.5 shadow-2xl backdrop-blur"
+            :class="compact ? 'top-12' : 'top-14'"
+            :aria-label="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')"
+            @submit.prevent="importCode"
+          >
+            <div class="flex items-center gap-2">
+              <input
+                v-model="importText"
+                v-focus
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                class="min-w-0 flex-1 rounded-md border bg-background px-3 text-foreground outline-none transition-colors placeholder:text-muted-foreground/50 focus:border-[hsl(var(--tac-amber)/0.6)]"
+                :class="[compact ? 'h-10 text-[16px]' : 'h-8 text-f11', importError ? 'border-[#e04a3a]/60' : 'border-border']"
+                :placeholder="importPlaceholder"
+                :aria-label="importPlaceholder"
+                :aria-invalid="!!importError"
+                :readonly="importBusy"
+                @input="importError = null"
+              />
+              <button type="submit" :class="[BTN, compact ? '' : 'h-8 !py-0']" :disabled="!importText.trim() || importBusy">
+                <Loader2 v-if="importBusy" class="h-3 w-3 animate-spin motion-reduce:animate-none" />
+                {{ importBusy ? tr("inventory.stickerCrafts.importReading", "Reading") : tr("inventory.stickerCrafts.import", "Import") }}
+              </button>
+            </div>
+            <Transition mode="out-in" enter-active-class="animate-fade-in motion-reduce:animate-none" leave-active-class="animate-fade-out motion-reduce:animate-none">
+              <p v-if="importError" key="error" class="text-f11 text-[#ff7a6a]" role="alert">{{ importError }}</p>
+              <p v-else key="hint" class="text-f9 text-muted-foreground/70">
+                {{ tr("inventory.stickerCrafts.importHint", "Lays the code's stickers on the mat as they sit on its gun. Save keeps it as your own craft.") }}
+              </p>
+            </Transition>
+          </form>
+        </Transition>
 
         <!-- How to drive it: the 3D viewer's own legend, bottom centre, as on a
              gun — the mat takes the same mouse (drag turns the view, right-drag
@@ -2100,7 +2247,7 @@ const FIELD =
       :class="picker ? 'bottom-16' : 'bottom-5'"
       :style="{ zIndex: picker ? Z.pickerToast : Z.toast }"
     >
-      <UndoToast :label="undoable?.label ?? null" undo-title="Put it back (Ctrl/⌘ + Z)" @undo="runUndo" @dismiss="settleUndo" />
+      <UndoToast class="max-w-full" :label="undoable?.label ?? null" undo-title="Put it back (Ctrl/⌘ + Z)" @undo="runUndo" @dismiss="settleUndo" />
     </div>
 
     <!-- The same fade the editor's picker takes (App.vue). v-if on the child,

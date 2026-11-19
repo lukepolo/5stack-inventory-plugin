@@ -45,6 +45,7 @@ import {
   type GamePluginState,
 } from "./panel.ts";
 import { buildInspectLink, type CS2BaseInventoryItem } from "./inspect.ts";
+import { readInspectCode, type CodeRefusal } from "./inspectDecode.ts";
 import {
   getStickerMarkup,
   getStickerMasks,
@@ -100,6 +101,7 @@ import {
   type Quote,
 } from "./prices.ts";
 import {
+  craftFromCode,
   getWeapons,
   getDefaults,
   getWeaponSkins,
@@ -3084,6 +3086,33 @@ app.put<{ Body: unknown }>("/api/sticker-crafts/board", { bodyLimit: 64_000 }, a
     [identity.steamId, JSON.stringify(mat.stickers), JSON.stringify(mat.groups)],
   );
   return { ok: true };
+});
+
+const CODE_REFUSALS: Record<CodeRefusal | "not-a-gun" | "no-stickers", string> = {
+  "too-long": "That's too long to be an inspect code.",
+  unmasked: "That link points at an item in someone's inventory, so it can't be read here. Paste the craft's Code from csinspect.com instead.",
+  "not-a-code": "That isn't an inspect code. Paste the craft's Code from csinspect.com.",
+  unreadable: "That code couldn't be read. Copy it again; it may have been cut short.",
+  "not-a-gun": "That code isn't for a gun that takes stickers.",
+  "no-stickers": "That code has no stickers this catalog knows.",
+};
+
+/**
+ * A craft read off a pasted inspect code, for the mat's Import: the gun, its
+ * finish's body, and each sticker on its anchor, with how many were left out.
+ * Writes nothing; the mat lays it down as a copy to save.
+ */
+app.post<{ Body: { code?: unknown } }>("/api/sticker-crafts/import", { bodyLimit: 16_384 }, async (request, reply) => {
+  if (!(await getIdentity(request))) {
+    return reply.status(401).send({ error: "unauthorized" });
+  }
+  const read = readInspectCode(request.body?.code);
+  const craft = read.ok ? craftFromCode(read.code) : null;
+  const reason = !read.ok ? read.reason : !craft ? "not-a-gun" : !craft.stickers.length ? "no-stickers" : null;
+  if (reason) {
+    return reply.status(400).send({ error: CODE_REFUSALS[reason], reason });
+  }
+  return craft;
 });
 
 /** Whether an administrator took down a craft of this author's with any of these marks (takedownMarks). */
