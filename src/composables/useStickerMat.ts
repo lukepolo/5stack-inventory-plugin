@@ -47,7 +47,10 @@ export type UndoKind = "open" | "store" | "import";
 type Undoable = { label: string; undo: () => void; commit?: () => void; kind?: UndoKind };
 const UNDO_MS = 6000;
 /** Cut inside the quotes, so a long name never pushes the rest of a toast out of its two lines. */
-const quoted = (name: string) => (name.length > 24 ? `${name.slice(0, 23).trimEnd()}…` : name);
+const quoted = (name: string) => {
+  const chars = Array.from(name);
+  return chars.length > 24 ? `${chars.slice(0, 23).join("").trimEnd()}…` : name;
+};
 
 export function useStickerMat(o: {
   stickers: Ref<BoardSticker[]>;
