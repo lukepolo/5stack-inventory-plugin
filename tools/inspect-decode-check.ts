@@ -1,13 +1,3 @@
-// Does a pasted inspect code come back as the gun and stickers it names, and is
-// anything else refused before it is parsed?
-//
-// Run: node --experimental-strip-types tools/inspect-decode-check.ts
-//
-// The Sticker Crafts mat's Import reads a stranger's text. Codes are written
-// here two independent ways: by cs2-lib-inspect through our own encoder
-// (buildInspectLink), and by a small protobuf writer below for what no encoder
-// will write (unknown stickers, bad anchors, broken bytes). The writer's framing
-// is pinned to cs2-lib-inspect's in both directions before anything trusts it.
 import { crc32 } from "node:zlib";
 import { buildInspectLink } from "../backend/src/inspect.ts";
 import { craftFromCode, type CodeCraft } from "../backend/src/catalog.ts";
@@ -44,7 +34,9 @@ const varint = (n: number): number[] => {
   do {
     let b = n % 128;
     n = Math.floor(n / 128);
-    if (n) b |= 0x80;
+    if (n) {
+      b |= 0x80;
+    }
     out.push(b);
   } while (n);
   return out;
@@ -102,7 +94,9 @@ const ours = buildInspectLink({
     2: { id: IBP_HOLO.id, schema: 2, rotation: -45.5 },
   },
 });
-if (!ours) throw new Error("buildInspectLink refused the AK-47 | Redline");
+if (!ours) {
+  throw new Error("buildInspectLink refused the AK-47 | Redline");
+}
 const oursHex = hexOf(ours);
 const oursPayload = [...Buffer.from(oursHex, "hex")].slice(1, -4);
 check("the writer frames a payload byte for byte as cs2-lib-inspect does", frame(oursPayload), oursHex.toUpperCase());
@@ -150,18 +144,23 @@ check("a sticker the catalog lacks is left out and counted", [placed(partly), ty
   [[CROWN_FOIL.id, 0, 0, 0, 0, 0], [HOWLING_DAWN.id, 2, 0, 0, 0, 0]],
   1,
 ]);
-const offGun = craft(frame(gun(AK47, null, [{ slot: 0, kit: CROWN_FOIL.kit }, { slot: 4, kit: IBP_HOLO.kit }, { slot: 31, kit: TITAN_HOLO.kit }])));
-check("an anchor the gun doesn't have is left out and counted (the AK-47 has four)", [placed(offGun), typeof offGun === "object" && offGun?.skipped], [
-  [[CROWN_FOIL.id, 0, 0, 0, 0, 0]],
-  2,
-]);
-const hd = craft(frame(gun(AWP, AWP_SNAKE_CAMO, [{ slot: 4, kit: CROWN_FOIL.kit }])));
-const legacy = craft(frame(gun(AWP, AWP_LIGHTNING_STRIKE, [{ slot: 4, kit: CROWN_FOIL.kit }])));
-check("anchors are the finish's body's: the AWP's fifth is on its legacy body only", [
-  typeof hd === "object" && hd?.skipped,
-  typeof legacy === "object" && legacy?.stickers.length,
-  typeof legacy === "object" && legacy?.legacy,
-], [1, 1, true]);
+const libSchemas = (hex: string) =>
+  Object.values(lib.parseInspectLink(CS2Economy, command(hex)).stickers ?? {}).map((s) => (s as { schema: number }).schema);
+const anchors = (c: CodeCraft | null | string) => (c && typeof c === "object" ? [c.stickers.map((s) => s.slot), c.skipped] : c);
+const offGun = frame(gun(AK47, null, [{ slot: 0, kit: CROWN_FOIL.kit }, { slot: 4, kit: IBP_HOLO.kit }, { slot: 31, kit: TITAN_HOLO.kit }]));
+check("an anchor the AK-47 doesn't have (it has four) moves to the next free one, as cs2-lib's parser puts it",
+  anchors(craft(offGun)), [libSchemas(offGun), 0]);
+check("which is 0, 1, 2 here", libSchemas(offGun), [0, 1, 2]);
+const fullAk = frame(gun(AK47, null, [0, 1, 2, 3, 4].map((slot) => ({ slot, kit: CROWN_FOIL.kit }))));
+check("a five-sticker AK-47: the fifth, on anchor 4, shares anchor 0 as cs2-lib's parser puts it",
+  anchors(craft(fullAk)), [libSchemas(fullAk), 0]);
+check("which is 0, 1, 2, 3, 0", libSchemas(fullAk), [0, 1, 2, 3, 0]);
+const hdAwp = frame(gun(AWP, AWP_SNAKE_CAMO, [{ slot: 4, kit: CROWN_FOIL.kit }]));
+const legacyAwp = frame(gun(AWP, AWP_LIGHTNING_STRIKE, [{ slot: 4, kit: CROWN_FOIL.kit }]));
+check("anchors are the finish's body's: the AWP's anchor 4 is its legacy body's only",
+  [anchors(craft(hdAwp)), anchors(craft(legacyAwp)), (craft(legacyAwp) as CodeCraft).legacy],
+  [[libSchemas(hdAwp), 0], [libSchemas(legacyAwp), 0], true]);
+check("so the HD AWP's moves to anchor 0 and the legacy one's stays on 4", [libSchemas(hdAwp), libSchemas(legacyAwp)], [[0], [4]]);
 const nan = craft(frame(gun(AK47, null, [{ slot: 0, kit: CROWN_FOIL.kit, x: NaN }, { slot: 1, kit: IBP_HOLO.kit, r: Infinity }, { slot: 2, kit: TITAN_HOLO.kit }])));
 check("a place or turn that isn't a number is left out and counted", [placed(nan), typeof nan === "object" && nan?.skipped], [
   [[TITAN_HOLO.id, 2, 0, 0, 0, 0]],
