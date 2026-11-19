@@ -6,15 +6,20 @@
 // owns the look and the motion. Where it sits is the caller's too (a class on
 // it), since the mat's rises over its own picker.
 import { Trash2 } from "lucide-vue-next";
+import type { Component } from "vue";
 
-defineProps<{
-  /** What happened, e.g. "Removed “Howling Dawn”". Null hides it. */
-  label: string | null;
-  /** The Undo button's tooltip (a keyboard shortcut, where there is one). */
-  undoTitle?: string;
-  /** The ✕'s tooltip — what dismissing does (settles it now). */
-  dismissTitle?: string;
-}>();
+withDefaults(
+  defineProps<{
+    /** What happened, e.g. "Removed “Howling Dawn”". Null hides it. */
+    label: string | null;
+    /** The Undo button's tooltip (a keyboard shortcut, where there is one). */
+    undoTitle?: string;
+    /** The ✕'s tooltip — what dismissing does (settles it now). */
+    dismissTitle?: string;
+    icon?: Component;
+  }>(),
+  { icon: () => Trash2 },
+);
 const emit = defineEmits<{ (e: "undo"): void; (e: "dismiss"): void }>();
 </script>
 
@@ -30,8 +35,8 @@ const emit = defineEmits<{ (e: "undo"): void; (e: "dismiss"): void }>();
       class="pointer-events-auto flex items-center gap-3 rounded-md border border-border bg-card px-4 py-2.5 text-f13 shadow-2xl"
       role="status"
     >
-      <Trash2 class="h-3.5 w-3.5 flex-none text-muted-foreground" />
-      <span class="max-w-[380px] truncate">{{ label }}</span>
+      <component :is="icon" class="h-3.5 w-3.5 flex-none text-muted-foreground" />
+      <span class="line-clamp-2 min-w-0 max-w-[380px]">{{ label }}</span>
       <button
         class="flex-none rounded-sm px-2 py-1 text-f11 font-bold uppercase tracking-cs1 text-[hsl(var(--tac-amber,33_94%_58%))] transition-colors hover:bg-muted"
         :title="undoTitle"

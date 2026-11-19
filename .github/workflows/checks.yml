@@ -88,6 +88,15 @@ jobs:
       - name: Inspect link round-trips
         run: npm run check:inspect
 
+      - name: A pasted inspect code reads back, and anything else is refused
+        run: npm run check:inspect-decode
+
+      - name: A gun's stickers land on the Sticker Crafts mat and go back unchanged
+        run: npm run check:gun-on-mat
+
+      - name: Undo after opening a craft puts the whole mat back, and a closed import never lands
+        run: npm run check:mat-open
+
       - name: StatTrak digits match the shader
         run: npm run check:stattrak
 

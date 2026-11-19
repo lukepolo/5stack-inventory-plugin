@@ -270,7 +270,26 @@
       "proposedUse": "Proposed use",
       "delete": "Delete",
       "loadError": "Your Sticker Crafts didn't load.",
-      "retry": "Try again"
+      "retry": "Try again",
+      "importCode": "Import a craft from an inspect code",
+      "importPlaceholder": "Paste a craft's inspect code",
+      "import": "Import",
+      "importReading": "Reading",
+      "importHint": "Lays the code's stickers on the mat as they sit on its gun. Save keeps it as your own craft.",
+      "importTooLong": "That's too long to be an inspect code.",
+      "importUnmasked": "That link points at an item in someone's inventory, so it can't be read here. Paste the craft's Code from csinspect.com instead.",
+      "importNotCode": "That isn't an inspect code. Paste the craft's Code from csinspect.com.",
+      "importUnreadable": "That code couldn't be read. Copy it again; it may have been cut short.",
+      "importNotGun": "That code isn't for a gun that takes stickers.",
+      "importNoStickers": "That code has no stickers this catalog knows.",
+      "importFailed": "Couldn't read that code. Try again.",
+      "importSignedOut": "You're signed out. Sign in again, then import the code.",
+      "importOffline": "Couldn't reach the server. Check your connection and try again.",
+      "importServer": "The server had trouble reading that code. Try again in a moment.",
+      "importDone": "Imported. Save to keep it as your craft.",
+      "importPartial": "Imported {count} of {total}. {skipped} couldn't be read.",
+      "opened": "Opened “{name}”",
+      "openedCopy": "Opened a copy of “{name}”"
     }
   }
 }

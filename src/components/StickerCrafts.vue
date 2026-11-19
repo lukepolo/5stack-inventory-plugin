@@ -22,6 +22,7 @@ import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, shallowRef
 import {
   BookmarkPlus,
   ChevronUp,
+  ClipboardPaste,
   CloudOff,
   Crosshair,
   Globe,
@@ -48,7 +49,16 @@ import {
   View,
   X,
 } from "lucide-vue-next";
-import { assetUrl, fetchStickerGeometry, fetchWeaponOutline, saveWeaponOutline, type CatalogWeapon, type InventoryItem } from "../api";
+import {
+  IMPORT_MAX_CHARS,
+  assetUrl,
+  fetchStickerGeometry,
+  fetchWeaponOutline,
+  importCraftCode,
+  saveWeaponOutline,
+  type CatalogWeapon,
+  type InventoryItem,
+} from "../api";
 import { useAttachmentPicker, type PickerRow } from "../composables/useAttachmentPicker";
 import { usePersistedBool, usePersistedString } from "../composables/usePersistedRef";
 import {
@@ -77,6 +87,7 @@ import {
 import type { StickerBoard } from "../stickerBoard";
 import type { WeaponOutline } from "../outlineTrace";
 import type { OutlineSpot } from "../composables/useStickerCraftPlacement";
+import { offChalk, useStickerMat } from "../composables/useStickerMat";
 import AttachmentPicker from "./AttachmentPicker.vue";
 import ModelRail, { type RailItem } from "./ModelRail.vue";
 import CraftUseCase from "./CraftUseCase.vue";
@@ -107,7 +118,7 @@ const emit = defineEmits<{
   (e: "put-on-gun", craftId: string, model: string, at: OutlineSpot | null): void;
 }>();
 
-const tr = inject<(k: string, f: string) => string>("tr", (_k, f) => f);
+const tr = inject<(k: string, f: string, n?: Record<string, unknown>) => string>("tr", (_k, f) => f);
 
 /** Snap step for dragging, in cm, and for turning, in degrees. */
 const SNAP_CM = 0.5;
@@ -209,34 +220,6 @@ const persistCraft = (c: SavedCraft) => {
   lastPersist = write;
   void track(write);
 };
-
-// ---- draw order -------------------------------------------------------------------
-/**
- * The mat in draw order, bottom first, as UNITS: a loose sticker, or a whole
- * grouping. A grouping's members are kept next to each other in the list —
- * the layer list shows a grouping as one block and drags it as one, which only
- * means something if the block is also one run of draw order. It sits where its
- * top-most member was.
- */
-type Unit = { kind: "one"; s: BoardSticker } | { kind: "group"; group: Grouping; members: BoardSticker[] };
-function unitsOf(list: BoardSticker[]): Unit[] {
-  const out: Unit[] = [];
-  const seen = new Set<string>();
-  for (let i = list.length - 1; i >= 0; i--) {
-    const s = list[i];
-    if (!s.group) {
-      out.push({ kind: "one", s });
-      continue;
-    }
-    if (seen.has(s.group)) continue;
-    seen.add(s.group);
-    const group = groups.value.find((g) => g.id === s.group) ?? { id: s.group, name: "Group" };
-    out.push({ kind: "group", group, members: list.filter((m) => m.group === s.group) });
-  }
-  return out.reverse();
-}
-const flatten = (units: Unit[]) => units.flatMap((u) => (u.kind === "one" ? [u.s] : u.members));
-const normalize = () => (stickers.value = flatten(unitsOf(stickers.value)));
 
 // ---- derived ------------------------------------------------------------------
 const byUid = (uid: string) => stickers.value.find((s) => s.uid === uid);
@@ -494,13 +477,6 @@ const rowProps = (s: BoardSticker) => ({
   coarse: props.compact,
 });
 
-/** Groupings left with one member are no grouping at all. */
-function pruneGroups() {
-  const counts = new Map<string, number>();
-  for (const s of stickers.value) if (s.group) counts.set(s.group, (counts.get(s.group) ?? 0) + 1);
-  for (const s of stickers.value) if (s.group && (counts.get(s.group) ?? 0) < 2) s.group = null;
-  groups.value = groups.value.filter((g) => (counts.get(g.id) ?? 0) >= 2);
-}
 function nextGroupName() {
   const used = new Set(groups.value.map((g) => g.name));
   let n = groups.value.length + 1;
@@ -589,74 +565,9 @@ function reorder(list: string, from: number, to: number) {
   stickers.value = flatten(units);
 }
 
-// ---- undo and notices ----------------------------------------------------------
-// The panel's way with a delete (the inventory's Undo toast): it happens at
-// once, and for a few seconds it can be taken back. One at a time — a second
-// delete settles the first. A saved craft's server delete waits out the window
-// (`commit`), so Undo never has anything to put back on the server.
-type Undoable = { label: string; undo: () => void; commit?: () => void };
-const undoable = ref<Undoable | null>(null);
-let undoTimer: ReturnType<typeof setTimeout> | undefined;
-const UNDO_MS = 6000;
-function settleUndo() {
-  const u = undoable.value;
-  undoable.value = null;
-  clearTimeout(undoTimer);
-  u?.commit?.();
-}
-function offerUndo(label: string, undo: () => void, commit?: () => void) {
-  settleUndo();
-  undoable.value = { label, undo, commit };
-  undoTimer = setTimeout(settleUndo, UNDO_MS);
-}
-function runUndo() {
-  const u = undoable.value;
-  if (!u) return;
-  undoable.value = null;
-  clearTimeout(undoTimer);
-  u.undo();
-}
+// ---- notices --------------------------------------------------------------------
 /** A word on what just happened — published, updated, or a write that failed — in the host's toast. */
 const say = (text: string, error = false) => emit("notify", text, error ? "error" : "success");
-/**
- * What a removal took off the mat, to put back on Undo: each sticker with its
- * place in the draw order, the groupings it was in, and the stickers left alone
- * in a grouping it emptied. Only that — not a picture of the whole mat, which
- * put back would also undo whatever was moved or added in the seconds since.
- */
-type Removed = { stickers: { s: BoardSticker; at: number }[]; groups: Grouping[]; ungrouped: { uid: string; group: string }[] };
-function takeOff(keep: (s: BoardSticker) => boolean): Removed {
-  const taken: Removed["stickers"] = [];
-  stickers.value.forEach((s, at) => !keep(s) && taken.push({ s: { ...toRaw(s) }, at }));
-  const theirs = new Set(taken.map((t) => t.s.group).filter((g): g is string => !!g));
-  const before = new Map(stickers.value.filter(keep).map((s) => [s.uid, s.group]));
-  const lost = groups.value.filter((g) => theirs.has(g.id)).map((g) => ({ ...g }));
-  stickers.value = stickers.value.filter(keep);
-  selected.value = new Set();
-  pruneGroups();
-  const ungrouped = stickers.value.flatMap((s) => (s.group === null && before.get(s.uid) ? [{ uid: s.uid, group: before.get(s.uid)! }] : []));
-  return { stickers: taken, groups: lost, ungrouped };
-}
-function putBack(r: Removed) {
-  const next = stickers.value.slice();
-  for (const { s, at } of r.stickers) next.splice(Math.min(at, next.length), 0, s);
-  const have = new Set(groups.value.map((g) => g.id));
-  groups.value = [...groups.value, ...r.groups.filter((g) => !have.has(g.id))];
-  for (const u of r.ungrouped) {
-    const s = next.find((x) => x.uid === u.uid);
-    if (s && s.group === null) s.group = u.group;
-  }
-  stickers.value = next;
-  selected.value = new Set(r.stickers.map((t) => t.s.uid));
-  pruneGroups();
-  normalize();
-}
-function clearBoard() {
-  if (!stickers.value.length) return;
-  nameDraft.value = null;
-  const removed = takeOff(() => false);
-  offerUndo("Cleared the mat", () => putBack(removed));
-}
 
 // ---- the library ------------------------------------------------------------------
 /**
@@ -815,8 +726,7 @@ async function putOnGun() {
   // Where it sits on that gun's chalk, so the editor puts it there rather than
   // on its slots' default spots. The chalk's box is centred on the home grid.
   const o = outline.value?.model === model ? outline.value : null;
-  const c = centroid(keep.value);
-  const at = o ? { x: c.x - (GRID_W / 2 - o.w / 2), y: c.y - (GRID_H / 2 - o.h / 2), anchors: o.anchors, uv: o.uv } : null;
+  const at = o ? { ...offChalk(centroid(keep.value), o), anchors: o.anchors, uv: o.uv } : null;
   emit("put-on-gun", id, model, at);
 }
 /** Enter in the name field: Update when the mat is a saved craft, else Save. */
@@ -897,32 +807,6 @@ function craftSpot(list: { x: number; y: number }[]): { x: number; y: number } {
     for (let x = a.x0 + 6; x <= a.x1 - 2; x += 6.5) if (clear(x, y)) return { x, y };
   }
   return mid;
-}
-/** Someone else's craft from the store, not one of yours. */
-const othersCraft = (entry: SavedCraft | StoreCraft) => "author" in entry && !(entry as StoreCraft).mine;
-/**
- * Lay a craft down on the mat, as a grouping again, selected. One of yours
- * stays linked to it (Update writes back); someone else's from the store is a
- * copy to make your own, named so. False when the mat has no room for it.
- */
-function placeSaved(entry: SavedCraft | StoreCraft): boolean {
-  if (stickers.value.length + entry.stickers.length > MAX_ON_BOARD) return false;
-  const theirs = othersCraft(entry);
-  const g = entry.stickers.length > 1 ? { id: newId(), name: theirs ? `${entry.name} (my copy)` : entry.name } : null;
-  if (g) groups.value = [...groups.value, g];
-  const at = craftSpot(entry.stickers);
-  const made = entry.stickers.map((s) => ({
-    ...toRaw(s),
-    uid: newId(),
-    x: clampX(at.x + s.x),
-    y: clampY(at.y + s.y),
-    group: g?.id ?? null,
-    craft: theirs ? null : entry.id,
-  }));
-  stickers.value = [...stickers.value, ...made];
-  selected.value = new Set(made.map((s) => s.uid));
-  board.value?.flash(made.map((s) => s.uid));
-  return true;
 }
 function renameSaved(entry: SavedCraft, name: string) {
   if (!name.trim()) return;
@@ -1050,6 +934,7 @@ function freeSpot(): { x: number; y: number } {
 function addSticker(row: PickerRow) {
   picker.value = null;
   if (!row.image || boardFull.value) return;
+  closeImport();
   const at = freeSpot();
   const s: BoardSticker = {
     uid: newId(),
@@ -1284,20 +1169,56 @@ const matCraftId = computed(() => {
   const only = from.size === 1 ? [...from][0] : "";
   return only && library.value.some((c) => c.id === only) ? only : null;
 });
-function openOnMat(entry: SavedCraft | StoreCraft) {
-  if (entry.stickers.length > MAX_ON_BOARD) return;
-  nameDraft.value = othersCraft(entry) ? `${entry.name} (my copy)`.slice(0, 40) : null;
-  const removed = takeOff(() => false);
-  placeSaved(entry);
-  galleryOpen.value = false;
-  const what = othersCraft(entry) ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`;
-  if (!removed.stickers.length) return say(what);
-  offerUndo(what, () => {
-    takeOff(() => false);
-    putBack(removed);
-  });
-}
+const {
+  unitsOf,
+  flatten,
+  normalize,
+  pruneGroups,
+  undoable,
+  offerUndo,
+  settleUndo,
+  runUndo,
+  takeOff,
+  putBack,
+  clearBoard,
+  openOnMat,
+  importOpen,
+  importText,
+  importBusy,
+  importError,
+  toggleImport,
+  toggleGallery,
+  openStore,
+  escape,
+  dispose,
+  closeImport,
+  importCode,
+} = useStickerMat({
+  stickers,
+  groups,
+  selected,
+  name: nameDraft,
+  outline: outlineModel,
+  gallery: galleryOpen,
+  spot: craftSpot,
+  clamp: (p) => ({ x: clampX(p.x), y: clampY(p.y) }),
+  flash: (uids) => board.value?.flash(uids),
+  newId,
+  tr,
+  read: importCraftCode,
+  geometry: fetchStickerGeometry,
+  outlineOf: async (model) => {
+    const o = outlines.value.get(model) ?? (await outlineFor(model));
+    if (o) {
+      outlines.value = new Map(outlines.value).set(model, o);
+    }
+    return o;
+  },
+  openStore: () => openCrafts("store"),
+});
+const undoIcon = computed(() => (undoable.value?.kind ? { open: LayoutGrid, store: Store, import: ClipboardPaste }[undoable.value.kind] : undefined));
 
+const importPlaceholder = computed(() => tr("inventory.stickerCrafts.importPlaceholder", "Paste a craft's inspect code"));
 /**
  * Where stickers may go: the home grid — or, with a weapon chalked, the
  * weapon's box and OUTLINE_ROOM round it, centred on the home grid's middle
@@ -1495,8 +1416,7 @@ function onKey(e: KeyboardEvent) {
     }
     return;
   }
-  if (galleryOpen.value && e.key === "Escape") {
-    galleryOpen.value = false;
+  if (e.key === "Escape" && escape()) {
     e.stopPropagation();
     return;
   }
@@ -1547,8 +1467,8 @@ onMounted(() => window.addEventListener("keydown", onKey));
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
   clearTimeout(justSavedTimer);
-  // Leaving settles a delete still on its Undo: it was meant.
-  settleUndo();
+  // Leaving settles a delete still on its Undo (it was meant) and cancels an import.
+  dispose();
   // Send a save that was still waiting on its debounce.
   flushBoard();
   board.value?.dispose();
@@ -1789,7 +1709,7 @@ const FIELD =
             :disabled="!loaded"
             :aria-expanded="galleryOpen"
             :title="galleryOpen ? 'Close All crafts (Esc)' : 'Every craft you have saved'"
-            @click="galleryOpen = !galleryOpen"
+            @click="toggleGallery"
           >
             <LayoutGrid class="h-3.5 w-3.5" /> {{ tr("inventory.stickerCrafts.allCrafts", "All crafts") }}
             <span class="font-mono text-f9 normal-case tracking-normal text-muted-foreground/70">{{ library.length }}</span>
@@ -1800,9 +1720,21 @@ const FIELD =
               :class="compact ? 'h-7 w-7' : 'h-8 w-8'"
               :disabled="!loaded"
               :aria-label="tr('inventory.stickerCrafts.store', 'Craft Store')"
-              @click="galleryOpen = false; openCrafts('store')"
+              @click="openStore"
             >
               <Store class="h-3.5 w-3.5" />
+            </button>
+          </Tooltip>
+          <Tooltip :text="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')">
+            <button
+              class="grid place-items-center rounded-lg border border-border bg-card/80 text-muted-foreground backdrop-blur tac-action disabled:opacity-50"
+              :class="[compact ? 'h-7 w-7' : 'h-8 w-8', importOpen ? 'tac-on' : '']"
+              :disabled="!loaded"
+              :aria-expanded="importOpen"
+              :aria-label="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')"
+              @click="toggleImport"
+            >
+              <ClipboardPaste class="h-3.5 w-3.5" />
             </button>
           </Tooltip>
           <Tooltip v-if="stickers.length" :text="tr('inventory.stickerCrafts.clearHint', 'Clear the mat — you can undo it for a few seconds')">
@@ -1816,6 +1748,44 @@ const FIELD =
             </button>
           </Tooltip>
         </div>
+
+        <Transition enter-active-class="animate-pop-in motion-reduce:animate-none" leave-active-class="animate-pop-out motion-reduce:animate-none">
+          <form
+            v-if="importOpen"
+            class="absolute right-3 z-[7] flex w-[min(420px,calc(100%-1.5rem))] flex-col gap-1.5 rounded-lg border border-border bg-card/95 p-2.5 shadow-2xl backdrop-blur"
+            :class="compact ? 'top-12' : 'top-14'"
+            :aria-label="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')"
+            @submit.prevent="importCode"
+          >
+            <div class="flex items-center gap-2">
+              <input
+                v-model="importText"
+                v-focus
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                class="min-w-0 flex-1 rounded-md border bg-background px-3 text-foreground outline-none transition-colors placeholder:text-muted-foreground/50 focus:border-[hsl(var(--tac-amber)/0.6)]"
+                :class="[compact ? 'h-10 text-[16px]' : 'h-8 text-f11', importError ? 'border-[#e04a3a]/60' : 'border-border']"
+                :placeholder="importPlaceholder"
+                :aria-label="importPlaceholder"
+                :aria-invalid="!!importError"
+                :maxlength="IMPORT_MAX_CHARS"
+                :readonly="importBusy"
+                @input="importError = null"
+              />
+              <button type="submit" :class="[BTN, compact ? '' : 'h-8 !py-0']" :disabled="!importText.trim() || importBusy">
+                <Loader2 v-if="importBusy" class="h-3 w-3 animate-spin motion-reduce:animate-none" />
+                {{ importBusy ? tr("inventory.stickerCrafts.importReading", "Reading") : tr("inventory.stickerCrafts.import", "Import") }}
+              </button>
+            </div>
+            <Transition mode="out-in" enter-active-class="animate-fade-in motion-reduce:animate-none" leave-active-class="animate-fade-out motion-reduce:animate-none">
+              <p v-if="importError" key="error" class="text-f11 text-[#ff7a6a]" role="alert">{{ importError }}</p>
+              <p v-else key="hint" class="text-f9 text-muted-foreground/70">
+                {{ tr("inventory.stickerCrafts.importHint", "Lays the code's stickers on the mat as they sit on its gun. Save keeps it as your own craft.") }}
+              </p>
+            </Transition>
+          </form>
+        </Transition>
 
         <!-- How to drive it: the 3D viewer's own legend, bottom centre, as on a
              gun — the mat takes the same mouse (drag turns the view, right-drag
@@ -2100,7 +2070,7 @@ const FIELD =
       :class="picker ? 'bottom-16' : 'bottom-5'"
       :style="{ zIndex: picker ? Z.pickerToast : Z.toast }"
     >
-      <UndoToast :label="undoable?.label ?? null" undo-title="Put it back (Ctrl/⌘ + Z)" @undo="runUndo" @dismiss="settleUndo" />
+      <UndoToast class="max-w-full" :icon="undoIcon" :label="undoable?.label ?? null" undo-title="Put it back (Ctrl/⌘ + Z)" @undo="runUndo" @dismiss="settleUndo" />
     </div>
 
     <!-- The same fade the editor's picker takes (App.vue). v-if on the child,

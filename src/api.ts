@@ -425,6 +425,16 @@ let cardsTakeWebp = false;
 let bakeEnvironment: string | null = null;
 export const getBakeEnvironment = () => bakeEnvironment;
 
+export class ApiError extends Error {
+  status: number;
+  reason: string | null;
+  constructor(message: string, status: number, reason: string | null) {
+    super(message);
+    this.status = status;
+    this.reason = reason;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}/api${path}`, {
     credentials: "include",
@@ -436,13 +446,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     // Surface the backend's human-readable error message when there is one.
     let message = `Something went wrong (${response.status}).`;
+    let reason: string | null = null;
     try {
-      const data = (await response.json()) as { error?: string };
-      if (data?.error) message = data.error;
+      const data = (await response.json()) as { error?: string; reason?: string };
+      if (data?.error) {
+        message = data.error;
+      }
+      if (typeof data?.reason === "string") {
+        reason = data.reason;
+      }
     } catch {
       /* non-JSON error body — keep the generic message */
     }
-    throw new Error(message);
+    throw new ApiError(message, response.status, reason);
   }
   const body = await response.json();
   // The catalog's OWN images are rewritten by the walk below, so the origin and
@@ -1799,6 +1815,18 @@ export const saveStickerCraft = (id: string, craft: { name: string; stickers: Cr
   request<{ ok: true }>(`/sticker-crafts/crafts/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(craft) });
 export const deleteStickerCraft = (id: string) =>
   request<{ ok: true }>(`/sticker-crafts/crafts/${encodeURIComponent(id)}`, { method: "DELETE" });
+
+export interface CraftCodeWire {
+  model: string;
+  name: string;
+  legacy: boolean;
+  stickers: { id: number; name: string; image: string | null; slot: number; x: number; y: number; r: number; w: number }[];
+  skipped: number;
+}
+/** CODE_LIMITS.maxChars in backend/src/inspectDecode.ts. */
+export const IMPORT_MAX_CHARS = 2048;
+export const importCraftCode = (code: string, signal?: AbortSignal) =>
+  request<CraftCodeWire>("/sticker-crafts/import", { method: "POST", body: JSON.stringify({ code }), signal });
 
 /** Where a craft picture is served — immutable: a new picture is a new key. */
 export const craftPictureUrl = (key: string) => `${API_BASE}/api/sticker-crafts/pictures/${encodeURIComponent(key)}`;
