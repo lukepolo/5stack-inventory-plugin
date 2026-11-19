@@ -198,6 +198,8 @@ const flip = (hex: string, at: number) => hex.slice(0, at) + (hex[at] === "0" ? 
 check("an odd number of hex digits", read(oursHex.slice(0, -1)), { ok: false, reason: "unreadable" });
 check("cut short by a byte", read(oursHex.slice(0, -2)), { ok: false, reason: "unreadable" });
 check("one digit changed fails the checksum", read(flip(oursHex, 20)), { ok: false, reason: "unreadable" });
+check("a good payload under a wrong checksum", read(flip(oursHex, oursHex.length - 1)), { ok: false, reason: "unreadable" });
+check("a good payload XOR-keyed under a wrong checksum", read(flip(keyed, keyed.length - 1)), { ok: false, reason: "unreadable" });
 check("too short to hold a gun", read("00AABBCC"), { ok: false, reason: "unreadable" });
 check("a field longer than what is left", read(frame([...u32(3, AK47), ...varint(12 * 8 + 2), 50, 1, 2])), { ok: false, reason: "unreadable" });
 check("a varint that never ends", read(frame([...varint(3 * 8), ...Array(11).fill(0xff)])), { ok: false, reason: "unreadable" });
