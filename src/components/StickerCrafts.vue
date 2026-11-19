@@ -87,8 +87,8 @@ import {
 } from "../stickerCraftsModel";
 import type { StickerBoard } from "../stickerBoard";
 import type { WeaponOutline } from "../outlineTrace";
-import { gunOnMat, type OutlineSpot } from "../composables/useStickerCraftPlacement";
-import { useMatOpen } from "../composables/useMatOpen";
+import type { OutlineSpot } from "../composables/useStickerCraftPlacement";
+import { importedCraft, offChalk, useStickerMat } from "../composables/useStickerMat";
 import AttachmentPicker from "./AttachmentPicker.vue";
 import ModelRail, { type RailItem } from "./ModelRail.vue";
 import CraftUseCase from "./CraftUseCase.vue";
@@ -221,34 +221,6 @@ const persistCraft = (c: SavedCraft) => {
   lastPersist = write;
   void track(write);
 };
-
-// ---- draw order -------------------------------------------------------------------
-/**
- * The mat in draw order, bottom first, as UNITS: a loose sticker, or a whole
- * grouping. A grouping's members are kept next to each other in the list —
- * the layer list shows a grouping as one block and drags it as one, which only
- * means something if the block is also one run of draw order. It sits where its
- * top-most member was.
- */
-type Unit = { kind: "one"; s: BoardSticker } | { kind: "group"; group: Grouping; members: BoardSticker[] };
-function unitsOf(list: BoardSticker[]): Unit[] {
-  const out: Unit[] = [];
-  const seen = new Set<string>();
-  for (let i = list.length - 1; i >= 0; i--) {
-    const s = list[i];
-    if (!s.group) {
-      out.push({ kind: "one", s });
-      continue;
-    }
-    if (seen.has(s.group)) continue;
-    seen.add(s.group);
-    const group = groups.value.find((g) => g.id === s.group) ?? { id: s.group, name: "Group" };
-    out.push({ kind: "group", group, members: list.filter((m) => m.group === s.group) });
-  }
-  return out.reverse();
-}
-const flatten = (units: Unit[]) => units.flatMap((u) => (u.kind === "one" ? [u.s] : u.members));
-const normalize = () => (stickers.value = flatten(unitsOf(stickers.value)));
 
 // ---- derived ------------------------------------------------------------------
 const byUid = (uid: string) => stickers.value.find((s) => s.uid === uid);
@@ -506,13 +478,6 @@ const rowProps = (s: BoardSticker) => ({
   coarse: props.compact,
 });
 
-/** Groupings left with one member are no grouping at all. */
-function pruneGroups() {
-  const counts = new Map<string, number>();
-  for (const s of stickers.value) if (s.group) counts.set(s.group, (counts.get(s.group) ?? 0) + 1);
-  for (const s of stickers.value) if (s.group && (counts.get(s.group) ?? 0) < 2) s.group = null;
-  groups.value = groups.value.filter((g) => (counts.get(g.id) ?? 0) >= 2);
-}
 function nextGroupName() {
   const used = new Set(groups.value.map((g) => g.name));
   let n = groups.value.length + 1;
@@ -601,74 +566,9 @@ function reorder(list: string, from: number, to: number) {
   stickers.value = flatten(units);
 }
 
-// ---- undo and notices ----------------------------------------------------------
-// The panel's way with a delete (the inventory's Undo toast): it happens at
-// once, and for a few seconds it can be taken back. One at a time — a second
-// delete settles the first. A saved craft's server delete waits out the window
-// (`commit`), so Undo never has anything to put back on the server.
-type Undoable = { label: string; undo: () => void; commit?: () => void };
-const undoable = ref<Undoable | null>(null);
-let undoTimer: ReturnType<typeof setTimeout> | undefined;
-const UNDO_MS = 6000;
-function settleUndo() {
-  const u = undoable.value;
-  undoable.value = null;
-  clearTimeout(undoTimer);
-  u?.commit?.();
-}
-function offerUndo(label: string, undo: () => void, commit?: () => void) {
-  settleUndo();
-  undoable.value = { label, undo, commit };
-  undoTimer = setTimeout(settleUndo, UNDO_MS);
-}
-function runUndo() {
-  const u = undoable.value;
-  if (!u) return;
-  undoable.value = null;
-  clearTimeout(undoTimer);
-  u.undo();
-}
+// ---- notices --------------------------------------------------------------------
 /** A word on what just happened — published, updated, or a write that failed — in the host's toast. */
 const say = (text: string, error = false) => emit("notify", text, error ? "error" : "success");
-/**
- * What a removal took off the mat, to put back on Undo: each sticker with its
- * place in the draw order, the groupings it was in, and the stickers left alone
- * in a grouping it emptied. Only that — not a picture of the whole mat, which
- * put back would also undo whatever was moved or added in the seconds since.
- */
-type Removed = { stickers: { s: BoardSticker; at: number }[]; groups: Grouping[]; ungrouped: { uid: string; group: string }[] };
-function takeOff(keep: (s: BoardSticker) => boolean): Removed {
-  const taken: Removed["stickers"] = [];
-  stickers.value.forEach((s, at) => !keep(s) && taken.push({ s: { ...toRaw(s) }, at }));
-  const theirs = new Set(taken.map((t) => t.s.group).filter((g): g is string => !!g));
-  const before = new Map(stickers.value.filter(keep).map((s) => [s.uid, s.group]));
-  const lost = groups.value.filter((g) => theirs.has(g.id)).map((g) => ({ ...g }));
-  stickers.value = stickers.value.filter(keep);
-  selected.value = new Set();
-  pruneGroups();
-  const ungrouped = stickers.value.flatMap((s) => (s.group === null && before.get(s.uid) ? [{ uid: s.uid, group: before.get(s.uid)! }] : []));
-  return { stickers: taken, groups: lost, ungrouped };
-}
-function putBack(r: Removed) {
-  const next = stickers.value.slice();
-  for (const { s, at } of r.stickers) next.splice(Math.min(at, next.length), 0, s);
-  const have = new Set(groups.value.map((g) => g.id));
-  groups.value = [...groups.value, ...r.groups.filter((g) => !have.has(g.id))];
-  for (const u of r.ungrouped) {
-    const s = next.find((x) => x.uid === u.uid);
-    if (s && s.group === null) s.group = u.group;
-  }
-  stickers.value = next;
-  selected.value = new Set(r.stickers.map((t) => t.s.uid));
-  pruneGroups();
-  normalize();
-}
-function clearBoard() {
-  if (!stickers.value.length) return;
-  nameDraft.value = null;
-  const removed = takeOff(() => false);
-  offerUndo("Cleared the mat", () => putBack(removed));
-}
 
 // ---- the library ------------------------------------------------------------------
 /**
@@ -827,8 +727,7 @@ async function putOnGun() {
   // Where it sits on that gun's chalk, so the editor puts it there rather than
   // on its slots' default spots. The chalk's box is centred on the home grid.
   const o = outline.value?.model === model ? outline.value : null;
-  const c = centroid(keep.value);
-  const at = o ? { x: c.x - (GRID_W / 2 - o.w / 2), y: c.y - (GRID_H / 2 - o.h / 2), anchors: o.anchors, uv: o.uv } : null;
+  const at = o ? { ...offChalk(centroid(keep.value), o), anchors: o.anchors, uv: o.uv } : null;
   emit("put-on-gun", id, model, at);
 }
 /** Enter in the name field: Update when the mat is a saved craft, else Save. */
@@ -909,33 +808,6 @@ function craftSpot(list: { x: number; y: number }[]): { x: number; y: number } {
     for (let x = a.x0 + 6; x <= a.x1 - 2; x += 6.5) if (clear(x, y)) return { x, y };
   }
   return mid;
-}
-/** Someone else's craft from the store, not one of yours. */
-const othersCraft = (entry: SavedCraft | StoreCraft) => "author" in entry && !(entry as StoreCraft).mine;
-/**
- * Lay a craft down on the mat, as a grouping again, selected. One of yours
- * stays linked to it (Update writes back); someone else's from the store is a
- * copy to make your own, named so, and so is one read off an inspect code
- * (`copy`). It goes where `at` says, else the first clear spot. False when the
- * mat has no room for it.
- */
-function placeSaved(entry: SavedCraft | StoreCraft, copy = othersCraft(entry), at = craftSpot(entry.stickers)): boolean {
-  if (stickers.value.length + entry.stickers.length > MAX_ON_BOARD) return false;
-  const theirs = othersCraft(entry);
-  const g = entry.stickers.length > 1 ? { id: newId(), name: theirs ? `${entry.name} (my copy)` : entry.name } : null;
-  if (g) groups.value = [...groups.value, g];
-  const made = entry.stickers.map((s) => ({
-    ...toRaw(s),
-    uid: newId(),
-    x: clampX(at.x + s.x),
-    y: clampY(at.y + s.y),
-    group: g?.id ?? null,
-    craft: copy ? null : entry.id,
-  }));
-  stickers.value = [...stickers.value, ...made];
-  selected.value = new Set(made.map((s) => s.uid));
-  board.value?.flash(made.map((s) => s.uid));
-  return true;
 }
 function renameSaved(entry: SavedCraft, name: string) {
   if (!name.trim()) return;
@@ -1063,6 +935,7 @@ function freeSpot(): { x: number; y: number } {
 function addSticker(row: PickerRow) {
   picker.value = null;
   if (!row.image || boardFull.value) return;
+  closeImport();
   const at = freeSpot();
   const s: BoardSticker = {
     uid: newId(),
@@ -1297,55 +1170,53 @@ const matCraftId = computed(() => {
   const only = from.size === 1 ? [...from][0] : "";
   return only && library.value.some((c) => c.id === only) ? only : null;
 });
-const mat = useMatOpen({
+const {
+  unitsOf,
+  flatten,
+  normalize,
+  pruneGroups,
+  undoable,
+  offerUndo,
+  settleUndo,
+  runUndo,
+  takeOff,
+  putBack,
+  clearBoard,
+  openOnMat,
+  importOpen,
+  importText,
+  importBusy,
+  importError,
+  toggleImport,
+  closeImport,
+  importCode,
+} = useStickerMat({
+  stickers,
+  groups,
+  selected,
   name: nameDraft,
   outline: outlineModel,
-  clear: () => takeOff(() => false),
-  restore: putBack,
-  offerUndo,
-  say,
+  gallery: galleryOpen,
+  spot: craftSpot,
+  clamp: (p) => ({ x: clampX(p.x), y: clampY(p.y) }),
+  flash: (uids) => board.value?.flash(uids),
+  newId,
   tr,
   read: importCraftCode,
   lay: layCode,
 });
-const { importOpen, importText, importBusy, importError, toggleImport, closeImport, importCode } = mat;
-function openOnMat(entry: SavedCraft | StoreCraft) {
-  if (entry.stickers.length > MAX_ON_BOARD) return;
-  const theirs = othersCraft(entry);
-  mat.replace(
-    () => {
-      nameDraft.value = theirs ? `${entry.name} (my copy)`.slice(0, 40) : null;
-      placeSaved(entry);
-      galleryOpen.value = false;
-    },
-    theirs ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`,
-  );
-}
 
 const importPlaceholder = computed(() => tr("inventory.stickerCrafts.importPlaceholder", "Paste a craft's inspect code"));
-/** Nothing changes until the returned step runs, so an import closed while it loads leaves the mat alone. */
-async function layCode(got: CraftCodeWire): Promise<() => void> {
+/** The outline is only cached here, so an import closed while it loads leaves the chalk alone. */
+async function layCode(got: CraftCodeWire) {
   const [geo, o] = await Promise.all([
     fetchStickerGeometry(got.model).catch(() => null),
     outlines.value.get(got.model) ?? outlineFor(got.model).catch(() => null),
   ]);
-  const laid = gunOnMat(got.stickers, geo?.slots ?? [], got.legacy, o);
-  const entry: SavedCraft = {
-    id: newId(),
-    name: got.name,
-    savedAt: Date.now(),
-    stickers: got.stickers.map((s, i) => ({ id: s.id, name: s.name, image: s.image ?? "", ...laid.stickers[i], wear: s.w })),
-  };
-  const at = laid.at && o ? { x: laid.at.x + GRID_W / 2 - o.w / 2, y: laid.at.y + GRID_H / 2 - o.h / 2 } : undefined;
-  return () => {
-    if (o) {
-      outlines.value = new Map(outlines.value).set(got.model, o);
-    }
-    outlineModel.value = got.model;
-    nameDraft.value = entry.name.slice(0, 40);
-    placeSaved(entry, true, at);
-    galleryOpen.value = false;
-  };
+  if (o) {
+    outlines.value = new Map(outlines.value).set(got.model, o);
+  }
+  return importedCraft(got, geo?.slots ?? [], o, newId());
 }
 
 /**
@@ -1856,7 +1727,7 @@ const FIELD =
               :class="compact ? 'h-7 w-7' : 'h-8 w-8'"
               :disabled="!loaded"
               :aria-label="tr('inventory.stickerCrafts.store', 'Craft Store')"
-              @click="galleryOpen = false; openCrafts('store')"
+              @click="galleryOpen = false; closeImport(); openCrafts('store')"
             >
               <Store class="h-3.5 w-3.5" />
             </button>

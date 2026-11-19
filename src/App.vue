@@ -13143,7 +13143,7 @@ watch([crumbTrail, () => props.path], ([trail]) => props.setCrumb?.(trail), { im
     <!-- Staged delete: the item is already out of the list; this is the 6s
          window in which that decision can be taken back. -->
     <UndoToast
-      class="fixed bottom-5 left-1/2 -translate-x-1/2"
+      class="fixed bottom-5 left-1/2 w-max max-w-[calc(100vw-2rem)] -translate-x-1/2"
       :style="{ zIndex: Z.toast }"
       :label="pendingDelete ? pendingDeleteLabel : null"
       dismiss-title="Dismiss (delete now)"

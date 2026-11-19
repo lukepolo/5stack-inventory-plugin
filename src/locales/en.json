@@ -285,6 +285,7 @@
       "importFailed": "Couldn't read that code. Try again.",
       "importSignedOut": "You're signed out. Sign in again, then import the code.",
       "importOffline": "Couldn't reach the server. Check your connection and try again.",
+      "importServer": "The server had trouble reading that code. Try again in a moment.",
       "importDone": "The code's stickers are on the mat. Save keeps them as your own craft.",
       "importedOne": "Imported 1 sticker.",
       "importedMany": "Imported {count} stickers.",
