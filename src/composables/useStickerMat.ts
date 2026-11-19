@@ -42,8 +42,12 @@ export type Unit = { kind: "one"; s: BoardSticker } | { kind: "group"; group: Gr
  * put back would also undo whatever was moved or added in the seconds since.
  */
 export type Removed = { stickers: { s: BoardSticker; at: number }[]; groups: Grouping[]; ungrouped: { uid: string; group: string }[] };
-type Undoable = { label: string; undo: () => void; commit?: () => void };
+/** What an Undo takes back, for its toast's icon; none is a removal. */
+export type UndoKind = "open" | "store" | "import";
+type Undoable = { label: string; undo: () => void; commit?: () => void; kind?: UndoKind };
 const UNDO_MS = 6000;
+/** Cut inside the quotes, so a long name never pushes the rest of a toast out of its two lines. */
+const quoted = (name: string) => (name.length > 24 ? `${name.slice(0, 23).trimEnd()}…` : name);
 
 export function useStickerMat(o: {
   stickers: Ref<BoardSticker[]>;
@@ -58,7 +62,9 @@ export function useStickerMat(o: {
   newId: () => string;
   tr: Tr;
   read: (code: string, signal: AbortSignal) => Promise<CraftCodeWire>;
-  lay: (got: CraftCodeWire) => Promise<{ entry: SavedCraft; at?: Spot }>;
+  geometry: (model: string) => Promise<{ slots: StickerSlot[] }>;
+  outlineOf: (model: string) => Promise<WeaponOutline | null>;
+  openStore: () => void;
 }) {
   const { stickers, groups, selected } = o;
 
@@ -110,9 +116,9 @@ export function useStickerMat(o: {
     clearTimeout(undoTimer);
     u?.commit?.();
   }
-  function offerUndo(label: string, undo: () => void, commit?: () => void) {
+  function offerUndo(label: string, undo: () => void, commit?: () => void, kind?: UndoKind) {
     settleUndo();
-    undoable.value = { label, undo, commit };
+    undoable.value = { label, undo, commit, kind };
     undoTimer = setTimeout(settleUndo, UNDO_MS);
   }
   function runUndo() {
@@ -198,16 +204,21 @@ export function useStickerMat(o: {
   }
 
   /** Undo puts back the name and the chalk with the stickers: Update and Put on your … act on all three. */
-  function replace(apply: () => void, what: string) {
+  function replace(apply: () => void, what: string, kind: UndoKind) {
     const before = { name: o.name.value, outline: o.outline.value };
     const taken = takeOff(() => false);
     apply();
-    offerUndo(what, () => {
-      takeOff(() => false);
-      putBack(taken);
-      o.name.value = before.name;
-      o.outline.value = before.outline;
-    });
+    offerUndo(
+      what,
+      () => {
+        takeOff(() => false);
+        putBack(taken);
+        o.name.value = before.name;
+        o.outline.value = before.outline;
+      },
+      undefined,
+      kind,
+    );
   }
   function openOnMat(entry: SavedCraft | StoreCraft) {
     if (entry.stickers.length > MAX_ON_BOARD) {
@@ -221,7 +232,10 @@ export function useStickerMat(o: {
         placeSaved(entry);
         o.gallery.value = false;
       },
-      theirs ? `“${entry.name}” is on the mat — Save keeps your own copy` : `Opened “${entry.name}”`,
+      theirs
+        ? o.tr("inventory.stickerCrafts.openedCopy", "Opened a copy of “{name}”", { name: quoted(entry.name) })
+        : o.tr("inventory.stickerCrafts.opened", "Opened “{name}”", { name: quoted(entry.name) }),
+      theirs ? "store" : "open",
     );
   }
 
@@ -243,7 +257,33 @@ export function useStickerMat(o: {
       closeImport();
     } else {
       importOpen.value = true;
+      o.gallery.value = false;
     }
+  }
+  function toggleGallery() {
+    closeImport();
+    o.gallery.value = !o.gallery.value;
+  }
+  function openStore() {
+    o.gallery.value = false;
+    closeImport();
+    o.openStore();
+  }
+  /** Escape: All crafts first, then the import. False when neither was open. */
+  function escape(): boolean {
+    if (o.gallery.value) {
+      o.gallery.value = false;
+      return true;
+    }
+    if (importOpen.value) {
+      closeImport();
+      return true;
+    }
+    return false;
+  }
+  function dispose() {
+    closeImport();
+    settleUndo();
   }
 
   function refusal(e: unknown, reading: boolean): string {
@@ -281,15 +321,13 @@ export function useStickerMat(o: {
   }
   function note(count: number, skipped: number): string {
     if (!skipped) {
-      return o.tr("inventory.stickerCrafts.importDone", "The code's stickers are on the mat. Save keeps them as your own craft.");
+      return o.tr("inventory.stickerCrafts.importDone", "Imported. Save to keep it as your craft.");
     }
-    const done = count === 1
-      ? o.tr("inventory.stickerCrafts.importedOne", "Imported 1 sticker.")
-      : o.tr("inventory.stickerCrafts.importedMany", "Imported {count} stickers.", { count });
-    const left = skipped === 1
-      ? o.tr("inventory.stickerCrafts.leftOutOne", "1 couldn't be read and was left out.")
-      : o.tr("inventory.stickerCrafts.leftOutMany", "{count} couldn't be read and were left out.", { count: skipped });
-    return `${done} ${left}`;
+    return o.tr("inventory.stickerCrafts.importPartial", "Imported {count} of {total}. {skipped} couldn't be read.", { count, total: count + skipped, skipped });
+  }
+  async function lay(got: CraftCodeWire) {
+    const [geo, outline] = await Promise.all([o.geometry(got.model).catch(() => null), o.outlineOf(got.model).catch(() => null)]);
+    return importedCraft(got, geo?.slots ?? [], outline, o.newId());
   }
 
   async function importCode() {
@@ -305,7 +343,7 @@ export function useStickerMat(o: {
     try {
       const got = await o.read(code, ctl.signal);
       reading = false;
-      const laid = ctl.signal.aborted ? null : await o.lay(got);
+      const laid = ctl.signal.aborted ? null : await lay(got);
       if (!laid || ctl.signal.aborted) {
         return;
       }
@@ -314,7 +352,7 @@ export function useStickerMat(o: {
         o.name.value = laid.entry.name.slice(0, 40);
         placeSaved(laid.entry, true, laid.at);
         o.gallery.value = false;
-      }, note(got.stickers.length, got.skipped));
+      }, note(got.stickers.length, got.skipped), "import");
       importOpen.value = false;
       importText.value = "";
     } catch (e) {
@@ -348,6 +386,10 @@ export function useStickerMat(o: {
     importBusy,
     importError,
     toggleImport,
+    toggleGallery,
+    openStore,
+    escape,
+    dispose,
     closeImport,
     importCode,
   };

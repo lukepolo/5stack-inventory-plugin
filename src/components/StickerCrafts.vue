@@ -57,7 +57,6 @@ import {
   importCraftCode,
   saveWeaponOutline,
   type CatalogWeapon,
-  type CraftCodeWire,
   type InventoryItem,
 } from "../api";
 import { useAttachmentPicker, type PickerRow } from "../composables/useAttachmentPicker";
@@ -88,7 +87,7 @@ import {
 import type { StickerBoard } from "../stickerBoard";
 import type { WeaponOutline } from "../outlineTrace";
 import type { OutlineSpot } from "../composables/useStickerCraftPlacement";
-import { importedCraft, offChalk, useStickerMat } from "../composables/useStickerMat";
+import { offChalk, useStickerMat } from "../composables/useStickerMat";
 import AttachmentPicker from "./AttachmentPicker.vue";
 import ModelRail, { type RailItem } from "./ModelRail.vue";
 import CraftUseCase from "./CraftUseCase.vue";
@@ -1188,6 +1187,10 @@ const {
   importBusy,
   importError,
   toggleImport,
+  toggleGallery,
+  openStore,
+  escape,
+  dispose,
   closeImport,
   importCode,
 } = useStickerMat({
@@ -1203,22 +1206,19 @@ const {
   newId,
   tr,
   read: importCraftCode,
-  lay: layCode,
+  geometry: fetchStickerGeometry,
+  outlineOf: async (model) => {
+    const o = outlines.value.get(model) ?? (await outlineFor(model));
+    if (o) {
+      outlines.value = new Map(outlines.value).set(model, o);
+    }
+    return o;
+  },
+  openStore: () => openCrafts("store"),
 });
+const undoIcon = computed(() => (undoable.value?.kind ? { open: LayoutGrid, store: Store, import: ClipboardPaste }[undoable.value.kind] : undefined));
 
 const importPlaceholder = computed(() => tr("inventory.stickerCrafts.importPlaceholder", "Paste a craft's inspect code"));
-/** The outline is only cached here, so an import closed while it loads leaves the chalk alone. */
-async function layCode(got: CraftCodeWire) {
-  const [geo, o] = await Promise.all([
-    fetchStickerGeometry(got.model).catch(() => null),
-    outlines.value.get(got.model) ?? outlineFor(got.model).catch(() => null),
-  ]);
-  if (o) {
-    outlines.value = new Map(outlines.value).set(got.model, o);
-  }
-  return importedCraft(got, geo?.slots ?? [], o, newId());
-}
-
 /**
  * Where stickers may go: the home grid — or, with a weapon chalked, the
  * weapon's box and OUTLINE_ROOM round it, centred on the home grid's middle
@@ -1416,13 +1416,7 @@ function onKey(e: KeyboardEvent) {
     }
     return;
   }
-  if (galleryOpen.value && e.key === "Escape") {
-    galleryOpen.value = false;
-    e.stopPropagation();
-    return;
-  }
-  if (importOpen.value && e.key === "Escape") {
-    closeImport();
+  if (e.key === "Escape" && escape()) {
     e.stopPropagation();
     return;
   }
@@ -1472,10 +1466,9 @@ function onKey(e: KeyboardEvent) {
 onMounted(() => window.addEventListener("keydown", onKey));
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKey);
-  closeImport();
   clearTimeout(justSavedTimer);
-  // Leaving settles a delete still on its Undo: it was meant.
-  settleUndo();
+  // Leaving settles a delete still on its Undo (it was meant) and cancels an import.
+  dispose();
   // Send a save that was still waiting on its debounce.
   flushBoard();
   board.value?.dispose();
@@ -1716,7 +1709,7 @@ const FIELD =
             :disabled="!loaded"
             :aria-expanded="galleryOpen"
             :title="galleryOpen ? 'Close All crafts (Esc)' : 'Every craft you have saved'"
-            @click="galleryOpen = !galleryOpen; closeImport()"
+            @click="toggleGallery"
           >
             <LayoutGrid class="h-3.5 w-3.5" /> {{ tr("inventory.stickerCrafts.allCrafts", "All crafts") }}
             <span class="font-mono text-f9 normal-case tracking-normal text-muted-foreground/70">{{ library.length }}</span>
@@ -1727,7 +1720,7 @@ const FIELD =
               :class="compact ? 'h-7 w-7' : 'h-8 w-8'"
               :disabled="!loaded"
               :aria-label="tr('inventory.stickerCrafts.store', 'Craft Store')"
-              @click="galleryOpen = false; closeImport(); openCrafts('store')"
+              @click="openStore"
             >
               <Store class="h-3.5 w-3.5" />
             </button>
@@ -1739,7 +1732,7 @@ const FIELD =
               :disabled="!loaded"
               :aria-expanded="importOpen"
               :aria-label="tr('inventory.stickerCrafts.importCode', 'Import a craft from an inspect code')"
-              @click="galleryOpen = false; toggleImport()"
+              @click="toggleImport"
             >
               <ClipboardPaste class="h-3.5 w-3.5" />
             </button>
@@ -2077,7 +2070,7 @@ const FIELD =
       :class="picker ? 'bottom-16' : 'bottom-5'"
       :style="{ zIndex: picker ? Z.pickerToast : Z.toast }"
     >
-      <UndoToast class="max-w-full" :label="undoable?.label ?? null" undo-title="Put it back (Ctrl/⌘ + Z)" @undo="runUndo" @dismiss="settleUndo" />
+      <UndoToast class="max-w-full" :icon="undoIcon" :label="undoable?.label ?? null" undo-title="Put it back (Ctrl/⌘ + Z)" @undo="runUndo" @dismiss="settleUndo" />
     </div>
 
     <!-- The same fade the editor's picker takes (App.vue). v-if on the child,
