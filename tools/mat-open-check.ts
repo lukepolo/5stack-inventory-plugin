@@ -289,6 +289,10 @@ async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
   const bob = { ...mine, id: "bob", mine: false, author: { steamId: "2", name: "Bob", avatar: null } } as unknown as StoreCraft;
   s.mat.openOnMat(bob);
   check("and a store copy's", s.mat.undoable.value?.label, "Opened a copy of “A craft with a really l…”");
+  s.mat.openOnMat({ ...mine, name: `${"A".repeat(22)}😀😀😀` });
+  check("an emoji where the cut falls stays whole", s.mat.undoable.value?.label, `Opened “${"A".repeat(22)}😀…”`);
+  s.mat.openOnMat({ ...mine, name: `${"A".repeat(20)}😀😀😀😀` });
+  check("and names are counted in characters, so 24 with emoji are not cut", s.mat.undoable.value?.label, `Opened “${"A".repeat(20)}😀😀😀😀”`);
 }
 {
   const s = scene();
