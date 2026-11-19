@@ -1,6 +1,6 @@
 import { ref } from "vue";
 import { ApiError, IMPORT_MAX_CHARS, type CraftCodeWire, type StickerSlot } from "../src/api";
-import { importedCraft, offChalk, useStickerMat } from "../src/composables/useStickerMat";
+import { offChalk, useStickerMat } from "../src/composables/useStickerMat";
 import { frameFrom, membersOf, outlineSeat, seat } from "../src/composables/useStickerCraftPlacement";
 import type { BoardSticker, Grouping, SavedCraft, StoreCraft } from "../src/stickerCraftsModel";
 import type { WeaponOutline } from "../src/outlineTrace";
@@ -55,13 +55,14 @@ const sticker = (uid: string, id: number, x: number, craft: string | null, group
   uid, id, name: `#${id}`, image: `/${id}.webp`, x, y: 15, rot: 0, wear: 0, group, craft,
 });
 
-function scene(opts: { empty?: boolean; layWith?: WeaponOutline | null } = {}) {
+function scene(opts: { empty?: boolean; layWith?: WeaponOutline | null; gallery?: boolean } = {}) {
   const stickers = ref<BoardSticker[]>(opts.empty ? [] : [sticker("a", 11, 20, "my-awp", "g1"), sticker("b", 12, 26, "my-awp", "g1")]);
   const groups = ref<Grouping[]>(opts.empty ? [] : [{ id: "g1", name: "My AWP" }]);
   const selected = ref(new Set<string>());
   const name = ref<string | null>(null);
   const outline = ref("awp");
-  const gallery = ref(false);
+  const gallery = ref(opts.gallery ?? false);
+  let stores = 0;
   const reads: { code: string; signal: AbortSignal; answer: Deferred<CraftCodeWire> }[] = [];
   const lays: Deferred<void>[] = [];
   let ids = 0;
@@ -82,15 +83,19 @@ function scene(opts: { empty?: boolean; layWith?: WeaponOutline | null } = {}) {
       reads.push({ code, signal, answer });
       return answer.promise;
     },
-    lay: async (got) => {
+    geometry: async () => ({ slots: SLOTS }),
+    outlineOf: async () => {
       const laid = deferred<void>();
       lays.push(laid);
       await laid.promise;
-      return importedCraft(got, SLOTS, opts.layWith === undefined ? OUTLINE : opts.layWith, "imported");
+      return opts.layWith === undefined ? OUTLINE : opts.layWith;
+    },
+    openStore: () => {
+      stores++;
     },
   });
   const state = () => JSON.stringify({ stickers: stickers.value, groups: groups.value, name: name.value, outline: outline.value });
-  return { mat, stickers, groups, name, outline, reads, lays, state };
+  return { mat, stickers, groups, name, outline, gallery, reads, lays, state, stores: () => stores };
 }
 type Scene = ReturnType<typeof scene>;
 async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
@@ -110,7 +115,7 @@ async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
   check("an import replaces the mat, chalks its gun and names it",
     [s.outline.value, s.name.value, s.stickers.value.map((x) => [x.id, x.craft])], ["ak47", "AK-47 | Redline", [[1, null], [2, null], [3, null], [4, null]]]);
   check("the code is sent trimmed", s.reads[0].code, "csgo_econ_action_preview 00AA");
-  check("it says how many were left out, on its Undo", s.mat.undoable.value?.label, "Imported 4 stickers. 1 couldn't be read and was left out.");
+  check("it says how many were left out, on its Undo", s.mat.undoable.value?.label, "Imported 4 of 5. 1 couldn't be read.");
   check("the form closes and empties", [s.mat.importOpen.value, s.mat.importText.value, s.mat.importBusy.value], [false, "", false]);
   s.mat.runUndo();
   check("Undo brings back the stickers with their craft and group, the name and the chalk exactly", s.state(), before);
@@ -129,7 +134,7 @@ async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
   const s = scene({ empty: true });
   const before = s.state();
   await importAK(s);
-  check("on an empty mat the import still offers its own Undo", s.mat.undoable.value?.label, "Imported 4 stickers. 1 couldn't be read and was left out.");
+  check("on an empty mat the import still offers its own Undo", s.mat.undoable.value?.label, "Imported 4 of 5. 1 couldn't be read.");
   s.mat.runUndo();
   check("which puts back the empty mat, its chalk and its name", s.state(), before);
 }
@@ -139,7 +144,7 @@ async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
   check("Clear offers its Undo", s.mat.undoable.value?.label, "Cleared the mat");
   const cleared = s.state();
   await importAK(s);
-  check("an import replaces Clear's Undo with its own", s.mat.undoable.value?.label, "Imported 4 stickers. 1 couldn't be read and was left out.");
+  check("an import replaces Clear's Undo with its own", s.mat.undoable.value?.label, "Imported 4 of 5. 1 couldn't be read.");
   s.mat.runUndo();
   check("so Undo goes back to the cleared mat, never the old stickers on top of the import", s.state(), cleared);
 }
@@ -190,7 +195,7 @@ async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
   s.reads[0].answer.resolve(AK);
   await done;
   await tick();
-  check("so the store's craft stays on the mat", [s.stickers.value.map((x) => x.id), s.mat.undoable.value?.label], [[5], "“Bob's duo” is on the mat — Save keeps your own copy"]);
+  check("so the store's craft stays on the mat", [s.stickers.value.map((x) => x.id), s.mat.undoable.value?.label], [[5], "Opened a copy of “Bob's duo”"]);
 }
 {
   const s = scene();
@@ -239,20 +244,136 @@ async function importAK(s: Scene, code = "  csgo_econ_action_preview 00AA  ") {
   await importAK(s);
   check("with no outline to lay it on, the layout goes at the first clear spot", [s.outline.value, s.stickers.value.length], ["ak47", 4]);
 }
+{
+  const s = scene({ empty: true });
+  s.mat.toggleImport();
+  s.mat.importText.value = "csgo_econ_action_preview 00AA";
+  const done = s.mat.importCode();
+  s.reads[0].answer.resolve(AK);
+  await tick();
+  s.lays[0].reject(new Error("the outline didn't load"));
+  await done;
+  check("an outline that fails to load still imports, off the chalk", [s.mat.importError.value, s.stickers.value.length, s.outline.value], [null, 4, "ak47"]);
+}
 
-async function refusal(error: unknown, from: "read" | "lay" = "read") {
+{
+  const s = scene({ empty: true });
+  s.mat.toggleImport();
+  s.mat.importText.value = "csgo_econ_action_preview 00AA";
+  const done = s.mat.importCode();
+  s.reads[0].answer.resolve({ ...AK, skipped: 0 });
+  await tick();
+  s.gallery.value = true;
+  s.lays[0].resolve();
+  await done;
+  check("a full import says so in two short sentences", s.mat.undoable.value?.label, "Imported. Save to keep it as your craft.");
+  check("and closes All crafts as it lands", s.gallery.value, false);
+}
+{
+  const s = scene({ empty: true });
+  s.mat.toggleImport();
+  s.mat.importText.value = "csgo_econ_action_preview 00AA";
+  const done = s.mat.importCode();
+  s.reads[0].answer.resolve({ ...AK, stickers: AK.stickers.slice(0, 3), skipped: 2 });
+  await tick();
+  s.lays[0].resolve();
+  await done;
+  check("two left out", s.mat.undoable.value?.label, "Imported 3 of 5. 2 couldn't be read.");
+}
+{
+  const s = scene({ gallery: true });
+  const mine: SavedCraft = { id: "mine", name: "A craft with a really long name for testing", savedAt: 0, stickers: [{ id: 7, name: "#7", image: "/7.webp", x: 0, y: 0, rot: 0, wear: 0 }] };
+  s.mat.openOnMat(mine);
+  check("opening a craft closes All crafts", s.gallery.value, false);
+  check("a long craft name is cut inside its quotes, never the sentence", s.mat.undoable.value?.label, "Opened “A craft with a really l…”");
+  const bob = { ...mine, id: "bob", mine: false, author: { steamId: "2", name: "Bob", avatar: null } } as unknown as StoreCraft;
+  s.mat.openOnMat(bob);
+  check("and a store copy's", s.mat.undoable.value?.label, "Opened a copy of “A craft with a really l…”");
+}
+{
+  const s = scene();
+  check("each Undo says what it was, for its icon", (() => {
+    const kinds: unknown[] = [];
+    s.mat.openOnMat({ id: "m", name: "M", savedAt: 0, stickers: [{ id: 7, name: "#7", image: "/7.webp", x: 0, y: 0, rot: 0, wear: 0 }] });
+    kinds.push(s.mat.undoable.value?.kind);
+    s.mat.openOnMat({ id: "b", name: "B", savedAt: 0, stickers: [{ id: 7, name: "#7", image: "/7.webp", x: 0, y: 0, rot: 0, wear: 0 }], mine: false, author: { steamId: "2", name: "Bob", avatar: null } } as unknown as StoreCraft);
+    kinds.push(s.mat.undoable.value?.kind);
+    s.mat.clearBoard();
+    kinds.push(s.mat.undoable.value?.kind ?? null);
+    return kinds;
+  })(), ["open", "store", null]);
+  await importAK(s);
+  check("and an import's", s.mat.undoable.value?.kind, "import");
+}
+
+async function reading(s: Scene) {
+  s.mat.toggleImport();
+  s.mat.importText.value = "csgo_econ_action_preview 00AA";
+  return s.mat.importCode();
+}
+async function landsAfter(s: Scene, done: Promise<void>) {
+  s.reads[0].answer.resolve(AK);
+  await done;
+  await tick();
+  return s.lays.length;
+}
+{
+  const s = scene();
+  const before = s.state();
+  const done = reading(s);
+  check("Escape while Reading closes the import", s.mat.escape(), true);
+  check("and cancels it", [s.reads[0].signal.aborted, s.mat.importOpen.value], [true, false]);
+  check("so nothing lands", [await landsAfter(s, done), s.state() === before], [0, true]);
+  check("Escape with nothing open is not ours", s.mat.escape(), false);
+}
+{
+  const s = scene();
+  const done = reading(s);
+  s.gallery.value = true;
+  check("Escape closes All crafts first", [s.mat.escape(), s.gallery.value, s.mat.importOpen.value], [true, false, true]);
+  check("then the import", [s.mat.escape(), s.reads[0].signal.aborted], [true, true]);
+  await landsAfter(s, done);
+}
+{
+  const s = scene();
+  const before = s.state();
+  const done = reading(s);
+  s.mat.openStore();
+  check("the Craft Store button cancels an import still Reading, closes All crafts and opens the store",
+    [s.reads[0].signal.aborted, s.mat.importOpen.value, s.gallery.value, s.stores()], [true, false, false, 1]);
+  check("and nothing lands", [await landsAfter(s, done), s.state() === before], [0, true]);
+}
+{
+  const s = scene();
+  const done = reading(s);
+  s.mat.toggleGallery();
+  check("All crafts cancels an import still Reading", [s.reads[0].signal.aborted, s.gallery.value], [true, true]);
+  await landsAfter(s, done);
+  s.mat.toggleGallery();
+  check("and closes again", s.gallery.value, false);
+}
+{
+  const s = scene({ gallery: true });
+  s.mat.toggleImport();
+  check("opening Import closes All crafts", [s.mat.importOpen.value, s.gallery.value], [true, false]);
+}
+{
+  const s = scene();
+  let committed = 0;
+  s.mat.offerUndo("Deleted “X”", () => {}, () => committed++);
+  const done = reading(s);
+  s.mat.dispose();
+  check("leaving the tab cancels the import and settles the Undo", [s.reads[0].signal.aborted, s.mat.undoable.value, committed], [true, null, 1]);
+  await landsAfter(s, done);
+}
+
+async function refusal(error: unknown) {
   const s = scene();
   const before = s.state();
   s.mat.toggleImport();
   s.mat.importText.value = "csgo_econ_action_preview 00AA";
   const done = s.mat.importCode();
-  if (from === "read") {
-    s.reads[0].answer.reject(error);
-  } else {
-    s.reads[0].answer.resolve(AK);
-    await tick();
-    s.lays[0].reject(error);
-  }
+  s.reads[0].answer.reject(error);
   await done;
   return [s.mat.importError.value, s.mat.importOpen.value, s.mat.importBusy.value, s.state() === before];
 }
@@ -269,7 +390,6 @@ for (const status of [500, 502, 503, 504]) {
 check("an answer that isn't JSON is the server's trouble, not the network", await refusal(new SyntaxError("Unexpected token '<'")),
   shown("The server had trouble reading that code. Try again in a moment."));
 check("any other refusal is try again", await refusal(new ApiError("Not Found", 404, null)), shown("Couldn't read that code. Try again."));
-check("a failure laying it out is try again, not the network", await refusal(new TypeError("x is undefined"), "lay"), shown("Couldn't read that code. Try again."));
 check("the paste field stops where the server does", IMPORT_MAX_CHARS, CODE_LIMITS.maxChars);
 
 if (failures) {
